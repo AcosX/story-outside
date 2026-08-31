@@ -9,12 +9,12 @@
 //   * Output is a per-sentence event sequence the client can play one at a
 //     time. Each event has type/sequence/text; dialogue carries a speaker;
 //     narration does not.
-//   * No event of type ask_player_choice is ever emitted by this generator.
-//     If the upstream beats include a choice marker, the cache is truncated
-//     before it (or the choice marker is replaced by a narration beat that
-//     does NOT ask the player anything).
+//   * Structured beat metadata is preserved: `type` ('narration' |
+//     'dialogue' | 'action') and `speaker` survive into the event stream.
+//   * A structured `type: 'ask_player_choice'` beat (or a text choice marker)
+//     truncates the opening. The choice beat itself NEVER enters the cache.
 //   * The generator is pure: same input → same output. It does NOT read or
-//     write any user/role/session state.
+//     write any user/role/session state and never forks by player role.
 //
 // The generator is intentionally minimal so it can be unit-tested without
 // any provider call. The output is also stable across Node versions.
@@ -23,7 +23,7 @@ import { canonicalSha256 } from './canonicalHash.mjs';
 
 /**
  * @typedef {Object} OpeningEvent
- * @property {string} type             'narration' | 'dialogue' | 'beat'.
+ * @property {string} type             'narration' | 'dialogue' | 'action' | 'beat'.
  * @property {number} sequence         0-based, contiguous, no gaps.
  * @property {string} text             Plain text shown to the reader.
  * @property {string} [speaker]        Set on 'dialogue'; canonical role id.
@@ -37,6 +37,7 @@ import { canonicalSha256 } from './canonicalHash.mjs';
  * @property {string} profile_identifier
  * @property {string} rules_version
  * @property {string} locale
+ * @property {string} variant
  * @property {string} boundary         'truncated_before_first_choice' | 'no_choice_in_story' | 'empty_story'.
  * @property {number} event_count
  * @property {OpeningEvent[]} events
@@ -75,6 +76,27 @@ function isChoiceMarker(text) {
 }
 
 /**
+ * Resolve the speaker for a beat. Structured `speaker` wins; otherwise the
+ * legacy `「label」` text prefix is used so existing string-only catalog rows
+ * keep working.
+ *
+ * @param {string|undefined} structuredSpeaker
+ * @param {string} text
+ * @param {ReadonlyArray<{ id: string, label: string }>} roles
+ * @param {number} index
+ */
+function resolveSpeaker(structuredSpeaker, text, roles, index) {
+  if (structuredSpeaker) {
+    const match = roles.find((r) => r.id === structuredSpeaker || r.label === structuredSpeaker);
+    if (!match) {
+      throw new Error(`generateOpeningCache: speaker '${structuredSpeaker}' is not a known role`);
+    }
+    return match.id;
+  }
+  return detectSpeaker(text, roles, index);
+}
+
+/**
  * Pick the speaker for a beat. The mock catalog assigns each beat to a role
  * in a deterministic pattern: round-robin over roles, but skip roles when
  * the current beat is a narration beat (no leading '「').
@@ -107,7 +129,7 @@ function detectSpeaker(text, roles, index) {
  * @param {string} input.story_version_uuid
  * @param {string} [input.opening_key]                  Default 'default'.
  * @param {{ identifier: string, rules_version: string, locale?: string }} input.profile
- * @param {{ id: string, title: string, hook: string, roles: Array<{id:string,label:string,mood?:string}>, beats: Array<{text:string,index?:number}> }} input.story
+ * @param {{ id: string, title: string, hook: string, roles: Array<{id:string,label:string,mood?:string}>, beats: Array<string | { text: string, index?: number, type?: string, speaker?: string }> }} input.story
  * @returns {OpeningCachePayload}
  */
 export function generateOpeningCache(input) {
@@ -131,11 +153,24 @@ export function generateOpeningCache(input) {
       // numbering keeps the cache easier to stream.
       continue;
     }
-    if (isChoiceMarker(text)) {
+    const structured = beat && typeof beat === 'object' ? beat : null;
+    const type = structured && typeof structured.type === 'string' ? structured.type : undefined;
+    if (type === 'ask_player_choice' || isChoiceMarker(text)) {
       boundary = 'truncated_before_first_choice';
       break;
     }
-    const speaker = detectSpeaker(text, roles, events.length);
+    const structuredSpeaker =
+      structured && typeof structured.speaker === 'string' && structured.speaker
+        ? structured.speaker
+        : undefined;
+    if (type === 'action') {
+      events.push({ type: 'action', sequence: events.length, text });
+      continue;
+    }
+    const speaker =
+      type === 'dialogue' || type === undefined
+        ? resolveSpeaker(structuredSpeaker, text, roles, events.length)
+        : null;
     /** @type {OpeningEvent} */
     const ev = speaker
       ? { type: 'dialogue', sequence: events.length, text, speaker }
@@ -153,6 +188,7 @@ export function generateOpeningCache(input) {
     profile_identifier: input.profile.identifier,
     rules_version: input.profile.rules_version,
     locale: input.profile.locale || 'zh-CN',
+    variant: input.profile.variant || 'default',
     boundary,
     event_count: events.length,
     events,
@@ -181,6 +217,7 @@ function _hashes(payload) {
     profile_identifier: payload.profile_identifier,
     rules_version: payload.rules_version,
     locale: payload.locale,
+    variant: payload.variant,
   };
   return {
     content_hash: canonicalSha256(content_payload),

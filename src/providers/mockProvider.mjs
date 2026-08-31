@@ -26,7 +26,10 @@ const CATALOG = [
     beats: [
       '雨声裹着玻璃窗，咖啡机嗡地停了。',
       '她把杯沿推向你的方向。',
-      '你想起一个还没问出口的问题。',
+      { type: 'dialogue', speaker: 'old-friend', text: '「旧友」你在等人吗？' },
+      { type: 'action', text: '她替你把冷掉的咖啡换成了热的。' },
+      { type: 'ask_player_choice', text: '你要怎么回答她？' },
+      '这一句不会出现在开场里。',
     ],
   },
   {

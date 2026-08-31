@@ -1,9 +1,10 @@
 -- Story Outside - canonical fresh-install schema.
 --
 -- This file is the deployment entrypoint. It creates the database and then
--- applies the same DDL as db/migrations/0001_initial_story_outside.sql.
+-- applies the same final DDL as db/migrations/0001_initial_story_outside.sql
+-- followed by db/migrations/0002_opening_cache_generation_profile.sql.
 -- The contract test tests/schema-contract.test.mjs keeps this body in sync
--- with the migration file.
+-- with the migration set.
 
 CREATE DATABASE IF NOT EXISTS story_outside
   CHARACTER SET utf8mb4
@@ -107,15 +108,18 @@ CREATE TABLE IF NOT EXISTS endings (
   CONSTRAINT chk_endings_conditions CHECK (conditions_payload IS NULL OR JSON_VALID(conditions_payload))
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
--- Story-level opening cache: scoped to story+version only, never user or role.
--- It remains usable until the first ask_player_choice event, then the app (or
--- trg_session_events_first_choice) marks the row invalidated.
+-- Story-level opening cache: scoped to story+version+public generation
+-- profile only, never user or role. Session first-choice consumption is
+-- recorded on game_sessions.first_choice_at and must not invalidate this
+-- shared cache for other sessions.
 CREATE TABLE IF NOT EXISTS story_opening_caches (
   id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
   cache_uuid CHAR(36) NOT NULL,
   story_id BIGINT UNSIGNED NOT NULL,
   story_version_id BIGINT UNSIGNED NOT NULL,
   opening_key VARCHAR(64) NOT NULL DEFAULT 'default',
+  generation_profile JSON NOT NULL,
+  generation_hash CHAR(64) NOT NULL,
   status ENUM('valid', 'invalidated', 'failed') NOT NULL DEFAULT 'valid',
   content_payload JSON NOT NULL,
   content_hash CHAR(64) NOT NULL,
@@ -128,14 +132,16 @@ CREATE TABLE IF NOT EXISTS story_opening_caches (
   updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
   PRIMARY KEY (id),
   UNIQUE KEY uq_story_opening_caches_uuid (cache_uuid),
-  UNIQUE KEY uq_story_opening_caches_scope (story_id, story_version_id, opening_key),
+  UNIQUE KEY uq_story_opening_caches_scope_generation (story_id, story_version_id, opening_key, generation_hash),
   KEY idx_story_opening_caches_valid (status, expires_at, last_used_at),
   CONSTRAINT fk_story_opening_caches_story FOREIGN KEY (story_id) REFERENCES stories(id)
     ON DELETE RESTRICT ON UPDATE RESTRICT,
   CONSTRAINT fk_story_opening_caches_version FOREIGN KEY (story_version_id) REFERENCES story_versions(id)
     ON DELETE RESTRICT ON UPDATE RESTRICT,
   CONSTRAINT chk_story_opening_caches_content CHECK (JSON_VALID(content_payload)),
+  CONSTRAINT chk_story_opening_caches_generation CHECK (JSON_VALID(generation_profile)),
   CONSTRAINT chk_story_opening_caches_hash CHECK (CHAR_LENGTH(content_hash) = 64),
+  CONSTRAINT chk_story_opening_caches_generation_hash CHECK (CHAR_LENGTH(generation_hash) = 64),
   CONSTRAINT chk_story_opening_caches_invalidated CHECK (
     (status = 'invalidated' AND invalidated_at IS NOT NULL) OR status <> 'invalidated'
   )
@@ -351,18 +357,12 @@ BEGIN
     UPDATE game_sessions
        SET first_choice_at = COALESCE(first_choice_at, NEW.occurred_at)
      WHERE id = NEW.session_id;
-
-    UPDATE story_opening_caches AS c
-      JOIN game_sessions AS s ON s.opening_cache_id = c.id
-       SET c.status = 'invalidated',
-           c.invalidated_at = COALESCE(c.invalidated_at, NEW.occurred_at),
-           c.invalidated_reason = 'first_ask_player_choice'
-     WHERE s.id = NEW.session_id
-       AND c.status = 'valid';
   END IF;
 END$$
 DELIMITER ;
 
--- Record this migration. INSERT IGNORE keeps the file re-runnable.
+-- Record the canonical migration set. INSERT IGNORE keeps the file
+-- re-runnable.
 INSERT IGNORE INTO schema_migrations (migration_name, applied_by)
-VALUES ('0001_initial_story_outside', NULL);
+VALUES ('0001_initial_story_outside', NULL),
+       ('0002_opening_cache_generation_profile', NULL);

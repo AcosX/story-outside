@@ -5,7 +5,8 @@
 //   * The rebuild route is idempotent: same story_version + same profile
 //     twice returns the same cache row.
 //   * The rebuild route with a new rules_version creates a fresh row.
-//   * Import + rebuild → session → first-choice end-to-end.
+//   * Import + rebuild → session → first-choice end-to-end. First choice is
+//     session-local; the shared opening cache stays valid for new sessions.
 
 import http from 'node:http';
 
@@ -152,7 +153,7 @@ try {
   }
 
   // ------------------------------------------------------------------
-  // /api/dev/sessions/:uuid/first-choice — invalidate opening cache.
+  // /api/dev/sessions/:uuid/first-choice — session-local consumed marker.
   // ------------------------------------------------------------------
   {
     const res = await fetch(
@@ -165,8 +166,44 @@ try {
     );
     const data = await res.json();
     check('POST first-choice 200', res.status === 200);
-    check('first-choice result is invalidated', data.result?.status === 'invalidated');
-    check('first-choice reason is first_ask_player_choice', data.result?.invalidated_reason === 'first_ask_player_choice');
+    check('first-choice result is a session consumed marker', data.result?.status === 'consumed');
+    check('first-choice marker is session-scoped', data.result?.session_uuid === '00000000-0000-4000-8000-aaaaaaaaaaaa');
+    check('first-choice reason is first_ask_player_choice', data.result?.invalidated_reason === 'first_ask_player_choice' || data.result?.reason === 'first_ask_player_choice');
+  }
+
+  // The route must not let a snapshot body mutate a different URL session.
+  {
+    const res = await fetch(
+      `${baseUrl}/api/dev/sessions/00000000-0000-4000-8000-aaaaaaaaaaab/first-choice`,
+      {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ snapshot }),
+      },
+    );
+    const data = await res.json();
+    check('POST first-choice URL/snapshot mismatch 400', res.status === 400, `status=${res.status}`);
+    check('mismatch error is session_uuid_mismatch', data?.error === 'session_uuid_mismatch');
+  }
+
+  // Another session can still pin the same valid opening cache after the
+  // first session consumed its first choice.
+  {
+    const res = await fetch(`${baseUrl}/api/dev/sessions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        session_uuid: '00000000-0000-4000-8000-aaaaaaaaaaac',
+        story_uuid: cafeFixture.story_uuid,
+        story_version_uuid: cafeFixture.versions[0].story_version_uuid,
+        user_ref: 'bob',
+        role_id: 'old-friend',
+      }),
+    });
+    const data = await res.json();
+    check('new session after first choice still 200', res.status === 200);
+    check('new session reuses the shared opening cache', data.snapshot?.opening_cache_uuid === snapshot.opening_cache_uuid);
+    check('shared opening cache remains valid', data.snapshot?.opening_cache_status === 'valid');
   }
 
   // ------------------------------------------------------------------

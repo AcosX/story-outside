@@ -9,10 +9,13 @@
 //     opening_key, generation_hash). A failed generation does NOT pollute
 //     the valid cache: it is written with status='failed' and never served
 //     as the public opening.
-//   * recordCacheInvalidation marks a row invalidated but does NOT remove
-//     it; the canonical history keeps it visible.
+//   * recordCacheInvalidation is an admin-level audit action only. It marks
+//     a row invalidated but does NOT remove it. First-choice consumption is
+//     SESSION-LOCAL and must call recordSessionFirstChoice instead; it must
+//     never invalidate the shared opening cache for other sessions.
 //   * The repository never persists user/role/session identifiers anywhere
 //     on story_versions or story_opening_caches (no such column exists).
+//     Session-local first-choice state lives in the session map only.
 //
 // This module is intentionally free of MariaDB calls. It mirrors the SQL
 // surface in db/migrations/0001_initial_story_outside.sql so a future
@@ -61,6 +64,7 @@ import { canonicalStoryHash } from './canonicalHash.mjs';
  * @property {string} status             'valid' | 'invalidated' | 'failed'.
  * @property {object} content_payload
  * @property {string} content_hash
+ * @property {object} generation_profile
  * @property {string} generation_hash
  * @property {number} use_count
  * @property {string|null} last_used_at
@@ -69,6 +73,15 @@ import { canonicalStoryHash } from './canonicalHash.mjs';
  * @property {string|null} expires_at
  * @property {string} created_at
  * @property {string} updated_at
+ */
+
+/**
+ * @typedef {Object} SessionFirstChoiceMarker
+ * @property {string} session_uuid
+ * @property {string|null} opening_cache_uuid
+ * @property {string} status           'consumed'.
+ * @property {string} first_choice_at
+ * @property {string} reason
  */
 
 const ID_PATTERN = /^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/;
@@ -111,6 +124,7 @@ function assertSlug(label, value) {
  *   versionsNoByStory: Map<string, number>,        // next version_no per story
  *   openingCaches: Map<string, OpeningCacheRow>,   // keyed by cache_uuid
  *   openingCachesByScope: Map<string, string>,     // scope key → cache_uuid (valid only)
+ *   sessionFirstChoices: Map<string, SessionFirstChoiceMarker>,  // session_uuid → marker
  * }}
  */
 function createEmptyState() {
@@ -122,6 +136,7 @@ function createEmptyState() {
     versionsNoByStory: new Map(),
     openingCaches: new Map(),
     openingCachesByScope: new Map(),
+    sessionFirstChoices: new Map(),
   };
 }
 
@@ -157,6 +172,8 @@ export function makeOpeningScopeKey(story_uuid, story_version_uuid, opening_key,
  * @property {(cache_uuid: string) => OpeningCacheRow | null} findOpeningCacheByUuid
  * @property {(input: Omit<OpeningCacheRow, 'cache_uuid'|'created_at'|'updated_at'>) => OpeningCacheRow} upsertOpeningCache
  * @property {(cache_uuid: string, reason: string) => OpeningCacheRow | null} recordCacheInvalidation
+ * @property {(input: { session_uuid: string, opening_cache_uuid?: string|null, reason?: string }) => SessionFirstChoiceMarker} recordSessionFirstChoice
+ * @property {(session_uuid: string) => SessionFirstChoiceMarker | null} findSessionFirstChoice
  * @property {(cache_uuid: string) => void} markCacheFailed
  * @property {() => { story_count: number, version_count: number, cache_count: number }} stats
  * @property {(row: StoryVersionRow) => void} _seedVersion
@@ -337,6 +354,8 @@ export function createInMemoryStoryRepository() {
         existing.status = input.status;
         existing.content_payload = input.content_payload;
         existing.content_hash = input.content_hash;
+        existing.generation_profile = input.generation_profile;
+        existing.generation_hash = input.generation_hash;
         existing.use_count = input.use_count ?? existing.use_count;
         existing.last_used_at = input.last_used_at ?? existing.last_used_at;
         existing.invalidated_at = input.invalidated_at ?? existing.invalidated_at;
@@ -355,6 +374,7 @@ export function createInMemoryStoryRepository() {
         status: input.status,
         content_payload: input.content_payload,
         content_hash: input.content_hash,
+        generation_profile: input.generation_profile,
         generation_hash: input.generation_hash,
         use_count: input.use_count ?? 0,
         last_used_at: input.last_used_at ?? null,
@@ -396,6 +416,29 @@ export function createInMemoryStoryRepository() {
       );
       state.openingCachesByScope.delete(key);
       return row;
+    },
+    recordSessionFirstChoice(input) {
+      if (!input || typeof input !== 'object') {
+        throw new Error('recordSessionFirstChoice: input required');
+      }
+      if (typeof input.session_uuid !== 'string' || !input.session_uuid) {
+        throw new Error('recordSessionFirstChoice: session_uuid required');
+      }
+      const existing = state.sessionFirstChoices.get(input.session_uuid);
+      if (existing) return existing;
+      const marker = {
+        session_uuid: input.session_uuid,
+        opening_cache_uuid: input.opening_cache_uuid || null,
+        status: 'consumed',
+        first_choice_at: nowIso(),
+        reason: input.reason || 'first_ask_player_choice',
+      };
+      state.sessionFirstChoices.set(input.session_uuid, marker);
+      return marker;
+    },
+    findSessionFirstChoice(session_uuid) {
+      if (typeof session_uuid !== 'string') return null;
+      return state.sessionFirstChoices.get(session_uuid) || null;
     },
     markCacheFailed(cache_uuid) {
       const row = state.openingCaches.get(cache_uuid);
@@ -439,6 +482,7 @@ export function createInMemoryStoryRepository() {
       state.versionsNoByStory = fresh.versionsNoByStory;
       state.openingCaches = fresh.openingCaches;
       state.openingCachesByScope = fresh.openingCachesByScope;
+      state.sessionFirstChoices = fresh.sessionFirstChoices;
     },
   };
 

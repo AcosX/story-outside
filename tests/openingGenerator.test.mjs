@@ -62,7 +62,7 @@ check('every event has a type and text', () => {
     profile: PROFILE,
   });
   for (const ev of out.events) {
-    assert.ok(['narration', 'dialogue', 'beat'].includes(ev.type));
+    assert.ok(['narration', 'dialogue', 'action', 'beat'].includes(ev.type));
     assert.equal(typeof ev.text, 'string');
     assert.ok(ev.text.length > 0);
   }
@@ -80,6 +80,61 @@ check('events do NOT include ask_player_choice type', () => {
   }
   // No event carries an ask_player_choice marker anywhere on it.
   assert.ok(!out.events.some((e) => /ask_player_choice/.test(JSON.stringify(e))));
+});
+
+check('structured ask_player_choice truncates and never enters the cache', () => {
+  const STORY_WITH_STRUCTURED_CHOICE = {
+    ...STORY,
+    beats: [
+      '雨声裹着玻璃窗。',
+      { type: 'dialogue', speaker: 'old-friend', text: '「旧友」你在等人吗？' },
+      { type: 'action', text: '她替你把冷掉的咖啡换成了热的。' },
+      { type: 'ask_player_choice', text: '你要怎么回答她？' },
+      '这一句不应该出现',
+    ],
+  };
+  const out = generateOpeningCache({
+    story_uuid: 's-1',
+    story_version_uuid: 'v-1',
+    story: STORY_WITH_STRUCTURED_CHOICE,
+    profile: PROFILE,
+  });
+  assert.equal(out.boundary, 'truncated_before_first_choice');
+  assert.equal(out.event_count, 3);
+  assert.equal(out.events[0].type, 'narration');
+  assert.equal(out.events[1].type, 'dialogue');
+  assert.equal(out.events[1].speaker, 'old-friend');
+  assert.equal(out.events[2].type, 'action');
+  assert.ok(!JSON.stringify(out.events).includes('ask_player_choice'));
+  assert.ok(!JSON.stringify(out.events).includes('你要怎么回答她？'));
+  assert.ok(!JSON.stringify(out.events).includes('这一句不应该出现'));
+});
+
+check('structured speaker wins and unknown structured speaker is rejected', () => {
+  const ok = generateOpeningCache({
+    story_uuid: 's-1',
+    story_version_uuid: 'v-1',
+    story: {
+      ...STORY,
+      beats: [{ type: 'dialogue', speaker: 'old-friend', text: '她说话了。' }],
+    },
+    profile: PROFILE,
+  });
+  assert.equal(ok.events[0].type, 'dialogue');
+  assert.equal(ok.events[0].speaker, 'old-friend');
+  assert.throws(
+    () =>
+      generateOpeningCache({
+        story_uuid: 's-1',
+        story_version_uuid: 'v-1',
+        story: {
+          ...STORY,
+          beats: [{ type: 'dialogue', speaker: 'ghost', text: '她说话了。' }],
+        },
+        profile: PROFILE,
+      }),
+    /not a known role/,
+  );
 });
 
 check('truncates BEFORE the first choice marker in beats', () => {

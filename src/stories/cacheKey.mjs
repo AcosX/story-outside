@@ -3,21 +3,23 @@
 // Hard contract (ClickUp 04):
 //   * The opening cache key is the SAME for every (user, role, session)
 //     that reads a given (story, story_version) at a given generation profile.
-//   * The key MUST be derived only from:
+//   * The key MUST be derived only from PUBLIC generation dimensions:
 //        - story_uuid (or stable slug)
 //        - story_version_uuid
 //        - opening_key (default 'default')
 //        - generation_profile.identifier
 //        - generation_profile.rules_version
+//        - generation_profile.locale (default 'zh-CN')
+//        - generation_profile.variant (allow-listed public variant, default 'default')
 //   * The key MUST NOT include any of:
 //        - user_id / user_ref / oauth subject / ip / device
 //        - role_id / role_label / role mood
 //        - session_id / session_uuid / client_request_id
 //        - timestamp / random nonce
-//   * Any attempt to pass a forbidden dimension into the key derivation MUST
-//     throw — we want the failure to be loud, not silent, so a future
-//     regression that tries to add user-scoped caching cannot accidentally
-//     produce a per-user cache that leaks cross-user data.
+//        - free-form tags or arbitrary profile/scope fields
+//   * Any unknown or forbidden dimension MUST throw — we want the failure to
+//     be loud, not silent, so a future regression cannot accidentally produce
+//     a per-user cache that leaks cross-user data.
 //
 // The output is hex(SHA-256) of the canonical profile bytes. Length is 64.
 
@@ -29,9 +31,9 @@ import { canonicalJsonStringify } from './canonicalHash.mjs';
  * @property {string} identifier       Free-form profile name, e.g. 'opening-default'.
  * @property {string} rules_version    Semantic rules version, e.g. 'opening-rules/1'.
  * @property {string} [locale]         Optional locale hint (e.g. 'zh-CN'). Defaults to 'zh-CN'.
- * @property {Record<string, string>} [tags] Optional tag set; included in the hash to
- *                                          allow side-by-band experiments that should NOT
- *                                          share a cache (e.g. 'narrator=internal').
+ * @property {string} [variant]        Optional allow-listed PUBLIC variant. Defaults to
+ *                                     'default'. Adding a variant is a deliberate public
+ *                                     cache split, never a per-user/per-role split.
  */
 
 const FORBIDDEN_KEYS = new Set([
@@ -68,15 +70,31 @@ const FORBIDDEN_KEYS = new Set([
 ]);
 
 /**
+ * Public variant names. A variant is a deliberate, authored split of a
+ * public cache (e.g. bundle edition), not a place to smuggle in identity.
+ */
+const PUBLIC_PROFILE_VARIANTS = new Set(['default', 'spoiler', 'bonus', 'bundle', 'demo']);
+
+const ALLOWED_SCOPE_KEYS = new Set(['story_uuid', 'story_version_uuid', 'opening_key', 'profile']);
+const ALLOWED_PROFILE_KEYS = new Set(['identifier', 'rules_version', 'locale', 'variant']);
+
+/**
  * @param {Record<string, unknown>} obj
  * @param {string} label
+ * @param {ReadonlySet<string>} allowed
  */
-function assertNoForbiddenKeys(obj, label) {
+function assertKnownKeys(obj, label, allowed) {
   for (const key of Object.keys(obj)) {
     if (FORBIDDEN_KEYS.has(key)) {
       throw new Error(
         `cacheKey: forbidden dimension '${key}' in ${label}. ` +
           `The opening cache MUST stay story/version-scoped.`,
+      );
+    }
+    if (!allowed.has(key)) {
+      throw new Error(
+        `cacheKey: unknown field '${key}' in ${label}. ` +
+          `Only public, allow-listed generation dimensions may affect the opening cache.`,
       );
     }
   }
@@ -100,23 +118,23 @@ function normaliseProfile(profile) {
   if (!profile || typeof profile !== 'object') {
     throw new Error('cacheKey: profile must be an object');
   }
+  assertKnownKeys(profile, 'profile', ALLOWED_PROFILE_KEYS);
   assertNonEmptyString('profile.identifier', profile.identifier);
   assertNonEmptyString('profile.rules_version', profile.rules_version);
-  const out = {
+  const variant =
+    typeof profile.variant === 'string' && profile.variant ? profile.variant : 'default';
+  if (!PUBLIC_PROFILE_VARIANTS.has(variant)) {
+    throw new Error(
+      `cacheKey: profile.variant '${variant}' is not an allow-listed public variant. ` +
+        `Allowed: ${[...PUBLIC_PROFILE_VARIANTS].sort().join(', ')}.`,
+    );
+  }
+  return {
     identifier: profile.identifier,
     rules_version: profile.rules_version,
     locale: typeof profile.locale === 'string' && profile.locale ? profile.locale : 'zh-CN',
+    variant,
   };
-  if (profile.tags && typeof profile.tags === 'object') {
-    assertNoForbiddenKeys(profile.tags, 'profile.tags');
-    /** @type {Record<string, string>} */
-    const tags = {};
-    for (const k of Object.keys(profile.tags).sort()) {
-      tags[k] = String(profile.tags[k]);
-    }
-    out.tags = tags;
-  }
-  return out;
 }
 
 /**
@@ -135,7 +153,7 @@ export function deriveOpeningCacheKey(scope) {
   }
   assertNonEmptyString('scope.story_uuid', scope.story_uuid);
   assertNonEmptyString('scope.story_version_uuid', scope.story_version_uuid);
-  assertNoForbiddenKeys(scope, 'scope');
+  assertKnownKeys(scope, 'scope', ALLOWED_SCOPE_KEYS);
   const profile = normaliseProfile(scope.profile);
   const opening_key =
     typeof scope.opening_key === 'string' && scope.opening_key

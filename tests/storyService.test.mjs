@@ -11,7 +11,8 @@
 //     retry succeeds and the previous valid cache is left untouched.
 //   * Rebuild with a different generation profile creates a NEW valid
 //     cache row; old rows remain in the table (auditable).
-//   * First-choice consumption invalidates the cache row but keeps it.
+//   * First-choice consumption is session-local: it returns a consumed
+//     marker and does NOT invalidate the shared opening cache.
 
 import assert from 'node:assert/strict';
 
@@ -190,7 +191,64 @@ async function runChecks() {
     assert.ok(!JSON.stringify(pinned.content_payload).includes('REWRITTEN'));
   });
 
+  await check('startSessionSnapshot rejects story/version mismatch and unknown role', async () => {
+    const { repository, fixtures } = createSeededRepository();
+    const cafe = fixtures.find((f) => f.slug === 'cafe-rain');
+    const nightShift = fixtures.find((f) => f.slug === 'night-shift');
+    assert.throws(
+      () =>
+        startSessionSnapshot({
+          repository,
+          session_uuid: '00000000-0000-4000-8000-bbbbbbbbbbbb',
+          story_uuid: nightShift.story_uuid,
+          story_version_uuid: cafe.story_version_uuid,
+          user_ref: 'u-1',
+          role_id: 'stranger',
+        }),
+      /does not match story_version/,
+    );
+    assert.throws(
+      () =>
+        startSessionSnapshot({
+          repository,
+          session_uuid: '00000000-0000-4000-8000-bbbbbbbbbbbc',
+          story_uuid: cafe.story_uuid,
+          story_version_uuid: cafe.story_version_uuid,
+          user_ref: 'u-1',
+          role_id: 'ghost',
+        }),
+      /is not a role of the pinned story_version/,
+    );
+    assert.throws(
+      () =>
+        startSessionSnapshot({
+          repository,
+          session_uuid: 'not-a-uuid',
+          story_uuid: cafe.story_uuid,
+          story_version_uuid: cafe.story_version_uuid,
+          user_ref: 'u-1',
+          role_id: 'stranger',
+        }),
+      /session_uuid must be a UUID/,
+    );
+  });
+
   console.log('\nOpening cache: shared across user/role');
+
+  await check('opening cache truncates before structured choice, keeps dialogue/action', async () => {
+    const { repository, fixtures } = createSeededRepository();
+    const cafe = fixtures.find((f) => f.slug === 'cafe-rain');
+    const fresh = await ensureOpeningCache({
+      repository,
+      story_version_uuid: cafe.story_version_uuid,
+    });
+    const events = fresh.cache.content_payload.events;
+    assert.equal(fresh.cache.content_payload.boundary, 'truncated_before_first_choice');
+    assert.ok(events.some((ev) => ev.type === 'dialogue' && ev.speaker === 'old-friend'));
+    assert.ok(events.some((ev) => ev.type === 'action'));
+    assert.ok(!JSON.stringify(fresh.cache.content_payload).includes('ask_player_choice'));
+    assert.ok(!JSON.stringify(fresh.cache.content_payload).includes('你要怎么回答她？'));
+  });
 
   await check('different users + roles share the same opening cache row', async () => {
     const { repository, fixtures } = createSeededRepository();
@@ -332,17 +390,53 @@ async function runChecks() {
     assert.equal(oldRow.status, 'valid');
   });
 
-  await check('in_place replace requires identical content_hash', async () => {
+  await check('rebuild with new generation profile keeps old generation lookup working', async () => {
     const { repository, fixtures } = createSeededRepository();
     const cafe = fixtures.find((f) => f.slug === 'cafe-rain');
-    await ensureOpeningCache({ repository, story_version_uuid: cafe.story_version_uuid });
+    const first = await ensureOpeningCache({
+      repository,
+      story_version_uuid: cafe.story_version_uuid,
+    });
+    const rebuilt = await rebuildOpeningCache({
+      repository,
+      story_version_uuid: cafe.story_version_uuid,
+      profile: {
+        identifier: 'opening-default',
+        rules_version: 'opening-rules/2',
+        locale: 'zh-CN',
+      },
+    });
+    assert.notEqual(rebuilt.cache.cache_uuid, first.cache.cache_uuid);
+    const oldLookup = repository.findOpeningCacheByScope(
+      cafe.story_uuid,
+      cafe.story_version_uuid,
+      'default',
+      first.cache.generation_hash,
+    );
+    assert.ok(oldLookup);
+    assert.equal(oldLookup.cache_uuid, first.cache.cache_uuid);
+    assert.equal(oldLookup.status, 'valid');
+    const newLookup = repository.findOpeningCacheByScope(
+      cafe.story_uuid,
+      cafe.story_version_uuid,
+      'default',
+      rebuilt.cache.generation_hash,
+    );
+    assert.ok(newLookup);
+    assert.equal(newLookup.cache_uuid, rebuilt.cache.cache_uuid);
+  });
+
+  await check('in_place replace requires identical content_hash', async () => {
+    const { repository, fixtures } = createSeededRepository();
+    const nightShift = fixtures.find((f) => f.slug === 'night-shift');
+    await ensureOpeningCache({ repository, story_version_uuid: nightShift.story_version_uuid });
     // Pre-import the generator helper (ESM-safe).
     const { generateOpeningCache: gen } = await import('../src/stories/openingGenerator.mjs');
     await assert.rejects(
       () =>
         ensureOpeningCache({
           repository,
-          story_version_uuid: cafe.story_version_uuid,
+          story_version_uuid: nightShift.story_version_uuid,
           options: {
             force: true,
             replace_strategy: 'in_place',
@@ -350,8 +444,8 @@ async function runChecks() {
               // Produce a different content hash by injecting an extra event.
               const mutated = { ...args.story, beats: [...args.story.beats, 'NEW'] };
               return gen({
-                story_uuid: cafe.story_uuid,
-                story_version_uuid: cafe.story_version_uuid,
+                story_uuid: nightShift.story_uuid,
+                story_version_uuid: nightShift.story_version_uuid,
                 opening_key: 'default',
                 profile: defaultGenerationProfile(),
                 story: mutated,
@@ -363,9 +457,9 @@ async function runChecks() {
     );
   });
 
-  console.log('\nFirst-choice invalidation');
+  console.log('\nFirst-choice consumption');
 
-  await check('first choice invalidates the cache row but keeps it', async () => {
+  await check('first choice returns a session-local consumed marker', async () => {
     const { repository, fixtures } = createSeededRepository();
     const cafe = fixtures.find((f) => f.slug === 'cafe-rain');
     const built = await ensureOpeningCache({
@@ -381,12 +475,55 @@ async function runChecks() {
       role_id: 'stranger',
     });
     const after = markFirstChoiceConsumed({ repository, snapshot });
-    assert.equal(after.status, 'invalidated');
-    assert.equal(after.invalidated_reason, 'first_ask_player_choice');
-    // The row is still in the repository (audit), not deleted.
+    assert.equal(after.status, 'consumed');
+    assert.equal(after.session_uuid, snapshot.session_uuid);
+    assert.equal(after.opening_cache_uuid, built.cache.cache_uuid);
+    assert.equal(after.reason, 'first_ask_player_choice');
+    assert.ok(after.first_choice_at);
+    // Idempotent for the same session.
+    const again = markFirstChoiceConsumed({ repository, snapshot });
+    assert.equal(again.first_choice_at, after.first_choice_at);
+  });
+
+  await check('first choice does NOT invalidate the shared opening cache', async () => {
+    const { repository, fixtures } = createSeededRepository();
+    const cafe = fixtures.find((f) => f.slug === 'cafe-rain');
+    const built = await ensureOpeningCache({
+      repository,
+      story_version_uuid: cafe.story_version_uuid,
+    });
+    const snapshot = startSessionSnapshot({
+      repository,
+      session_uuid: '00000000-0000-4000-8000-cccccccccccd',
+      story_uuid: cafe.story_uuid,
+      story_version_uuid: cafe.story_version_uuid,
+      user_ref: 'dave',
+      role_id: 'stranger',
+    });
+    markFirstChoiceConsumed({ repository, snapshot });
+    // The shared row is still valid and still found by scope lookup.
     const stillThere = repository.findOpeningCacheByUuid(built.cache.cache_uuid);
     assert.ok(stillThere);
-    assert.equal(stillThere.status, 'invalidated');
+    assert.equal(stillThere.status, 'valid');
+    assert.equal(stillThere.invalidated_at, null);
+    const lookedUp = repository.findOpeningCacheByScope(
+      cafe.story_uuid,
+      cafe.story_version_uuid,
+      'default',
+      built.cache.generation_hash,
+    );
+    assert.equal(lookedUp.cache_uuid, built.cache.cache_uuid);
+    // A different session can still pin and reuse the same public opening.
+    const nextSession = startSessionSnapshot({
+      repository,
+      session_uuid: '00000000-0000-4000-8000-ccccccccccce',
+      story_uuid: cafe.story_uuid,
+      story_version_uuid: cafe.story_version_uuid,
+      user_ref: 'erin',
+      role_id: 'old-friend',
+    });
+    assert.equal(nextSession.opening_cache_uuid, built.cache.cache_uuid);
+    assert.equal(nextSession.opening_cache_status, 'valid');
   });
 
   console.log('\nVersion import: provider name + slug mismatch is rejected');

@@ -15,9 +15,9 @@
 //     that the session will read). Subsequent reads MUST go through this
 //     snapshot — never against the latest upstream DTO.
 //   * markFirstChoiceConsumed records the first ask_player_choice on a
-//     session and invalidates the opening cache for that session's
-//     story_version. The cache is NOT deleted; it is marked invalidated
-//     and a fresh one can be generated via rebuildOpeningCache.
+//     SESSION and returns a session-local consumed marker. It NEVER
+//     invalidates the shared story/version opening cache: another session
+//     may still read and cache the same public opening.
 //
 // This module is the seam between the provider layer and the application
 // state. It does not write to MariaDB and does not load any secrets.
@@ -38,6 +38,7 @@ import { generateOpeningCache } from './openingGenerator.mjs';
  * @property {string} identifier
  * @property {string} rules_version
  * @property {string} [locale]
+ * @property {string} [variant]        Public allow-listed cache variant.
  */
 
 /**
@@ -75,6 +76,7 @@ export function defaultGenerationProfile() {
     identifier: 'opening-default',
     rules_version: 'opening-rules/1',
     locale: 'zh-CN',
+    variant: 'default',
   };
 }
 
@@ -233,6 +235,7 @@ export async function ensureOpeningCache({ repository, story_version_uuid, optio
       status: 'failed',
       content_payload: { error: 'generation_failed', message: String(err && err.message || err) },
       content_hash: '',
+      generation_profile: profile,
       generation_hash,
       use_count: 0,
       last_used_at: null,
@@ -276,6 +279,7 @@ export async function ensureOpeningCache({ repository, story_version_uuid, optio
     status: 'valid',
     content_payload: payload,
     content_hash: payload.hash.content_hash,
+    generation_profile: profile,
     generation_hash,
     use_count: existing && existing.status === 'valid' ? existing.use_count : 0,
     last_used_at: null,
@@ -291,6 +295,10 @@ export async function ensureOpeningCache({ repository, story_version_uuid, optio
  * cache uuid so subsequent reads on this session are isolated from later
  * upstream changes.
  *
+ * Fail-closed validation: the supplied story_uuid MUST match the version
+ * row and the role MUST exist in that pinned version. Invalid identifiers
+ * are rejected before any state is captured.
+ *
  * @param {object} input
  * @param {StoryRepository} input.repository
  * @param {string} input.session_uuid
@@ -305,8 +313,26 @@ export function startSessionSnapshot({ repository, session_uuid, story_uuid, sto
   if (!session_uuid || !story_uuid || !story_version_uuid || !user_ref || !role_id) {
     throw new Error('startSessionSnapshot: session_uuid, story_uuid, story_version_uuid, user_ref, role_id required');
   }
+  if (!UUID_PATTERN.test(session_uuid)) {
+    throw new Error('startSessionSnapshot: session_uuid must be a UUID');
+  }
+  if (!UUID_PATTERN.test(story_uuid)) {
+    throw new Error('startSessionSnapshot: story_uuid must be a UUID');
+  }
+  if (!UUID_PATTERN.test(story_version_uuid)) {
+    throw new Error('startSessionSnapshot: story_version_uuid must be a UUID');
+  }
   const version = repository.findVersion(story_version_uuid);
   if (!version) throw new Error('startSessionSnapshot: unknown story_version');
+  if (version.story_uuid !== story_uuid) {
+    throw new Error(
+      `startSessionSnapshot: story_uuid '${story_uuid}' does not match story_version '${version.story_uuid}'`,
+    );
+  }
+  const roles = Array.isArray(version.roles_payload) ? version.roles_payload : [];
+  if (!roles.some((r) => r && r.id === role_id)) {
+    throw new Error(`startSessionSnapshot: role_id '${role_id}' is not a role of the pinned story_version`);
+  }
   const profile = defaultGenerationProfile();
   const generation_hash = deriveOpeningCacheKey({
     story_uuid,
@@ -335,10 +361,17 @@ export function startSessionSnapshot({ repository, session_uuid, story_uuid, sto
   };
 }
 
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 /**
- * Mark the first ask_player_choice consumed by a session. Invalidates the
- * session's opening cache row so subsequent reads do not re-serve stale
- * openings.
+ * Mark the first ask_player_choice consumed by a session. The shared
+ * opening cache stays valid for every other session; this marker only stops
+ * THIS session from continuing to import/advance the public opening.
+ *
+ * The in-memory repository has no persistent game_sessions table, so it
+ * returns an explicit session-local consumed marker with the snapshot's
+ * cache uuid for observability. A MariaDB DAO can persist the same marker
+ * to game_sessions.first_choice_at.
  *
  * @param {object} input
  * @param {StoryRepository} input.repository
@@ -347,12 +380,17 @@ export function startSessionSnapshot({ repository, session_uuid, story_uuid, sto
  */
 export function markFirstChoiceConsumed({ repository, snapshot, reason }) {
   if (!repository) throw new Error('markFirstChoiceConsumed: repository required');
-  if (!snapshot) throw new Error('markFirstChoiceConsumed: snapshot required');
-  if (!snapshot.opening_cache_uuid) return null;
-  return repository.recordCacheInvalidation(
-    snapshot.opening_cache_uuid,
-    reason || 'first_ask_player_choice',
-  );
+  if (!snapshot || typeof snapshot !== 'object') {
+    throw new Error('markFirstChoiceConsumed: snapshot required');
+  }
+  if (!snapshot.session_uuid || typeof snapshot.session_uuid !== 'string') {
+    throw new Error('markFirstChoiceConsumed: snapshot.session_uuid required');
+  }
+  return repository.recordSessionFirstChoice({
+    session_uuid: snapshot.session_uuid,
+    opening_cache_uuid: snapshot.opening_cache_uuid || null,
+    reason: reason || 'first_ask_player_choice',
+  });
 }
 
 /**

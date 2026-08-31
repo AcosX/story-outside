@@ -1,11 +1,12 @@
 # 故事之外 · MariaDB 数据模型与迁移
 
-> 适用范围：ClickUp 03。本文件描述 `story-outside` 在 MariaDB 上的初始数据模型、迁移策略、验证命令和演进边界。
+> 适用范围：ClickUp 04。本文件描述 `story-outside` 在 MariaDB 上的数据模型、迁移策略、验证命令和演进边界，以及 ClickUp 04 应用层映射。
 >
 > 当前实现文件：
 >
-> - `db/migrations/0001_initial_story_outside.sql` — 增量迁移
-> - `db/schema.sql` — 全新环境一键建库入口
+> - `db/migrations/0001_initial_story_outside.sql` — 增量迁移（历史基线）
+> - `db/migrations/0002_opening_cache_generation_profile.sql` — 开场缓存 generation profile 与 session-local first choice
+> - `db/schema.sql` — 全新环境一键建库入口（0001 + 0002 的最终 DDL）
 > - `tests/schema-contract.test.mjs` — 不依赖真实数据库凭据的 schema/SQL 契约测试
 
 ## 1. 设计原则
@@ -44,12 +45,11 @@
 
 ### 3.2 开场缓存生命周期
 
-- `story_opening_caches` 是作品级缓存，表中没有任何 `user_id` / `role_id` 列。
-- 唯一键为 `(story_id, story_version_id, opening_key)`；默认 `opening_key = 'default'`。
-- 缓存从创建到第一次 `ask_player_choice` 前可被任意用户/角色复用。
-- 插入 `ask_player_choice` 事件时，`trg_session_events_first_choice` 会：
-  - 在 `game_sessions.first_choice_at` 第一次写入该时间；
-  - 把该会话引用的 `story_opening_caches` 标记为 `invalidated`，并记录 `invalidated_at` / reason。
+- `story_opening_caches` 是作品级缓存，表中没有任何 `user_id` / `role_id` / `session_id` 列。
+- 唯一键为 `(story_id, story_version_id, opening_key, generation_hash)`；同一作品/版本可以有多个公开 generation profile 并存。
+- `generation_profile` JSON 只允许公开生成维度：`identifier` / `rules_version` / `locale` / `variant`。**不允许**任意 tags、未知字段或任何用户/角色/会话维度进入缓存键。
+- 缓存从创建到某一会话首次 `ask_player_choice` 前可被任意用户/角色复用。
+- 插入 `ask_player_choice` 事件时，`trg_session_events_first_choice` 只负责在 `game_sessions.first_choice_at` 第一次写入该时间。**不再** invalidate 共享 `story_opening_caches`；是否停止某个会话继续导入开场由应用层按 session-local marker 决定。
 
 ### 3.3 canonical 事件历史
 
@@ -91,10 +91,11 @@
 
 ## 5. 迁移策略
 
-- 迁移文件按编号递增：`0001_initial_story_outside.sql`，后续为 `0002_*.sql`，以此类推。
+- 迁移文件按编号递增：`0001_initial_story_outside.sql`、`0002_opening_cache_generation_profile.sql`，后续为 `0003_*.sql`，以此类推。
 - `0001` 可重复执行：`CREATE TABLE IF NOT EXISTS`、`DROP TRIGGER IF EXISTS`、`INSERT IGNORE` 都不产生重复错误。
-- 已应用迁移在部署环境中**不要编辑**；结构变更必须新增迁移文件。
-- `schema.sql` 是当前 canonical 全量入口，包含建库与完整 DDL；`tests/schema-contract.test.mjs` 会校验它与迁移文件主体保持一致。
+- `0002` 可重复执行：使用 `ADD COLUMN IF NOT EXISTS`、`ADD UNIQUE INDEX IF NOT EXISTS`、`DROP INDEX IF EXISTS`、`ADD CONSTRAINT IF NOT EXISTS` 与 drop-before-create trigger；旧 0001 的 `uq_story_opening_caches_scope` 被移除，旧行以 legacy generation 回填。
+- 已应用迁移在部署环境中**不要编辑**；结构变更必须新增迁移文件。`0001` 是历史基线，其中的旧 trigger 级联行为由 `0002` 替换，不回头修改。
+- `schema.sql` 是当前 canonical 全量入口，包含建库与 0001+0002 合并后的最终 DDL；`tests/schema-contract.test.mjs` 会校验它与迁移集合保持一致。
 - schema 不创建应用账号、不写入任何密钥。应用账号权限由部署环境负责，推荐：普通读写账号不授予 `session_events` 的 `UPDATE` / `DELETE`，与 trigger 形成双重防线。
 
 ## 6. 真实 MariaDB 验证
@@ -106,11 +107,14 @@
 mariadb --version
 mariadb-admin --no-defaults ping
 
-# 方式 A：先建临时数据库，再应用迁移
+# 方式 A：先建临时数据库，再依次应用迁移（建议 0001 与 0002 各跑两遍验证幂等）
 DB="story_outside_schema_check_$(date +%s)"
 mariadb --no-defaults -e "CREATE DATABASE \`$DB\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
 mariadb --no-defaults "$DB" < db/migrations/0001_initial_story_outside.sql
-mariadb --no-defaults "$DB" -e "SHOW TABLES; SELECT migration_name FROM schema_migrations;"
+mariadb --no-defaults "$DB" < db/migrations/0001_initial_story_outside.sql
+mariadb --no-defaults "$DB" < db/migrations/0002_opening_cache_generation_profile.sql
+mariadb --no-defaults "$DB" < db/migrations/0002_opening_cache_generation_profile.sql
+mariadb --no-defaults "$DB" -e "SHOW TABLES; SELECT migration_name FROM schema_migrations; SHOW CREATE TABLE story_opening_caches\G"
 mariadb --no-defaults -e "DROP DATABASE \`$DB\`;"
 
 # 方式 B：全新环境直接使用 canonical 入口
@@ -130,11 +134,11 @@ node tests/schema-contract.test.mjs
 
 该测试不连接数据库、不读取任何凭据，只做文本/结构断言：
 
-- `db/migrations/0001_initial_story_outside.sql` 与 `db/schema.sql` 存在且 DDL 主体一致；
+- `db/migrations/0001_initial_story_outside.sql`、`db/migrations/0002_opening_cache_generation_profile.sql` 与 `db/schema.sql` 存在，且 schema 代表 0001+0002 的最终形态；
 - 必备表与必备列齐全；
-- 版本、事件序列、幂等键等唯一约束存在；
+- 版本、事件序列、幂等键、opening cache generation 复合唯一键等约束存在；
 - 外键覆盖 story/version/session/event 关系；
-- `session_events` 的 append-only trigger 存在；
+- `session_events` 的 append-only trigger 存在；`trg_session_events_first_choice` 只写 `game_sessions.first_choice_at`，不再级联修改 `story_opening_caches`；
 - 未混入 PostgreSQL 专属语法；
 - 未出现 `password`、`app_key`、`access_secret`、`access_token` 等密钥字段。
 
@@ -151,9 +155,9 @@ ClickUp 04 增加了导入、版本化与作品级开场缓存的逻辑。该逻
 ### 9.1 模块边界
 
 - `src/stories/canonicalHash.mjs` — 稳定 SHA-256 + canonical JSON（按 key 递归排序）。同一故事内容（不计字段顺序）→ 同一 `checksum`；任一字段变化 → 新的 `checksum`。
-- `src/stories/cacheKey.mjs` — 开场缓存键推导。键只由 `story_uuid` / `story_version_uuid` / `opening_key` / `profile.identifier` / `profile.rules_version`（以及可选 `locale`、`profile.tags`）组成。**任何** `user_id` / `role_id` / `session_id` / `ip` / `device` / `timestamp` / `nonce` 出现在 scope 上都会明确报错。
-- `src/stories/openingGenerator.mjs` — 纯函数：`story_version` 内容 → 逐句事件序列。在第一个 `ask_player_choice` 标记之前截断；输出中**不允许**出现 `ask_player_choice` 类型事件。
-- `src/stories/repository.mjs` — 内存仓库，实现与 MariaDB 表对齐的方法集合：`upsertStory` / `findVersionByChecksum` / `importVersion` / `upsertOpeningCache` / `recordCacheInvalidation` 等。
+- `src/stories/cacheKey.mjs` — 开场缓存键推导。键只由 `story_uuid` / `story_version_uuid` / `opening_key` / `profile.identifier` / `profile.rules_version` / `profile.locale` / allow-listed `profile.variant` 组成。**任何** `user_id` / `role_id` / `session_id` / `ip` / `device` / `timestamp` / `nonce`、任意 tags 或未知字段出现在 scope/profile 上都会明确报错。
+- `src/stories/openingGenerator.mjs` — 纯函数：`story_version` 内容 → 逐句事件序列。结构化 `type: 'ask_player_choice'` beat（或文本标记）之前截断；输出中**不允许**出现 choice tool call / `ask_player_choice` 事件。结构化 dialogue/action 与说话人保留在公开开场中。
+- `src/stories/repository.mjs` — 内存仓库，实现与 MariaDB 表对齐的方法集合：`upsertStory` / `findVersionByChecksum` / `importVersion` / `upsertOpeningCache` / `recordCacheInvalidation` / `recordSessionFirstChoice` 等。
 - `src/stories/storyService.mjs` — 应用层 facade：`importStory` / `ensureOpeningCache` / `rebuildOpeningCache` / `startSessionSnapshot` / `markFirstChoiceConsumed`。
 - `src/stories/fixture.mjs` — 用 mock provider 的内容预填仓库，保证 admin/dev 路由能拿到稳定的 `story_uuid` / `story_version_uuid`。
 
@@ -163,22 +167,22 @@ ClickUp 04 增加了导入、版本化与作品级开场缓存的逻辑。该逻
 | --- | --- | --- |
 | `stories` | `repository.upsertStory` | `slug` / `story_uuid` / `title` / `hook` / `locale` / `status`；目录行，不携带正文。 |
 | `story_versions` | `repository.importVersion` / `repository.findVersion` / `repository.listVersionsByStory` | `version_uuid` / `story_id` / `version_no` / `content_payload` / `roles_payload` / `checksum` / `status`。同一 `checksum` 已存在时直接复用；不同则 `version_no` 递增，旧行保留。 |
-| `story_opening_caches` | `repository.upsertOpeningCache` / `repository.findOpeningCacheByScope` / `repository.recordCacheInvalidation` | `cache_uuid` / `story_id` / `story_version_id` / `opening_key` / `status` (valid/invalidated/failed) / `content_payload` / `content_hash` / `use_count`。生成失败产生 `status='failed'` 行，不覆盖既有 `valid` 行。 |
-| `game_sessions` | `storyService.startSessionSnapshot` | `session_uuid` / `story_id` / `story_version_id` / `user_ref` / `role_id` / `opening_cache_id` / `first_choice_at` / `ending_id`。**应用层只读快照**，会话级状态写仍需 DAO。 |
-| `session_events` | `markFirstChoiceConsumed` 仅触发 invalidation，不直接写事件 | canonical 事件流仍仅经 DAO 写入；仓库只响应触发器的等价动作。 |
+| `story_opening_caches` | `repository.upsertOpeningCache` / `repository.findOpeningCacheByScope` / `repository.recordCacheInvalidation` | `cache_uuid` / `story_id` / `story_version_id` / `opening_key` / `generation_profile` / `generation_hash` / `status` (valid/invalidated/failed) / `content_payload` / `content_hash` / `use_count`。生成失败产生 `status='failed'` 行，不覆盖既有 `valid` 行。 |
+| `game_sessions` | `storyService.startSessionSnapshot` / `repository.recordSessionFirstChoice` | `session_uuid` / `story_id` / `story_version_id` / `user_ref` / `role_id` / `opening_cache_id` / `first_choice_at` / `ending_id`。**应用层只读快照**，会话级状态写仍需 DAO。 |
+| `session_events` | `markFirstChoiceConsumed` 只返回 session-local marker，不直接写事件 | canonical 事件流仍仅经 DAO 写入；仓库只保存会话首次选择 marker，不再触发共享缓存 invalidation。 |
 
 > 注：内存仓库仅复现 schema 表面上的应用语义；不会假装数据已写入 MariaDB。任何 `repository.*` 调用都不发起 SQL。当未来引入 `src/stories/daoMaria.mjs` 时，可以逐方法替换仓库实现，服务层和路由代码不需要变动。
 
 ### 9.3 开场缓存作用域与不可变性
 
 - `opening_key` 默认为 `'default'`；保留多套 `opening_key` 是为以后的 spoof / 彩蛋 / 实验者索引位预留。
-- 唯一键：`(story_uuid, story_version_uuid, opening_key)`，再加 generation profile 推导出的 `generation_hash`。
-- 一旦 `status='valid'`，其 `content_payload` / `content_hash` **不可变**。后续调用如果仍在同一 generation 下重复生成，将直接返回原缓存；需要变更必须通过 `rebuildOpeningCache(...)`（显式传 `rules_version` / `identifier` / `locale`）或 `ensureOpeningCache({ force: true, replace_strategy: 'new_generation' | 'in_place' })`。
-- `recordCacheInvalidation` 会将行状态改为 `invalidated`，并从基于 scope 的查找索引中移除；行本身仍然保留以供审计。
-- `markFirstChoiceConsumed` 是会话首次发生 `ask_player_choice` 事件的等价动作；它会调用 `recordCacheInvalidation(reason='first_ask_player_choice')`，与 `trg_session_events_first_choice` 触发器在生产环境中的行为一致。
+- 唯一键：`(story_uuid, story_version_uuid, opening_key, generation_hash)`，其中 `generation_hash` 由公开 generation profile 推导。旧版本缓存与新一代 profile 可并存。
+- 一旦 `status='valid'`，其 `content_payload` / `content_hash` **不可变**。后续调用如果仍在同一 generation 下重复生成，将直接返回原缓存；需要变更必须通过 `rebuildOpeningCache(...)`（显式传 `rules_version` / `identifier` / `locale` / allow-listed `variant`）或 `ensureOpeningCache({ force: true, replace_strategy: 'new_generation' | 'in_place' })`。
+- `recordCacheInvalidation` 是 admin 层显式审计动作：将行状态改为 `invalidated`，并从基于 scope 的查找索引中移除；行本身保留。
+- `markFirstChoiceConsumed` 是会话首次发生 `ask_player_choice` 事件的等价动作；它只返回 **session-local consumed marker**（`session_uuid` / `opening_cache_uuid` / `first_choice_at` / reason）。它**不**调用 `recordCacheInvalidation`，因此其他 Session 仍可复用共享开场缓存。当前内存仓库没有持久化 `game_sessions` 表，marker 保存在 `sessionFirstChoices` 映射；未来 DAO 应落库到 `game_sessions.first_choice_at`。
 
 ### 9.4 替换 DAO 的注意事项
 
 - 应用层需要的 SQL 列在仓库里的命名与 SQL 列名一致，便于未来 SQL 写入无歧义映射。
-- `session_events` 的 append-only 限制仍由 trigger 保证，应用层**不能也不应** `UPDATE` / `DELETE`。`markFirstChoiceConsumed` 模拟的是触发器对 `story_opening_caches` 的级联动作，而不是绕过 `session_events` 直接修改事件。
+- `session_events` 的 append-only 限制仍由 trigger 保证，应用层**不能也不应** `UPDATE` / `DELETE`。`markFirstChoiceConsumed` 只记录 session-local first-choice marker，不绕过 `session_events` 直接修改事件，也不修改共享 opening cache。
 - 后续 DAO 落地后，仓库方法可逐个替换为参数化查询；建议为每个方法单独提供单元测试 + 集成测试，保留现有应用层语义不变。

@@ -73,6 +73,25 @@ check('detail accepts string beats', () => {
   assert.equal(detail.beats[0].index, 0);
 });
 
+check('detail preserves structured beat type and speaker', () => {
+  const detail = normaliseStoryDetail({
+    id: 'x',
+    title: 't',
+    hook: 'h',
+    roles: [{ id: 'r', label: 'R' }],
+    beats: [
+      { text: 'r says hi', index: 0, type: 'dialogue', speaker: 'r' },
+      { text: 'she acts', index: 1, type: 'action', extra: 'stripped' },
+      { text: 'choose now', index: 2, type: 'ask_player_choice' },
+    ],
+  });
+  assert.equal(detail.beats[0].type, 'dialogue');
+  assert.equal(detail.beats[0].speaker, 'r');
+  assert.equal(detail.beats[1].type, 'action');
+  assert.equal(detail.beats[1].extra, undefined);
+  assert.equal(detail.beats[2].type, 'ask_player_choice');
+});
+
 // ---------------------------------------------------------------------------
 // Mock provider — happy path
 // ---------------------------------------------------------------------------
@@ -108,6 +127,15 @@ check('getStory returns detail with beats', async () => {
   assert.ok(Array.isArray(story.beats));
   assert.ok(story.beats.length >= 1);
   assert.equal(typeof story.beats[0].text, 'string');
+});
+
+check('mock catalog contains a structured first-choice boundary', async () => {
+  const story = await provider.getStory('cafe-rain');
+  const choice = story.beats.find((b) => b.type === 'ask_player_choice');
+  assert.ok(choice, 'cafe-rain should expose a structured ask_player_choice beat');
+  assert.equal(typeof choice.text, 'string');
+  const dialogue = story.beats.find((b) => b.type === 'dialogue');
+  assert.ok(dialogue && typeof dialogue.speaker === 'string');
 });
 
 check('getStory returns defensive copies', async () => {

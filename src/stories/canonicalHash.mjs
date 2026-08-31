@@ -30,15 +30,23 @@ import { createHash } from 'node:crypto';
  * Roles are normalised as {id,label,mood}; the hash is taken over the
  * normalised roles array.
  *
+ * Beats are normalised as {index,text,type,speaker}. Structured `type` and
+ * `speaker` are first-class authored fields, so changing them changes the
+ * version checksum.
+ *
  * @typedef {Object} CanonicalStoryContent
  * @property {string} id
  * @property {string} title
  * @property {string} hook
  * @property {Array<{id:string,label:string,mood:string}>} roles
- * @property {Array<{index:number,text:string}>} beats
+ * @property {Array<{index:number,text:string,type?:string,speaker?:string}>} beats
  */
 
-const FORBIDDEN_JSON = /[\u0000-\u001f]/;
+// JSON itself permits \n, \r and \t in string values. They are normal story
+// formatting and must not change versioning. The remaining C0 controls are
+// rejected before canonicalisation so binary / protocol garbage cannot leak
+// into hashes or event text.
+const FORBIDDEN_JSON = /[\u0000-\u0008\u000b\u000c\u000e-\u001f]/;
 
 /**
  * @param {unknown} value
@@ -142,10 +150,13 @@ export function canonicalStoryContent(detail) {
     if (!b || typeof b !== 'object') {
       throw new TypeError(`beats[${i}] not an object`);
     }
-    return {
+    const beat = {
       index: typeof b.index === 'number' ? b.index : i,
       text: String(b.text ?? ''),
     };
+    if (typeof b.type === 'string' && b.type) beat.type = b.type;
+    if (typeof b.speaker === 'string' && b.speaker) beat.speaker = b.speaker;
+    return beat;
   });
   return {
     id: d.id,

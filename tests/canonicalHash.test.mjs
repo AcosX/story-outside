@@ -59,8 +59,10 @@ check('rejects NaN / Infinity', () => {
   assert.throws(() => canonicalSha256({ a: Number.POSITIVE_INFINITY }), /non-finite/);
 });
 
-check('rejects non-printable characters', () => {
+check('rejects truly disallowed C0 control characters', () => {
   assert.throws(() => canonicalSha256({ a: 'hi\u0001' }), /non-printable/);
+  assert.throws(() => canonicalSha256({ a: 'hi\u0000' }), /non-printable/);
+  assert.throws(() => canonicalSha256({ a: 'hi\u001f' }), /non-printable/);
 });
 
 check('json stringify has no whitespace', () => {
@@ -84,6 +86,15 @@ const BASE = {
     '你想起一个还没问出口的问题。',
   ],
 };
+
+check('allows normal newline, carriage return, and tab in story text', () => {
+  const hashed = canonicalStoryHash({
+    ...BASE,
+    beats: ['第一句\n第二句\r\n\t第三句', '多行\n对白'],
+  });
+  assert.equal(hashed.length, 64);
+  assert.match(hashed, /^[0-9a-f]{64}$/);
+});
 
 check('hash is 64-char hex', () => {
   const h = canonicalStoryHash(BASE);
@@ -145,13 +156,44 @@ check('detail must include id/title/hook/roles/beats', () => {
   );
 });
 
-check('beats can be objects with text/index', () => {
+check('structured beat type/speaker are preserved in canonical content', () => {
   const out = canonicalStoryContent({
     ...BASE,
-    beats: BASE.beats.map((text, index) => ({ text, index })),
+    beats: [
+      { text: '「旧友」你在等人吗？', index: 0, type: 'dialogue', speaker: 'old-friend' },
+      { text: '她推来一杯咖啡。', index: 1, type: 'action' },
+      { text: '你要怎么回答？', index: 2, type: 'ask_player_choice' },
+    ],
   });
-  assert.equal(out.beats.length, 3);
-  assert.equal(out.beats[0].index, 0);
+  assert.equal(out.beats[0].type, 'dialogue');
+  assert.equal(out.beats[0].speaker, 'old-friend');
+  assert.equal(out.beats[1].type, 'action');
+  assert.equal(out.beats[2].type, 'ask_player_choice');
+});
+
+check('structured speaker/type change DOES change the story hash', () => {
+  const a = canonicalStoryHash({
+    ...BASE,
+    beats: [{ text: '「旧友」你在等人吗？', index: 0, type: 'dialogue', speaker: 'old-friend' }],
+  });
+  const b = canonicalStoryHash({
+    ...BASE,
+    beats: [{ text: '「旧友」你在等人吗？', index: 0, type: 'dialogue', speaker: 'stranger' }],
+  });
+  const c = canonicalStoryHash({
+    ...BASE,
+    beats: [{ text: '「旧友」你在等人吗？', index: 0, type: 'narration', speaker: 'old-friend' }],
+  });
+  assert.notEqual(a, b);
+  assert.notEqual(a, c);
+});
+
+check('unknown extra beat fields are still stripped', () => {
+  const out = canonicalStoryContent({
+    ...BASE,
+    beats: [{ text: 'x', index: 0, telemetry: 'leak' }],
+  });
+  assert.equal(out.beats[0].telemetry, undefined);
 });
 
 check('roles without mood default to empty string', () => {

@@ -360,6 +360,7 @@ const server = http.createServer(async (req, res) => {
           identifier: String(body.profile.identifier || defaultGenerationProfile().identifier),
           rules_version: String(body.profile.rules_version || defaultGenerationProfile().rules_version),
           locale: typeof body.profile.locale === 'string' ? body.profile.locale : 'zh-CN',
+          variant: typeof body.profile.variant === 'string' ? body.profile.variant : 'default',
         }
       : defaultGenerationProfile();
     try {
@@ -425,7 +426,8 @@ const server = http.createServer(async (req, res) => {
   }
 
   // POST /api/dev/sessions/:uuid/first-choice — record the first
-  // ask_player_choice on a session and invalidate its opening cache.
+  // ask_player_choice on THAT session and return a session-local consumed
+  // marker. The shared opening cache is NOT invalidated for other sessions.
   const firstChoiceMatch = pathname.match(/^\/api\/dev\/sessions\/([0-9a-fA-F-]+)\/first-choice$/);
   if (method === 'POST' && firstChoiceMatch) {
     let body = {};
@@ -438,6 +440,15 @@ const server = http.createServer(async (req, res) => {
     if (!body.snapshot || typeof body.snapshot !== 'object') {
       return jsonResponse(res, 400, {
         error: 'missing_snapshot',
+        demo: DEMO_FLAG,
+        dev: DEV_FLAG,
+      });
+    }
+    const urlSessionUuid = firstChoiceMatch[1];
+    const snapshotSessionUuid = body.snapshot.session_uuid;
+    if (typeof snapshotSessionUuid !== 'string' || snapshotSessionUuid !== urlSessionUuid) {
+      return jsonResponse(res, 400, {
+        error: 'session_uuid_mismatch',
         demo: DEMO_FLAG,
         dev: DEV_FLAG,
       });

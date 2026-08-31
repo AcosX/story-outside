@@ -20,6 +20,12 @@
  * @typedef {Object} Beat
  * @property {string} text          The beat line shown to the reader.
  * @property {number} index         Zero-based beat index within the story.
+ * @property {('narration'|'dialogue'|'action'|'ask_player_choice')} [type]
+ *                                  Optional structured beat kind. Providers
+ *                                  SHOULD use 'ask_player_choice' for the
+ *                                  first choice boundary instead of relying
+ *                                  on text markers.
+ * @property {string} [speaker]     Canonical role id for dialogue beats.
  */
 
 /**
@@ -160,7 +166,21 @@ export function normaliseStoryDetail(raw) {
     if (typeof b.text !== 'string') {
       throw new ValidationError(`beat[${i}] of story ${summary.id} missing text`);
     }
-    return { text: b.text, index: typeof b.index === 'number' ? b.index : i };
+    const beat = { text: b.text, index: typeof b.index === 'number' ? b.index : i };
+    if (typeof b.type === 'string' && BEAT_TYPES.has(b.type)) {
+      beat.type = b.type;
+    }
+    if (typeof b.speaker === 'string' && b.speaker) {
+      beat.speaker = b.speaker;
+    }
+    return beat;
   });
   return { ...summary, beats };
 }
+
+/**
+ * Structured beat kinds the pipeline understands. Unknown types are dropped
+ * by normalisation so a future provider field cannot silently change story
+ * hashing semantics.
+ */
+const BEAT_TYPES = new Set(['narration', 'dialogue', 'action', 'ask_player_choice']);

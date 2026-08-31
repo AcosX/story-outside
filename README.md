@@ -19,7 +19,7 @@
 │   │   └── index.mjs         #   Provider 选择器（默认 mock）
 │   └── stories/              # Phase 4 应用层（不写入 MariaDB）
 │       ├── canonicalHash.mjs #   canonical JSON + SHA-256，用于 story_versions.checksum
-│       ├── cacheKey.mjs      #   开场缓存 key 推导（user/role/session 明确禁入）
+│       ├── cacheKey.mjs      #   开场缓存 key 推导（仅公开 generation 维度；user/role/session/任意 tags 禁入）
 │       ├── openingGenerator.mjs  # 逐句事件生成器；在 ask_player_choice 前截断
 │       ├── repository.mjs    #   内存版 DAO（与 SQL 表面一致，未来可换 MariaDB DAO）
 │       ├── storyService.mjs  #   应用层 facade（import / ensure / rebuild / snapshot）
@@ -117,7 +117,7 @@ HTTP route (src/server.mjs)
 | POST | `/api/admin/stories/:slug/import` | 用 mock provider 拉一次详情并写入版本仓库（相同 DTO 命中复用） |
 | POST | `/api/admin/opening-cache/rebuild` | 为某个 `story_version_uuid` 生成作品级开场缓存；可换 `profile.rules_version` 走新 generation |
 | POST | `/api/dev/sessions` | 为会话生成快照（`session_uuid` / `user_ref` / `role_id` / `story_version_uuid`），固定引用 |
-| POST | `/api/dev/sessions/:uuid/first-choice` | 模拟会话首次 `ask_player_choice`，把快照引用的开场缓存标记为 `invalidated` |
+| POST | `/api/dev/sessions/:uuid/first-choice` | 模拟会话首次 `ask_player_choice`，只返回该 session 的 consumed marker；不 invalidate 共享开场缓存 |
 
 所有 admin / dev 响应都带 `dev: { demo: true, admin_only: false, dev_only: true, authenticated: false, reason: ... }` 横幅。**这些路由没有鉴权**，不写入 MariaDB，**严禁**暴露在公网——上线前需要前置反向代理 + 鉴权层。
 

@@ -24,6 +24,7 @@ const PROFILE = {
   identifier: 'opening-default',
   rules_version: 'opening-rules/1',
   locale: 'zh-CN',
+  variant: 'default',
 };
 
 console.log('Cache key derivation');
@@ -109,6 +110,32 @@ check('different opening_key → different key', () => {
   assert.notEqual(a, b);
 });
 
+check('different variant → different key', () => {
+  const a = deriveOpeningCacheKey({
+    story_uuid: 's-1',
+    story_version_uuid: 'v-1',
+    profile: { ...PROFILE, variant: 'default' },
+  });
+  const b = deriveOpeningCacheKey({
+    story_uuid: 's-1',
+    story_version_uuid: 'v-1',
+    profile: { ...PROFILE, variant: 'bundle' },
+  });
+  assert.notEqual(a, b);
+});
+
+check('unlisted variant is rejected', () => {
+  assert.throws(
+    () =>
+      deriveOpeningCacheKey({
+        story_uuid: 's-1',
+        story_version_uuid: 'v-1',
+        profile: { ...PROFILE, variant: 'user-secret' },
+      }),
+    /not an allow-listed public variant/,
+  );
+});
+
 console.log('\nForbidden dimensions');
 
 // The whole point of this test: user/role/session identifiers must never
@@ -128,30 +155,53 @@ for (const key of _forbiddenCacheKeyDimensions()) {
   });
 }
 
-check('forbids user_id even nested in profile.tags', () => {
+check('forbids user_id as an unknown profile field', () => {
   assert.throws(
     () =>
       deriveOpeningCacheKey({
         story_uuid: 's-1',
         story_version_uuid: 'v-1',
-        profile: { ...PROFILE, tags: { user_id: 'u-1' } },
+        profile: { ...PROFILE, user_id: 'u-1' },
       }),
-    /forbidden dimension/,
+    /forbidden dimension|unknown field/,
   );
 });
 
-check('non-forbidden tags ARE allowed and included in the key', () => {
-  const a = deriveOpeningCacheKey({
-    story_uuid: 's-1',
-    story_version_uuid: 'v-1',
-    profile: { ...PROFILE, tags: { narrator: 'internal' } },
-  });
-  const b = deriveOpeningCacheKey({
-    story_uuid: 's-1',
-    story_version_uuid: 'v-1',
-    profile: { ...PROFILE, tags: { narrator: 'external' } },
-  });
-  assert.notEqual(a, b);
+check('free-form tags are rejected as an unknown profile field', () => {
+  assert.throws(
+    () =>
+      deriveOpeningCacheKey({
+        story_uuid: 's-1',
+        story_version_uuid: 'v-1',
+        profile: { ...PROFILE, tags: { narrator: 'internal' } },
+      }),
+    /unknown field 'tags'/,
+  );
+});
+
+check('unknown top-level scope fields are rejected', () => {
+  assert.throws(
+    () =>
+      deriveOpeningCacheKey({
+        story_uuid: 's-1',
+        story_version_uuid: 'v-1',
+        profile: PROFILE,
+        request_id: 'req-1',
+      }),
+    /unknown field 'request_id'/,
+  );
+});
+
+check('unknown non-identity profile fields are rejected too', () => {
+  assert.throws(
+    () =>
+      deriveOpeningCacheKey({
+        story_uuid: 's-1',
+        story_version_uuid: 'v-1',
+        profile: { ...PROFILE, experiment: 'alpha' },
+      }),
+    /unknown field 'experiment'/,
+  );
 });
 
 check('empty opening_key defaults to "default"', () => {
