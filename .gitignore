@@ -1,0 +1,34 @@
+# Node / tooling
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# Env / secrets — never commit
+.env
+.env.*
+secrets/
+hackathon.config.local.json
+
+# Logs
+*.log
+logs/
+
+# Build output (future-proof)
+dist/
+build/
+.next/
+out/
+
+# Test artifacts
+coverage/
+.nyc_output/
+
+# Vendor scripts that we never run inside the project — keep ignored from grep impact

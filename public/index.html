@@ -1,0 +1,198 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>故事之外 — 如果当时，由你来选</title>
+    <meta
+      name="description"
+      content="《故事之外》知乎黑客松 MVP。如果当时，由你来选——进入故事，看看另一条世界线。"
+    />
+    <link rel="icon" href="/mascot/liu-kaishan-idle.gif" />
+    <link rel="stylesheet" href="/styles/main.css" />
+  </head>
+  <body>
+    <header class="topbar" aria-label="页头">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true">另一条世界线</span>
+        <span class="brand-name">故事之外</span>
+      </div>
+      <span class="mode-tag" title="本项目当前为 demo 模式" data-mode-tag>
+        demo · 未连接知乎官方 API
+      </span>
+    </header>
+
+    <main id="stage" class="stage" aria-live="polite">
+      <!-- Section 1: Hero -->
+      <section id="screen-hero" class="screen screen-hero active" data-screen="hero">
+        <div class="hero-grid">
+          <div class="hero-copy">
+            <h1 class="hero-title">故事之外</h1>
+            <p class="hero-tagline">如果当时，由你来选——进入故事，看看另一条世界线。</p>
+            <p class="hero-sub">
+              一次只有一句台词的群聊。一条被改写的人生。在这里没有标准答案。
+            </p>
+            <div class="hero-actions">
+              <button class="btn btn-primary" data-action="goto" data-target="stories">
+                进入故事
+              </button>
+              <button class="btn btn-ghost" data-action="goto" data-target="chat">
+                先试一下群聊
+              </button>
+            </div>
+            <p class="hero-meta" data-demo-meta></p>
+          </div>
+          <figure class="hero-mascot" aria-label="刘看山招一招手">
+            <img
+              src="/mascot/liu-kaishan-waving.gif"
+              alt="刘看山在招呼你进入故事"
+              width="220"
+              height="220"
+              loading="eager"
+              decoding="async"
+            />
+            <figcaption>刘看山 · 知乎 IP</figcaption>
+          </figure>
+        </div>
+      </section>
+
+      <!-- Section 2: Story picker -->
+      <section
+        id="screen-stories"
+        class="screen screen-stories"
+        data-screen="stories"
+        hidden
+      >
+        <header class="screen-head">
+          <h2>选一个故事起点</h2>
+          <p class="screen-sub">每个故事都开放两到三种视角。</p>
+        </header>
+        <ul id="story-list" class="story-list" aria-busy="true">
+          <li class="story-card placeholder">加载中…</li>
+        </ul>
+        <div class="screen-foot">
+          <button class="btn btn-ghost" data-action="goto" data-target="hero">
+            返回上一页
+          </button>
+        </div>
+      </section>
+
+      <!-- Section 3: Role picker -->
+      <section
+        id="screen-roles"
+        class="screen screen-roles"
+        data-screen="roles"
+        hidden
+      >
+        <header class="screen-head">
+          <h2 id="role-title">选一个角色</h2>
+          <p class="screen-sub" id="role-hook"></p>
+        </header>
+        <ul id="role-list" class="role-list"></ul>
+        <div class="screen-foot">
+          <button class="btn btn-ghost" data-action="goto" data-target="stories">
+            重选故事
+          </button>
+        </div>
+      </section>
+
+      <!-- Section 4: Player -->
+      <section
+        id="screen-player"
+        class="screen screen-player"
+        data-screen="player"
+        hidden
+      >
+        <header class="screen-head">
+          <h2 id="player-title">正在播放</h2>
+          <p class="screen-sub" id="player-context"></p>
+        </header>
+        <ol id="beat-list" class="beat-list" aria-label="剧情节拍"></ol>
+        <div class="player-actions">
+          <button class="btn btn-primary" id="advance-btn">下一句</button>
+          <button class="btn btn-ghost" data-action="goto" data-target="chat">
+            进入群聊
+          </button>
+        </div>
+        <div class="screen-foot">
+          <button class="btn btn-ghost" data-action="goto" data-target="roles">
+            换一个视角
+          </button>
+          <button class="btn btn-ghost" data-action="goto" data-target="stories">
+            重选故事
+          </button>
+        </div>
+      </section>
+
+      <!-- Section 5: Group chat placeholder -->
+      <section
+        id="screen-chat"
+        class="screen screen-chat"
+        data-screen="chat"
+        hidden
+      >
+        <header class="screen-head">
+          <h2>群聊 · 占位流程</h2>
+          <p class="screen-sub">
+            demo 模式：你说一句，前端把它原样回显。下一阶段会接入群聊逐句播放。
+          </p>
+        </header>
+        <div class="chat-shell">
+          <ol id="chat-log" class="chat-log" aria-live="polite"></ol>
+          <form id="chat-form" class="chat-form" autocomplete="off">
+            <input
+              type="text"
+              id="chat-input"
+              name="text"
+              placeholder="随便说一句…"
+              maxlength="200"
+              required
+            />
+            <button type="submit" class="btn btn-primary">发送</button>
+          </form>
+        </div>
+        <div class="screen-foot">
+          <button class="btn btn-ghost" data-action="goto" data-target="hero">
+            回到首页
+          </button>
+        </div>
+      </section>
+
+      <!-- Section 6: Done -->
+      <section
+        id="screen-done"
+        class="screen screen-done"
+        data-screen="done"
+        hidden
+      >
+        <header class="screen-head">
+          <h2>这一条线到这里</h2>
+          <p class="screen-sub">
+            故事没有真正结束。换个角色、再选一个起点，看看另一条世界线。
+          </p>
+        </header>
+        <div class="screen-foot">
+          <button class="btn btn-primary" data-action="goto" data-target="stories">
+            再选一个故事
+          </button>
+          <button class="btn btn-ghost" data-action="goto" data-target="hero">
+            回到首页
+          </button>
+        </div>
+      </section>
+    </main>
+
+    <aside id="toast" class="toast" hidden></aside>
+
+    <footer class="bottombar">
+      <span>《故事之外》· 知乎黑客松 MVP · Phase 1 demo</span>
+      <span class="bottombar-meta">
+        <a href="/api/health" target="_blank" rel="noopener">/api/health</a>
+        ·
+        <a href="/api/stories" target="_blank" rel="noopener">/api/stories</a>
+      </span>
+    </footer>
+
+    <script type="module" src="/scripts/app.js"></script>
+  </body>
+</html>
