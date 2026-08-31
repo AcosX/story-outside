@@ -8,6 +8,7 @@
 // (default: mock). Routes never call Zhihu APIs directly.
 
 import http from 'node:http';
+import { randomUUID } from 'node:crypto';
 import { readFile, stat } from 'node:fs/promises';
 import { extname, join, normalize, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -18,6 +19,14 @@ import {
   StoryNotFoundError,
   ValidationError,
 } from './providers/index.mjs';
+import {
+  createSeededRepository,
+  defaultGenerationProfile,
+  importStory as importStoryFromProvider,
+  markFirstChoiceConsumed,
+  rebuildOpeningCache,
+  startSessionSnapshot,
+} from './stories/index.mjs';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 const ROOT = resolve(__dirname, '..');
@@ -30,6 +39,22 @@ const DEMO_FLAG = Object.freeze({
   official_zhihu_api: false,
   reason:
     'Phase 2 builds an interactive narrative demo without touching the real Zhihu Open Platform. Data is served by src/providers/mockProvider.mjs (default STORY_OUTSIDE_PROVIDER=mock). See docs/official-zhihu-skill.md for the planned real-provider integration boundary.',
+});
+
+// Phase 4: admin / dev tooling flag. Every /api/admin/* and /api/dev/* route
+// carries this banner so a future frontend / proxy can hide them in prod.
+// There is NO authentication here — these routes are demo/dev-only by design
+// and MUST NOT be exposed on a public deployment without an upstream auth
+// proxy. The flag below is the loud self-warning, not a substitute for it.
+const DEV_FLAG = Object.freeze({
+  demo: true,
+  admin_only: false,
+  dev_only: true,
+  authenticated: false,
+  reason:
+    'Phase 4 admin/dev routes are demo-only. There is no auth, no rate limit, ' +
+    'and no audit log. Do not expose them publicly. Put an upstream auth proxy ' +
+    'in front before deploying beyond localhost.',
 });
 
 const MIME = {
@@ -137,6 +162,22 @@ function classifyProviderError(err) {
   return { status: 500, code: 'provider_error' };
 }
 
+// Stories application layer. Seeded once per process from the mock catalog so
+// admin/dev tooling can rebuild caches against a known set of UUIDs without
+// having to POST a separate import for every story. The repository lives in
+// memory only; see docs/data-model.md for the MariaDB mapping.
+const { repository: storyRepo, fixtures: storyFixtures } = createSeededRepository();
+
+/**
+ * Phase 4 catalogue helper: list slugs from the in-memory fixture set so
+ * admin/dev routes can map a stable slug → story_version_uuid without
+ * hardcoding every id at the route layer.
+ * @returns {Array<{ slug: string, story_uuid: string, story_version_uuid: string }>}
+ */
+function listFixtureStorySlugs() {
+  return storyFixtures.slice();
+}
+
 const server = http.createServer(async (req, res) => {
   const method = req.method || 'GET';
   const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
@@ -148,7 +189,7 @@ const server = http.createServer(async (req, res) => {
       ok: true,
       name: 'story-outside',
       version: '0.1.0',
-      phase: 2,
+      phase: 4,
       uptimeSeconds: Math.round(process.uptime()),
       nodeVersion: process.version,
       demo: DEMO_FLAG,
@@ -232,6 +273,192 @@ const server = http.createServer(async (req, res) => {
     });
   }
 
+  // -----------------------------------------------------------------------
+  // Phase 4 routes — story import, version, opening cache, session snapshot.
+  //
+  // All Phase 4 routes are demo/dev-only and live under /api/admin/* so a
+  // future reverse proxy can block them with one ACL. They carry the DEV_FLAG
+  // banner on every response, are un-authenticated by design, and intentionally
+  // do not write to MariaDB.
+  // -----------------------------------------------------------------------
+
+  // GET /api/admin/stories — list the seeded fixture stories with their
+  // story_uuid / story_version_uuid so admins can copy identifiers.
+  if (method === 'GET' && pathname === '/api/admin/stories') {
+    const out = [];
+    for (const f of storyFixtures) {
+      const versions = storyRepo.listVersionsByStory(f.story_uuid);
+      out.push({
+        slug: f.slug,
+        story_uuid: f.story_uuid,
+        versions: versions.map((v) => ({
+          story_version_uuid: v.version_uuid,
+          version_no: v.version_no,
+          checksum: v.checksum,
+          status: v.status,
+        })),
+      });
+    }
+    return jsonResponse(res, 200, { demo: DEMO_FLAG, dev: DEV_FLAG, stories: out });
+  }
+
+  // POST /api/admin/stories/import — run the canonical import pipeline for a
+  // slug. Same content → no new version; different content → new version_no.
+  const importMatch = pathname.match(/^\/api\/admin\/stories\/([a-z0-9-]+)\/import$/);
+  if (method === 'POST' && importMatch) {
+    let body = {};
+    try {
+      body = await readJsonBody(req);
+    } catch (err) {
+      const { status, code } = classifyProviderError(err);
+      return jsonResponse(res, status, { error: code, demo: DEMO_FLAG, dev: DEV_FLAG });
+    }
+    const story_uuid = typeof body.story_uuid === 'string' && body.story_uuid
+      ? body.story_uuid
+      : `00000000-0000-4000-8000-${randomUUID().slice(0, 12).padStart(12, '0')}`;
+    try {
+      const result = await importStoryFromProvider({
+        repository: storyRepo,
+        provider,
+        slug: importMatch[1],
+        story_uuid,
+      });
+      return jsonResponse(res, 200, { demo: DEMO_FLAG, dev: DEV_FLAG, result });
+    } catch (err) {
+      const { status, code } = classifyProviderError(err);
+      return jsonResponse(res, status, {
+        error: code,
+        message: String(err && err.message ? err.message : err),
+        demo: DEMO_FLAG,
+        dev: DEV_FLAG,
+      });
+    }
+  }
+
+  // POST /api/admin/opening-cache/rebuild — generate / refresh the public
+  // opening cache for a story_version. Body may carry a custom generation
+  // profile (identifier/rules_version/locale). Without a different
+  // generation_hash the call returns the existing valid cache (idempotent).
+  const rebuildMatch = pathname.match(/^\/api\/admin\/opening-cache\/rebuild$/);
+  if (method === 'POST' && rebuildMatch) {
+    let body = {};
+    try {
+      body = await readJsonBody(req);
+    } catch (err) {
+      const { status, code } = classifyProviderError(err);
+      return jsonResponse(res, status, { error: code, demo: DEMO_FLAG, dev: DEV_FLAG });
+    }
+    if (!body.story_version_uuid || typeof body.story_version_uuid !== 'string') {
+      return jsonResponse(res, 400, {
+        error: 'missing_story_version_uuid',
+        demo: DEMO_FLAG,
+        dev: DEV_FLAG,
+      });
+    }
+    const profile = body.profile && typeof body.profile === 'object'
+      ? {
+          identifier: String(body.profile.identifier || defaultGenerationProfile().identifier),
+          rules_version: String(body.profile.rules_version || defaultGenerationProfile().rules_version),
+          locale: typeof body.profile.locale === 'string' ? body.profile.locale : 'zh-CN',
+        }
+      : defaultGenerationProfile();
+    try {
+      const result = await rebuildOpeningCache({
+        repository: storyRepo,
+        story_version_uuid: body.story_version_uuid,
+        profile,
+      });
+      return jsonResponse(res, 200, { demo: DEMO_FLAG, dev: DEV_FLAG, result });
+    } catch (err) {
+      const { status, code } = classifyProviderError(err);
+      return jsonResponse(res, status, {
+        error: code,
+        message: String(err && err.message ? err.message : err),
+        demo: DEMO_FLAG,
+        dev: DEV_FLAG,
+      });
+    }
+  }
+
+  // POST /api/dev/sessions — start a session snapshot against a given
+  // story_version. Body: { session_uuid, story_uuid, story_version_uuid,
+  // user_ref, role_id }. The returned snapshot pins story_version_id so
+  // upstream content changes do not affect the session.
+  if (method === 'POST' && pathname === '/api/dev/sessions') {
+    let body = {};
+    try {
+      body = await readJsonBody(req);
+    } catch (err) {
+      const { status, code } = classifyProviderError(err);
+      return jsonResponse(res, status, { error: code, demo: DEMO_FLAG, dev: DEV_FLAG });
+    }
+    const required = ['session_uuid', 'story_uuid', 'story_version_uuid', 'user_ref', 'role_id'];
+    for (const k of required) {
+      if (typeof body[k] !== 'string' || !body[k]) {
+        return jsonResponse(res, 400, {
+          error: 'missing_field',
+          field: k,
+          demo: DEMO_FLAG,
+          dev: DEV_FLAG,
+        });
+      }
+    }
+    try {
+      const snapshot = startSessionSnapshot({
+        repository: storyRepo,
+        session_uuid: body.session_uuid,
+        story_uuid: body.story_uuid,
+        story_version_uuid: body.story_version_uuid,
+        user_ref: body.user_ref,
+        role_id: body.role_id,
+      });
+      return jsonResponse(res, 200, { demo: DEMO_FLAG, dev: DEV_FLAG, snapshot });
+    } catch (err) {
+      const { status, code } = classifyProviderError(err);
+      return jsonResponse(res, status, {
+        error: code,
+        message: String(err && err.message ? err.message : err),
+        demo: DEMO_FLAG,
+        dev: DEV_FLAG,
+      });
+    }
+  }
+
+  // POST /api/dev/sessions/:uuid/first-choice — record the first
+  // ask_player_choice on a session and invalidate its opening cache.
+  const firstChoiceMatch = pathname.match(/^\/api\/dev\/sessions\/([0-9a-fA-F-]+)\/first-choice$/);
+  if (method === 'POST' && firstChoiceMatch) {
+    let body = {};
+    try {
+      body = await readJsonBody(req);
+    } catch (err) {
+      const { status, code } = classifyProviderError(err);
+      return jsonResponse(res, status, { error: code, demo: DEMO_FLAG, dev: DEV_FLAG });
+    }
+    if (!body.snapshot || typeof body.snapshot !== 'object') {
+      return jsonResponse(res, 400, {
+        error: 'missing_snapshot',
+        demo: DEMO_FLAG,
+        dev: DEV_FLAG,
+      });
+    }
+    try {
+      const result = markFirstChoiceConsumed({
+        repository: storyRepo,
+        snapshot: body.snapshot,
+      });
+      return jsonResponse(res, 200, { demo: DEMO_FLAG, dev: DEV_FLAG, result });
+    } catch (err) {
+      const { status, code } = classifyProviderError(err);
+      return jsonResponse(res, status, {
+        error: code,
+        message: String(err && err.message ? err.message : err),
+        demo: DEMO_FLAG,
+        dev: DEV_FLAG,
+      });
+    }
+  }
+
   // Root → static
   if (method === 'GET' && (pathname === '/' || pathname === '/index.html')) {
     return serveStatic(req, res, '/index.html');
@@ -259,4 +486,4 @@ if (isMainModule) {
   });
 }
 
-export { server, DEMO_FLAG, classifyProviderError };
+export { server, DEMO_FLAG, DEV_FLAG, classifyProviderError, storyRepo, storyFixtures, listFixtureStorySlugs };

@@ -143,3 +143,42 @@ node tests/schema-contract.test.mjs
 - 新增状态枚举或字段时，优先走 `0002_*.sql` 增量迁移并更新 `db/schema.sql`，不能只改一边。
 - canonical 事件新增类型时，同步更新 `session_events.event_type` 枚举与本文档；不要复用旧事件类型表达新含义。
 - 任何引入用户体系/多租户/鉴权的变更，必须继续遵守“不落库密钥、不存明文凭据”。
+
+## 9. 应用层映射（ClickUp 04）
+
+ClickUp 04 增加了导入、版本化与作品级开场缓存的逻辑。该逻辑全部在 Node 应用内运行（`src/stories/`），**不写入真实 MariaDB**。当前阶段仅提供凭据无关的内存版数据访问与 fixture，便于在没有数据库的环境里完成单元 / HTTP 测试，并为未来 MariaDB DAO 替换留出接缝。
+
+### 9.1 模块边界
+
+- `src/stories/canonicalHash.mjs` — 稳定 SHA-256 + canonical JSON（按 key 递归排序）。同一故事内容（不计字段顺序）→ 同一 `checksum`；任一字段变化 → 新的 `checksum`。
+- `src/stories/cacheKey.mjs` — 开场缓存键推导。键只由 `story_uuid` / `story_version_uuid` / `opening_key` / `profile.identifier` / `profile.rules_version`（以及可选 `locale`、`profile.tags`）组成。**任何** `user_id` / `role_id` / `session_id` / `ip` / `device` / `timestamp` / `nonce` 出现在 scope 上都会明确报错。
+- `src/stories/openingGenerator.mjs` — 纯函数：`story_version` 内容 → 逐句事件序列。在第一个 `ask_player_choice` 标记之前截断；输出中**不允许**出现 `ask_player_choice` 类型事件。
+- `src/stories/repository.mjs` — 内存仓库，实现与 MariaDB 表对齐的方法集合：`upsertStory` / `findVersionByChecksum` / `importVersion` / `upsertOpeningCache` / `recordCacheInvalidation` 等。
+- `src/stories/storyService.mjs` — 应用层 facade：`importStory` / `ensureOpeningCache` / `rebuildOpeningCache` / `startSessionSnapshot` / `markFirstChoiceConsumed`。
+- `src/stories/fixture.mjs` — 用 mock provider 的内容预填仓库，保证 admin/dev 路由能拿到稳定的 `story_uuid` / `story_version_uuid`。
+
+### 9.2 SQL 表 ↔ 仓库 / 服务映射
+
+| MariaDB 表 | 仓库 / 服务 | 重要列 ↔ 内存表示 |
+| --- | --- | --- |
+| `stories` | `repository.upsertStory` | `slug` / `story_uuid` / `title` / `hook` / `locale` / `status`；目录行，不携带正文。 |
+| `story_versions` | `repository.importVersion` / `repository.findVersion` / `repository.listVersionsByStory` | `version_uuid` / `story_id` / `version_no` / `content_payload` / `roles_payload` / `checksum` / `status`。同一 `checksum` 已存在时直接复用；不同则 `version_no` 递增，旧行保留。 |
+| `story_opening_caches` | `repository.upsertOpeningCache` / `repository.findOpeningCacheByScope` / `repository.recordCacheInvalidation` | `cache_uuid` / `story_id` / `story_version_id` / `opening_key` / `status` (valid/invalidated/failed) / `content_payload` / `content_hash` / `use_count`。生成失败产生 `status='failed'` 行，不覆盖既有 `valid` 行。 |
+| `game_sessions` | `storyService.startSessionSnapshot` | `session_uuid` / `story_id` / `story_version_id` / `user_ref` / `role_id` / `opening_cache_id` / `first_choice_at` / `ending_id`。**应用层只读快照**，会话级状态写仍需 DAO。 |
+| `session_events` | `markFirstChoiceConsumed` 仅触发 invalidation，不直接写事件 | canonical 事件流仍仅经 DAO 写入；仓库只响应触发器的等价动作。 |
+
+> 注：内存仓库仅复现 schema 表面上的应用语义；不会假装数据已写入 MariaDB。任何 `repository.*` 调用都不发起 SQL。当未来引入 `src/stories/daoMaria.mjs` 时，可以逐方法替换仓库实现，服务层和路由代码不需要变动。
+
+### 9.3 开场缓存作用域与不可变性
+
+- `opening_key` 默认为 `'default'`；保留多套 `opening_key` 是为以后的 spoof / 彩蛋 / 实验者索引位预留。
+- 唯一键：`(story_uuid, story_version_uuid, opening_key)`，再加 generation profile 推导出的 `generation_hash`。
+- 一旦 `status='valid'`，其 `content_payload` / `content_hash` **不可变**。后续调用如果仍在同一 generation 下重复生成，将直接返回原缓存；需要变更必须通过 `rebuildOpeningCache(...)`（显式传 `rules_version` / `identifier` / `locale`）或 `ensureOpeningCache({ force: true, replace_strategy: 'new_generation' | 'in_place' })`。
+- `recordCacheInvalidation` 会将行状态改为 `invalidated`，并从基于 scope 的查找索引中移除；行本身仍然保留以供审计。
+- `markFirstChoiceConsumed` 是会话首次发生 `ask_player_choice` 事件的等价动作；它会调用 `recordCacheInvalidation(reason='first_ask_player_choice')`，与 `trg_session_events_first_choice` 触发器在生产环境中的行为一致。
+
+### 9.4 替换 DAO 的注意事项
+
+- 应用层需要的 SQL 列在仓库里的命名与 SQL 列名一致，便于未来 SQL 写入无歧义映射。
+- `session_events` 的 append-only 限制仍由 trigger 保证，应用层**不能也不应** `UPDATE` / `DELETE`。`markFirstChoiceConsumed` 模拟的是触发器对 `story_opening_caches` 的级联动作，而不是绕过 `session_events` 直接修改事件。
+- 后续 DAO 落地后，仓库方法可逐个替换为参数化查询；建议为每个方法单独提供单元测试 + 集成测试，保留现有应用层语义不变。
