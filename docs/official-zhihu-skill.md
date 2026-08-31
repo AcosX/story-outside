@@ -12,17 +12,30 @@
 
 ## 2. mock ↔ 官方 adapter 的接缝
 
-未来真的接入官方能力时，按下列接缝替换。Phase 1 把接缝先固定下来，便于后续并行开发：
+未来真的接入官方能力时，按下列接缝替换。Phase 2 已把接缝落地，便于后续并行开发：
 
 | 现在的 mock | 未来真实 adapter | 替换位置 |
 | --- | --- | --- |
-| `GET /api/stories` 返回 `STORIES` 数组 | 由后端 catalog 服务读取真实故事库（暂未确认是否走知乎创作内容接口） | `src/server.mjs` 顶部 `STORIES` 常量 + `listStories()` |
-| `GET /api/stories/:id` 返回单条 + beats | 同样由 catalog 服务提供；不直接调知乎 | 同上 |
-| `POST /api/stories/advance` 仅递增 index | 接入 LLM 生成下一句；如要"展示用户关注/收藏"，从这里转调用户数据接口 | 同上 handler |
-| `POST /api/chat` 原样回显 | 真正的群聊逐句播放；同样要避免无脑调用户数据接口 | 同上 handler |
+| `GET /api/stories` 返回 `STORIES` 数组 | 由后端 catalog 服务读取真实故事库（暂未确认是否走知乎创作内容接口） | `src/providers/mockProvider.mjs` 的 `listStories()` |
+| `GET /api/stories/:id` 返回单条 + beats | 同样由 catalog 服务提供；不直接调知乎 | `src/providers/mockProvider.mjs` 的 `getStory()` |
+| `POST /api/stories/advance` 仅递增 index | 接入 LLM 生成下一句；如要"展示用户关注/收藏"，从这里转调用户数据接口 | `src/providers/mockProvider.mjs` 的 `advanceStory()` |
+| `POST /api/chat` 原样回显 | 真正的群聊逐句播放；同样要避免无脑调用户数据接口 | 同上 handler（仍留在 `src/server.mjs`，不是 provider 接缝的一部分） |
 | `GET /api/health` 返回 demo 标志 | 在 OAuth 联调成功且 doctor 通过后切到 `mode: "live"` | `DEMO_FLAG` 常量 |
 
-后端**不**直接依赖 `vendor/zhihu-hackathon/scripts/*.mjs`。它们是编排型脚本，不属于运行依赖。后续若要"按官方指引执行 OAuth 流程"，应当是开发机本地跑这些脚本去申请/写入钥匙串，**而不是**服务器在每次启动时去跑。
+Provider 接缝的关键文件：
+
+- `src/providers/dto.mjs` —— 与 transport 无关的 DTO（`StorySummary`、`StoryDetail`、`AdvanceResult` 等）和错误类型（`StoryNotFoundError`、`ValidationError`）。
+- `src/providers/mockProvider.mjs` —— 内存版 Mock；返回上面 DTO。
+- `src/providers/index.mjs` —— Provider 选择器；读 `STORY_OUTSIDE_PROVIDER`（默认 `mock`）。
+- `src/providers/realProvider.mjs` —— **尚未实现**；接入官方 API 时按接缝实现，从这里发起 token / 用户接口调用。
+
+选择器规则：
+
+- `STORY_OUTSIDE_PROVIDER=mock`（默认） → MockProvider。
+- `STORY_OUTSIDE_PROVIDER=real` → **明确报错**而不是静默回退 mock，避免生产上错配置后假装还能谈上知乎。
+- `STORY_OUTSIDE_PROVIDER=<其他>` → 启动报 `Unknown STORY_OUTSIDE_PROVIDER`。
+
+后端**不**直接依赖 `vendor/zhihu-hackathon/scripts/*.mjs`。它们是编排型脚本，不属于运行依赖。后续若要"按官方指引执行 OAuth 流程"，应当是开发机本地跑这些脚本去申请/写入钥匙串，**而不是**服务器在每次启动时去跑。`src/providers/realProvider.mjs` 一律不许 `import` 任何 `vendor/zhihu-hackathon/**` 路径。
 
 ## 3. 官方 API 调用边界（按官方 Skill 与 references 整理）
 

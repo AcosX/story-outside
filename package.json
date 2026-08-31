@@ -10,7 +10,7 @@
   "scripts": {
     "start": "node src/server.mjs",
     "dev": "node src/server.mjs",
-    "test": "node tests/health.test.mjs",
+    "test": "node tests/health.test.mjs && node tests/providers.test.mjs && node tests/http.test.mjs",
     "check": "node scripts/check.mjs"
   },
   "dependencies": {},
