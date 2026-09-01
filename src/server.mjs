@@ -27,6 +27,12 @@ import {
   rebuildOpeningCache,
   startSessionSnapshot,
 } from './stories/index.mjs';
+import {
+  commitOpeningEvent,
+  createSession,
+  interruptWithPlayerInput,
+  recoverSession,
+} from './stories/sessionService.mjs';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 const ROOT = resolve(__dirname, '..');
@@ -167,6 +173,43 @@ function classifyProviderError(err) {
 // having to POST a separate import for every story. The repository lives in
 // memory only; see docs/data-model.md for the MariaDB mapping.
 const { repository: storyRepo, fixtures: storyFixtures } = createSeededRepository();
+
+// sessionService deliberately keeps its state private to the repository. The
+// route layer keeps only the request's non-secret pinned metadata so recovery
+// can return the same metadata without reaching into service internals.
+const sessionPinnedMetadata = new Map();
+
+const SESSION_UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+function isSessionUuid(value) {
+  return typeof value === 'string' && SESSION_UUID_PATTERN.test(value);
+}
+
+function sessionError(err) {
+  const text = String(err && err.message ? err.message : '');
+  if (/unknown session/i.test(text)) {
+    return { status: 404, code: 'session_not_found', message: 'Session was not found.' };
+  }
+  if (/revision mismatch/i.test(text)) {
+    return { status: 400, code: 'revision_mismatch', message: 'Expected revision does not match the current session revision.' };
+  }
+  if (/cache_uuid|pinned cache|cache .*match|invalid cache/i.test(text)) {
+    return { status: 400, code: 'invalid_cache', message: 'The opening cache is invalid for this session.' };
+  }
+  if (/already exists/i.test(text)) {
+    return { status: 400, code: 'duplicate_session', message: 'The session already exists.' };
+  }
+  return { status: 400, code: 'validation_failed', message: 'The session request is invalid.' };
+}
+
+function sessionErrorResponse(res, err) {
+  const { status, code, message } = sessionError(err);
+  return jsonResponse(res, status, { error: code, message, demo: DEMO_FLAG, dev: DEV_FLAG });
+}
+
+function validObject(value) {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
 
 /**
  * Phase 4 catalogue helper: list slugs from the in-memory fixture set so
@@ -381,18 +424,90 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
-  // POST /api/dev/sessions — start a session snapshot against a given
-  // story_version. Body: { session_uuid, story_uuid, story_version_uuid,
-  // user_ref, role_id }. The returned snapshot pins story_version_id so
-  // upstream content changes do not affect the session.
+  // ClickUp 05 session playback routes. These call the session-local service
+  // directly: creating a session pins the supplied cache, recovery is read
+  // only, and events are appended only by explicit commit/interrupt calls.
   if (method === 'POST' && pathname === '/api/dev/sessions') {
     let body = {};
     try {
       body = await readJsonBody(req);
     } catch (err) {
-      const { status, code } = classifyProviderError(err);
-      return jsonResponse(res, status, { error: code, demo: DEMO_FLAG, dev: DEV_FLAG });
+      return sessionErrorResponse(res, err);
     }
+    // Keep the ClickUp 04 snapshot route compatible when the new playback
+    // fields are absent. A request containing the new fields uses the strict
+    // sessionService contract below.
+    const isPlaybackRequest = validObject(body) &&
+      ['model', 'prompt', 'generation_profile'].some((key) => Object.prototype.hasOwnProperty.call(body, key));
+    if (isPlaybackRequest) {
+      const required = ['session_uuid', 'story_uuid', 'story_version_uuid', 'user_ref', 'role_id', 'model', 'prompt', 'generation_profile'];
+      const missing = required.find((key) => {
+        if (!Object.prototype.hasOwnProperty.call(body, key)) return true;
+        if (key === 'generation_profile') return !validObject(body[key]);
+        if (key === 'prompt') return typeof body[key] !== 'string';
+        return typeof body[key] !== 'string' || body[key].length === 0;
+      });
+      if (missing) {
+        return jsonResponse(res, 400, {
+          error: 'validation_failed', message: 'The session request is invalid.',
+          field: missing, demo: DEMO_FLAG, dev: DEV_FLAG,
+        });
+      }
+      for (const key of ['session_uuid', 'story_uuid', 'story_version_uuid']) {
+        if (!isSessionUuid(body[key])) {
+          return jsonResponse(res, 400, {
+            error: 'validation_failed', message: 'The session request is invalid.',
+            field: key, demo: DEMO_FLAG, dev: DEV_FLAG,
+          });
+        }
+      }
+      if (!isSessionUuid(body.generation_profile.cache_uuid)) {
+        return jsonResponse(res, 400, {
+          error: 'invalid_cache', message: 'The opening cache is invalid for this session.',
+          demo: DEMO_FLAG, dev: DEV_FLAG,
+        });
+      }
+      const pinnedCache = storyRepo.findOpeningCacheByUuid(body.generation_profile.cache_uuid);
+      if (!pinnedCache || pinnedCache.status !== 'valid') {
+        return jsonResponse(res, 400, {
+          error: 'invalid_cache', message: 'The opening cache is invalid for this session.',
+          demo: DEMO_FLAG, dev: DEV_FLAG,
+        });
+      }
+      try {
+        const result = createSession({
+          repository: storyRepo,
+          session_uuid: body.session_uuid,
+          story_uuid: body.story_uuid,
+          story_version_uuid: body.story_version_uuid,
+          user_ref: body.user_ref,
+          role_id: body.role_id,
+          model: body.model,
+          prompt: body.prompt,
+          generation_profile: body.generation_profile,
+        });
+        const profile = {};
+        for (const key of ['cache_uuid', 'story_uuid', 'story_version_uuid', 'generation_hash', 'identifier', 'rules_version', 'locale', 'variant']) {
+          if (body.generation_profile[key] !== undefined) profile[key] = body.generation_profile[key];
+        }
+        const pinned = {
+          user_ref: body.user_ref,
+          role_id: body.role_id,
+          model: body.model,
+          prompt: body.prompt,
+          generation_profile: profile,
+        };
+        sessionPinnedMetadata.set(body.session_uuid, pinned);
+        return jsonResponse(res, 200, {
+          demo: DEMO_FLAG, dev: DEV_FLAG, ...result, pinned,
+          session: { ...result, pinned },
+        });
+      } catch (err) {
+        return sessionErrorResponse(res, err);
+      }
+    }
+
+    // Legacy Phase 4 snapshot contract.
     const required = ['session_uuid', 'story_uuid', 'story_version_uuid', 'user_ref', 'role_id'];
     for (const k of required) {
       if (typeof body[k] !== 'string' || !body[k]) {
@@ -422,6 +537,98 @@ const server = http.createServer(async (req, res) => {
         demo: DEMO_FLAG,
         dev: DEV_FLAG,
       });
+    }
+  }
+
+  // GET /api/dev/sessions/:uuid — recover only canonical session state. This
+  // endpoint never generates from, or appends to, the opening cache.
+  const sessionMatch = pathname.match(/^\/api\/dev\/sessions\/([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$/);
+  if (method === 'GET' && sessionMatch) {
+    try {
+      const recovered = recoverSession({ repository: storyRepo, session_uuid: sessionMatch[1] });
+      return jsonResponse(res, 200, {
+        demo: DEMO_FLAG,
+        dev: DEV_FLAG,
+        ...recovered,
+        pinned: sessionPinnedMetadata.get(sessionMatch[1]) || null,
+      });
+    } catch (err) {
+      return sessionErrorResponse(res, err);
+    }
+  }
+
+  // POST /api/dev/sessions/:uuid/opening-events — append exactly one
+  // explicitly supplied cache event. The service enforces contiguous order,
+  // optimistic revision checks, and request-id idempotency.
+  const openingEventsMatch = pathname.match(/^\/api\/dev\/sessions\/([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\/opening-events$/);
+  if (method === 'POST' && openingEventsMatch) {
+    let body = {};
+    try {
+      body = await readJsonBody(req);
+    } catch (err) {
+      return sessionErrorResponse(res, err);
+    }
+    if (!validObject(body) || !isSessionUuid(body.cache_uuid) || !validObject(body.event) ||
+        !Number.isInteger(body.expected_revision) ||
+        typeof body.client_request_id !== 'string' || !body.client_request_id ||
+        typeof body.event.type !== 'string' || !body.event.type ||
+        !Number.isInteger(body.event.sequence) || typeof body.event.text !== 'string') {
+      return jsonResponse(res, 400, {
+        error: 'validation_failed', message: 'The opening event request is invalid.',
+        demo: DEMO_FLAG, dev: DEV_FLAG,
+      });
+    }
+    try {
+      const result = commitOpeningEvent({
+        repository: storyRepo,
+        session_uuid: openingEventsMatch[1],
+        cache_uuid: body.cache_uuid,
+        event: body.event,
+        client_request_id: body.client_request_id,
+        expected_revision: body.expected_revision,
+      });
+      return jsonResponse(res, 200, { demo: DEMO_FLAG, dev: DEV_FLAG, ...result });
+    } catch (err) {
+      return sessionErrorResponse(res, err);
+    }
+  }
+
+  // POST /api/dev/sessions/:uuid/interrupt — explicitly switch to realtime
+  // by appending player input. This route intentionally never invalidates a
+  // shared opening cache.
+  const interruptMatch = pathname.match(/^\/api\/dev\/sessions\/([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\/interrupt$/);
+  if (method === 'POST' && interruptMatch) {
+    let body = {};
+    try {
+      body = await readJsonBody(req);
+    } catch (err) {
+      return sessionErrorResponse(res, err);
+    }
+    if (!validObject(body) || typeof body.text !== 'string' || !body.text ||
+        typeof body.client_request_id !== 'string' || !body.client_request_id ||
+        !Number.isInteger(body.expected_revision)) {
+      return jsonResponse(res, 400, {
+        error: 'validation_failed', message: 'The interrupt request is invalid.',
+        demo: DEMO_FLAG, dev: DEV_FLAG,
+      });
+    }
+    try {
+      const result = interruptWithPlayerInput({
+        repository: storyRepo,
+        session_uuid: interruptMatch[1],
+        text: body.text,
+        client_request_id: body.client_request_id,
+        expected_revision: body.expected_revision,
+      });
+      return jsonResponse(res, 200, {
+        demo: DEMO_FLAG,
+        dev: DEV_FLAG,
+        ...result,
+        player_event: result.event,
+        realtime_transition: { state: result.state, cursor: result.cursor, revision: result.revision },
+      });
+    } catch (err) {
+      return sessionErrorResponse(res, err);
     }
   }
 
