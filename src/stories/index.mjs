@@ -29,3 +29,12 @@ export {
   listSessionEvents,
   recoverSession,
 } from './sessionService.mjs';
+export {
+  commitDisplayedEvent,
+  discardPendingTail,
+  dropPendingAfterLegacyInterrupt,
+  interruptWithPlayerInputFromPending,
+  listPendingSessionUuids,
+  recoverPendingSession,
+  stageNarrativeBatch,
+} from './pendingLifecycle.mjs';
