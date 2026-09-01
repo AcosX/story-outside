@@ -98,6 +98,37 @@ async function run() {
     event: shown(events[1]), expected_revision: 0,
   }), /revision mismatch/);
 
+  createSession({
+    repository, session_uuid: OTHER_SESSION, story_uuid: story.story_uuid,
+    story_version_uuid: story.story_version_uuid, user_ref: 'u-2', role_id: 'stranger',
+    model: 'test-model', prompt: 'fixed prompt', generation_profile: profile,
+  });
+  const firstEarlyOpening = commitOpeningEvent({
+    repository, session_uuid: OTHER_SESSION, cache_uuid: cache.cache_uuid,
+    event: shown(events[0]), expected_revision: 0,
+  });
+  assert.equal(firstEarlyOpening.cursor, 1);
+  const interruptedAfterFirstOpening = interruptWithPlayerInput({
+    repository, session_uuid: OTHER_SESSION, text: '先打断', expected_revision: 1,
+  });
+  assert.equal(interruptedAfterFirstOpening.cursor, 1);
+  assert.equal(interruptedAfterFirstOpening.revision, 2);
+  assert.equal(interruptedAfterFirstOpening.event.event_seq, 2);
+  assert.equal(recoverSession({ repository, session_uuid: OTHER_SESSION }).history.length, 2);
+
+  const immediateInterruptSession = '00000000-0000-4000-8000-000000000105';
+  createSession({
+    repository, session_uuid: immediateInterruptSession, story_uuid: story.story_uuid,
+    story_version_uuid: story.story_version_uuid, user_ref: 'u-3', role_id: 'stranger',
+    model: 'test-model', prompt: 'fixed prompt', generation_profile: profile,
+  });
+  const immediateInterrupt = interruptWithPlayerInput({
+    repository, session_uuid: immediateInterruptSession, text: '立即打断', expected_revision: 0,
+  });
+  assert.equal(immediateInterrupt.cursor, 0);
+  assert.equal(immediateInterrupt.revision, 1);
+  assert.equal(immediateInterrupt.event.event_seq, 1);
+
   let revision = first.revision;
   for (let i = 1; i < events.length; i += 1) {
     const out = commitOpeningEvent({ repository, session_uuid: SESSION, cache_uuid: cache.cache_uuid, event: shown(events[i]), expected_revision: revision });
@@ -115,7 +146,7 @@ async function run() {
   assert.equal(interrupted.event.event_type, 'player_input');
   assert.equal(interrupted.event.origin, 'user');
   assert.equal(interrupted.event.source, 'player');
-  assert.equal(interrupted.event.event_seq, interrupted.cursor);
+  assert.equal(interrupted.event.event_seq, interrupted.cursor + 1);
   assert.equal(interrupted.event.source_sequence, interrupted.event.event_seq);
   assert.deepEqual(interruptWithPlayerInput({ repository, session_uuid: SESSION, text: '我等一个答案', client_request_id: 'input-1', expected_revision: 0 }), interrupted);
   assert.throws(() => interruptWithPlayerInput({ repository, session_uuid: SESSION, text: '不同', client_request_id: 'input-1' }), /different request/);

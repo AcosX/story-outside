@@ -170,7 +170,6 @@ function normalizeCacheEvent(event, pinned, cache_uuid, session_uuid) {
   }
   return {
     event_id: randomUUID(),
-    event_seq: event.sequence + 1,
     event_type: 'story_opening',
     origin: 'imported',
     source: 'opening_cache',
@@ -180,11 +179,12 @@ function normalizeCacheEvent(event, pinned, cache_uuid, session_uuid) {
   };
 }
 
-function append(session, canonical) {
-  session.history.push(canonical);
-  session.cursor += 1;
+function append(session, canonical, advancesCursor) {
+  const committed = { ...canonical, event_seq: session.history.length + 1 };
+  session.history.push(committed);
+  if (advancesCursor) session.cursor += 1;
   session.revision += 1;
-  return canonical;
+  return committed;
 }
 
 function publicSession(session, includeHistory = false) {
@@ -270,7 +270,7 @@ export function commitOpeningEvent({ repository, session_uuid, cache_uuid, event
   const pinned = validatePinnedCache(cache, session.story_uuid, session.story_version_uuid)
     .find((candidate) => candidate && candidate.sequence === event.sequence);
   const canonical = normalizeCacheEvent(event, pinned, cache_uuid, session.session_uuid);
-  const committed = append(session, canonical);
+  const committed = append(session, canonical, true);
   if (session.cursor >= cache.content_payload.event_count) session.state = 'awaiting_first_choice';
   const result = { session_uuid, cache_uuid, event: clone(committed), cursor: session.cursor, revision: session.revision, state: session.state };
   if (id) session.requestIds.set(id, { kind: 'opening', fingerprint: requestFingerprint('opening', { event }), result });
@@ -289,16 +289,16 @@ export function interruptWithPlayerInput({ repository, session_uuid, text, clien
     throw new Error('interruptWithPlayerInput: session is not interruptible');
   }
   requiredString('text', text);
+  const sourceSequence = session.history.length + 1;
   const canonical = append(session, {
     event_id: randomUUID(),
-    event_seq: session.cursor + 1,
     event_type: 'player_input',
     origin: 'user',
     source: 'player',
-    source_sequence: session.cursor + 1,
+    source_sequence: sourceSequence,
     payload: { text },
     occurred_at: nowIso(),
-  });
+  }, false);
   session.state = 'realtime';
   const result = { session_uuid, cache_uuid: session.cache_uuid, event: clone(canonical), cursor: session.cursor, revision: session.revision, state: session.state };
   if (id) session.requestIds.set(id, { kind: 'interrupt', fingerprint: requestFingerprint('interrupt', { text }), result });
