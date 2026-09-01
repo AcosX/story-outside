@@ -7,4 +7,3 @@
 - `request` / `revision` 采用幂等语义，重复提交不应产生重复副作用。
 - `recoverRuntime` 负责恢复可继续的运行态；`resumeTurn` 只恢复可续接的回合，不替代首次创建。
 - 不在此文档声称已有 MariaDB DAO；持久层实现应以实际代码为准。
-
