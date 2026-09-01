@@ -137,6 +137,39 @@ await test('sensitive keys are rejected recursively and provider rejects are san
   assert.equal(provider.callCount, 2);
 });
 
+await test('system_prompt and tool_definitions reject sensitive keys and camelCase accessToken', async () => {
+  const base = await setup();
+  assert.throws(() => createAgentRuntime({
+    repository: base.repository,
+    session_uuid: base.session_uuid,
+    provider: createMockAgentProvider(),
+    system_prompt: { kind: 'system', secrets: { accessToken: 'x' } },
+    tool_definitions: [{ name: 'ask_player_choice' }],
+    expected_story_version_uuid: base.version.version_uuid,
+    expected_story_version_checksum: base.version.checksum,
+    expected_model: 'gpt-test',
+    expected_generation_profile: { identifier: base.cache.generation_profile.identifier, rules_version: base.cache.generation_profile.rules_version, cache_uuid: base.cache.cache_uuid, generation_hash: base.cache.generation_hash },
+  }), (error) => error instanceof AgentRuntimeError && error.code === 'invalid_input');
+
+  assert.throws(() => createAgentRuntime({
+    repository: base.repository,
+    session_uuid: base.session_uuid,
+    provider: createMockAgentProvider(),
+    system_prompt: { kind: 'system', text: 'sys' },
+    tool_definitions: [{ name: 'ask_player_choice', headers: { accept: 'x' } }],
+    expected_story_version_uuid: base.version.version_uuid,
+    expected_story_version_checksum: base.version.checksum,
+    expected_model: 'gpt-test',
+    expected_generation_profile: { identifier: base.cache.generation_profile.identifier, rules_version: base.cache.generation_profile.rules_version, cache_uuid: base.cache.cache_uuid, generation_hash: base.cache.generation_hash },
+  }), (error) => error instanceof AgentRuntimeError && error.code === 'invalid_input');
+});
+
+await test('turn_id is a valid UUID', async () => {
+  const runtime = await buildRuntime(createMockAgentProvider({ responses: [{ messages: [{ role: 'assistant', content: 'hello' }] }] }));
+  const result = await runTurn(runtime, { input: { a: 1 }, expected_revision: recoverRuntime(runtime).base_revision });
+  assert.match(result.turn_id, /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
+});
+
 await test('resumeTurn without args is read-only and deep-cloned', async () => {
   const provider = createMockAgentProvider({ responses: [{ messages: [{ role: 'assistant', content: 'hello' }] }] });
   const runtime = await buildRuntime(provider);

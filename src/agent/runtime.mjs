@@ -1,9 +1,10 @@
 import { canonicalJsonStringify } from '../stories/canonicalHash.mjs';
 import { getSession, listSessionEvents } from '../stories/sessionService.mjs';
+import { randomUUID } from 'node:crypto';
 
 const RUNTIME_STATE = Symbol('agentRuntimeState');
 const ALLOWED_TOOL_CALLS = new Set(['ask_player_choice', 'finish_story']);
-const SENSITIVE_KEY_PATTERN = /(^|[^a-z])(password|token|access_token|secret|api_key|app_key|authorization|cookie|headers)([^a-z]|$)/i;
+const SENSITIVE_KEY_PATTERN = /^(password|token|access[_-]?token|secret|api[_-]?key|app[_-]?key|authorization|cookie|headers?)$/i;
 const ERROR_CODES = new Set(['pin_mismatch', 'invalid_input', 'provider_failure', 'unknown_tool', 'invalid_tool_call', 'revision_mismatch', 'duplicate_request']);
 
 class AgentRuntimeError extends Error {
@@ -47,6 +48,11 @@ function fingerprint(input, revision, request_id) {
   return canonicalJsonStringify({ input, revision, request_id: request_id ?? null });
 }
 
+function isSensitiveKey(key) {
+  const normalized = key.replace(/[-_\s]/g, '').toLowerCase();
+  return SENSITIVE_KEY_PATTERN.test(key) || ['password', 'token', 'accesstoken', 'secret', 'apikey', 'appkey', 'authorization', 'cookie', 'headers', 'header'].includes(normalized);
+}
+
 function scanSensitiveKeys(value, path = 'value') {
   if (!value || typeof value !== 'object') return;
   if (Array.isArray(value)) {
@@ -54,9 +60,15 @@ function scanSensitiveKeys(value, path = 'value') {
     return;
   }
   for (const [key, child] of Object.entries(value)) {
-    if (SENSITIVE_KEY_PATTERN.test(key.replace(/[-_]/g, '_'))) fail('invalid_input', `sensitive key rejected at ${path}.${key}`);
+    if (isSensitiveKey(key)) fail('invalid_input', `sensitive key rejected at ${path}.${key}`);
     scanSensitiveKeys(child, `${path}.${key}`);
   }
+}
+
+function sanitizeFiniteJson(value, label) {
+  const json = assertFiniteJson(value, label);
+  scanSensitiveKeys(json, label);
+  return json;
 }
 
 function normalizeChoice(value, index) {
@@ -129,8 +141,8 @@ export function createAgentRuntime({ repository, session_uuid, provider, system_
       session_uuid,
       provider,
       pinned: clone({ story_uuid: session.story_uuid, story_version_uuid: session.story_version_uuid, story_version_checksum: session.story_version_checksum, role_id: session.role_id, model: session.model, generation_profile: session.generation_profile }),
-      system_prompt: clone(assertFiniteJson(system_prompt, 'system_prompt')),
-      tool_definitions: clone(assertObjectArray(assertFiniteJson(tool_definitions, 'tool_definitions'), 'tool_definitions')),
+      system_prompt: clone(sanitizeFiniteJson(system_prompt, 'system_prompt')),
+      tool_definitions: clone(assertObjectArray(sanitizeFiniteJson(tool_definitions, 'tool_definitions'), 'tool_definitions')),
       base_revision: session.revision,
       base_cursor: session.cursor,
       successful_turns: [],
@@ -178,7 +190,7 @@ export async function runTurn(runtime, { request_id, input, expected_revision } 
     fail('provider_failure', 'agent provider failed');
   }
   const providerResult = normalizeProviderResult(rawResult);
-  const turn_id = crypto.randomUUID();
+  const turn_id = randomUUID();
   const result = { turn_id, request_id: key, base_revision: state.base_revision, base_cursor: state.base_cursor, kind: providerResult.tool_calls.length ? 'tool_call' : 'narrative', messages: providerResult.messages, tool_calls: providerResult.tool_calls, pending: providerResult.tool_calls.length > 0 };
   state.pending = clone(result);
   state.successful_turns.push(clone(result));
