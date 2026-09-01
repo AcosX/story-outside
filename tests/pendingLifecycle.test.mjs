@@ -306,13 +306,38 @@ await test('stale pending_id after a fresh stage is rejected', async () => {
   const first = stageNarrativeBatch({
     repository, session_uuid, events: makeBatch(2), source: 'runtime', expected_revision: 0,
   });
-  // Replace the pending batch.
-  const second = stageNarrativeBatch({
+  // Re-stage with the SAME payload → idempotent return. pending_id is stable.
+  const sameReplay = stageNarrativeBatch({
     repository, session_uuid, events: makeBatch(2), source: 'runtime', expected_revision: 0,
+  });
+  assert.equal(sameReplay.pending_id, first.pending_id);
+  // Re-stage with a DIFFERENT payload → fail closed. The active pending
+  // must NOT be silently overwritten (ClickUp 08 P1.2).
+  assert.throws(() => stageNarrativeBatch({
+    repository, session_uuid, events: [
+      { type: 'narration', sequence: 0, text: 'different line 1' },
+      { type: 'dialogue', sequence: 1, text: 'different line 2', speaker: 'stranger' },
+    ], source: 'runtime', expected_revision: 0,
+  }), /unconsumed pending/);
+  // The pending_id is still the original one; a stale one is rejected.
+  assert.throws(() => commitDisplayedEvent({
+    repository, session_uuid, pending_id: '00000000-0000-4000-8000-deadbeef0000',
+    sequence: 0, expected_revision: 0,
+  }), /pending_id/);
+  // Drain the active batch with a full commit, then stage a fresh one.
+  commitDisplayedEvent({
+    repository, session_uuid, pending_id: first.pending_id, sequence: 0, expected_revision: 0,
+  });
+  commitDisplayedEvent({
+    repository, session_uuid, pending_id: first.pending_id, sequence: 1, expected_revision: 1,
+  });
+  // After draining, a brand-new stage succeeds with a new pending_id.
+  const second = stageNarrativeBatch({
+    repository, session_uuid, events: makeBatch(2), source: 'runtime', expected_revision: 2,
   });
   assert.notEqual(first.pending_id, second.pending_id);
   assert.throws(() => commitDisplayedEvent({
-    repository, session_uuid, pending_id: first.pending_id, sequence: 0, expected_revision: 0,
+    repository, session_uuid, pending_id: first.pending_id, sequence: 0, expected_revision: 2,
   }), /pending_id/);
 });
 
@@ -324,6 +349,120 @@ await test('stage rejects non-contiguous sequences', async () => {
       { type: 'narration', sequence: 2, text: 'two' },
     ], source: 'runtime', expected_revision: 0,
   }), /sequence must equal/);
+});
+
+await test('P1.2: stageNarrativeBatch rejects a different payload while a pending is unconsumed', async () => {
+  // ClickUp 08 P1.2 — active pending concurrency. With an unconsumed
+  // pending batch, a fresh stage MUST NOT silently overwrite it. Same
+  // payload returns the existing pending (idempotent); different payload
+  // fails closed.
+  const { repository, session_uuid } = await buildSession();
+  const first = stageNarrativeBatch({
+    repository, session_uuid, events: makeBatch(3), source: 'runtime', expected_revision: 0,
+  });
+  // Same payload (no client_request_id) → idempotent return; pending_id is stable.
+  const sameReplay = stageNarrativeBatch({
+    repository, session_uuid, events: makeBatch(3), source: 'runtime', expected_revision: 0,
+  });
+  assert.equal(sameReplay.pending_id, first.pending_id);
+  assert.equal(sameReplay.committed_count, 0);
+  assert.equal(sameReplay.events.length, 3);
+  // Different payload → fail closed; the active pending is untouched.
+  assert.throws(() => stageNarrativeBatch({
+    repository, session_uuid, events: [
+      { type: 'narration', sequence: 0, text: 'late provider line' },
+    ], source: 'runtime', expected_revision: 0,
+  }), /unconsumed pending/);
+  // The pending_id is still the original one.
+  const recovered = recoverPendingSession({ repository, session_uuid });
+  assert.equal(recovered.pending.pending_id, first.pending_id);
+  assert.equal(recovered.pending.events.length, 3);
+});
+
+await test('P1.2: late provider arriving AFTER partial commit is rejected, original batch survives', async () => {
+  // A partial commit advances revision; a late provider with the OLD
+  // expected_revision must fail closed with revision_mismatch. A late
+  // provider that somehow guesses the new revision must still fail
+  // closed because the active pending is unconsumed (committed_count<events).
+  const { repository, session_uuid } = await buildSession();
+  const staged = stageNarrativeBatch({
+    repository, session_uuid, events: makeBatch(4), source: 'runtime', expected_revision: 0,
+  });
+  commitDisplayedEvent({
+    repository, session_uuid, pending_id: staged.pending_id,
+    sequence: 0, expected_revision: 0,
+  });
+  // Stale revision → revision_mismatch, not "unconsumed pending".
+  assert.throws(() => stageNarrativeBatch({
+    repository, session_uuid, events: makeBatch(2), source: 'runtime', expected_revision: 0,
+  }), /revision mismatch/);
+  // With the right revision but a different payload → unconsumed pending.
+  assert.throws(() => stageNarrativeBatch({
+    repository, session_uuid, events: makeBatch(2), source: 'runtime', expected_revision: 1,
+  }), /unconsumed pending/);
+  // With the right revision AND the same payload → idempotent return.
+  const replay = stageNarrativeBatch({
+    repository, session_uuid, events: makeBatch(4), source: 'runtime', expected_revision: 1,
+  });
+  assert.equal(replay.pending_id, staged.pending_id);
+  assert.equal(replay.committed_count, 1);
+  // Active pending is still 4 items, 1 committed.
+  const recovered = recoverPendingSession({ repository, session_uuid });
+  assert.equal(recovered.pending.events.length, 4);
+  assert.equal(recovered.pending.committed_count, 1);
+});
+
+await test('P1.2: two stages with the SAME client_request_id are idempotent even when other state advanced', async () => {
+  const { repository, session_uuid } = await buildSession();
+  const staged = stageNarrativeBatch({
+    repository, session_uuid, events: makeBatch(2), source: 'runtime',
+    expected_revision: 0, client_request_id: 'stage-req-1',
+  });
+  const replay = stageNarrativeBatch({
+    repository, session_uuid, events: makeBatch(2), source: 'runtime',
+    expected_revision: 0, client_request_id: 'stage-req-1',
+  });
+  assert.deepEqual(replay, staged);
+  // Drain the pending so the second stage-with-different-id can succeed.
+  commitDisplayedEvent({
+    repository, session_uuid, pending_id: staged.pending_id,
+    sequence: 0, expected_revision: 0,
+  });
+  commitDisplayedEvent({
+    repository, session_uuid, pending_id: staged.pending_id,
+    sequence: 1, expected_revision: 1,
+  });
+  // A new client_request_id with the same payload after the drain
+  // produces a brand-new pending batch.
+  const fresh = stageNarrativeBatch({
+    repository, session_uuid, events: makeBatch(2), source: 'runtime', expected_revision: 2,
+  });
+  assert.notEqual(fresh.pending_id, staged.pending_id);
+});
+
+await test('P1.2: tool_call-bearing batch with the same payload round-trips through stage idempotently', async () => {
+  const { repository, session_uuid } = await buildSession();
+  const tool_call = { tool_call_id: 'tool-1', name: 'ask_player_choice', payload: { question: 'q', options: [{ id: 'a', label: 'A' }, { id: 'b', label: 'B' }] } };
+  const first = stageNarrativeBatch({
+    repository, session_uuid, items: [
+      { type: 'narration', sequence: 0, text: 'narrative line 1' },
+    ], source: 'runtime', expected_revision: 0, tool_call,
+  });
+  assert.equal(first.tool_call.tool_call_id, 'tool-1');
+  const replay = stageNarrativeBatch({
+    repository, session_uuid, items: [
+      { type: 'narration', sequence: 0, text: 'narrative line 1' },
+    ], source: 'runtime', expected_revision: 0, tool_call,
+  });
+  assert.equal(replay.pending_id, first.pending_id);
+  assert.equal(replay.tool_call.tool_call_id, 'tool-1');
+  // Different tool_call_id → fail closed.
+  assert.throws(() => stageNarrativeBatch({
+    repository, session_uuid, items: [
+      { type: 'narration', sequence: 0, text: 'narrative line 1' },
+    ], source: 'runtime', expected_revision: 0,
+    tool_call: { tool_call_id: 'tool-2', name: 'ask_player_choice', payload: { question: 'q', options: [{ id: 'a', label: 'A' }, { id: 'b', label: 'B' }] } },
+  }), /unconsumed pending/);
 });
 
 await test('stage rejects unknown event types and missing text', async () => {

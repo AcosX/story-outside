@@ -149,22 +149,15 @@ function normalizeProviderResult(result) {
     });
     return { items: normalisedItems, tool_call: null };
   }
-  // messages absent, tool_calls present: single tool call with no narrative items.
-  assertObjectArray(result.tool_calls, 'tool_calls');
-  if (result.tool_calls.length !== 1) fail('invalid_tool_call', 'provider must return exactly one tool_call when messages are absent');
-  let normalisedTool;
-  try {
-    normalisedTool = executeToolCall({
-      name: result.tool_calls[0].name,
-      arguments: result.tool_calls[0].arguments,
-      tool_call_id: result.tool_calls[0].tool_call_id ?? result.tool_calls[0].id,
-      id: result.tool_calls[0].id,
-    });
-  } catch (error) {
-    if (error instanceof ToolValidationError) fail('invalid_tool_call', error.message);
-    throw error;
+  // tool_calls without messages (or items): a "tool-only" batch. ClickUp 08
+  // forbids this shape — a tool call must ride on a batch that already
+  // carries at least one narrative item. Allowing a tool-only batch would
+  // park an un-committable pending slot (no event_seq to commit) and leak
+  // the tool surface into canonical history through some future code
+  // path. Reject it explicitly so a misbehaving provider fails closed.
+  if (hasToolCalls) {
+    fail('invalid_tool_call', 'provider must return at least one narrative item; tool-only batches are not allowed');
   }
-  return { items: [], tool_call: normalisedTool };
 }
 
 export function createMockAgentProvider({ responses = [], handler, failure } = {}) {

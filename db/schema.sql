@@ -360,7 +360,7 @@ CREATE TABLE IF NOT EXISTS pending_batch_items (
     OR status IN ('pending', 'discarded')
   ),
   CONSTRAINT chk_pending_batch_items_discarded CHECK (
-    (status = 'discarded' AND occurred_at IS NULL) OR status IN ('pending', 'committed')
+    (status = 'discarded' AND occurred_at IS NULL AND promoted_event_id IS NULL) OR status IN ('pending', 'committed')
   )
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 

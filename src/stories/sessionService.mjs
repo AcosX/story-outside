@@ -434,13 +434,59 @@ export function stageNarrativeBatch({ repository, session_uuid, items, tool_call
   });
   const session = sessionFor(repository, session_uuid);
   const id = requestId(client_request_id);
+  const stageFingerprintInput = { payload: { items: normalized, tool_call: tool_call || null, source: source || NARRATIVE_SOURCE } };
   if (id) {
-    const prior = idempotentResult(session, id, 'stage', { payload: { items: normalized, tool_call: tool_call || null, source: source || NARRATIVE_SOURCE } });
+    const prior = idempotentResult(session, id, 'stage', stageFingerprintInput);
     if (prior) return prior;
   }
   validateRevision(session, expected_revision);
   if (session.state !== 'opening' && session.state !== 'awaiting_first_choice' && session.state !== 'realtime') {
     throw new Error(`stageNarrativeBatch: session is not accepting narrative batches (state=${session.state})`);
+  }
+  // Active-pending concurrency guard (ClickUp 08 P1.2): if there is an
+  // unconsumed pending batch (some items committed, but the final commit
+  // has not landed), a fresh stage MUST NOT silently overwrite it. The
+  // payload either matches the active pending (idempotent return) or it
+  // is rejected. The only escape hatches for the caller are
+  //   * commitNarrativeEvent to drain the active batch, or
+  //   * interruptWithPlayerInput / discardPendingTail to drop it.
+  // The same rule applies whether or not the caller supplied a
+  // client_request_id: payload equality is the contract, not the request
+  // id. A late-arriving provider with a different result for the same
+  // logical request therefore fails closed instead of corrupting the
+  // active pending.
+  if (session.pending) {
+    const active = session.pending;
+    const samePayload = canonicalJsonStringify(stageFingerprintInput.payload)
+      === canonicalJsonStringify({
+        items: active.events.map((event) => ({
+          type: event.type,
+          sequence: event.sequence,
+          text: event.text,
+          ...(event.speaker !== undefined ? { speaker: event.speaker } : {}),
+        })),
+        tool_call: active.tool_call || null,
+        source: active.source,
+      });
+    if (samePayload) {
+      // Idempotent re-stage: surface the existing pending snapshot
+      // instead of mutating it. The committed_count, produced_at, and
+      // pending_id stay stable.
+      return {
+        session_uuid,
+        pending_id: active.pending_id,
+        events: clone(active.events),
+        tool_call: active.tool_call ? clone(active.tool_call) : null,
+        committed_count: active.committed_count,
+        source: active.source,
+        produced_at: active.produced_at,
+        revision: session.revision,
+        state: session.state,
+      };
+    }
+    throw new Error(
+      `stageNarrativeBatch: session already has an unconsumed pending batch (pending_id=${active.pending_id}, committed=${active.committed_count}/${active.events.length}); commit, interrupt, or discard it before staging a different batch`,
+    );
   }
   const pending_id = randomUUID();
   const pending = {
@@ -646,6 +692,15 @@ export function listSessionEvents({ repository, session_uuid }) {
  * the provider, never replays, never mutates state. Safe to call from a
  * fresh repository instance for cross-process resume as long as the
  * repository instance is reseeded with the same sessions.
+ *
+ * ClickUp 08 P1.6 boundary: the application-layer in-memory repository
+ * documented in src/stories/repository.mjs does NOT persist sessions
+ * across process restarts. `recoverSession` is therefore only safe to
+ * call from the same process that originally staged the session. A
+ * future MariaDB-backed DAO will replace the in-memory map with the
+ * `game_sessions` table; until that DAO lands, callers MUST NOT claim
+ * that SQL migrations have provided runtime persistence — they only
+ * pin the schema the future DAO will write through.
  */
 export function recoverSession({ repository, session_uuid }) {
   if (!repository) throw new Error('recoverSession: repository required');

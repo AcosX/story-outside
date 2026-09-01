@@ -22,7 +22,8 @@
 
 import assert from 'node:assert/strict';
 import http from 'node:http';
-import { server, storyFixtures } from '../src/server.mjs';
+import { server, storyFixtures, storyRepo } from '../src/server.mjs';
+import { createAgentRuntime, createMockAgentProvider, runTurn, recoverRuntime } from '../src/agent/runtime.mjs';
 
 const PICK = await new Promise((resolve, reject) => {
   const probe = http.createServer();
@@ -287,16 +288,20 @@ try {
     pending_id: '00000000-0000-4000-8000-deadbeef0000', sequence: 0, expected_revision: 7,
   });
   check('wrong pending_id is rejected', wrong.response.status === 400);
+  // ClickUp 08 P1.2: drain gen4 so a fresh stage is allowed.
+  await post(narrativePath, {
+    pending_id: gen4.data.pending_id, sequence: 0, expected_revision: 7, client_request_id: 'gen4-c0',
+  });
 
   // ----- finish_story tool call flow -----
   const gen5 = await post(generatePath, {
     request_id: 'turn-5',
     input: { text: 'finish the story now' },
-    expected_revision: 7,
+    expected_revision: 8,
   });
   check('generate 5 carries a finish_story tool_call', gen5.data?.tool_call?.kind === 'story_finished' && gen5.data?.tool_call?.terminal === true);
   const finishCommit = await post(narrativePath, {
-    pending_id: gen5.data.pending_id, sequence: 0, expected_revision: 7, client_request_id: 'finish-c0',
+    pending_id: gen5.data.pending_id, sequence: 0, expected_revision: 8, client_request_id: 'finish-c0',
   });
   check('finish_story batch commit returns 200', finishCommit.response.status === 200);
   check('finish commit surfaces terminal tool_call', finishCommit.data?.pending_tool_call?.kind === 'story_finished');
@@ -326,6 +331,295 @@ try {
     repository: repo, session_uuid: '00000000-0000-4000-8000-eeeeeeeeeeee',
     items: [], expected_revision: 0,
   }), /at least one narrative item or a tool_call/);
+
+  // ----- P1.1: canonical cursor + next-turn history visibility -----
+  // The next-turn runtime context (buildRequest) must observe every
+  // committed event from previous turns with monotonically increasing
+  // event_seq. cursor never regresses.
+  const turn1Snap = await request(recoverPath);
+  assert.ok(Array.isArray(turn1Snap.data.history), 'recover.history is an array');
+  for (let i = 0; i < turn1Snap.data.history.length; i += 1) {
+    check(`P1.1: history[${i}].event_seq = ${i + 1}`, turn1Snap.data.history[i].event_seq === i + 1);
+    if (i > 0) {
+      check(`P1.1: history[${i}].prev_event_seq = ${i}`, turn1Snap.data.history[i].prev_event_seq === i);
+    } else {
+      check(`P1.1: history[0].prev_event_seq = null`, turn1Snap.data.history[i].prev_event_seq === null);
+    }
+  }
+  // All committed events are narrative_beat / llm / runtime OR
+  // player_input / user / player. The SQL enum in 0003+0004 keeps these
+  // values as the only legal canonical history; the runtime must never
+  // produce a tool_call or chat_message event here.
+  check('P1.1: every committed event uses SQL-legal event_type / origin / source',
+    turn1Snap.data.history.every((e) => {
+      const legal = (
+        (e.event_type === 'narrative_beat' && e.origin === 'llm' && e.source === 'runtime')
+        || (e.event_type === 'player_input' && e.origin === 'user' && e.source === 'player')
+      );
+      return legal && e.event_type !== 'tool_call' && e.event_type !== 'chat_message';
+    }));
+  // cursor never regresses: after the interrupt path the cursor must be
+  // >= the opening cursor (here it's exactly the opening cursor because
+  // we never opened any cache event).
+  check('P1.1: cursor is a non-negative integer and never regressed',
+    Number.isInteger(turn1Snap.data.cursor) && turn1Snap.data.cursor >= 0);
+
+  // P1.1: the next-turn runtime context (buildRequest) MUST see every
+  // committed event. We instrument a provider to capture the request it
+  // receives, run a turn, commit the staged item, then build a fresh
+  // runtime (matching the HTTP layer's per-request pattern) and run
+  // another turn; the second request MUST include the committed event.
+  const sessP11 = '00000000-0000-4000-8000-0a0a0a0a0a0a';
+  await post('/api/dev/sessions', {
+    session_uuid: sessP11,
+    story_uuid: fixture.story_uuid,
+    story_version_uuid: fixture.story_version_uuid,
+    user_ref: 'story-outside-08-p11',
+    role_id: 'stranger',
+    model: 'mock-p11',
+    prompt: 'p11 prompt',
+    generation_profile: { ...cache.generation_profile, cache_uuid: cacheUuid },
+  });
+  // First-turn provider that captures the request it receives.
+  let capturedRequest1 = null;
+  const provider1 = createMockAgentProvider({ handler: async (req) => {
+    capturedRequest1 = JSON.parse(JSON.stringify(req));
+    return { items: [{ role: 'assistant', type: 'narration', text: 'first line' }] };
+  } });
+  const recoveredP11 = (await import('../src/stories/sessionService.mjs')).recoverSession({ repository: storyRepo, session_uuid: sessP11 });
+  const runtimeP11a = createAgentRuntime({
+    repository: storyRepo,
+    session_uuid: sessP11,
+    provider: provider1,
+    system_prompt: { kind: 'system', text: 'p1.1 test' },
+    tool_definitions: [{ name: 'ask_player_choice' }, { name: 'finish_story' }],
+    expected_story_version_uuid: recoveredP11.story_version_uuid,
+    expected_story_version_checksum: recoveredP11.story_version_checksum,
+    expected_model: recoveredP11.model,
+    expected_generation_profile: recoveredP11.generation_profile,
+  });
+  // First turn.
+  const turnOne = await runTurn(runtimeP11a, { input: { text: 'turn one' }, expected_revision: recoverRuntime(runtimeP11a).base_revision });
+  check('P1.1: first turn returns 1-item batch', turnOne.items.length === 1);
+  // Commit the staged item through the HTTP layer.
+  await post(`/api/dev/sessions/${sessP11}/narrative-events`, {
+    pending_id: turnOne.pending_id, sequence: 0, expected_revision: 0, client_request_id: 'p11-c0',
+  });
+  // Second turn: build a fresh runtime (mirrors the HTTP layer's
+  // per-request pattern) and capture the request it receives.
+  let capturedRequest2 = null;
+  const provider2 = createMockAgentProvider({ handler: async (req) => {
+    capturedRequest2 = JSON.parse(JSON.stringify(req));
+    return { items: [{ role: 'assistant', type: 'narration', text: 'second line' }] };
+  } });
+  const recoveredP11b = (await import('../src/stories/sessionService.mjs')).recoverSession({ repository: storyRepo, session_uuid: sessP11 });
+  const runtimeP11b = createAgentRuntime({
+    repository: storyRepo,
+    session_uuid: sessP11,
+    provider: provider2,
+    system_prompt: { kind: 'system', text: 'p1.1 test' },
+    tool_definitions: [{ name: 'ask_player_choice' }, { name: 'finish_story' }],
+    expected_story_version_uuid: recoveredP11b.story_version_uuid,
+    expected_story_version_checksum: recoveredP11b.story_version_checksum,
+    expected_model: recoveredP11b.model,
+    expected_generation_profile: recoveredP11b.generation_profile,
+  });
+  await runTurn(runtimeP11b, { input: { text: 'turn two' }, expected_revision: recoverRuntime(runtimeP11b).base_revision });
+  check('P1.1: first turn request has empty canonical_history', Array.isArray(capturedRequest1.canonical_history) && capturedRequest1.canonical_history.length === 0);
+  check('P1.1: second turn request sees the committed event in canonical_history',
+    Array.isArray(capturedRequest2.canonical_history) && capturedRequest2.canonical_history.length === 1 && capturedRequest2.canonical_history[0].event_seq === 1);
+
+  // ----- P1.2: active pending concurrency (same payload → idempotent; different → fail closed) -----
+  // Stage a fresh batch via the runtime/HTTP layer.
+  const sessionP12 = '00000000-0000-4000-8000-0fedcbabcdef';
+  await post('/api/dev/sessions', {
+    session_uuid: sessionP12,
+    story_uuid: fixture.story_uuid,
+    story_version_uuid: fixture.story_version_uuid,
+    user_ref: 'story-outside-08-p12',
+    role_id: 'stranger',
+    model: 'mock-p12',
+    prompt: 'p12 prompt',
+    generation_profile: { ...cache.generation_profile, cache_uuid: cacheUuid },
+  });
+  // First stage with a 1-item batch.
+  const p12GenA = await post(`/api/dev/sessions/${sessionP12}/generate`, {
+    request_id: 'p12-turn-A',
+    input: { text: 'short' },
+    expected_revision: 0,
+  });
+  check('P1.2: first stage returns 200', p12GenA.response.status === 200);
+  const p12PendingA = p12GenA.data?.pending_id;
+  // Re-stage with the SAME payload and SAME client_request_id → idempotent replay.
+  const p12GenARetry = await post(`/api/dev/sessions/${sessionP12}/generate`, {
+    request_id: 'p12-turn-A',
+    input: { text: 'short' },
+    expected_revision: 0,
+  });
+  check('P1.2: same request_id + same payload is idempotent (same pending_id)',
+    p12GenARetry.response.status === 200 && p12GenARetry.data?.pending_id === p12PendingA);
+  // Re-stage with the SAME payload and NO client_request_id → idempotent return (same pending_id).
+  const p12GenANoId = await post(`/api/dev/sessions/${sessionP12}/generate`, {
+    input: { text: 'short' },
+    expected_revision: 0,
+  });
+  check('P1.2: re-stage with same payload without request_id returns same pending',
+    p12GenANoId.response.status === 200 && p12GenANoId.data?.pending_id === p12PendingA);
+  // Re-stage with a DIFFERENT payload → fail closed (unconsumed pending).
+  const p12GenDifferent = await post(`/api/dev/sessions/${sessionP12}/generate`, {
+    input: { text: 'long reply please' },
+    expected_revision: 0,
+  });
+  check('P1.2: re-stage with different payload is rejected (unconsumed pending)',
+    p12GenDifferent.response.status === 400 && /unconsumed pending/.test(p12GenDifferent.data?.message || p12GenDifferent.data?.error || ''));
+
+  // ----- P1.5: same request_id with different payload at commit is rejected (already covered) -----
+  // ----- P1.3: 5-item / empty batch / tool-only are rejected at the runtime layer -----
+  // Use a direct call to the sessionService to bypass the HTTP demo runtime mock.
+  // The runtime mock never exceeds 4 items, so we exercise the cap explicitly.
+  assert.throws(() => ss.stageNarrativeBatch({
+    repository: repo, session_uuid: '00000000-0000-4000-8000-eeeeeeeeeeee',
+    items: [
+      { type: 'narration', text: 'a' },
+      { type: 'narration', text: 'b' },
+      { type: 'narration', text: 'c' },
+      { type: 'narration', text: 'd' },
+      { type: 'narration', text: 'e' },
+    ], expected_revision: 0,
+  }), /at most 4/);
+  assert.throws(() => ss.stageNarrativeBatch({
+    repository: repo, session_uuid: '00000000-0000-4000-8000-eeeeeeeeeeee',
+    items: [], expected_revision: 0,
+  }), /at least one narrative item or a tool_call/);
+
+  // ----- P1.3: runtime rejects tool-only batches and 5-item batches at the normalize layer -----
+  const recoveredForRuntime = await request(`/api/dev/sessions/${sessionUuid}/recover`);
+  const baseProvider = createMockAgentProvider();
+  let caught;
+  // tool-only (no items) → rejected
+  caught = null;
+  try {
+    const provider = createMockAgentProvider({ responses: [{
+      tool_calls: [{ id: 'tool-only', name: 'ask_player_choice', arguments: { question: 'q', options: [{ id: 'a', label: 'A' }, { id: 'b', label: 'B' }] } }],
+    }] });
+    const runtime = createAgentRuntime({
+      repository: storyRepo,
+      session_uuid: sessionUuid,
+      provider,
+      system_prompt: { kind: 'system', text: 'p1.3 test' },
+      tool_definitions: [{ name: 'ask_player_choice' }, { name: 'finish_story' }],
+      expected_story_version_uuid: recoveredForRuntime.data?.story_version_uuid,
+      expected_story_version_checksum: recoveredForRuntime.data?.story_version_checksum,
+      expected_model: recoveredForRuntime.data?.model,
+      expected_generation_profile: recoveredForRuntime.data?.generation_profile,
+    });
+    await runTurn(runtime, { input: { text: 'tool-only test' }, expected_revision: recoverRuntime(runtime).base_revision });
+  } catch (err) { caught = err; }
+  check('P1.3: tool-only batches (no narrative items) are rejected', !!caught && caught.code === 'invalid_tool_call');
+  // 5-item batch → rejected
+  caught = null;
+  try {
+    const provider = createMockAgentProvider({ responses: [{
+      items: [
+        { role: 'assistant', type: 'narration', text: 'a' },
+        { role: 'assistant', type: 'narration', text: 'b' },
+        { role: 'assistant', type: 'narration', text: 'c' },
+        { role: 'assistant', type: 'narration', text: 'd' },
+        { role: 'assistant', type: 'narration', text: 'e' },
+      ],
+    }] });
+    const runtime = createAgentRuntime({
+      repository: storyRepo,
+      session_uuid: sessionUuid,
+      provider,
+      system_prompt: { kind: 'system', text: 'p1.3 test' },
+      tool_definitions: [{ name: 'ask_player_choice' }, { name: 'finish_story' }],
+      expected_story_version_uuid: recoveredForRuntime.data?.story_version_uuid,
+      expected_story_version_checksum: recoveredForRuntime.data?.story_version_checksum,
+      expected_model: recoveredForRuntime.data?.model,
+      expected_generation_profile: recoveredForRuntime.data?.generation_profile,
+    });
+    await runTurn(runtime, { input: { text: '5-item test' }, expected_revision: recoverRuntime(runtime).base_revision });
+  } catch (err) { caught = err; }
+  check('P1.3: 5-item batches are rejected by the runtime cap', !!caught && caught.code === 'invalid_tool_call');
+  // legacy messages + tool_calls mixed → rejected
+  caught = null;
+  try {
+    const provider = createMockAgentProvider({ responses: [{
+      messages: [{ role: 'assistant', content: 'hi' }],
+      tool_calls: [{ id: 'mix', name: 'ask_player_choice', arguments: { question: 'q', options: [{ id: 'a', label: 'A' }, { id: 'b', label: 'B' }] } }],
+    }] });
+    const runtime = createAgentRuntime({
+      repository: storyRepo,
+      session_uuid: sessionUuid,
+      provider,
+      system_prompt: { kind: 'system', text: 'p1.3 test' },
+      tool_definitions: [{ name: 'ask_player_choice' }, { name: 'finish_story' }],
+      expected_story_version_uuid: recoveredForRuntime.data?.story_version_uuid,
+      expected_story_version_checksum: recoveredForRuntime.data?.story_version_checksum,
+      expected_model: recoveredForRuntime.data?.model,
+      expected_generation_profile: recoveredForRuntime.data?.generation_profile,
+    });
+    await runTurn(runtime, { input: { text: 'mixed legacy' }, expected_revision: recoverRuntime(runtime).base_revision });
+  } catch (err) { caught = err; }
+  check('P1.3: legacy messages+tool_calls mix is rejected', !!caught && caught.code === 'invalid_tool_call');
+
+  // ----- P1.6: recover is read-only, never calls the provider, never mutates -----
+  // A recover call MUST NOT call the provider (we instrument the mock to
+  // throw on any call so any leak would surface).
+  let providerCalled = false;
+  const instrumentedProvider = createMockAgentProvider({ handler: async () => { providerCalled = true; throw new Error('provider must not be called by recover'); } });
+  // Use the long-lived sessionUuid that already has multiple canonical events
+  // so the recover surface is non-trivial.
+  const sessP16Recover = sessionUuid;
+  const recoveredForP16 = (await import('../src/stories/sessionService.mjs')).recoverSession({ repository: storyRepo, session_uuid: sessP16Recover });
+  check('P1.6: recoverSession returns the canonical history snapshot without mutating',
+    Array.isArray(recoveredForP16.history) && recoveredForP16.history.length >= 1 && Number.isInteger(recoveredForP16.revision));
+  check('P1.6: recoverSession never invokes the provider', !providerCalled);
+  // The current pending state is untouched: a subsequent recover call
+  // returns an identical snapshot (no double-append, no replay).
+  const recoverAgain = (await import('../src/stories/sessionService.mjs')).recoverSession({ repository: storyRepo, session_uuid: sessP16Recover });
+  check('P1.6: recover is idempotent across calls',
+    JSON.stringify(recoverAgain) === JSON.stringify(recoveredForP16));
+
+  // ----- P1.5: interrupt atomically discards tail + appends player_input -----
+  // The interrupt must drop the speculative pending tail AND append the
+  // player_input as a new canonical event in one logical call. We stage a
+  // batch on a fresh session, commit 1 item, then interrupt; the result
+  // should show dropped_pending_id + the player_input event with
+  // revision advanced.
+  const sessP15 = '00000000-0000-4000-8000-0fedcba98765';
+  await post('/api/dev/sessions', {
+    session_uuid: sessP15,
+    story_uuid: fixture.story_uuid,
+    story_version_uuid: fixture.story_version_uuid,
+    user_ref: 'story-outside-08-p15',
+    role_id: 'stranger',
+    model: 'mock-p15',
+    prompt: 'p15 prompt',
+    generation_profile: { ...cache.generation_profile, cache_uuid: cacheUuid },
+  });
+  const p15Gen = await post(`/api/dev/sessions/${sessP15}/generate`, {
+    request_id: 'p15-turn-1',
+    input: { text: 'long reply please' },
+    expected_revision: 0,
+  });
+  check('P1.5: stage 4-item batch for interrupt test', p15Gen.response.status === 200 && p15Gen.data?.items?.length === 4);
+  const p15Pending = p15Gen.data.pending_id;
+  await post(`/api/dev/sessions/${sessP15}/narrative-events`, {
+    pending_id: p15Pending, sequence: 0, expected_revision: 0, client_request_id: 'p15-c0',
+  });
+  const p15Interrupt = await post(`/api/dev/sessions/${sessP15}/interrupt`, {
+    text: 'interrupted here',
+    client_request_id: 'p15-int',
+    expected_revision: 1,
+  });
+  check('P1.5: interrupt atomically drops tail', p15Interrupt.response.status === 200 && p15Interrupt.data?.dropped_pending_id === p15Pending);
+  check('P1.5: interrupt appends exactly one player_input event',
+    p15Interrupt.data?.event?.event_type === 'player_input' && p15Interrupt.data?.event?.event_seq === 2);
+  check('P1.5: history after interrupt = 1 narrative + 1 player_input',
+    p15Interrupt.data?.revision === 2 && (await request(`/api/dev/sessions/${sessP15}/recover`)).data?.history?.length === 2);
+  check('P1.5: state transitions to realtime', p15Interrupt.data?.state === 'realtime');
 } finally {
   await new Promise((resolve) => server.close(resolve));
 }

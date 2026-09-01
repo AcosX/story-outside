@@ -418,6 +418,20 @@ check(
   "0004 records its migration ledger entry",
   migration0004.includes("INSERT IGNORE INTO schema_migrations (migration_name, applied_by)")
 );
+// ClickUp 08 P1.4: the discarded CHECK constraint must reject any row
+// where status='discarded' but promoted_event_id/occurred_at are set.
+check(
+  "0004 discarded CHECK rejects promoted_event_id on discarded rows",
+  migration0004.includes("status = 'discarded' AND occurred_at IS NULL AND promoted_event_id IS NULL")
+);
+check(
+  "schema.sql discarded CHECK also rejects promoted_event_id on discarded rows",
+  schema.includes("status = 'discarded' AND occurred_at IS NULL AND promoted_event_id IS NULL")
+);
+check(
+  "docs/data-model.md documents the discarded CHECK contract",
+  docs.includes("discarded") && docs.includes("promoted_event_id")
+);
 
 // Engine and charset invariants.
 for (const [label, sql] of [
