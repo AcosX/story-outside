@@ -10,7 +10,7 @@
   "scripts": {
     "start": "node src/server.mjs",
     "dev": "node src/server.mjs",
-    "test": "node tests/health.test.mjs && node tests/providers.test.mjs && node tests/http.test.mjs && node tests/schema-contract.test.mjs && node tests/canonicalHash.test.mjs && node tests/cacheKey.test.mjs && node tests/openingGenerator.test.mjs && node tests/storyService.test.mjs && node tests/sessionService.test.mjs && node tests/adminRoutes.test.mjs",
+    "test": "node tests/health.test.mjs && node tests/providers.test.mjs && node tests/http.test.mjs && node tests/schema-contract.test.mjs && node tests/canonicalHash.test.mjs && node tests/cacheKey.test.mjs && node tests/openingGenerator.test.mjs && node tests/storyService.test.mjs && node tests/sessionService.test.mjs && node tests/sessionHttp.test.mjs && node tests/adminRoutes.test.mjs",
     "check": "node scripts/check.mjs"
   },
   "dependencies": {},
