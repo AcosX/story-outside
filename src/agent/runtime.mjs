@@ -1,9 +1,9 @@
 import { canonicalJsonStringify } from '../stories/canonicalHash.mjs';
 import { getSession, listSessionEvents } from '../stories/sessionService.mjs';
 import { randomUUID } from 'node:crypto';
+import { executeToolCall, ToolValidationError } from './tools.mjs';
 
 const RUNTIME_STATE = Symbol('agentRuntimeState');
-const ALLOWED_TOOL_CALLS = new Set(['ask_player_choice', 'finish_story']);
 const SENSITIVE_KEY_PATTERN = /^(password|token|access[_-]?token|secret|api[_-]?key|app[_-]?key|authorization|cookie|headers?)$/i;
 const ERROR_CODES = new Set(['pin_mismatch', 'invalid_input', 'provider_failure', 'unknown_tool', 'invalid_tool_call', 'revision_mismatch', 'duplicate_request']);
 
@@ -71,16 +71,6 @@ function sanitizeFiniteJson(value, label) {
   return json;
 }
 
-function normalizeChoice(value, index) {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) fail('invalid_tool_call', `ask_player_choice option ${index} must be an object`);
-  const id = value.id;
-  const label = value.label ?? value.text;
-  if (typeof id !== 'string' || !id || (typeof label !== 'string' || !label)) fail('invalid_tool_call', `ask_player_choice option ${index} requires non-empty id and label/text`);
-  const out = { id, label: typeof value.label === 'string' && value.label ? value.label : label };
-  if (typeof value.text === 'string' && value.text) out.text = value.text;
-  return out;
-}
-
 function normalizeProviderResult(result) {
   if (!result || typeof result !== 'object') fail('provider_failure', 'provider result must be an object');
   const hasMessages = result.messages !== undefined;
@@ -92,18 +82,15 @@ function normalizeProviderResult(result) {
   }) : undefined;
   if (messages && messages.length === 0) fail('provider_failure', 'provider result must include messages or tool_calls');
   const tool_calls = hasToolCalls ? assertObjectArray(result.tool_calls, 'tool_calls').map((call) => {
-    if (typeof call.name !== 'string' || !ALLOWED_TOOL_CALLS.has(call.name)) fail('unknown_tool', 'unknown tool call');
-    if (!call.arguments || typeof call.arguments !== 'object' || Array.isArray(call.arguments)) fail('invalid_tool_call', 'tool arguments must be an object');
-    const args = assertFiniteJson(call.arguments, 'tool arguments');
-    scanSensitiveKeys(args, 'tool_arguments');
-    if (call.name === 'ask_player_choice') {
-      if (!Array.isArray(args.options) || args.options.length < 2) fail('invalid_tool_call', 'ask_player_choice requires at least two options');
-      args.options = args.options.map(normalizeChoice);
+    if (!call || typeof call !== 'object') fail('invalid_tool_call', 'tool call must be an object');
+    const payload = { name: call.name, arguments: call.arguments, tool_call_id: call.tool_call_id ?? call.id };
+    try {
+      const normalized = executeToolCall(payload);
+      return { ...normalized, arguments: clone(normalized.payload), tool_envelope: clone(normalized) };
+    } catch (error) {
+      if (error instanceof ToolValidationError) fail('invalid_tool_call', error.message);
+      throw error;
     }
-    if (call.name === 'finish_story') {
-      if (typeof args.summary !== 'string' || !args.summary.trim()) fail('invalid_tool_call', 'finish_story requires summary');
-    }
-    return { name: call.name, arguments: clone(args) };
   }) : undefined;
   if (tool_calls && tool_calls.length !== 1) fail('invalid_tool_call', 'provider must return exactly one tool_call');
   if (!messages && !tool_calls) fail('provider_failure', 'provider result must include messages or tool_calls');
@@ -191,7 +178,7 @@ export async function runTurn(runtime, { request_id, input, expected_revision } 
   }
   const providerResult = normalizeProviderResult(rawResult);
   const turn_id = randomUUID();
-  const result = { turn_id, request_id: key, base_revision: state.base_revision, base_cursor: state.base_cursor, kind: providerResult.tool_calls.length ? 'tool_call' : 'narrative', messages: providerResult.messages, tool_calls: providerResult.tool_calls, pending: providerResult.tool_calls.length > 0 };
+  const result = { turn_id, request_id: key, base_revision: state.base_revision, base_cursor: state.base_cursor, kind: providerResult.tool_calls.length ? 'tool_call' : 'narrative', messages: providerResult.messages, tool_calls: providerResult.tool_calls, tool_result: providerResult.tool_calls[0] ? clone(providerResult.tool_calls[0].tool_envelope) : null, tool_envelope: providerResult.tool_calls[0] ? clone(providerResult.tool_calls[0].tool_envelope) : null, pending: providerResult.tool_calls.length > 0 };
   state.pending = clone(result);
   state.successful_turns.push(clone(result));
   if (key) state.requestIndex.set(key, { fingerprint: fp, result: clone(result) });
