@@ -180,7 +180,7 @@ try {
     recovered.data?.history?.length === cacheEvents.length + 1 &&
     recovered.data.history[0].event_type === 'story_opening' &&
     recovered.data.history.at(-1).event_type === 'player_input');
-  check('recovery cursor/revision match history', recovered.data?.cursor === cacheEvents.length + 1 && recovered.data?.revision === cacheEvents.length + 1);
+  check('recovery cursor/revision match displayed openings and history', recovered.data?.cursor === cacheEvents.length && recovered.data?.revision === cacheEvents.length + 1);
   check('recovery is read-only and cache remains valid',
     recovered.data?.opening_cache_status === 'valid' &&
     (await request(`/api/dev/sessions/${sessionUuid}`)).data?.history?.length === recovered.data.history.length);
