@@ -40,7 +40,7 @@ UPDATE pending_batches
        item_count = COALESCE(item_count, 0);
 
 ALTER TABLE pending_batches
-  MODIFY expected_revision BIGINT UNSIGNED NOT NULL,
+  MODIFY expected_revision BIGINT UNSIGNED NOT NULL DEFAULT 0,
   MODIFY committed_count INT UNSIGNED NOT NULL DEFAULT 0,
   MODIFY item_count INT UNSIGNED NOT NULL DEFAULT 0;
 
@@ -58,6 +58,35 @@ UPDATE pending_batches
    SET source = COALESCE(source, 'legacy');
 ALTER TABLE pending_batches
   MODIFY source VARCHAR(64) NOT NULL DEFAULT 'runtime';
+
+-- ClickUp 08 P1.4: provenance + counts guards on pending_batches. These
+-- mirror db/schema.sql exactly so a 0001→0004 upgrade ends up equivalent to
+-- a fresh install. Re-runnable: drop-by-name then recreate.
+ALTER TABLE pending_batches
+  DROP CONSTRAINT IF EXISTS chk_pending_batches_source,
+  DROP CONSTRAINT IF EXISTS chk_pending_batches_counts;
+
+ALTER TABLE pending_batches
+  ADD CONSTRAINT chk_pending_batches_source CHECK (CHAR_LENGTH(source) > 0),
+  ADD CONSTRAINT chk_pending_batches_counts CHECK (committed_count <= item_count);
+
+-- Composite session-scoped index/FK (ClickUp 08 P1.4): a promoted event
+-- must belong to the SAME session as the pending batch. session_events gets
+-- a (session_id, event_id) index so pending_batches and pending_batch_items
+-- can reference the pair, and pending_batches gains a composite FK from
+-- (session_id, promoted_event_id) → session_events(session_id, event_id).
+-- NULL promoted_event_id skips the FK check (MATCH SIMPLE).
+ALTER TABLE session_events
+  ADD KEY IF NOT EXISTS idx_session_events_session_event (session_id, event_id);
+
+ALTER TABLE pending_batches
+  ADD KEY IF NOT EXISTS idx_pending_batches_session_id_id (session_id, id),
+  DROP FOREIGN KEY IF EXISTS fk_pending_batches_promoted_event_session;
+
+ALTER TABLE pending_batches
+  ADD CONSTRAINT fk_pending_batches_promoted_event_session
+    FOREIGN KEY (session_id, promoted_event_id) REFERENCES session_events(session_id, event_id)
+    ON DELETE RESTRICT ON UPDATE RESTRICT;
 
 -- Per-item table: one row per ordered narrative beat. item_seq is the
 -- 0-based index inside the staged batch and MUST be unique per batch. The
@@ -99,7 +128,21 @@ CREATE TABLE IF NOT EXISTS pending_batch_items (
   )
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
--- Drop legacy-name constraint before re-create (kept here for symmetry with
+-- Re-run guard: existing rows of pending_batch_items (created by an earlier
+-- 0004 pass) also need the denormalized session scope so the composite FKs
+-- below can enforce same-session promotion.
+ALTER TABLE pending_batch_items
+  ADD COLUMN IF NOT EXISTS session_id BIGINT UNSIGNED NULL AFTER batch_id;
+
+UPDATE pending_batch_items pbi
+  JOIN pending_batches pb ON pb.id = pbi.batch_id
+   SET pbi.session_id = pb.session_id
+ WHERE pbi.session_id IS NULL;
+
+ALTER TABLE pending_batch_items
+  MODIFY session_id BIGINT UNSIGNED NOT NULL;
+
+-- Drop legacy-name constraints before re-create (kept here for symmetry with
 -- 0001/0003 pattern, even though no named constraint is required).
 ALTER TABLE pending_batch_items
   DROP CONSTRAINT IF EXISTS chk_pending_batch_items_committed,
@@ -112,6 +155,45 @@ ALTER TABLE pending_batch_items
   ),
   ADD CONSTRAINT chk_pending_batch_items_discarded CHECK (
     (status = 'discarded' AND occurred_at IS NULL AND promoted_event_id IS NULL) OR status IN ('pending', 'committed')
+  );
+
+-- ClickUp 08 P1.4 item-state guards:
+--   * chk_pending_batch_items_pending: a pending row must NOT carry a
+--     promoted_event_id / occurred_at (only committed rows may).
+--   * chk_pending_batch_items_tool_commit: a tool_call item can never be
+--     'committed' — tool calls never become canonical events, so they have
+--     no promoted_event_id to satisfy chk_pending_batch_items_committed.
+--   * Composite FKs bind the item to its batch's session and force a
+--     committed item's promoted_event_id to resolve to an event of that
+--     SAME session (cross-session promotion is rejected by the database,
+--     not just documented).
+ALTER TABLE pending_batch_items
+  DROP CONSTRAINT IF EXISTS chk_pending_batch_items_pending,
+  DROP CONSTRAINT IF EXISTS chk_pending_batch_items_tool_commit,
+  DROP FOREIGN KEY IF EXISTS fk_pending_batch_items_batch,
+  DROP FOREIGN KEY IF EXISTS fk_pending_batch_items_session_batch,
+  DROP FOREIGN KEY IF EXISTS fk_pending_batch_items_promoted_event,
+  DROP FOREIGN KEY IF EXISTS fk_pending_batch_items_promoted_event_session;
+
+ALTER TABLE pending_batch_items
+  ADD CONSTRAINT fk_pending_batch_items_batch
+    FOREIGN KEY (batch_id) REFERENCES pending_batches(id)
+    ON DELETE CASCADE ON UPDATE RESTRICT,
+  ADD CONSTRAINT fk_pending_batch_items_session_batch
+    FOREIGN KEY (session_id, batch_id) REFERENCES pending_batches(session_id, id)
+    ON DELETE CASCADE ON UPDATE RESTRICT,
+  ADD CONSTRAINT fk_pending_batch_items_promoted_event
+    FOREIGN KEY (promoted_event_id) REFERENCES session_events(event_id)
+    ON DELETE RESTRICT ON UPDATE RESTRICT,
+  ADD CONSTRAINT fk_pending_batch_items_promoted_event_session
+    FOREIGN KEY (session_id, promoted_event_id) REFERENCES session_events(session_id, event_id)
+    ON DELETE RESTRICT ON UPDATE RESTRICT,
+  ADD CONSTRAINT chk_pending_batch_items_pending CHECK (
+    (status = 'pending' AND promoted_event_id IS NULL AND occurred_at IS NULL)
+    OR status IN ('committed', 'discarded')
+  ),
+  ADD CONSTRAINT chk_pending_batch_items_tool_commit CHECK (
+    item_type <> 'tool_call' OR status <> 'committed'
   );
 
 -- application_status mirrors the lifecycle for fast lookups; the existing

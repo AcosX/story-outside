@@ -1,5 +1,5 @@
 import { canonicalJsonStringify } from '../stories/canonicalHash.mjs';
-import { getSession, listSessionEvents, stageNarrativeBatch } from '../stories/sessionService.mjs';
+import { getSession, listSessionEvents, lookupTurnRequest, registerTurnRequest, stageNarrativeBatch } from '../stories/sessionService.mjs';
 import { randomUUID } from 'node:crypto';
 import { executeToolCall, ToolValidationError } from './tools.mjs';
 
@@ -83,12 +83,22 @@ function sanitizeFiniteJson(value, label) {
  *   * tool_call: optional normalised tool call (the FINAL item)
  *
  * The provider can express this either as:
- *   { messages: [...], tool_calls: [<one>] }
- * where messages are 1..4 ordered narrative beats, OR
- *   { items: [...], tool_call: {...} }
- * for explicit ClickUp 08 shape. Mixed messages+tool_calls without an
- * items array is rejected so the application layer never has to guess
- * whether tool_calls rides along with the narrative batch.
+ *   { messages: [...], tool_calls: [<exactly one>] }  (legacy OpenAI-ish)
+ * where messages are 1..4 ordered narrative beats and the single
+ * tool_calls entry rides the batch as the optional FINAL tool, OR
+ *   { items: [...], tool_call: {...} }                (explicit 08 shape)
+ *
+ * Both shapes normalise to the same { items, tool_call } pair so the
+ * application layer never has to guess whether the tool rides along.
+ * Everything else fails closed:
+ *   * tool-only batches (tool_calls without any narrative)
+ *   * empty batches (0 narrative items)
+ *   * >4 narrative items
+ *   * more than one tool_call in the legacy array (multi-tool)
+ *   * a tool that is not final (a tool-like entry inside items, or a
+ *     non-assistant message)
+ *   * illegal tool payloads (unknown name / bad arguments / missing id)
+ * A normalised tool call never becomes a canonical event.
  */
 function normalizeProviderResult(result) {
   if (!result || typeof result !== 'object') fail('provider_failure', 'provider result must be an object');
@@ -109,7 +119,14 @@ function normalizeProviderResult(result) {
       if (role !== undefined && role !== 'assistant') fail('invalid_tool_call', `items[${index}].role must be 'assistant' or omitted`);
       if (text === null || !text.trim()) fail('invalid_tool_call', `items[${index}].text must be a non-empty string`);
       const out = { role: 'assistant', text };
-      if (item.type !== undefined) out.type = item.type;
+      if (item.type !== undefined) {
+        // A tool may never hide inside the narrative items: type must be a
+        // narrative beat kind, never 'tool_call' or anything else.
+        if (!['narration', 'dialogue', 'action', 'beat'].includes(item.type)) {
+          fail('invalid_tool_call', `items[${index}].type must be a narrative beat type`);
+        }
+        out.type = item.type;
+      }
       if (item.speaker !== undefined) out.speaker = item.speaker;
       if (item.sequence !== undefined && item.sequence !== index) fail('invalid_tool_call', `items[${index}].sequence must equal ${index}`);
       return out;
@@ -131,33 +148,60 @@ function normalizeProviderResult(result) {
     }
     return { items: normalisedItems, tool_call: normalisedTool };
   }
-  // Legacy shape: { messages, tool_calls }.
-  if (hasMessages && hasToolCalls) fail('invalid_tool_call', 'messages and tool_calls cannot be mixed');
+  // Legacy shape: { messages } and/or { tool_calls }.
   if (!hasMessages && !hasToolCalls) fail('provider_failure', 'provider result must include messages, items, or tool_calls');
-  if (hasMessages) {
-    assertObjectArray(result.messages, 'messages');
-    if (result.messages.length < MIN_NARRATIVE || result.messages.length > MAX_NARRATIVE) {
-      fail('invalid_tool_call', `messages must contain ${MIN_NARRATIVE} to ${MAX_NARRATIVE} narrative items`);
-    }
-    const normalisedItems = result.messages.map((msg, index) => {
-      if (msg.role !== 'assistant' || typeof msg.content !== 'string' || !msg.content.trim()) fail('invalid_tool_call', `messages[${index}] must be an assistant message with non-empty string content`);
-      const out = { role: 'assistant', text: msg.content };
-      if (msg.type !== undefined) out.type = msg.type;
-      if (msg.speaker !== undefined) out.speaker = msg.speaker;
-      if (msg.sequence !== undefined && msg.sequence !== index) fail('invalid_tool_call', `messages[${index}].sequence must equal ${index}`);
-      return out;
-    });
-    return { items: normalisedItems, tool_call: null };
-  }
-  // tool_calls without messages (or items): a "tool-only" batch. ClickUp 08
-  // forbids this shape — a tool call must ride on a batch that already
-  // carries at least one narrative item. Allowing a tool-only batch would
-  // park an un-committable pending slot (no event_seq to commit) and leak
-  // the tool surface into canonical history through some future code
-  // path. Reject it explicitly so a misbehaving provider fails closed.
-  if (hasToolCalls) {
+  if (!hasMessages) {
+    // tool_calls without messages (or items): a "tool-only" batch. ClickUp 08
+    // forbids this shape — a tool call must ride on a batch that already
+    // carries at least one narrative item. Allowing a tool-only batch would
+    // park an un-committable pending slot (no event_seq to commit) and leak
+    // the tool surface into canonical history through some future code
+    // path. Reject it explicitly so a misbehaving provider fails closed.
     fail('invalid_tool_call', 'provider must return at least one narrative item; tool-only batches are not allowed');
   }
+  assertObjectArray(result.messages, 'messages');
+  if (result.messages.length < MIN_NARRATIVE || result.messages.length > MAX_NARRATIVE) {
+    fail('invalid_tool_call', `messages must contain ${MIN_NARRATIVE} to ${MAX_NARRATIVE} narrative items`);
+  }
+  const normalisedItems = result.messages.map((msg, index) => {
+    if (msg.role !== 'assistant' || typeof msg.content !== 'string' || !msg.content.trim()) fail('invalid_tool_call', `messages[${index}] must be an assistant message with non-empty string content`);
+    const out = { role: 'assistant', text: msg.content };
+    if (msg.type !== undefined) {
+      if (!['narration', 'dialogue', 'action', 'beat'].includes(msg.type)) {
+        fail('invalid_tool_call', `messages[${index}].type must be a narrative beat type`);
+      }
+      out.type = msg.type;
+    }
+    if (msg.speaker !== undefined) out.speaker = msg.speaker;
+    if (msg.sequence !== undefined && msg.sequence !== index) fail('invalid_tool_call', `messages[${index}].sequence must equal ${index}`);
+    return out;
+  });
+  if (hasToolCalls) {
+    // Legacy combined shape: { messages: 1..4, tool_calls: [<one>] }.
+    // Unambiguous: messages are the ordered narrative items and the single
+    // tool call is the optional FINAL item. Multi-tool arrays and empty
+    // arrays are rejected; a tool-only batch (no messages at all) was
+    // already rejected above.
+    if (!Array.isArray(result.tool_calls) || result.tool_calls.length !== 1) {
+      fail('invalid_tool_call', 'legacy tool_calls must contain exactly one tool call');
+    }
+    const toolCall = result.tool_calls[0];
+    if (!toolCall || typeof toolCall !== 'object' || Array.isArray(toolCall)) fail('invalid_tool_call', 'tool_calls[0] must be an object');
+    let normalisedTool = null;
+    try {
+      normalisedTool = executeToolCall({
+        name: toolCall.name,
+        arguments: toolCall.arguments,
+        tool_call_id: toolCall.tool_call_id ?? toolCall.id,
+        id: toolCall.id,
+      });
+    } catch (error) {
+      if (error instanceof ToolValidationError) fail('invalid_tool_call', error.message);
+      throw error;
+    }
+    return { items: normalisedItems, tool_call: normalisedTool };
+  }
+  return { items: normalisedItems, tool_call: null };
 }
 
 export function createMockAgentProvider({ responses = [], handler, failure } = {}) {
@@ -197,7 +241,6 @@ export function createAgentRuntime({ repository, session_uuid, provider, system_
       base_cursor: session.cursor,
       successful_turns: [],
       staged: null,
-      requestIndex: new Map(),
     },
     enumerable: false,
     writable: false,
@@ -239,10 +282,22 @@ export async function runTurn(runtime, { request_id, input, expected_revision } 
   const key = typeof request_id === 'string' && request_id.length > 0 ? request_id : null;
   if (!Number.isInteger(expected_revision)) fail('invalid_input', 'expected_revision must be an integer');
   const fp = fingerprint(inputJson, expected_revision, key);
-  const existing = key && state.requestIndex.get(key);
-  if (existing) {
-    if (existing.fingerprint !== fp) fail('duplicate_request', 'request_id already used for a different request');
-    return clone(existing.result);
+  // Turn-level idempotency is owned by the SESSION (session.turnRequests),
+  // not by this runtime instance: the HTTP layer builds a fresh runtime per
+  // request, so a same request_id + input + revision across requests must
+  // replay the exact prior result (turn_id / items / tool / pending_id)
+  // without calling the provider again (ClickUp 08 P1.5 cross-request
+  // idempotency).
+  if (key) {
+    const existing = lookupTurnRequest({
+      repository: state.repository,
+      session_uuid: state.session_uuid,
+      request_id: key,
+    });
+    if (existing) {
+      if (existing.fingerprint !== fp) fail('duplicate_request', 'request_id already used for a different request');
+      return existing.result;
+    }
   }
   if (expected_revision !== state.base_revision) fail('revision_mismatch', 'revision mismatch');
   if (session.revision !== state.base_revision) fail('revision_mismatch', 'revision mismatch');
@@ -304,7 +359,6 @@ export async function runTurn(runtime, { request_id, input, expected_revision } 
     pending_total: staged.events.length,
     state: staged.state,
     session_uuid: state.session_uuid,
-    base_revision: state.base_revision,
     tool_call: providerResult.tool_call ? buildToolCallEnvelope(providerResult.tool_call, state.session_uuid, turn_id, state.base_revision) : null,
     tool_envelope: providerResult.tool_call ? buildToolCallEnvelope(providerResult.tool_call, state.session_uuid, turn_id, state.base_revision) : null,
     tool_result: providerResult.tool_call ? {
@@ -319,7 +373,15 @@ export async function runTurn(runtime, { request_id, input, expected_revision } 
     pending: !!providerResult.tool_call,
   };
   state.successful_turns.push(clone(result));
-  if (key) state.requestIndex.set(key, { fingerprint: fp, result: clone(result) });
+  if (key) {
+    registerTurnRequest({
+      repository: state.repository,
+      session_uuid: state.session_uuid,
+      request_id: key,
+      fingerprint: fp,
+      result,
+    });
+  }
   return clone(result);
 }
 

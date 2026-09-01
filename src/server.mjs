@@ -722,6 +722,14 @@ const server = http.createServer(async (req, res) => {
   // history; the player must commit each item via the narrative-events
   // route below. The runtime base_revision pins expected_revision to the
   // session's current revision.
+  //
+  // Idempotency: the runtime instance is created per request, but
+  // request-level idempotency (request_id + input + expected_revision) is
+  // owned by the SESSION (sessionService.turnRequests). Replaying the
+  // same request_id + input + expected_revision returns the exact prior
+  // result (same turn_id / pending_id / tool envelope) without calling
+  // the provider again; the same request_id with a different input or
+  // revision fails closed with duplicate_request.
   const generateMatch = pathname.match(/^\/api\/dev\/sessions\/([0-9a-fA-F-]+)\/generate$/);
   if (method === 'POST' && generateMatch) {
     const sessionUuid = generateMatch[1];
@@ -827,6 +835,9 @@ const server = http.createServer(async (req, res) => {
   // GET /api/dev/sessions/:uuid/recover — read-only canonical recovery.
   // Returns canonical history + revision + cursor + active pending
   // snapshot. Never calls the provider, never replays, never mutates.
+  // Same-process only: the repository is in-memory, so a fresh process
+  // does not know this session (persistence is a future MariaDB DAO's
+  // job; the SQL migrations only pin that contract).
   const recoverMatch = pathname.match(/^\/api\/dev\/sessions\/([0-9a-fA-F-]+)\/recover$/);
   if (method === 'GET' && recoverMatch) {
     try {

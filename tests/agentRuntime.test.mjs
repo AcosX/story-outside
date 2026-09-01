@@ -173,7 +173,10 @@ await test('provider results reject empty, mixed, multi-tool, unknown, and bad p
   // rejected by the explicit cap.
   const cases = [
     [{ messages: [] }, 'invalid_tool_call'],
-    [{ messages: [{ role: 'assistant', content: 'hi' }], tool_calls: [{ name: 'finish_story', arguments: { summary: 'done' } }] }, 'invalid_tool_call'],
+    // Legacy multi-tool_calls array (2 entries) is rejected even when 1..4
+    // messages are present: the batch contract allows exactly one OPTIONAL
+    // FINAL tool call.
+    [{ messages: [{ role: 'assistant', content: 'hi' }], tool_calls: [{ name: 'ask_player_choice', arguments: { question: 'q', options: [{ id: 'a', label: 'A' }, { id: 'b', label: 'B' }] } }, { name: 'finish_story', arguments: { summary: 'done', ending: 'e', original_difference: 'd', key_choices: ['x'], character_outcomes: [{ character: 'A', fate: 'B' }] } }] }, 'invalid_tool_call'],
     [{ tool_calls: [{ name: 'ask_player_choice', arguments: { options: [{ id: 'a', label: 'A' }, { id: 'b', label: 'B' }] } }, { name: 'finish_story', arguments: { summary: 'done' } }] }, 'invalid_tool_call'],
     [{ tool_calls: [{ name: 'unknown', arguments: {} }] }, 'invalid_tool_call'],
     [{ tool_calls: [{ name: 'finish_story', arguments: { summary: '' } }] }, 'invalid_tool_call'],
@@ -191,6 +194,36 @@ await test('provider tool calls reject empty optional fields', async () => {
   const badProvider = createMockAgentProvider({ responses: [{
     items: [{ role: 'assistant', type: 'narration', text: 'closing' }],
     tool_call: { id: 'tool-empty', name: 'finish_story', arguments: { summary: 'done', ending: 'ending', original_difference: 'diff', key_choices: ['x'], character_outcomes: [{ character: 'A', fate: 'B', change: '' }] } },
+  }] });
+  const runtime = await buildRuntime(badProvider);
+  await assert.rejects(() => runTurn(runtime, { input: { a: 1 }, expected_revision: recoverRuntime(runtime).base_revision }), (error) => error instanceof AgentRuntimeError && error.code === 'invalid_tool_call');
+});
+
+await test('legacy messages + single tool_call normalises unambiguously to items + final tool', async () => {
+  // ClickUp 08 P1.3: the legacy { messages: 1..4, tool_calls: [<one>] }
+  // shape is unambiguous — messages are the ordered narrative items and
+  // the single tool call rides the batch as the optional FINAL item.
+  const provider = createMockAgentProvider({ responses: [{
+    messages: [{ role: 'assistant', content: 'beat one' }, { role: 'assistant', content: 'beat two' }],
+    tool_calls: [{ id: 'legacy-tool', name: 'ask_player_choice', arguments: { question: 'choose', options: [{ id: 'a', label: 'A' }, { id: 'b', label: 'B' }] } }],
+  }] });
+  const runtime = await buildRuntime(provider);
+  const result = await runTurn(runtime, { input: { a: 1 }, expected_revision: recoverRuntime(runtime).base_revision });
+  assert.equal(result.kind, 'tool_call');
+  assert.equal(result.items.length, 2);
+  assert.equal(result.items[0].text, 'beat one');
+  assert.equal(result.items[1].text, 'beat two');
+  assert.equal(result.tool_call.tool_call_id, 'legacy-tool');
+  assert.equal(result.tool_call.kind, 'choice_required');
+  // The tool is NOT part of pending.events; it rides separately.
+  assert.equal(result.pending_total, 2);
+  assert.equal(provider.callCount, 1);
+});
+
+await test('tool_call-like entry inside items is rejected (tool must be final, never in narrative)', async () => {
+  // A tool may never hide inside the narrative items array.
+  const badProvider = createMockAgentProvider({ responses: [{
+    items: [{ role: 'assistant', type: 'tool_call', text: 'sneaky tool' }],
   }] });
   const runtime = await buildRuntime(badProvider);
   await assert.rejects(() => runTurn(runtime, { input: { a: 1 }, expected_revision: recoverRuntime(runtime).base_revision }), (error) => error instanceof AgentRuntimeError && error.code === 'invalid_tool_call');

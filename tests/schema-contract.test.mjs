@@ -117,6 +117,7 @@ const REQUIRED_COLUMNS = {
   ],
   pending_batch_items: [
     "batch_id BIGINT UNSIGNED NOT NULL",
+    "session_id BIGINT UNSIGNED NOT NULL",
     "item_uuid CHAR(36) NOT NULL",
     "item_seq INT UNSIGNED NOT NULL",
     "item_type ENUM('narrative_beat', 'tool_call') NOT NULL",
@@ -178,7 +179,9 @@ const REQUIRED_INDEXES = [
   "idx_game_sessions_story_version_cache",
   "idx_session_events_session_created",
   "idx_session_events_source_sequence",
+  "idx_session_events_session_event",
   "idx_pending_batches_queue",
+  "idx_pending_batches_session_id_id",
   "idx_pending_batches_fingerprint",
   "idx_pending_batch_items_batch_status",
   "idx_session_checkpoints_dirty",
@@ -194,6 +197,7 @@ const REQUIRED_FKS = [
   "REFERENCES game_sessions(id)",
   "REFERENCES endings(id)",
   "REFERENCES session_events(event_id)",
+  "REFERENCES session_events(session_id, event_id)",
   "REFERENCES session_events(session_id, event_seq)",
 ];
 
@@ -256,7 +260,17 @@ const REQUIRED_0004_FRAGMENTS = [
   "ADD COLUMN IF NOT EXISTS superseded_by CHAR(36) NULL",
   "ADD COLUMN IF NOT EXISTS source VARCHAR(64) NULL",
   "ADD UNIQUE INDEX IF NOT EXISTS uq_pending_batches_fingerprint",
-  "MODIFY expected_revision BIGINT UNSIGNED NOT NULL",
+  "MODIFY expected_revision BIGINT UNSIGNED NOT NULL DEFAULT 0",
+  "chk_pending_batches_source",
+  "chk_pending_batches_counts",
+  "ADD COLUMN IF NOT EXISTS session_id BIGINT UNSIGNED NULL",
+  "idx_session_events_session_event",
+  "idx_pending_batches_session_id_id",
+  "fk_pending_batches_promoted_event_session",
+  "fk_pending_batch_items_session_batch",
+  "fk_pending_batch_items_promoted_event_session",
+  "chk_pending_batch_items_pending",
+  "chk_pending_batch_items_tool_commit",
   "CREATE TABLE IF NOT EXISTS pending_batch_items",
   "UNIQUE KEY uq_pending_batch_items_uuid",
   "UNIQUE KEY uq_pending_batch_items_batch_seq (batch_id, item_seq)",
@@ -504,6 +518,8 @@ for (const constraint of [
   "chk_pending_batch_items_payload",
   "chk_pending_batch_items_committed",
   "chk_pending_batch_items_discarded",
+  "chk_pending_batch_items_pending",
+  "chk_pending_batch_items_tool_commit",
 ]) {
   check(`schema constraint ${constraint}`, schema.includes(constraint));
 }

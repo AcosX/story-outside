@@ -9,8 +9,17 @@
 //
 //   * Opening events come from the pinned cache via commitOpeningEvent.
 //     They MUST be explicitly displayed before they reach canonical
-//     history, the cursor MUST equal event.sequence, and the revision
-//     check MUST pass.
+//     history, opening order is enforced against session.opening_cursor,
+//     and the revision check MUST pass.
+//
+//   * Cursor semantics (ClickUp 08 P1.1): `cursor` is the CANONICAL
+//     cursor — the count of committed canonical events. It equals
+//     session.revision and the last committed event_seq, and advances on
+//     EVERY commit (opening, narrative, player_input). The opening
+//     playback position lives in a separate INTERNAL `opening_cursor`
+//     (only opening commits advance it); it is exposed read-only so
+//     clients can keep driving the opening sequence while `cursor`
+//     stays consistent with the full canonical chain.
 //
 //   * Narrative events come from the runtime via stageNarrativeBatch + a
 //     sequence of commitNarrativeEvent calls. Each commit appends exactly
@@ -18,6 +27,14 @@
 //     speculative tail is parked on session.pending and NEVER reaches
 //     canonical history unless the corresponding commitNarrativeEvent is
 //     called.
+//
+//   * source_sequence is a per (session, source) monotonic counter
+//     (0-based, contiguous, recoverable from history). It never resets
+//     between batches, so the SQL unique key
+//     uq_session_events_source_sequence(session_id, source, source_sequence)
+//     holds across consecutive runtime batches and repeated player
+//     interrupts. Opening events keep their pinned cache sequence (they
+//     use the 'opening_cache' source).
 //
 //   * A tool call may ride on a batch as the OPTIONAL FINAL item. It is
 //     validated, surfaced as part of the staged batch, and never written
@@ -27,7 +44,8 @@
 //   * interruptWithPlayerInput atomically:
 //       - discards the speculative pending tail;
 //       - appends the player_input as a NEW canonical event;
-//       - switches the session state to 'realtime'.
+//       - switches the session state to 'realtime' (a realtime session
+//         may be interrupted again; the state stays 'realtime').
 //
 //   * recoverSession is read-only: returns canonical history + revision +
 //     cursor + the active pending snapshot. Never calls the provider,
@@ -37,6 +55,11 @@
 //     fingerprint contract as the application layer: a reused id with the
 //     same payload replays the prior result; a reused id with a different
 //     payload fails closed.
+//
+//   * Turn-level request idempotency (request_id + input + revision) is
+//     owned by the SESSION (session.turnRequests), not by any transient
+//     runtime instance, so the HTTP layer's per-request runtime creation
+//     still replays a stable result for the same request_id.
 //
 // Stale revision / wrong pending_id / out-of-order sequence / mixed
 // payloads / unknown event types fail closed.
@@ -230,7 +253,7 @@ function normalizeCacheEvent(event, pinned, cache_uuid, session_uuid) {
   };
 }
 
-function append(session, canonical, advancesCursor, clientRequestId = null) {
+function append(session, canonical, clientRequestId = null) {
   const eventSeq = session.history.length + 1;
   const committed = {
     ...canonical,
@@ -252,9 +275,33 @@ function append(session, canonical, advancesCursor, clientRequestId = null) {
     client_request_id: committed.client_request_id,
   });
   session.history.push(committed);
-  if (advancesCursor) session.cursor += 1;
+  // Every committed canonical event advances the canonical cursor by 1:
+  // cursor === revision === max(event_seq) === history.length. This is the
+  // ClickUp 08 P1.1 invariant — the opening playback position is tracked
+  // separately in session.opening_cursor.
+  session.cursor += 1;
   session.revision += 1;
   return committed;
+}
+
+/**
+ * Next source_sequence for a (session, source) pair. Per-source counters
+ * are 0-based, contiguous, and monotonic — they never reset between
+ * batches. The counter is seeded from canonical history on first use so
+ * a session object rebuilt from persisted history (future DAO) derives
+ * the same next value without extra state.
+ */
+function nextSourceSequence(session, source) {
+  if (!session.sourceSeq.has(source)) {
+    let count = 0;
+    for (const event of session.history) {
+      if (event.source === source) count += 1;
+    }
+    session.sourceSeq.set(source, count);
+  }
+  const next = session.sourceSeq.get(source);
+  session.sourceSeq.set(source, next + 1);
+  return next;
 }
 
 function publicSession(session, includeHistory = false) {
@@ -272,6 +319,7 @@ function publicSession(session, includeHistory = false) {
     prompt: session.prompt,
     state: session.state,
     cursor: session.cursor,
+    opening_cursor: session.opening_cursor,
     revision: session.revision,
   };
   if (includeHistory) result.history = clone(session.history);
@@ -342,10 +390,13 @@ export function createSession({ repository, session_uuid, story_uuid, story_vers
     prompt,
     state: cache.content_payload && cache.content_payload.event_count === 0 ? 'awaiting_first_choice' : 'opening',
     cursor: 0,
+    opening_cursor: 0,
     revision: 0,
     history: [],
     pending: null,
     requestIds: new Map(),
+    turnRequests: new Map(),
+    sourceSeq: new Map(),
   };
   state.sessions.set(session_uuid, session);
   return publicSession(session);
@@ -363,15 +414,18 @@ export function commitOpeningEvent({ repository, session_uuid, cache_uuid, event
   validateRevision(session, expected_revision);
   if (session.state !== 'opening') throw new Error('commitOpeningEvent: session is not in opening state');
   if (!Number.isInteger(event && event.sequence)) throw new Error('commitOpeningEvent: event.sequence must be an integer');
-  if (event.sequence !== session.cursor) throw new Error(`commitOpeningEvent: event.sequence must equal cursor ${session.cursor}`);
+  // Opening order is enforced against the OPENING cursor (the number of
+  // opening events already displayed), not the canonical cursor.
+  if (event.sequence !== session.opening_cursor) throw new Error(`commitOpeningEvent: event.sequence must equal opening cursor ${session.opening_cursor}`);
   const cache = repository.findOpeningCacheByUuid(session.cache_uuid);
   if (!cache || cache.status !== 'valid') throw new Error('commitOpeningEvent: pinned cache is no longer valid');
   const pinned = validatePinnedCache(cache, session.story_uuid, session.story_version_uuid)
     .find((candidate) => candidate && candidate.sequence === event.sequence);
   const canonical = normalizeCacheEvent(event, pinned, cache_uuid, session.session_uuid);
-  const committed = append(session, canonical, true, id);
-  if (session.cursor >= cache.content_payload.event_count) session.state = 'awaiting_first_choice';
-  const result = { session_uuid, cache_uuid, event: clone(committed), cursor: session.cursor, revision: session.revision, state: session.state };
+  const committed = append(session, canonical, id);
+  session.opening_cursor += 1;
+  if (session.opening_cursor >= cache.content_payload.event_count) session.state = 'awaiting_first_choice';
+  const result = { session_uuid, cache_uuid, event: clone(committed), cursor: session.cursor, opening_cursor: session.opening_cursor, revision: session.revision, state: session.state };
   if (id) session.requestIds.set(id, { kind: 'opening', fingerprint: requestFingerprint('opening', { event }), result });
   return clone(result);
 }
@@ -480,6 +534,8 @@ export function stageNarrativeBatch({ repository, session_uuid, items, tool_call
         committed_count: active.committed_count,
         source: active.source,
         produced_at: active.produced_at,
+        cursor: session.cursor,
+        opening_cursor: session.opening_cursor,
         revision: session.revision,
         state: session.state,
       };
@@ -508,6 +564,8 @@ export function stageNarrativeBatch({ repository, session_uuid, items, tool_call
     committed_count: 0,
     source: pending.source,
     produced_at: pending.produced_at,
+    cursor: session.cursor,
+    opening_cursor: session.opening_cursor,
     revision: session.revision,
     state: session.state,
   };
@@ -550,6 +608,16 @@ export function commitNarrativeEvent({ repository, session_uuid, pending_id, seq
     throw new Error('commitNarrativeEvent: expected_revision must be an integer');
   }
   const session = sessionFor(repository, session_uuid);
+  const id = requestId(client_request_id);
+  // Idempotency lookup comes FIRST: after the final commit clears
+  // session.pending, a replay of that same commit must still return the
+  // original result instead of failing the pending_id check (ClickUp 08
+  // P1.5 final-commit idempotency). A reused id with a different
+  // pending_id/sequence still fails closed via the fingerprint.
+  if (id) {
+    const prior = idempotentResult(session, id, 'commit', { pending_id, sequence });
+    if (prior) return prior;
+  }
   if (!session.pending || session.pending.pending_id !== pending_id) {
     throw new Error('commitNarrativeEvent: pending_id does not match the active pending batch');
   }
@@ -558,11 +626,6 @@ export function commitNarrativeEvent({ repository, session_uuid, pending_id, seq
     throw new Error(
       `commitNarrativeEvent: sequence ${sequence} is out of range (batch has ${session.pending.events.length} items)`,
     );
-  }
-  const id = requestId(client_request_id);
-  if (id) {
-    const prior = idempotentResult(session, id, 'commit', { pending_id, sequence });
-    if (prior) return prior;
   }
   if (sequence !== session.pending.committed_count) {
     throw new Error(
@@ -580,10 +643,10 @@ export function commitNarrativeEvent({ repository, session_uuid, pending_id, seq
     event_type: 'narrative_beat',
     origin: NARRATIVE_ORIGIN,
     source: session.pending.source,
-    source_sequence: sequence,
+    source_sequence: nextSourceSequence(session, session.pending.source),
     payload: clone(staged),
     occurred_at: nowIso(),
-  }, false, id);
+  }, id);
   session.pending.committed_count += 1;
   const totalCommitted = session.pending.committed_count;
   const totalEvents = session.pending.events.length;
@@ -595,6 +658,7 @@ export function commitNarrativeEvent({ repository, session_uuid, pending_id, seq
     pending_id,
     event: clone(canonical),
     cursor: session.cursor,
+    opening_cursor: session.opening_cursor,
     revision: session.revision,
     state: session.state,
     pending_committed_count: totalCommitted,
@@ -626,7 +690,7 @@ export function interruptWithPlayerInput({ repository, session_uuid, text, clien
   const prior = idempotentResult(session, id, 'interrupt', { text });
   if (prior) return prior;
   validateRevision(session, expected_revision);
-  if (session.state !== 'opening' && session.state !== 'awaiting_first_choice') {
+  if (session.state !== 'opening' && session.state !== 'awaiting_first_choice' && session.state !== 'realtime') {
     throw new Error('interruptWithPlayerInput: session is not interruptible');
   }
   requiredString('text', text);
@@ -640,22 +704,65 @@ export function interruptWithPlayerInput({ repository, session_uuid, text, clien
     event_type: 'player_input',
     origin: 'user',
     source: 'player',
-    source_sequence: session.history.length + 1,
+    source_sequence: nextSourceSequence(session, 'player'),
     payload: { text },
     occurred_at: nowIso(),
-  }, false, id);
+  }, id);
   session.state = 'realtime';
   const result = {
     session_uuid,
     cache_uuid: session.cache_uuid,
     event: clone(canonical),
     cursor: session.cursor,
+    opening_cursor: session.opening_cursor,
     revision: session.revision,
     state: session.state,
     dropped_pending_id: dropped ? dropped.pending_id : null,
     dropped_pending_count: dropped ? dropped.events.length - dropped.committed_count : 0,
   };
   if (id) session.requestIds.set(id, { kind: 'interrupt', fingerprint: requestFingerprint('interrupt', { text }), result });
+  return clone(result);
+}
+
+/**
+ * Session-owned turn-level idempotency store (ClickUp 08 P1.5 HTTP
+ * cross-request idempotency). The HTTP layer creates a fresh runtime per
+ * request, so request_id dedup MUST live on the session, not on a
+ * transient runtime instance. The runtime registers the full turn result
+ * (turn_id / items / tool envelope / pending_id) here after a successful
+ * stage; a later request with the same request_id + input + revision
+ * replays that exact result without calling the provider again.
+ */
+export function lookupTurnRequest({ repository, session_uuid, request_id }) {
+  if (!repository) throw new Error('lookupTurnRequest: repository required');
+  assertUuid('session_uuid', session_uuid);
+  if (typeof request_id !== 'string' || request_id.length === 0) {
+    throw new Error('lookupTurnRequest: request_id must be a non-empty string');
+  }
+  const prior = sessionFor(repository, session_uuid).turnRequests.get(request_id);
+  return prior ? { fingerprint: prior.fingerprint, result: clone(prior.result) } : null;
+}
+
+/**
+ * Register (or replay) a turn-level request result on the session. A
+ * reused request_id with the SAME fingerprint replays the prior result; a
+ * reused request_id with a DIFFERENT fingerprint fails closed.
+ */
+export function registerTurnRequest({ repository, session_uuid, request_id, fingerprint, result }) {
+  if (!repository) throw new Error('registerTurnRequest: repository required');
+  assertUuid('session_uuid', session_uuid);
+  if (typeof request_id !== 'string' || request_id.length === 0) {
+    throw new Error('registerTurnRequest: request_id must be a non-empty string');
+  }
+  const session = sessionFor(repository, session_uuid);
+  const prior = session.turnRequests.get(request_id);
+  if (prior) {
+    if (prior.fingerprint !== fingerprint) {
+      throw new Error('sessionService: request_id was already used for a different request');
+    }
+    return clone(prior.result);
+  }
+  session.turnRequests.set(request_id, { fingerprint, result: clone(result) });
   return clone(result);
 }
 
@@ -689,18 +796,17 @@ export function listSessionEvents({ repository, session_uuid }) {
 /**
  * Read-only recovery. Returns the canonical session projection, the full
  * canonical history, and the active pending snapshot (if any). Never calls
- * the provider, never replays, never mutates state. Safe to call from a
- * fresh repository instance for cross-process resume as long as the
- * repository instance is reseeded with the same sessions.
+ * the provider, never replays, never mutates state.
  *
- * ClickUp 08 P1.6 boundary: the application-layer in-memory repository
- * documented in src/stories/repository.mjs does NOT persist sessions
- * across process restarts. `recoverSession` is therefore only safe to
- * call from the same process that originally staged the session. A
- * future MariaDB-backed DAO will replace the in-memory map with the
- * `game_sessions` table; until that DAO lands, callers MUST NOT claim
- * that SQL migrations have provided runtime persistence — they only
- * pin the schema the future DAO will write through.
+ * ClickUp 08 P1.6 persistence boundary: the application-layer in-memory
+ * repository (src/stories/repository.mjs) does NOT persist sessions
+ * across process restarts, so `recoverSession` is only safe to call from
+ * the SAME process that originally staged the session. It is NOT
+ * cross-process recovery. A future MariaDB-backed DAO will replace the
+ * in-memory map with the `game_sessions` table; until that DAO lands,
+ * callers MUST NOT claim that the SQL migrations provide runtime
+ * persistence — the migrations only pin the schema the future DAO will
+ * write through. Tests and docs must not describe this as cross-process.
  */
 export function recoverSession({ repository, session_uuid }) {
   if (!repository) throw new Error('recoverSession: repository required');

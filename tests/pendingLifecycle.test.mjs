@@ -135,9 +135,11 @@ await test('commitDisplayedEvent appends exactly one canonical event per call', 
   const recovered = recoverPendingSession({ repository, session_uuid });
   assert.equal(recovered.history.length, 3);
   assert.equal(recovered.revision, 3);
-  // cursor advances only with opening events; narrative events only advance
-  // revision. The session had no opening commits, so cursor stays at 0.
-  assert.equal(recovered.cursor, 0);
+  // The canonical cursor counts ALL committed canonical events, so it
+  // equals revision (3). The opening playback position (opening_cursor)
+  // stays 0 because no opening event was committed.
+  assert.equal(recovered.cursor, 3);
+  assert.equal(recovered.opening_cursor, 0);
 });
 
 await test('un-displayed events never reach canonical history', async () => {
@@ -496,8 +498,8 @@ await test('recover does not duplicate history and never calls provider', async 
   const r1 = recoverPendingSession({ repository, session_uuid });
   assert.equal(r1.history.length, 2);
   assert.equal(r1.revision, 2);
-  // narrative commits advance revision but not cursor.
-  assert.equal(r1.cursor, 0);
+  // narrative commits advance the canonical cursor together with revision.
+  assert.equal(r1.cursor, 2);
   assert.equal(r1.pending.pending_id, staged.pending_id);
   assert.equal(r1.pending.committed_count, 2);
   assert.equal(r1.pending.events.length, 4);

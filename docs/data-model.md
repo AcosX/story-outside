@@ -74,14 +74,19 @@
 - `request_uuid` 唯一做幂等；`base_event_id` 指向生成所基于的 canonical 事件。
 - 提正成功后由应用把 `promoted_event_id` 指向对应 `session_events.event_id`，完成 speculative → canonical 的对应关系。
 - `priority`、`available_at`、`expires_at`、`attempts` 支持简单队列调度与重试。
-- ClickUp 08 在 `pending_batches` 上额外约束：`expected_revision`（乐观并发）、`request_fingerprint`（64 字符，唯一，请求 id 复用不同负载时由应用层做 fail-closed；数据库通过唯一键作为最后防线）、`committed_count <= item_count`（`chk_pending_batches_counts`）、`source` 非空。
-- `pending_batch_items` 是 08 新增的逐项表：每个 staged item 一行，`(batch_id, item_seq)` 唯一，`item_type` 区分 narrative_beat 与 tool_call；`status` 在 pending/committed/discarded 三态机内流转，`chk_pending_batch_items_committed` / `chk_pending_batch_items_discarded` 保证 committed 必须有 `promoted_event_id` 与 `occurred_at`，discarded 必须两者为 NULL。
+- ClickUp 08 在 `pending_batches` 上额外约束：`expected_revision`（乐观并发，默认 0，与 `db/schema.sql` 一致）、`request_fingerprint`（64 字符，唯一，请求 id 复用不同负载时由应用层做 fail-closed；数据库通过唯一键作为最后防线）、`committed_count <= item_count`（`chk_pending_batches_counts`）、`source` 非空（`chk_pending_batches_source`）。0004 与 schema.sql 同步补齐这两个 CHECK。
+- `pending_batch_items` 是 08 新增的逐项表：每个 staged item 一行，`(batch_id, item_seq)` 唯一，`item_type` 区分 narrative_beat 与 tool_call；`status` 在 pending/committed/discarded 三态机内流转，`chk_pending_batch_items_committed` / `chk_pending_batch_items_discarded` 保证 committed 必须有 `promoted_event_id` 与 `occurred_at`，discarded 必须两者为 NULL；`chk_pending_batch_items_pending` 进一步保证 pending 状态也不得携带 `promoted_event_id` / `occurred_at`（只有 committed 行可以有）。
+- `chk_pending_batch_items_tool_commit`：tool_call 行永远不能是 `committed` —— tool 从不进入 canonical `session_events`，因此不存在可指向的 promoted event。
+- 同 session 完整性由数据库强制，而非仅文档声明：`pending_batch_items.session_id` 冗余自 `pending_batches.session_id`，`(session_id, batch_id) → pending_batches(session_id, id)` 复合外键保证 item 归属其 batch 的 session；`(session_id, promoted_event_id) → session_events(session_id, event_id)` 复合外键保证 committed item 的 promoted event 属于同一 session（跨 session promotion 被 MariaDB 拒绝）。`pending_batches.promoted_event_id` 同样受 `(session_id, promoted_event_id)` 复合外键约束。
 
 ### 3.5 会话 playback 游标与状态
 
 - `game_sessions.model`、`prompt`、`generation_profile` 是创建会话时的生成快照；未来 DAO 必须与会话一同写入，不能从后来变化的全局配置回读。
-- `opening_cursor` 是会话 playback 游标，初始值为 `0`；`opening_state` 只允许 `opening`、`awaiting_first_choice`、`realtime`。它表达当前播放边界，不替代 canonical `session_events`。
+- `cursor`（canonical cursor，ClickUp 08 P1.1）等于已提交 canonical 事件总数，恒等于 `session_revision` 与最后一条 `session_events.event_seq`；每次 commit（opening / narrative / player_input）都 +1，单调不回退。
+- `opening_cursor` 是独立的 opening 播放位置（内部语义），只随 `story_opening` commit 递增；`commitOpeningEvent` 用它与 `event.sequence` 比对来强制开场顺序，开场放完（`opening_cursor >= event_count`）后 `opening_state` 进入 `awaiting_first_choice`。对外只读暴露，供客户端继续驱动开场播放。
+- `opening_state` 只允许 `opening`、`awaiting_first_choice`、`realtime`。`stageNarrativeBatch` 接受三种状态；`interruptWithPlayerInput` 接受 `opening` / `awaiting_first_choice` / `realtime`，realtime 会话可再次打断（丢弃 pending tail、追加 player_input、状态保持 `realtime`）。
 - `session_revision` 是会话边界的单调修订号，供 `expected_revision` 乐观锁使用；事件提交成功后应由 DAO 在同一事务中推进它，并以 canonical history 为准恢复。
+- `source_sequence` 是 (session, source) 维度的单调连续计数器（0-based，可从 canonical history 恢复），跨 batch 不复位，因此 `(session_id, source, source_sequence)` 唯一键在连续多批 runtime 事件与多次 player interrupt 下成立；opening 事件使用 pinned cache 的 0-based sequence（source=`opening_cache`）。
 - session 同时以复合外键绑定 `story_id + story_version_id`，opening cache 还必须属于同一 story/version；不能只凭三个独立 id 组合出跨作品会话。
 
 ### 3.6 checkpoint 投影
@@ -110,7 +115,7 @@
 - `0001` 可重复执行：`CREATE TABLE IF NOT EXISTS`、`DROP TRIGGER IF EXISTS`、`INSERT IGNORE` 都不产生重复错误。
 - `0002` 可重复执行：使用 `ADD COLUMN IF NOT EXISTS`、`ADD UNIQUE INDEX IF NOT EXISTS`、`DROP INDEX IF EXISTS`、`ADD CONSTRAINT IF NOT EXISTS` 与 drop-before-create trigger；旧 0001 的 `uq_story_opening_caches_scope` 被移除，旧行以 legacy generation 回填。
 - `0003` 可重复执行：先为复合外键暴露父表复合索引，再回填旧 session/event 行的 playback/provenance 默认值；事件枚举扩展后，命名 CHECK/外键按名称 drop/recreate（MariaDB 不支持 `ADD FOREIGN KEY IF NOT EXISTS`），最后完成非空与幂等约束；旧事件的 `source='legacy'`、`source_sequence=event_seq` 只在空值时回填。
-- `0004` 可重复执行：扩展 `pending_batches` 生命周期字段（`expected_revision` / `request_fingerprint` / `committed_count` / `item_count` / `source` / `superseded_by`），先 backfill NULL 值，再 MODIFY 为 NOT NULL；新增 `pending_batch_items` 表表达逐项有序 payload 与三态机；新增/重建命名 CHECK 与索引。MariaDB 不支持 `ADD FOREIGN KEY IF NOT EXISTS`，所以外键仍按 drop-by-name + create 模式。
+- `0004` 可重复执行：扩展 `pending_batches` 生命周期字段（`expected_revision` 默认 0 / `request_fingerprint` / `committed_count` / `item_count` / `source` / `superseded_by`），先 backfill NULL 值，再 MODIFY 为 NOT NULL；补 `chk_pending_batches_source` / `chk_pending_batches_counts` 两个 CHECK 与 schema.sql 对齐；新增 `pending_batch_items` 表表达逐项有序 payload 与三态机（含 `session_id` 冗余列、`chk_pending_batch_items_pending`、`chk_pending_batch_items_tool_commit` 与同 session 复合外键）；新增/重建命名 CHECK 与索引。MariaDB 不支持 `ADD FOREIGN KEY IF NOT EXISTS`，所以外键仍按 drop-by-name + create 模式。
 - 已应用迁移在部署环境中**不要编辑**；结构变更必须新增迁移文件。`0001` 是历史基线，其中的旧 trigger 级联行为由 `0002` 替换，不回头修改。
 - `schema.sql` 是当前 canonical 全量入口，包含建库与 0001+0002+0003+0004 合并后的最终 DDL；`tests/schema-contract.test.mjs` 会校验它与迁移集合保持一致。
 - schema 不创建应用账号、不写入任何密钥。应用账号权限由部署环境负责，推荐：普通读写账号不授予 `session_events` 的 `UPDATE` / `DELETE`，与 trigger 形成双重防线。
@@ -147,6 +152,27 @@ mariadb --no-defaults story_outside -e "SHOW TRIGGERS LIKE 'session_events';"
 mariadb --no-defaults story_outside -e "SHOW CREATE TABLE session_events\G"
 mariadb --no-defaults story_outside -e "SHOW CREATE TABLE pending_batches\G; SHOW CREATE TABLE pending_batch_items\G;"
 ```
+
+### 6.1 负面约束探针（ClickUp 08 P1.4 / P1.7）
+
+仓库提供一键脚本 `scripts/mariadb-probes.sh`，在 scratch 库上验证：0001→0004 每步重复 3 次幂等 + 额外重复 0004 + 全新 `schema.sql` 独立可建 + 下列负面约束确实拒绝非法行（用两 session 探针证明跨 session promotion 被拒）。脚本结束自动 DROP 临时库：
+
+```bash
+bash scripts/mariadb-probes.sh /path/to/story-outside
+```
+
+脚本覆盖的负面探针（`EXPECT_FAIL` = 必须报错；`EXPECT_OK` = 必须成功）：
+
+1. `pending_batches.source=''` → `chk_pending_batches_source` 拒绝；
+2. `pending_batches.committed_count > item_count` → `chk_pending_batches_counts` 拒绝；
+3. `pending_batches.expected_revision` 为 `NOT NULL DEFAULT 0`（与 schema.sql 一致，information_schema 校验）；
+4. `pending_batch_items` status=`pending` 且带 `promoted_event_id`/`occurred_at` → `chk_pending_batch_items_pending` 拒绝；
+5. 跨 session promotion：item 属于 session A、`promoted_event_id` 指向 session B 的 canonical 事件 → `fk_pending_batch_items_promoted_event_session` 复合外键拒绝；
+6. 同 session promotion（item 与 promoted event 同属 session A）→ 成功；
+7. `pending_batch_items` item_type=`tool_call` 且 status=`committed` → `chk_pending_batch_items_tool_commit` 拒绝；
+8. item 的 `session_id` 与其 batch 的 `session_id` 不一致 → `fk_pending_batch_items_session_batch` 复合外键拒绝。
+
+> 注意：脚本用 `(SELECT id FROM game_sessions WHERE session_uuid=...)` 子查询解析 session 主键，不假设自增 id 连续——本机 MariaDB 的 `auto_increment_increment=3`（Galera 风格配置）下自增步长不是 1，直接写死 id=1/2 会导致探针误报。
 
 ## 7. 契约测试
 
@@ -196,9 +222,9 @@ node tests/schema-contract.test.mjs
 | `story_versions` | `repository.importVersion` / `repository.findVersion` / `repository.listVersionsByStory` | `version_uuid` / `story_id` / `version_no` / `content_payload` / `roles_payload` / `checksum` / `status`。同一 `checksum` 已存在时直接复用；不同则 `version_no` 递增，旧行保留。 |
 | `story_opening_caches` | `repository.upsertOpeningCache` / `repository.findOpeningCacheByScope` / `repository.recordCacheInvalidation` | `cache_uuid` / `story_id` / `story_version_id` / `opening_key` / `generation_profile` / `generation_hash` / `status` (valid/invalidated/failed) / `content_payload` / `content_hash` / `use_count`。生成失败产生 `status='failed'` 行，不覆盖既有 `valid` 行。 |
 | `game_sessions` | `createSession` / `recoverSession` / `repository.recordSessionFirstChoice` | `session_uuid` / `story_id` / `story_version_id` / `user_ref` / `role_id` / `model` / `prompt` / `generation_profile` / `opening_cache_id` / `opening_cursor` / `opening_state` / `session_revision` / `first_choice_at` / `ending_id`。创建会话时固定 story/version/cache 复合关系；未来 DAO 在同一事务中写入快照并推进 revision。 |
-| `session_events` | `commitOpeningEvent` / `commitNarrativeEvent` / `interruptWithPlayerInput` 的未来 DAO 接缝 | canonical 事件流只允许 INSERT；`event_seq` 是 session chain，`source` / `source_sequence` 是 producer provenance，`client_request_id` 做幂等。`markFirstChoiceConsumed` 只返回 session-local marker，不直接把预览写成 canonical 事件。 |
+| `session_events` | `commitOpeningEvent` / `commitNarrativeEvent` / `interruptWithPlayerInput` 的未来 DAO 接缝 | canonical 事件流只允许 INSERT；`event_seq` 是 session chain，`source` / `source_sequence` 是 producer provenance（(session, source) 单调计数器，跨 batch 不复位），`client_request_id` 做幂等。`markFirstChoiceConsumed` 只返回 session-local marker，不直接把预览写成 canonical 事件。 |
 | `pending_batches` | `stageNarrativeBatch` 的未来 DAO 接缝 | speculative request / response 包；生命周期 `expected_revision` / `request_fingerprint`（唯一）/ `committed_count <= item_count`（`chk_pending_batches_counts`）/ `source` 非空；提正时设 `promoted_event_id` 与 `status='succeeded'`。 |
-| `pending_batch_items` | `stageNarrativeBatch` + `commitNarrativeEvent` 的未来 DAO 接缝 | 每个 staged narrative beat 一行，`(batch_id, item_seq)` 唯一，`item_type='narrative_beat'` / `tool_call`；committed 必须填 `promoted_event_id` + `occurred_at`（`chk_pending_batch_items_committed`），discarded 必须两者为 NULL（`chk_pending_batch_items_discarded`）。 |
+| `pending_batch_items` | `stageNarrativeBatch` + `commitNarrativeEvent` 的未来 DAO 接缝 | 每个 staged narrative beat 一行，`(batch_id, item_seq)` 唯一，`item_type='narrative_beat'` / `tool_call`；`session_id` 冗余自 batch；committed 必须填 `promoted_event_id` + `occurred_at`（`chk_pending_batch_items_committed`），discarded 必须两者为 NULL（`chk_pending_batch_items_discarded`），pending 同样不得携带（`chk_pending_batch_items_pending`）；tool_call 行不可 committed（`chk_pending_batch_items_tool_commit`）；`(session_id, promoted_event_id)` 复合外键强制 promoted event 与 batch 同 session。 |
 
 > 注：内存仓库仅复现 schema 表面上的应用语义；不会假装数据已写入 MariaDB。任何 `repository.*` 调用都不发起 SQL。当未来引入 `src/stories/daoMaria.mjs` 时，可以逐方法替换仓库实现，服务层和路由代码不需要变动。
 
