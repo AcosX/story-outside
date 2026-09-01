@@ -1,11 +1,17 @@
 import { canonicalJsonStringify } from '../stories/canonicalHash.mjs';
-import { getSession, listSessionEvents } from '../stories/sessionService.mjs';
+import { getSession, listSessionEvents, stageNarrativeBatch } from '../stories/sessionService.mjs';
 import { randomUUID } from 'node:crypto';
 import { executeToolCall, ToolValidationError } from './tools.mjs';
 
 const RUNTIME_STATE = Symbol('agentRuntimeState');
 const SENSITIVE_KEY_PATTERN = /^(password|token|access[_-]?token|secret|api[_-]?key|app[_-]?key|authorization|cookie|headers?)$/i;
 const ERROR_CODES = new Set(['pin_mismatch', 'invalid_input', 'provider_failure', 'unknown_tool', 'invalid_tool_call', 'revision_mismatch', 'duplicate_request']);
+
+// ClickUp 08 contract: a provider turn MAY return 1..4 ordered narrative
+// items and OPTIONALLY a single tool call as the FINAL item. The runtime
+// normalises both shapes into one canonical stage.
+const MIN_NARRATIVE = 1;
+const MAX_NARRATIVE = 4;
 
 class AgentRuntimeError extends Error {
   constructor(code, message) {
@@ -71,30 +77,94 @@ function sanitizeFiniteJson(value, label) {
   return json;
 }
 
+/**
+ * Normalise a provider result into the ClickUp 08 shape:
+ *   * items    : array of 1..4 narrative items in order
+ *   * tool_call: optional normalised tool call (the FINAL item)
+ *
+ * The provider can express this either as:
+ *   { messages: [...], tool_calls: [<one>] }
+ * where messages are 1..4 ordered narrative beats, OR
+ *   { items: [...], tool_call: {...} }
+ * for explicit ClickUp 08 shape. Mixed messages+tool_calls without an
+ * items array is rejected so the application layer never has to guess
+ * whether tool_calls rides along with the narrative batch.
+ */
 function normalizeProviderResult(result) {
   if (!result || typeof result !== 'object') fail('provider_failure', 'provider result must be an object');
   const hasMessages = result.messages !== undefined;
   const hasToolCalls = result.tool_calls !== undefined;
-  if (hasMessages && hasToolCalls) fail('invalid_tool_call', 'messages and tool_calls cannot be mixed');
-  const messages = hasMessages ? assertObjectArray(result.messages, 'messages').map((msg) => {
-    if (msg.role !== 'assistant' || typeof msg.content !== 'string' || !msg.content.trim()) fail('invalid_tool_call', 'assistant messages must contain non-empty string content');
-    return { role: 'assistant', content: msg.content };
-  }) : undefined;
-  if (messages && messages.length === 0) fail('provider_failure', 'provider result must include messages or tool_calls');
-  const tool_calls = hasToolCalls ? assertObjectArray(result.tool_calls, 'tool_calls').map((call) => {
-    if (!call || typeof call !== 'object') fail('invalid_tool_call', 'tool call must be an object');
-    const payload = { name: call.name, arguments: call.arguments, tool_call_id: call.tool_call_id ?? call.id, id: call.id };
-    try {
-      const normalized = executeToolCall(payload);
-      return { ...normalized, arguments: clone(normalized.payload), tool_envelope: clone(normalized), tool_result: clone(normalized.payload) };
-    } catch (error) {
-      if (error instanceof ToolValidationError) fail('invalid_tool_call', error.message);
-      throw error;
+  const hasItems = result.items !== undefined;
+  const hasExplicitTool = result.tool_call !== undefined;
+  if (hasItems) {
+    if (hasMessages || hasToolCalls) fail('invalid_tool_call', 'items cannot be combined with messages/tool_calls');
+    assertObjectArray(result.items, 'items');
+    if (result.items.length < MIN_NARRATIVE || result.items.length > MAX_NARRATIVE) {
+      fail('invalid_tool_call', `items must contain ${MIN_NARRATIVE} to ${MAX_NARRATIVE} narrative items`);
     }
-  }) : undefined;
-  if (tool_calls && tool_calls.length !== 1) fail('invalid_tool_call', 'provider must return exactly one tool_call');
-  if (!messages && !tool_calls) fail('provider_failure', 'provider result must include messages or tool_calls');
-  return { messages: messages ?? [], tool_calls: tool_calls ?? [] };
+    const normalisedItems = result.items.map((item, index) => {
+      if (!item || typeof item !== 'object' || Array.isArray(item)) fail('invalid_tool_call', `items[${index}] must be an object`);
+      const role = item.role;
+      const text = typeof item.text === 'string' ? item.text : (typeof item.content === 'string' ? item.content : null);
+      if (role !== undefined && role !== 'assistant') fail('invalid_tool_call', `items[${index}].role must be 'assistant' or omitted`);
+      if (text === null || !text.trim()) fail('invalid_tool_call', `items[${index}].text must be a non-empty string`);
+      const out = { role: 'assistant', text };
+      if (item.type !== undefined) out.type = item.type;
+      if (item.speaker !== undefined) out.speaker = item.speaker;
+      if (item.sequence !== undefined && item.sequence !== index) fail('invalid_tool_call', `items[${index}].sequence must equal ${index}`);
+      return out;
+    });
+    let normalisedTool = null;
+    if (hasExplicitTool && result.tool_call !== null) {
+      if (!result.tool_call || typeof result.tool_call !== 'object' || Array.isArray(result.tool_call)) fail('invalid_tool_call', 'tool_call must be an object');
+      try {
+        normalisedTool = executeToolCall({
+          name: result.tool_call.name,
+          arguments: result.tool_call.arguments,
+          tool_call_id: result.tool_call.tool_call_id ?? result.tool_call.id,
+          id: result.tool_call.id,
+        });
+      } catch (error) {
+        if (error instanceof ToolValidationError) fail('invalid_tool_call', error.message);
+        throw error;
+      }
+    }
+    return { items: normalisedItems, tool_call: normalisedTool };
+  }
+  // Legacy shape: { messages, tool_calls }.
+  if (hasMessages && hasToolCalls) fail('invalid_tool_call', 'messages and tool_calls cannot be mixed');
+  if (!hasMessages && !hasToolCalls) fail('provider_failure', 'provider result must include messages, items, or tool_calls');
+  if (hasMessages) {
+    assertObjectArray(result.messages, 'messages');
+    if (result.messages.length < MIN_NARRATIVE || result.messages.length > MAX_NARRATIVE) {
+      fail('invalid_tool_call', `messages must contain ${MIN_NARRATIVE} to ${MAX_NARRATIVE} narrative items`);
+    }
+    const normalisedItems = result.messages.map((msg, index) => {
+      if (msg.role !== 'assistant' || typeof msg.content !== 'string' || !msg.content.trim()) fail('invalid_tool_call', `messages[${index}] must be an assistant message with non-empty string content`);
+      const out = { role: 'assistant', text: msg.content };
+      if (msg.type !== undefined) out.type = msg.type;
+      if (msg.speaker !== undefined) out.speaker = msg.speaker;
+      if (msg.sequence !== undefined && msg.sequence !== index) fail('invalid_tool_call', `messages[${index}].sequence must equal ${index}`);
+      return out;
+    });
+    return { items: normalisedItems, tool_call: null };
+  }
+  // messages absent, tool_calls present: single tool call with no narrative items.
+  assertObjectArray(result.tool_calls, 'tool_calls');
+  if (result.tool_calls.length !== 1) fail('invalid_tool_call', 'provider must return exactly one tool_call when messages are absent');
+  let normalisedTool;
+  try {
+    normalisedTool = executeToolCall({
+      name: result.tool_calls[0].name,
+      arguments: result.tool_calls[0].arguments,
+      tool_call_id: result.tool_calls[0].tool_call_id ?? result.tool_calls[0].id,
+      id: result.tool_calls[0].id,
+    });
+  } catch (error) {
+    if (error instanceof ToolValidationError) fail('invalid_tool_call', error.message);
+    throw error;
+  }
+  return { items: [], tool_call: normalisedTool };
 }
 
 export function createMockAgentProvider({ responses = [], handler, failure } = {}) {
@@ -133,7 +203,7 @@ export function createAgentRuntime({ repository, session_uuid, provider, system_
       base_revision: session.revision,
       base_cursor: session.cursor,
       successful_turns: [],
-      pending: null,
+      staged: null,
       requestIndex: new Map(),
     },
     enumerable: false,
@@ -154,6 +224,19 @@ function buildRequest(state, inputJson) {
   };
 }
 
+function buildToolCallEnvelope(toolCall, session_uuid, turn_id, base_revision) {
+  if (!toolCall) return null;
+  return {
+    ...clone(toolCall),
+    session_uuid,
+    turn_id,
+    base_revision,
+    kind: toolCall.kind,
+    requires_player: toolCall.requires_player,
+    terminal: toolCall.terminal,
+  };
+}
+
 export async function runTurn(runtime, { request_id, input, expected_revision } = {}) {
   const state = runtimeState(runtime);
   const session = getSession({ repository: state.repository, session_uuid: state.session_uuid });
@@ -171,19 +254,77 @@ export async function runTurn(runtime, { request_id, input, expected_revision } 
   if (expected_revision !== state.base_revision) fail('revision_mismatch', 'revision mismatch');
   if (session.revision !== state.base_revision) fail('revision_mismatch', 'revision mismatch');
   let rawResult;
+  let turn_id;
   try {
-    const turn_id = randomUUID();
+    turn_id = randomUUID();
     state.turn_id = turn_id;
     rawResult = await state.provider.complete(buildRequest(state, inputJson));
-    state.turn_id = turn_id;
   } catch {
     fail('provider_failure', 'agent provider failed');
   }
   const providerResult = normalizeProviderResult(rawResult);
-  const turn_id = state.turn_id;
-  const tool_call = providerResult.tool_calls[0];
-  const result = { turn_id, request_id: key, base_revision: state.base_revision, base_cursor: state.base_cursor, kind: providerResult.tool_calls.length ? 'tool_call' : 'narrative', messages: providerResult.messages, tool_calls: providerResult.tool_calls.map((call) => ({ ...call, session_uuid: state.session_uuid, turn_id, base_revision: state.base_revision, tool_envelope: { ...clone(call.tool_envelope), session_uuid: state.session_uuid, turn_id, base_revision: state.base_revision }, tool_result: { ...clone(call.tool_result), session_uuid: state.session_uuid, turn_id, base_revision: state.base_revision } })), tool_result: tool_call ? { ...clone(tool_call.tool_result), session_uuid: state.session_uuid, turn_id, base_revision: state.base_revision, kind: tool_call.kind, requires_player: tool_call.requires_player, terminal: tool_call.terminal } : null, tool_envelope: tool_call ? { ...clone(tool_call.tool_envelope), session_uuid: state.session_uuid, turn_id, base_revision: state.base_revision, kind: tool_call.kind, requires_player: tool_call.requires_player, terminal: tool_call.terminal } : null, pending: providerResult.tool_calls.length > 0 };
-  state.pending = clone(result);
+  // ClickUp 08 contract: the runtime STAGES the provider result on the
+  // canonical session pending slot. There is exactly one active pending
+  // per session. The runtime does NOT keep a separate pending record.
+  let staged;
+  try {
+    staged = stageNarrativeBatch({
+      repository: state.repository,
+      session_uuid: state.session_uuid,
+      items: providerResult.items.map((it) => ({
+        type: it.type || 'narration',
+        text: it.text,
+        ...(it.speaker !== undefined ? { speaker: it.speaker } : {}),
+      })),
+      tool_call: providerResult.tool_call ? {
+        tool_call_id: providerResult.tool_call.tool_call_id,
+        name: providerResult.tool_call.name,
+        payload: providerResult.tool_call.payload,
+        kind: providerResult.tool_call.kind,
+        requires_player: providerResult.tool_call.requires_player,
+        terminal: providerResult.tool_call.terminal,
+      } : undefined,
+      source: 'runtime',
+      expected_revision: state.base_revision,
+      client_request_id: key ? `${key}:stage` : undefined,
+    });
+  } catch (error) {
+    fail('invalid_tool_call', error && error.message ? error.message : String(error));
+  }
+  state.staged = staged;
+  // The "items" we hand back to callers mirror the staged order so the
+  // HTTP route layer can stream them one by one. tool_call rides along as
+  // the optional final item but is never written to canonical history.
+  const result = {
+    turn_id,
+    request_id: key,
+    base_revision: state.base_revision,
+    base_cursor: state.base_cursor,
+    kind: providerResult.tool_call ? 'tool_call' : 'narrative',
+    items: providerResult.items.map((it) => ({
+      type: it.type || 'narration',
+      text: it.text,
+      ...(it.speaker !== undefined ? { speaker: it.speaker } : {}),
+    })),
+    pending_id: staged.pending_id,
+    pending_committed_count: staged.committed_count,
+    pending_total: staged.events.length,
+    state: staged.state,
+    session_uuid: state.session_uuid,
+    base_revision: state.base_revision,
+    tool_call: providerResult.tool_call ? buildToolCallEnvelope(providerResult.tool_call, state.session_uuid, turn_id, state.base_revision) : null,
+    tool_envelope: providerResult.tool_call ? buildToolCallEnvelope(providerResult.tool_call, state.session_uuid, turn_id, state.base_revision) : null,
+    tool_result: providerResult.tool_call ? {
+      kind: providerResult.tool_call.kind,
+      requires_player: providerResult.tool_call.requires_player,
+      terminal: providerResult.tool_call.terminal,
+      payload: clone(providerResult.tool_call.payload),
+      session_uuid: state.session_uuid,
+      turn_id,
+      base_revision: state.base_revision,
+    } : null,
+    pending: !!providerResult.tool_call,
+  };
   state.successful_turns.push(clone(result));
   if (key) state.requestIndex.set(key, { fingerprint: fp, result: clone(result) });
   return clone(result);
@@ -197,7 +338,15 @@ export async function resumeTurn(runtime, args = {}) {
 
 export function recoverRuntime(runtime) {
   const state = runtimeState(runtime);
-  return clone({ session_uuid: state.session_uuid, pinned: state.pinned, base_revision: state.base_revision, base_cursor: state.base_cursor, canonical_history: listSessionEvents({ repository: state.repository, session_uuid: state.session_uuid }), successful_turns: state.successful_turns, pending: state.pending });
+  return clone({
+    session_uuid: state.session_uuid,
+    pinned: state.pinned,
+    base_revision: state.base_revision,
+    base_cursor: state.base_cursor,
+    canonical_history: listSessionEvents({ repository: state.repository, session_uuid: state.session_uuid }),
+    successful_turns: state.successful_turns,
+    staged: state.staged,
+  });
 }
 
 export { AgentRuntimeError };

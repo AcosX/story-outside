@@ -72,9 +72,10 @@ await test('runTurn supports async providers and records audit fields', async ()
   assert.equal(result.request_id, 'req-1');
   assert.equal(result.base_revision, state.base_revision);
   assert.equal(result.base_cursor, state.base_cursor);
-  assert.deepEqual(result.messages, [{ role: 'assistant', content: 'hello' }]);
-  assert.deepEqual(result.tool_calls, []);
+  assert.deepEqual(result.items, [{ type: 'narration', text: 'hello' }]);
+  assert.equal(result.tool_call, null);
   assert.equal(result.pending, false);
+  assert.match(result.pending_id, /^[0-9a-f-]{36}$/);
   assert.equal(provider.callCount, 1);
   const repeat = await runTurn(runtime, { request_id: 'req-1', input: { a: 1 }, expected_revision: state.base_revision });
   assert.deepEqual(repeat, result);
@@ -106,8 +107,8 @@ await test('tool calls validate options, summary, and classify as tool_call', as
   const result = await runTurn(runtime, { input: { a: 1 }, expected_revision: recoverRuntime(runtime).base_revision });
   assert.equal(result.kind, 'tool_call');
   assert.equal(result.pending, true);
-  assert.equal(result.tool_calls.length, 1);
-  assert.equal(result.tool_calls[0].tool_call_id, 'tool-123');
+  assert.equal(result.tool_call.tool_call_id, 'tool-123');
+  assert.equal(result.tool_call.kind, 'choice_required');
   assert.equal(result.tool_result.kind, 'choice_required');
   assert.equal(provider.callCount, 1);
 });
@@ -148,7 +149,7 @@ await test('provider tool calls reject unknown fields, duplicates, and missing i
 
 await test('provider results reject empty, mixed, multi-tool, unknown, and bad payloads', async () => {
   const cases = [
-    [{ messages: [] }, 'provider_failure'],
+    [{ messages: [] }, 'invalid_tool_call'],
     [{ messages: [{ role: 'assistant', content: 'hi' }], tool_calls: [{ name: 'finish_story', arguments: { summary: 'done' } }] }, 'invalid_tool_call'],
     [{ tool_calls: [{ name: 'ask_player_choice', arguments: { options: [{ id: 'a', label: 'A' }, { id: 'b', label: 'B' }] } }, { name: 'finish_story', arguments: { summary: 'done' } }] }, 'invalid_tool_call'],
     [{ tool_calls: [{ name: 'unknown', arguments: {} }] }, 'invalid_tool_call'],
@@ -236,7 +237,7 @@ await test('tool envelopes carry normalized tool results and preserve canonical 
   const result = await runTurn(runtime, { input: { a: 1 }, expected_revision: before.base_revision });
   assert.equal(result.kind, 'tool_call');
   assert.equal(result.pending, true);
-  assert.equal(result.tool_calls[0].tool_call_id, 'tool-123');
+  assert.equal(result.tool_call.tool_call_id, 'tool-123');
   assert.equal(result.tool_result.kind, 'choice_required');
   assert.equal(result.tool_envelope.terminal, false);
   const after = recoverRuntime(runtime);

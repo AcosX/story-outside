@@ -28,17 +28,80 @@ import {
   startSessionSnapshot,
 } from './stories/index.mjs';
 import {
+  commitNarrativeEvent,
   commitOpeningEvent,
   createSession,
+  discardPendingTail,
   interruptWithPlayerInput,
+  listSessionEvents,
   recoverSession,
+  stageNarrativeBatch,
 } from './stories/sessionService.mjs';
+import {
+  AgentRuntimeError,
+  createAgentRuntime,
+  createMockAgentProvider,
+  recoverRuntime,
+  resumeTurn,
+  runTurn,
+} from './agent/runtime.mjs';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 const ROOT = resolve(__dirname, '..');
 const PUBLIC_DIR = resolve(ROOT, 'public');
 const PORT = Number(process.env.PORT || 4173);
 const HOST = process.env.HOST || '127.0.0.1';
+
+/**
+ * Build a deterministic, story-aware mock provider that satisfies the
+ * ClickUp 08 wire contract: 1..4 ordered narrative items plus an
+ * OPTIONAL final tool call (never both items and a tool call with the
+ * items array empty, and never without a tool_call riding the items).
+ *
+ * The mock parses the player's input.text to decide what to produce:
+ *   - default: a 3-item narration batch;
+ *   - text begins with 'choice' → a 1-item batch + ask_player_choice;
+ *   - text begins with 'finish' → a 1-item batch + finish_story;
+ *   - text contains 'long'   → a 4-item batch;
+ *   - text contains 'short'  → a 1-item batch.
+ */
+function buildDemoMockAgentProvider(input) {
+  const text = typeof input === 'object' && input !== null && typeof input.text === 'string'
+    ? input.text.toLowerCase() : '';
+  const isLong = text.includes('long');
+  const isShort = text.includes('short');
+  const isChoice = text.startsWith('choice');
+  const isFinish = text.startsWith('finish');
+  const count = isChoice || isFinish ? 1
+    : isLong ? 4
+    : isShort ? 1
+    : 3;
+  const items = [];
+  for (let i = 0; i < count; i += 1) {
+    items.push({ role: 'assistant', type: i % 2 === 0 ? 'narration' : 'dialogue', text: `demo ${i % 2 === 0 ? 'line' : 'utterance'} ${i + 1}` });
+  }
+  let tool_call = null;
+  if (isChoice) {
+    tool_call = {
+      id: `tool-${randomUUID()}`,
+      name: 'ask_player_choice',
+      arguments: { question: 'demo question', options: [{ id: 'a', label: 'A' }, { id: 'b', label: 'B' }] },
+    };
+  } else if (isFinish) {
+    tool_call = {
+      id: `tool-${randomUUID()}`,
+      name: 'finish_story',
+      arguments: {
+        summary: 'demo summary',
+        ending: 'demo ending',
+        original_difference: 'demo diff',
+        key_choices: ['demo choice'],
+        character_outcomes: [{ character: 'demo', fate: 'demo fate' }],
+      },
+    };
+  }
+  return createMockAgentProvider({ responses: [{ items, tool_call }] });
+}
 
 const DEMO_FLAG = Object.freeze({
   mode: 'demo',
@@ -639,6 +702,139 @@ const server = http.createServer(async (req, res) => {
         ...result,
         player_event: result.event,
         realtime_transition: { state: result.state, cursor: result.cursor, revision: result.revision },
+      });
+    } catch (err) {
+      return sessionErrorResponse(res, err);
+    }
+  }
+
+  // ClickUp 08 narrative-batch routes.
+  //
+  // The runtime's Mock provider is used for the demo: it yields one
+  // narrative item per turn until input.text begins with "choice" or
+  // "finish", then yields the matching tool call. The contract is the
+  // real ClickUp 08 wire shape; a future Real provider must obey the
+  // same invariants.
+
+  // POST /api/dev/sessions/:uuid/generate — call the runtime and STAGE
+  // the result on the canonical session pending slot. Returns the staged
+  // batch (items + optional tool call). Does NOT append to canonical
+  // history; the player must commit each item via the narrative-events
+  // route below. The runtime base_revision pins expected_revision to the
+  // session's current revision.
+  const generateMatch = pathname.match(/^\/api\/dev\/sessions\/([0-9a-fA-F-]+)\/generate$/);
+  if (method === 'POST' && generateMatch) {
+    const sessionUuid = generateMatch[1];
+    let body = {};
+    try {
+      body = await readJsonBody(req);
+    } catch (err) {
+      return sessionErrorResponse(res, err);
+    }
+    if (!validObject(body) || typeof body.input !== 'object' || body.input === null ||
+        !Number.isInteger(body.expected_revision) ||
+        (body.request_id !== undefined && (typeof body.request_id !== 'string' || !body.request_id.length))) {
+      return jsonResponse(res, 400, {
+        error: 'validation_failed', message: 'The generate request is invalid.',
+        demo: DEMO_FLAG, dev: DEV_FLAG,
+      });
+    }
+    let runtime;
+    try {
+      const recovered = recoverSession({ repository: storyRepo, session_uuid: sessionUuid });
+      runtime = createAgentRuntime({
+        repository: storyRepo,
+        session_uuid: sessionUuid,
+        provider: buildDemoMockAgentProvider(body.input),
+        system_prompt: { kind: 'system', text: 'demo runtime prompt' },
+        tool_definitions: [
+          { type: 'function', function: { name: 'ask_player_choice', parameters: { type: 'object' } } },
+          { type: 'function', function: { name: 'finish_story', parameters: { type: 'object' } } },
+        ],
+        expected_story_version_uuid: recovered.story_version_uuid,
+        expected_story_version_checksum: recovered.story_version_checksum,
+        expected_model: recovered.model,
+        expected_generation_profile: recovered.generation_profile,
+      });
+    } catch (err) {
+      if (err instanceof AgentRuntimeError) {
+        return jsonResponse(res, 400, {
+          error: err.code, message: err.message, demo: DEMO_FLAG, dev: DEV_FLAG,
+        });
+      }
+      return sessionErrorResponse(res, err);
+    }
+    try {
+      const result = await runTurn(runtime, {
+        ...(body.request_id ? { request_id: body.request_id } : {}),
+        input: body.input,
+        expected_revision: body.expected_revision,
+      });
+      return jsonResponse(res, 200, {
+        demo: DEMO_FLAG, dev: DEV_FLAG,
+        ...result,
+        session_uuid: sessionUuid,
+        pending_id: result.pending_id,
+      });
+    } catch (err) {
+      if (err instanceof AgentRuntimeError) {
+        return jsonResponse(res, 400, {
+          error: err.code, message: err.message, demo: DEMO_FLAG, dev: DEV_FLAG,
+        });
+      }
+      return sessionErrorResponse(res, err);
+    }
+  }
+
+  // POST /api/dev/sessions/:uuid/narrative-events — commit exactly ONE
+  // displayed narrative event from the active pending batch. The event
+  // is appended to canonical history; revision advances by 1. The optional
+  // final tool_call (if present) is exposed on the last commit result but
+  // never becomes a canonical event.
+  const narrativeMatch = pathname.match(/^\/api\/dev\/sessions\/([0-9a-fA-F-]+)\/narrative-events$/);
+  if (method === 'POST' && narrativeMatch) {
+    const sessionUuid = narrativeMatch[1];
+    let body = {};
+    try {
+      body = await readJsonBody(req);
+    } catch (err) {
+      return sessionErrorResponse(res, err);
+    }
+    if (!validObject(body) || typeof body.pending_id !== 'string' || !body.pending_id ||
+        !Number.isInteger(body.sequence) ||
+        !Number.isInteger(body.expected_revision) ||
+        (body.client_request_id !== undefined && (typeof body.client_request_id !== 'string' || !body.client_request_id.length))) {
+      return jsonResponse(res, 400, {
+        error: 'validation_failed', message: 'The narrative-event commit request is invalid.',
+        demo: DEMO_FLAG, dev: DEV_FLAG,
+      });
+    }
+    try {
+      const result = commitNarrativeEvent({
+        repository: storyRepo,
+        session_uuid: sessionUuid,
+        pending_id: body.pending_id,
+        sequence: body.sequence,
+        expected_revision: body.expected_revision,
+        ...(body.client_request_id ? { client_request_id: body.client_request_id } : {}),
+      });
+      return jsonResponse(res, 200, { demo: DEMO_FLAG, dev: DEV_FLAG, ...result });
+    } catch (err) {
+      return sessionErrorResponse(res, err);
+    }
+  }
+
+  // GET /api/dev/sessions/:uuid/recover — read-only canonical recovery.
+  // Returns canonical history + revision + cursor + active pending
+  // snapshot. Never calls the provider, never replays, never mutates.
+  const recoverMatch = pathname.match(/^\/api\/dev\/sessions\/([0-9a-fA-F-]+)\/recover$/);
+  if (method === 'GET' && recoverMatch) {
+    try {
+      const recovered = recoverSession({ repository: storyRepo, session_uuid: recoverMatch[1] });
+      return jsonResponse(res, 200, {
+        demo: DEMO_FLAG, dev: DEV_FLAG,
+        ...recovered,
+        pinned: sessionPinnedMetadata.get(recoverMatch[1]) || null,
       });
     } catch (err) {
       return sessionErrorResponse(res, err);

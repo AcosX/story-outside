@@ -12,6 +12,7 @@ const ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 const MIGRATION_0001_PATH = join(ROOT, "db/migrations/0001_initial_story_outside.sql");
 const MIGRATION_0002_PATH = join(ROOT, "db/migrations/0002_opening_cache_generation_profile.sql");
 const MIGRATION_0003_PATH = join(ROOT, "db/migrations/0003_session_playback.sql");
+const MIGRATION_0004_PATH = join(ROOT, "db/migrations/0004_pending_batch_lifecycle.sql");
 const SCHEMA_PATH = join(ROOT, "db/schema.sql");
 const DOCS_PATH = join(ROOT, "docs/data-model.md");
 
@@ -107,6 +108,21 @@ const REQUIRED_COLUMNS = {
     "request_payload JSON NOT NULL",
     "response_payload JSON NULL",
     "promoted_event_id CHAR(36) NULL",
+    "expected_revision BIGINT UNSIGNED NOT NULL DEFAULT 0",
+    "request_fingerprint CHAR(64) NULL",
+    "committed_count INT UNSIGNED NOT NULL DEFAULT 0",
+    "item_count INT UNSIGNED NOT NULL DEFAULT 0",
+    "source VARCHAR(64) NOT NULL DEFAULT 'runtime'",
+    "superseded_by CHAR(36) NULL",
+  ],
+  pending_batch_items: [
+    "batch_id BIGINT UNSIGNED NOT NULL",
+    "item_uuid CHAR(36) NOT NULL",
+    "item_seq INT UNSIGNED NOT NULL",
+    "item_type ENUM('narrative_beat', 'tool_call') NOT NULL",
+    "status ENUM('pending', 'committed', 'discarded') NOT NULL DEFAULT 'pending'",
+    "payload JSON NOT NULL",
+    "promoted_event_id CHAR(36) NULL",
   ],
   session_checkpoints: [
     "session_id BIGINT UNSIGNED NOT NULL",
@@ -139,6 +155,9 @@ const REQUIRED_KEYS = [
   "uq_session_events_source_sequence",
   "uq_pending_batches_batch_uuid",
   "uq_pending_batches_request_uuid",
+  "uq_pending_batches_fingerprint",
+  "uq_pending_batch_items_uuid",
+  "uq_pending_batch_items_batch_seq",
   "uq_session_checkpoints_uuid",
   "uq_endings_uuid",
   "uq_endings_version_key",
@@ -160,6 +179,8 @@ const REQUIRED_INDEXES = [
   "idx_session_events_session_created",
   "idx_session_events_source_sequence",
   "idx_pending_batches_queue",
+  "idx_pending_batches_fingerprint",
+  "idx_pending_batch_items_batch_status",
   "idx_session_checkpoints_dirty",
   "idx_endings_story_version_public",
 ];
@@ -226,6 +247,28 @@ const REQUIRED_0003_FRAGMENTS = [
   "0003_session_playback",
 ];
 
+const REQUIRED_0004_FRAGMENTS = [
+  "ALTER TABLE pending_batches",
+  "ADD COLUMN IF NOT EXISTS expected_revision BIGINT UNSIGNED NULL",
+  "ADD COLUMN IF NOT EXISTS request_fingerprint CHAR(64) NULL",
+  "ADD COLUMN IF NOT EXISTS committed_count INT UNSIGNED NULL",
+  "ADD COLUMN IF NOT EXISTS item_count INT UNSIGNED NULL",
+  "ADD COLUMN IF NOT EXISTS superseded_by CHAR(36) NULL",
+  "ADD COLUMN IF NOT EXISTS source VARCHAR(64) NULL",
+  "ADD UNIQUE INDEX IF NOT EXISTS uq_pending_batches_fingerprint",
+  "MODIFY expected_revision BIGINT UNSIGNED NOT NULL",
+  "CREATE TABLE IF NOT EXISTS pending_batch_items",
+  "UNIQUE KEY uq_pending_batch_items_uuid",
+  "UNIQUE KEY uq_pending_batch_items_batch_seq (batch_id, item_seq)",
+  "fk_pending_batch_items_batch",
+  "fk_pending_batch_items_promoted_event",
+  "chk_pending_batch_items_seq",
+  "chk_pending_batch_items_payload",
+  "chk_pending_batch_items_committed",
+  "chk_pending_batch_items_discarded",
+  "0004_pending_batch_lifecycle",
+];
+
 const JSON_TABLES = [
   "stories",
   "story_versions",
@@ -234,6 +277,7 @@ const JSON_TABLES = [
   "game_sessions",
   "session_events",
   "pending_batches",
+  "pending_batch_items",
   "session_checkpoints",
 ];
 
@@ -292,6 +336,7 @@ function triggerBlock(sql, triggerName) {
 let migration0001 = "";
 let migration0002 = "";
 let migration0003 = "";
+let migration0004 = "";
 let schema = "";
 let docs = "";
 
@@ -299,6 +344,7 @@ try {
   migration0001 = await readFile(MIGRATION_0001_PATH, "utf8");
   migration0002 = await readFile(MIGRATION_0002_PATH, "utf8");
   migration0003 = await readFile(MIGRATION_0003_PATH, "utf8");
+  migration0004 = await readFile(MIGRATION_0004_PATH, "utf8");
   schema = await readFile(SCHEMA_PATH, "utf8");
   docs = await readFile(DOCS_PATH, "utf8");
 } catch (err) {
@@ -311,6 +357,7 @@ try {
 check("0001 migration file is non-empty", migration0001.trim().length > 0);
 check("0002 migration file is non-empty", migration0002.trim().length > 0);
 check("0003 migration file is non-empty", migration0003.trim().length > 0);
+check("0004 migration file is non-empty", migration0004.trim().length > 0);
 check("schema file is non-empty", schema.trim().length > 0);
 check("data-model doc is non-empty", docs.trim().length > 0);
 
@@ -357,23 +404,50 @@ check(
   migration0003.includes("INSERT IGNORE INTO schema_migrations")
 );
 
+// 0004 adds the pending batch lifecycle columns and pending_batch_items
+// table; both must round-trip through the canonical schema.sql entrypoint.
+check(
+  "0004 contains pending batch lifecycle fragments",
+  REQUIRED_0004_FRAGMENTS.every((fragment) => migration0004.includes(fragment))
+);
+check(
+  "0004 backfills nullable columns before NOT NULL conversion",
+  migration0004.indexOf("UPDATE pending_batches") < migration0004.indexOf("MODIFY expected_revision BIGINT UNSIGNED NOT NULL")
+);
+check(
+  "0004 records its migration ledger entry",
+  migration0004.includes("INSERT IGNORE INTO schema_migrations (migration_name, applied_by)")
+);
+
 // Engine and charset invariants.
 for (const [label, sql] of [
   ["0001", migration0001],
   ["0002", migration0002],
   ["0003", migration0003],
+  ["0004", migration0004],
   ["schema", schema],
 ]) {
   const tableCount = (sql.match(/CREATE TABLE IF NOT EXISTS\s+/g) || []).length;
   const engineCount = (sql.match(/ENGINE=InnoDB/g) || []).length;
-  check(`${label} uses InnoDB for every table`, tableCount === engineCount, `${tableCount} tables / ${engineCount} engines`);
+  // 0004 adds one new table (pending_batch_items) and alters pending_batches.
+  // It uses CREATE TABLE IF NOT EXISTS exactly once.
+  if (label === "0004") {
+    check(`${label} uses InnoDB for every table`, engineCount >= tableCount && engineCount > 0, `${tableCount} tables / ${engineCount} engines`);
+  } else {
+    check(`${label} uses InnoDB for every table`, tableCount === engineCount, `${tableCount} tables / ${engineCount} engines`);
+  }
   check(`${label} pins UTC timezone`, sql.includes("SET time_zone = '+00:00'"));
-  if (!["0002", "0003"].includes(label)) {
+  if (!["0002", "0003", "0004"].includes(label)) {
     check(`${label} uses utf8mb4`, tableCount >= 1 && sql.includes("utf8mb4"));
     check(`${label} uses DATETIME(6)`, sql.includes("DATETIME(6)"));
   }
-  if (!["0002", "0003"].includes(label)) {
+  if (label === "0004") {
+    // 0004 only creates pending_batch_items; other tables are inherited
+    // from 0001/0002/0003.
+    check(`${label} JSON_VALID guard for pending_batch_items`, sql.includes("JSON_VALID(payload)"));
+  } else if (!["0002", "0003"].includes(label)) {
     for (const table of JSON_TABLES) {
+      if (table === "pending_batch_items") continue; // added in 0004
       check(
         `${label} JSON_VALID guard for ${table}`,
         tableBlock(sql, table).includes("JSON_VALID")
@@ -410,6 +484,12 @@ for (const constraint of [
   "chk_game_sessions_revision",
   "chk_session_events_source",
   "chk_session_events_source_sequence",
+  "chk_pending_batches_source",
+  "chk_pending_batches_counts",
+  "chk_pending_batch_items_seq",
+  "chk_pending_batch_items_payload",
+  "chk_pending_batch_items_committed",
+  "chk_pending_batch_items_discarded",
 ]) {
   check(`schema constraint ${constraint}`, schema.includes(constraint));
 }
@@ -449,6 +529,7 @@ for (const [label, sql] of [
   ["0001", migration0001],
   ["0002", migration0002],
   ["0003", migration0003],
+  ["0004", migration0004],
   ["schema", schema],
 ]) {
   for (const pattern of POSTGRES_ONLY_PATTERNS) {
@@ -461,6 +542,7 @@ for (const [label, sql] of [
   ["0001", migration0001],
   ["0002", migration0002],
   ["0003", migration0003],
+  ["0004", migration0004],
   ["schema", schema],
 ]) {
   for (const pattern of SECRET_PATTERNS) {
@@ -475,6 +557,8 @@ for (const table of REQUIRED_TABLES) {
 for (const fragment of [
   "db/migrations/0001_initial_story_outside.sql",
   "db/migrations/0002_opening_cache_generation_profile.sql",
+  "db/migrations/0003_session_playback.sql",
+  "db/migrations/0004_pending_batch_lifecycle.sql",
   "db/schema.sql",
   "node tests/schema-contract.test.mjs",
   "append-only",
@@ -486,6 +570,8 @@ for (const fragment of [
   "player_input",
   "imported",
   "source_sequence",
+  "narrative_beat",
+  "request_fingerprint",
 ]) {
   check(`docs covers ${fragment}`, docs.includes(fragment));
 }

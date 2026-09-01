@@ -108,8 +108,8 @@ await test('commitDisplayedEvent appends exactly one canonical event per call', 
   });
   assert.equal(committed0.event.event_seq, 1);
   assert.equal(committed0.event.prev_event_seq, null);
-  assert.equal(committed0.event.event_type, 'narrative');
-  assert.equal(committed0.event.origin, 'runtime');
+  assert.equal(committed0.event.event_type, 'narrative_beat');
+  assert.equal(committed0.event.origin, 'llm');
   assert.equal(committed0.event.source, 'runtime');
   assert.equal(committed0.event.source_sequence, 0);
   assert.equal(committed0.event.payload.text, 'narrative line 1');
@@ -135,14 +135,16 @@ await test('commitDisplayedEvent appends exactly one canonical event per call', 
   const recovered = recoverPendingSession({ repository, session_uuid });
   assert.equal(recovered.history.length, 3);
   assert.equal(recovered.revision, 3);
-  assert.equal(recovered.cursor, 3);
+  // cursor advances only with opening events; narrative events only advance
+  // revision. The session had no opening commits, so cursor stays at 0.
+  assert.equal(recovered.cursor, 0);
 });
 
 await test('un-displayed events never reach canonical history', async () => {
   const { repository, session_uuid } = await buildSession();
-  // Stage a 5-event batch.
+  // Stage a 4-event batch (the maximum allowed by ClickUp 08).
   const staged = stageNarrativeBatch({
-    repository, session_uuid, events: makeBatch(5), source: 'runtime', expected_revision: 0,
+    repository, session_uuid, events: makeBatch(4), source: 'runtime', expected_revision: 0,
   });
   // The player sees only 2 of them.
   commitDisplayedEvent({
@@ -151,18 +153,18 @@ await test('un-displayed events never reach canonical history', async () => {
   commitDisplayedEvent({
     repository, session_uuid, pending_id: staged.pending_id, sequence: 1, expected_revision: 1,
   });
-  // The remaining 3 are un-displayed and never reach canonical history.
+  // The remaining 2 are un-displayed and never reach canonical history.
   const recovered = recoverPendingSession({ repository, session_uuid });
   assert.equal(recovered.history.length, 2);
   assert.equal(recovered.revision, 2);
-  // The lifecycle view carries its own canonical history; the legacy
-  // sessionService view stays untouched (no events were committed through
-  // that surface in this test).
-  assert.equal(listSessionEvents({ repository, session_uuid }).length, 0);
-  assert.equal(getSession({ repository, session_uuid }).revision, 0);
+  // sessionService owns the same history now (the lifecycle facade is a
+  // thin layer over it). listSessionEvents MUST agree with the lifecycle
+  // view: there is exactly one canonical history.
+  assert.equal(listSessionEvents({ repository, session_uuid }).length, 2);
+  assert.equal(getSession({ repository, session_uuid }).revision, 2);
   // Pending snapshot still shows the full staged batch, only 2 committed.
   assert.equal(recovered.pending.committed_count, 2);
-  assert.equal(recovered.pending.events.length, 5);
+  assert.equal(recovered.pending.events.length, 4);
 });
 
 await test('mid-batch interrupt keeps only committed canonical history and drops pending tail', async () => {
@@ -191,8 +193,8 @@ await test('mid-batch interrupt keeps only committed canonical history and drops
   const recovered = recoverPendingSession({ repository, session_uuid });
   assert.equal(recovered.pending, null);
   assert.equal(recovered.history.length, 3);
-  assert.equal(recovered.history[0].event_type, 'narrative');
-  assert.equal(recovered.history[1].event_type, 'narrative');
+  assert.equal(recovered.history[0].event_type, 'narrative_beat');
+  assert.equal(recovered.history[1].event_type, 'narrative_beat');
   assert.equal(recovered.history[2].event_type, 'player_input');
   assert.equal(recovered.revision, 3);
   assert.equal(recovered.state, 'realtime');
@@ -230,7 +232,7 @@ await test('commitDisplayedEvent is idempotent on client_request_id', async () =
   });
   assert.deepEqual(replay, first);
   // No duplicate append.
-  assert.equal(listSessionEvents({ repository, session_uuid }).length, 0);
+  assert.equal(listSessionEvents({ repository, session_uuid }).length, 1);
   assert.equal(recoverPendingSession({ repository, session_uuid }).history.length, 1);
 });
 
@@ -355,17 +357,18 @@ await test('recover does not duplicate history and never calls provider', async 
   const r1 = recoverPendingSession({ repository, session_uuid });
   assert.equal(r1.history.length, 2);
   assert.equal(r1.revision, 2);
-  assert.equal(r1.cursor, 2);
+  // narrative commits advance revision but not cursor.
+  assert.equal(r1.cursor, 0);
   assert.equal(r1.pending.pending_id, staged.pending_id);
   assert.equal(r1.pending.committed_count, 2);
   assert.equal(r1.pending.events.length, 4);
   // Second recover must be a clean snapshot, not a replay.
   const r2 = recoverPendingSession({ repository, session_uuid });
   assert.deepEqual(r2, r1);
-  // pendingLifecycle owns its own canonical history; the sessionService
-  // view stays untouched by these commits.
-  assert.equal(listSessionEvents({ repository, session_uuid }).length, 0);
-  assert.equal(recoverSession({ repository, session_uuid }).history.length, 0);
+  // The lifecycle facade and sessionService share the canonical history
+  // (one history per session). Both views MUST agree.
+  assert.equal(listSessionEvents({ repository, session_uuid }).length, 2);
+  assert.equal(recoverSession({ repository, session_uuid }).history.length, 2);
 });
 
 await test('discardPendingTail wipes speculative state without appending', async () => {
@@ -384,10 +387,10 @@ await test('discardPendingTail wipes speculative state without appending', async
   assert.equal(recovered.history.length, 1);
 });
 
-await test('sessionService commitOpeningEvent + pending commit coexist on the same session', async () => {
-  // The two surfaces share the session but write to disjoint history
-  // arrays. commitOpeningEvent writes through sessionService; pending
-  // writes through pendingLifecycle. A client may freely mix them.
+await test('sessionService commitOpeningEvent + pending commit share the same canonical history', async () => {
+  // ClickUp 08 contract: there is exactly ONE canonical history per
+  // session. Opening commits (cache-backed) and narrative commits
+  // (runtime-backed) both append to the same array; revision is shared.
   const { repository, session_uuid, cache } = await buildSession();
   const events = cache.content_payload.events;
   // First commit one opening cache event through sessionService.
@@ -396,21 +399,26 @@ await test('sessionService commitOpeningEvent + pending commit coexist on the sa
     event: { ...events[0], displayed: true }, expected_revision: 0,
   });
   assert.equal(getSession({ repository, session_uuid }).revision, 1);
-  // Then stage + commit a runtime batch through pendingLifecycle.
-  // pendingLifecycle's revision starts from its own history.length (0).
+  // Then stage + commit a runtime batch through pendingLifecycle. Both
+  // surfaces observe the SAME revision (1) and append to the SAME history.
   const staged = stageNarrativeBatch({
-    repository, session_uuid, events: makeBatch(2), source: 'runtime', expected_revision: 0,
+    repository, session_uuid, events: makeBatch(2), source: 'runtime', expected_revision: 1,
   });
+  // Stage does NOT advance revision, so the commit uses revision=1.
   commitDisplayedEvent({
-    repository, session_uuid, pending_id: staged.pending_id, sequence: 0, expected_revision: 0,
+    repository, session_uuid, pending_id: staged.pending_id, sequence: 0, expected_revision: 1,
   });
-  assert.equal(recoverPendingSession({ repository, session_uuid }).history.length, 1);
-  assert.equal(recoverPendingSession({ repository, session_uuid }).revision, 1);
-  // sessionService's history is unchanged by the pending commit.
-  assert.equal(listSessionEvents({ repository, session_uuid }).length, 1);
+  assert.equal(recoverPendingSession({ repository, session_uuid }).history.length, 2);
+  assert.equal(recoverPendingSession({ repository, session_uuid }).revision, 2);
+  // sessionService's history IS the canonical history (no duplication).
+  assert.equal(listSessionEvents({ repository, session_uuid }).length, 2);
 });
 
-await test('legacy interrupt path leaves the lifecycle coherent after dropPendingAfterLegacyInterrupt', async () => {
+await test('legacy interrupt path leaves the lifecycle coherent by itself', async () => {
+  // ClickUp 08 contract: there is ONE canonical history. The legacy
+  // sessionService interrupt path already drops the speculative pending
+  // tail atomically with appending the player_input event, so no extra
+  // "dropPendingAfterLegacyInterrupt" hook is needed.
   const { repository, session_uuid } = await buildSession();
   const staged = stageNarrativeBatch({
     repository, session_uuid, events: makeBatch(3), source: 'runtime', expected_revision: 0,
@@ -418,16 +426,18 @@ await test('legacy interrupt path leaves the lifecycle coherent after dropPendin
   commitDisplayedEvent({
     repository, session_uuid, pending_id: staged.pending_id, sequence: 0, expected_revision: 0,
   });
-  // sessionService revision is still 0 (pendingLifecycle owns a separate
-  // history), so the legacy interrupt uses expected_revision: 0.
+  // sessionService revision is now 1 (opening of pending commit advances
+  // revision). The legacy interrupt uses expected_revision: 1.
   const interrupted = interruptWithPlayerInput({
-    repository, session_uuid, text: '走老路径打断', expected_revision: 0,
+    repository, session_uuid, text: '走老路径打断', expected_revision: 1,
   });
   assert.equal(interrupted.state, 'realtime');
-  // The pending lifecycle still holds the orphaned batch; the route layer
-  // should call dropPendingAfterLegacyInterrupt to keep them coherent.
-  const { dropPendingAfterLegacyInterrupt } = await import('../src/stories/pendingLifecycle.mjs');
-  const dropped = dropPendingAfterLegacyInterrupt({ repository, session_uuid });
-  assert.equal(dropped.dropped_pending_id, staged.pending_id);
+  // The pending tail is dropped as part of the interrupt — the lifecycle
+  // is automatically coherent.
   assert.equal(recoverPendingSession({ repository, session_uuid }).pending, null);
+  // History shows: 1 narrative commit + 1 player_input.
+  const recovered = recoverPendingSession({ repository, session_uuid });
+  assert.equal(recovered.history.length, 2);
+  assert.equal(recovered.history[0].event_type, 'narrative_beat');
+  assert.equal(recovered.history[1].event_type, 'player_input');
 });
