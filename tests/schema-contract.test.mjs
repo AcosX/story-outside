@@ -1,6 +1,7 @@
 // tests/schema-contract.test.mjs — dependency-free schema/SQL contract checks.
 // Validates db/migrations/0001_initial_story_outside.sql,
-// db/migrations/0002_opening_cache_generation_profile.sql, db/schema.sql, and
+// db/migrations/0002_opening_cache_generation_profile.sql,
+// db/migrations/0003_session_playback.sql, db/schema.sql, and
 // docs/data-model.md without needing database credentials or a running server.
 
 import { readFile } from "node:fs/promises";
@@ -10,6 +11,7 @@ import { fileURLToPath } from "node:url";
 const ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 const MIGRATION_0001_PATH = join(ROOT, "db/migrations/0001_initial_story_outside.sql");
 const MIGRATION_0002_PATH = join(ROOT, "db/migrations/0002_opening_cache_generation_profile.sql");
+const MIGRATION_0003_PATH = join(ROOT, "db/migrations/0003_session_playback.sql");
 const SCHEMA_PATH = join(ROOT, "db/schema.sql");
 const DOCS_PATH = join(ROOT, "docs/data-model.md");
 
@@ -70,18 +72,28 @@ const REQUIRED_COLUMNS = {
     "story_version_id BIGINT UNSIGNED NOT NULL",
     "user_ref VARCHAR(128) NOT NULL",
     "role_id VARCHAR(64) NOT NULL",
+    "model VARCHAR(128) NOT NULL",
+    "prompt TEXT NOT NULL",
+    "generation_profile JSON NOT NULL",
     "status ENUM('active', 'paused', 'ended', 'abandoned') NOT NULL DEFAULT 'active'",
     "opening_cache_id BIGINT UNSIGNED NULL",
     "first_choice_at DATETIME(6) NULL",
+    "opening_cursor BIGINT UNSIGNED NOT NULL DEFAULT 0",
+    "opening_state ENUM('opening', 'awaiting_first_choice', 'realtime') NOT NULL DEFAULT 'opening'",
+    "session_revision BIGINT UNSIGNED NOT NULL DEFAULT 0",
     "ending_id BIGINT UNSIGNED NULL",
     "ended_at DATETIME(6) NULL",
   ],
   session_events: [
     "event_id CHAR(36) NOT NULL",
+    "event_type ENUM(",
+    "    'player_input',",
+    "origin ENUM('user', 'system', 'llm', 'imported') NOT NULL",
     "session_id BIGINT UNSIGNED NOT NULL",
     "event_seq BIGINT UNSIGNED NOT NULL",
     "prev_event_seq BIGINT UNSIGNED NULL",
-    "origin ENUM('user', 'system', 'llm', 'imported') NOT NULL",
+    "source VARCHAR(64) NOT NULL",
+    "source_sequence BIGINT UNSIGNED NOT NULL",
     "payload JSON NOT NULL",
     "client_request_id CHAR(36) NULL",
     "hash CHAR(64) NOT NULL",
@@ -124,6 +136,7 @@ const REQUIRED_KEYS = [
   "uq_session_events_event_id",
   "uq_session_events_seq",
   "uq_session_events_client_request",
+  "uq_session_events_source_sequence",
   "uq_pending_batches_batch_uuid",
   "uq_pending_batches_request_uuid",
   "uq_session_checkpoints_uuid",
@@ -138,9 +151,14 @@ const LEGACY_0001_KEYS = [
 
 const REQUIRED_INDEXES = [
   "idx_story_versions_story_status",
+  "idx_story_versions_story_id_id",
   "idx_story_opening_caches_valid",
+  "idx_story_opening_caches_story_version_id",
   "idx_game_sessions_user_status",
+  "idx_game_sessions_playback",
+  "idx_game_sessions_story_version_cache",
   "idx_session_events_session_created",
+  "idx_session_events_source_sequence",
   "idx_pending_batches_queue",
   "idx_session_checkpoints_dirty",
   "idx_endings_story_version_public",
@@ -149,7 +167,9 @@ const REQUIRED_INDEXES = [
 const REQUIRED_FKS = [
   "REFERENCES stories(id)",
   "REFERENCES story_versions(id)",
+  "REFERENCES story_versions(story_id, id)",
   "REFERENCES story_opening_caches(id)",
+  "REFERENCES story_opening_caches(story_id, story_version_id, id)",
   "REFERENCES game_sessions(id)",
   "REFERENCES endings(id)",
   "REFERENCES session_events(event_id)",
@@ -177,6 +197,33 @@ const REQUIRED_0002_FRAGMENTS = [
   "DROP INDEX IF EXISTS uq_story_opening_caches_scope",
   "DROP TRIGGER IF EXISTS trg_session_events_first_choice",
   "0002_opening_cache_generation_profile",
+];
+
+const REQUIRED_0003_FRAGMENTS = [
+  "ALTER TABLE game_sessions",
+  "ADD COLUMN IF NOT EXISTS model VARCHAR(128) NULL",
+  "ADD COLUMN IF NOT EXISTS prompt TEXT NULL",
+  "ADD COLUMN IF NOT EXISTS generation_profile JSON NULL",
+  "ADD COLUMN IF NOT EXISTS opening_cursor BIGINT UNSIGNED NULL DEFAULT 0",
+  "ADD COLUMN IF NOT EXISTS opening_state ENUM('opening', 'awaiting_first_choice', 'realtime') NULL DEFAULT 'opening'",
+  "ADD COLUMN IF NOT EXISTS session_revision BIGINT UNSIGNED NULL DEFAULT 0",
+  "ADD INDEX IF NOT EXISTS idx_story_versions_story_id_id",
+  "ADD INDEX IF NOT EXISTS idx_story_opening_caches_story_version_id",
+  "ADD UNIQUE INDEX IF NOT EXISTS uq_session_events_source_sequence",
+  "ADD COLUMN IF NOT EXISTS source VARCHAR(64) NULL",
+  "ADD COLUMN IF NOT EXISTS source_sequence BIGINT UNSIGNED NULL",
+  "DROP TRIGGER IF EXISTS trg_session_events_no_update",
+  "CREATE TRIGGER trg_session_events_no_update",
+  "MODIFY event_type ENUM(",
+  "    'player_input',",
+  "MODIFY origin ENUM('user', 'system', 'llm', 'imported') NOT NULL",
+  "DROP FOREIGN KEY IF EXISTS fk_game_sessions_story_version_pair",
+  "DROP FOREIGN KEY IF EXISTS fk_game_sessions_opening_cache_scope",
+  "ADD CONSTRAINT fk_game_sessions_story_version_pair",
+  "ADD CONSTRAINT fk_game_sessions_opening_cache_scope",
+  "ADD CONSTRAINT fk_story_opening_caches_story_version_pair",
+  "ADD CONSTRAINT chk_session_events_source",
+  "0003_session_playback",
 ];
 
 const JSON_TABLES = [
@@ -211,6 +258,10 @@ const SECRET_PATTERNS = [
 
 let failures = 0;
 
+function columnLabel(fragment) {
+  return fragment.trim().split(/\s+/)[0] || "fragment";
+}
+
 function check(name, ok, detail = "") {
   if (ok) {
     console.log(`  ok   ${name}`);
@@ -240,12 +291,14 @@ function triggerBlock(sql, triggerName) {
 
 let migration0001 = "";
 let migration0002 = "";
+let migration0003 = "";
 let schema = "";
 let docs = "";
 
 try {
   migration0001 = await readFile(MIGRATION_0001_PATH, "utf8");
   migration0002 = await readFile(MIGRATION_0002_PATH, "utf8");
+  migration0003 = await readFile(MIGRATION_0003_PATH, "utf8");
   schema = await readFile(SCHEMA_PATH, "utf8");
   docs = await readFile(DOCS_PATH, "utf8");
 } catch (err) {
@@ -257,6 +310,7 @@ try {
 // Files exist and are non-empty.
 check("0001 migration file is non-empty", migration0001.trim().length > 0);
 check("0002 migration file is non-empty", migration0002.trim().length > 0);
+check("0003 migration file is non-empty", migration0003.trim().length > 0);
 check("schema file is non-empty", schema.trim().length > 0);
 check("data-model doc is non-empty", docs.trim().length > 0);
 
@@ -266,7 +320,7 @@ for (const table of REQUIRED_TABLES) {
   check(`schema defines table ${table}`, schemaBlock.length > 0);
   for (const column of REQUIRED_COLUMNS[table] || []) {
     check(
-      `schema ${table}.${column.split(" ")[0]} column`,
+      `schema ${table}.${columnLabel(column)} contract`,
       schemaBlock.includes(column)
     );
   }
@@ -287,21 +341,38 @@ for (const table of REQUIRED_TABLES) {
   );
 }
 
+// 0003 is the session playback/canonical provenance upgrade and is safe to
+// repeat after 0001 then 0002.
+check(
+  "0003 contains session playback and provenance fragments",
+  REQUIRED_0003_FRAGMENTS.every((fragment) => migration0003.includes(fragment))
+);
+check(
+  "0003 backfills nullable columns before NOT NULL conversion",
+  migration0003.indexOf("UPDATE game_sessions") < migration0003.indexOf("MODIFY model VARCHAR(128) NOT NULL") &&
+    migration0003.indexOf("UPDATE session_events") < migration0003.indexOf("MODIFY source VARCHAR(64) NOT NULL")
+);
+check(
+  "0003 records its migration ledger entry",
+  migration0003.includes("INSERT IGNORE INTO schema_migrations")
+);
+
 // Engine and charset invariants.
 for (const [label, sql] of [
   ["0001", migration0001],
   ["0002", migration0002],
+  ["0003", migration0003],
   ["schema", schema],
 ]) {
   const tableCount = (sql.match(/CREATE TABLE IF NOT EXISTS\s+/g) || []).length;
   const engineCount = (sql.match(/ENGINE=InnoDB/g) || []).length;
   check(`${label} uses InnoDB for every table`, tableCount === engineCount, `${tableCount} tables / ${engineCount} engines`);
   check(`${label} pins UTC timezone`, sql.includes("SET time_zone = '+00:00'"));
-  if (label !== "0002") {
+  if (!["0002", "0003"].includes(label)) {
     check(`${label} uses utf8mb4`, tableCount >= 1 && sql.includes("utf8mb4"));
     check(`${label} uses DATETIME(6)`, sql.includes("DATETIME(6)"));
   }
-  if (label !== "0002") {
+  if (!["0002", "0003"].includes(label)) {
     for (const table of JSON_TABLES) {
       check(
         `${label} JSON_VALID guard for ${table}`,
@@ -324,6 +395,23 @@ for (const key of LEGACY_0001_KEYS) {
 }
 for (const index of REQUIRED_INDEXES) {
   check(`schema index ${index}`, schema.includes(index));
+}
+check(
+  "schema composite FK support indexes are not redundant UNIQUE keys",
+  schema.includes("KEY idx_story_versions_story_id_id (story_id, id)") &&
+    schema.includes("KEY idx_story_opening_caches_story_version_id (story_id, story_version_id, id)") &&
+    !schema.includes("UNIQUE KEY uq_story_versions_story_id_id") &&
+    !schema.includes("UNIQUE KEY uq_story_opening_caches_story_version_id")
+);
+for (const constraint of [
+  "chk_game_sessions_model",
+  "chk_game_sessions_generation_profile",
+  "chk_game_sessions_opening_cursor",
+  "chk_game_sessions_revision",
+  "chk_session_events_source",
+  "chk_session_events_source_sequence",
+]) {
+  check(`schema constraint ${constraint}`, schema.includes(constraint));
 }
 for (const fk of REQUIRED_FKS) {
   check(`schema FK ${fk}`, schema.includes(fk));
@@ -360,6 +448,7 @@ for (const trigger of REQUIRED_APPEND_ONLY_TRIGGERS) {
 for (const [label, sql] of [
   ["0001", migration0001],
   ["0002", migration0002],
+  ["0003", migration0003],
   ["schema", schema],
 ]) {
   for (const pattern of POSTGRES_ONLY_PATTERNS) {
@@ -371,6 +460,7 @@ for (const [label, sql] of [
 for (const [label, sql] of [
   ["0001", migration0001],
   ["0002", migration0002],
+  ["0003", migration0003],
   ["schema", schema],
 ]) {
   for (const pattern of SECRET_PATTERNS) {
@@ -393,6 +483,9 @@ for (const fragment of [
   "generation_profile",
   "session-local",
   "first_choice_at",
+  "player_input",
+  "imported",
+  "source_sequence",
 ]) {
   check(`docs covers ${fragment}`, docs.includes(fragment));
 }

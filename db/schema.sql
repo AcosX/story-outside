@@ -2,7 +2,8 @@
 --
 -- This file is the deployment entrypoint. It creates the database and then
 -- applies the same final DDL as db/migrations/0001_initial_story_outside.sql
--- followed by db/migrations/0002_opening_cache_generation_profile.sql.
+-- followed by db/migrations/0002_opening_cache_generation_profile.sql and
+-- db/migrations/0003_session_playback.sql.
 -- The contract test tests/schema-contract.test.mjs keeps this body in sync
 -- with the migration set.
 
@@ -69,6 +70,7 @@ CREATE TABLE IF NOT EXISTS story_versions (
   PRIMARY KEY (id),
   UNIQUE KEY uq_story_versions_uuid (version_uuid),
   UNIQUE KEY uq_story_versions_story_no (story_id, version_no),
+  KEY idx_story_versions_story_id_id (story_id, id),
   UNIQUE KEY uq_story_versions_checksum (checksum),
   KEY idx_story_versions_story_status (story_id, status),
   CONSTRAINT fk_story_versions_story FOREIGN KEY (story_id) REFERENCES stories(id)
@@ -133,11 +135,14 @@ CREATE TABLE IF NOT EXISTS story_opening_caches (
   PRIMARY KEY (id),
   UNIQUE KEY uq_story_opening_caches_uuid (cache_uuid),
   UNIQUE KEY uq_story_opening_caches_scope_generation (story_id, story_version_id, opening_key, generation_hash),
+  KEY idx_story_opening_caches_story_version_id (story_id, story_version_id, id),
   KEY idx_story_opening_caches_valid (status, expires_at, last_used_at),
   CONSTRAINT fk_story_opening_caches_story FOREIGN KEY (story_id) REFERENCES stories(id)
     ON DELETE RESTRICT ON UPDATE RESTRICT,
   CONSTRAINT fk_story_opening_caches_version FOREIGN KEY (story_version_id) REFERENCES story_versions(id)
     ON DELETE RESTRICT ON UPDATE RESTRICT,
+  CONSTRAINT fk_story_opening_caches_story_version_pair FOREIGN KEY (story_id, story_version_id)
+    REFERENCES story_versions(story_id, id) ON DELETE RESTRICT ON UPDATE RESTRICT,
   CONSTRAINT chk_story_opening_caches_content CHECK (JSON_VALID(content_payload)),
   CONSTRAINT chk_story_opening_caches_generation CHECK (JSON_VALID(generation_profile)),
   CONSTRAINT chk_story_opening_caches_hash CHECK (CHAR_LENGTH(content_hash) = 64),
@@ -156,10 +161,16 @@ CREATE TABLE IF NOT EXISTS game_sessions (
   story_version_id BIGINT UNSIGNED NOT NULL,
   user_ref VARCHAR(128) NOT NULL,
   role_id VARCHAR(64) NOT NULL,
+  model VARCHAR(128) NOT NULL,
+  prompt TEXT NOT NULL,
+  generation_profile JSON NOT NULL,
   role_label VARCHAR(80) NULL,
   status ENUM('active', 'paused', 'ended', 'abandoned') NOT NULL DEFAULT 'active',
   opening_cache_id BIGINT UNSIGNED NULL,
   first_choice_at DATETIME(6) NULL,
+  opening_cursor BIGINT UNSIGNED NOT NULL DEFAULT 0,
+  opening_state ENUM('opening', 'awaiting_first_choice', 'realtime') NOT NULL DEFAULT 'opening',
+  session_revision BIGINT UNSIGNED NOT NULL DEFAULT 0,
   ending_id BIGINT UNSIGNED NULL,
   ended_at DATETIME(6) NULL,
   locale VARCHAR(16) NOT NULL DEFAULT 'zh-CN',
@@ -172,15 +183,25 @@ CREATE TABLE IF NOT EXISTS game_sessions (
   KEY idx_game_sessions_story_version (story_id, story_version_id),
   KEY idx_game_sessions_opening_cache (opening_cache_id),
   KEY idx_game_sessions_ending (ending_id),
+  KEY idx_game_sessions_playback (opening_state, session_revision, updated_at),
+  KEY idx_game_sessions_story_version_cache (story_id, story_version_id, opening_cache_id),
   CONSTRAINT fk_game_sessions_story FOREIGN KEY (story_id) REFERENCES stories(id)
     ON DELETE RESTRICT ON UPDATE RESTRICT,
   CONSTRAINT fk_game_sessions_story_version FOREIGN KEY (story_version_id) REFERENCES story_versions(id)
     ON DELETE RESTRICT ON UPDATE RESTRICT,
+  CONSTRAINT fk_game_sessions_story_version_pair FOREIGN KEY (story_id, story_version_id)
+    REFERENCES story_versions(story_id, id) ON DELETE RESTRICT ON UPDATE RESTRICT,
   CONSTRAINT fk_game_sessions_opening_cache FOREIGN KEY (opening_cache_id) REFERENCES story_opening_caches(id)
     ON DELETE SET NULL ON UPDATE RESTRICT,
+  CONSTRAINT fk_game_sessions_opening_cache_scope FOREIGN KEY (story_id, story_version_id, opening_cache_id)
+    REFERENCES story_opening_caches(story_id, story_version_id, id) ON DELETE RESTRICT ON UPDATE RESTRICT,
   CONSTRAINT fk_game_sessions_ending FOREIGN KEY (ending_id) REFERENCES endings(id)
     ON DELETE SET NULL ON UPDATE RESTRICT,
   CONSTRAINT chk_game_sessions_role CHECK (CHAR_LENGTH(role_id) > 0),
+  CONSTRAINT chk_game_sessions_model CHECK (CHAR_LENGTH(model) > 0),
+  CONSTRAINT chk_game_sessions_generation_profile CHECK (JSON_VALID(generation_profile)),
+  CONSTRAINT chk_game_sessions_opening_cursor CHECK (opening_cursor >= 0),
+  CONSTRAINT chk_game_sessions_revision CHECK (session_revision >= 0),
   CONSTRAINT chk_game_sessions_meta CHECK (meta_payload IS NULL OR JSON_VALID(meta_payload)),
   CONSTRAINT chk_game_sessions_first_choice CHECK (first_choice_at IS NULL OR first_choice_at >= created_at),
   CONSTRAINT chk_game_sessions_ended CHECK (ended_at IS NULL OR ended_at >= created_at),
@@ -204,6 +225,7 @@ CREATE TABLE IF NOT EXISTS session_events (
     'story_opening',
     'ask_player_choice',
     'player_choice',
+    'player_input',
     'narrative_beat',
     'chat_message',
     'ending_reached',
@@ -211,6 +233,8 @@ CREATE TABLE IF NOT EXISTS session_events (
     'system_event'
   ) NOT NULL,
   origin ENUM('user', 'system', 'llm', 'imported') NOT NULL,
+  source VARCHAR(64) NOT NULL,
+  source_sequence BIGINT UNSIGNED NOT NULL,
   payload JSON NOT NULL,
   client_request_id CHAR(36) NULL,
   hash CHAR(64) NOT NULL,
@@ -220,13 +244,17 @@ CREATE TABLE IF NOT EXISTS session_events (
   UNIQUE KEY uq_session_events_event_id (event_id),
   UNIQUE KEY uq_session_events_seq (session_id, event_seq),
   UNIQUE KEY uq_session_events_client_request (client_request_id),
+  UNIQUE KEY uq_session_events_source_sequence (session_id, source, source_sequence),
   KEY idx_session_events_session_created (session_id, created_at),
   KEY idx_session_events_type_occurred (event_type, occurred_at),
+  KEY idx_session_events_source_sequence (source, source_sequence),
   CONSTRAINT fk_session_events_session FOREIGN KEY (session_id) REFERENCES game_sessions(id)
     ON DELETE RESTRICT ON UPDATE RESTRICT,
   CONSTRAINT fk_session_events_prev FOREIGN KEY (session_id, prev_event_seq)
     REFERENCES session_events(session_id, event_seq) ON DELETE RESTRICT ON UPDATE RESTRICT,
   CONSTRAINT chk_session_events_seq CHECK (event_seq > 0),
+  CONSTRAINT chk_session_events_source CHECK (CHAR_LENGTH(source) > 0),
+  CONSTRAINT chk_session_events_source_sequence CHECK (source_sequence >= 0),
   CONSTRAINT chk_session_events_payload CHECK (JSON_VALID(payload)),
   CONSTRAINT chk_session_events_hash CHECK (CHAR_LENGTH(hash) = 64),
   CONSTRAINT chk_session_events_prev CHECK (prev_event_seq IS NULL OR prev_event_seq < event_seq)
@@ -365,4 +393,5 @@ DELIMITER ;
 -- re-runnable.
 INSERT IGNORE INTO schema_migrations (migration_name, applied_by)
 VALUES ('0001_initial_story_outside', NULL),
-       ('0002_opening_cache_generation_profile', NULL);
+       ('0002_opening_cache_generation_profile', NULL),
+       ('0003_session_playback', NULL);
