@@ -474,6 +474,19 @@ const server = http.createServer(async (req, res) => {
           demo: DEMO_FLAG, dev: DEV_FLAG,
         });
       }
+      // A cache-only profile is safe to accept here because every omitted
+      // generation dimension is copied from the already pinned cache. Never
+      // fill these fields from a process-global/default profile: doing so
+      // could combine a valid cache_uuid with a different cache generation.
+      const pinnedProfile = validObject(pinnedCache.generation_profile)
+        ? pinnedCache.generation_profile
+        : {};
+      const generation_profile = { ...body.generation_profile };
+      for (const key of ['identifier', 'rules_version', 'locale', 'variant']) {
+        if (generation_profile[key] === undefined && pinnedProfile[key] !== undefined) {
+          generation_profile[key] = pinnedProfile[key];
+        }
+      }
       try {
         const result = createSession({
           repository: storyRepo,
@@ -484,11 +497,11 @@ const server = http.createServer(async (req, res) => {
           role_id: body.role_id,
           model: body.model,
           prompt: body.prompt,
-          generation_profile: body.generation_profile,
+          generation_profile,
         });
         const profile = {};
         for (const key of ['cache_uuid', 'story_uuid', 'story_version_uuid', 'generation_hash', 'identifier', 'rules_version', 'locale', 'variant']) {
-          if (body.generation_profile[key] !== undefined) profile[key] = body.generation_profile[key];
+          if (generation_profile[key] !== undefined) profile[key] = generation_profile[key];
         }
         const pinned = {
           user_ref: body.user_ref,
