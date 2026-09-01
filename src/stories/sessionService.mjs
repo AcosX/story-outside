@@ -3,7 +3,7 @@
 // session or accidentally observe one another's history.
 
 import { randomUUID } from 'node:crypto';
-import { canonicalJsonStringify } from './canonicalHash.mjs';
+import { canonicalJsonStringify, canonicalSha256 } from './canonicalHash.mjs';
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const SESSION_STATE = 'sessionState';
@@ -179,8 +179,27 @@ function normalizeCacheEvent(event, pinned, cache_uuid, session_uuid) {
   };
 }
 
-function append(session, canonical, advancesCursor) {
-  const committed = { ...canonical, event_seq: session.history.length + 1 };
+function append(session, canonical, advancesCursor, clientRequestId = null) {
+  const eventSeq = session.history.length + 1;
+  const committed = {
+    ...canonical,
+    event_seq: eventSeq,
+    prev_event_seq: eventSeq === 1 ? null : eventSeq - 1,
+    client_request_id: clientRequestId,
+    created_at: nowIso(),
+  };
+  committed.hash = canonicalSha256({
+    event_id: committed.event_id,
+    event_seq: committed.event_seq,
+    prev_event_seq: committed.prev_event_seq,
+    event_type: committed.event_type,
+    origin: committed.origin,
+    source: committed.source,
+    source_sequence: committed.source_sequence,
+    payload: committed.payload,
+    occurred_at: committed.occurred_at,
+    client_request_id: committed.client_request_id,
+  });
   session.history.push(committed);
   if (advancesCursor) session.cursor += 1;
   session.revision += 1;
@@ -270,7 +289,7 @@ export function commitOpeningEvent({ repository, session_uuid, cache_uuid, event
   const pinned = validatePinnedCache(cache, session.story_uuid, session.story_version_uuid)
     .find((candidate) => candidate && candidate.sequence === event.sequence);
   const canonical = normalizeCacheEvent(event, pinned, cache_uuid, session.session_uuid);
-  const committed = append(session, canonical, true);
+  const committed = append(session, canonical, true, id);
   if (session.cursor >= cache.content_payload.event_count) session.state = 'awaiting_first_choice';
   const result = { session_uuid, cache_uuid, event: clone(committed), cursor: session.cursor, revision: session.revision, state: session.state };
   if (id) session.requestIds.set(id, { kind: 'opening', fingerprint: requestFingerprint('opening', { event }), result });
@@ -298,7 +317,7 @@ export function interruptWithPlayerInput({ repository, session_uuid, text, clien
     source_sequence: sourceSequence,
     payload: { text },
     occurred_at: nowIso(),
-  }, false);
+  }, false, id);
   session.state = 'realtime';
   const result = { session_uuid, cache_uuid: session.cache_uuid, event: clone(canonical), cursor: session.cursor, revision: session.revision, state: session.state };
   if (id) session.requestIds.set(id, { kind: 'interrupt', fingerprint: requestFingerprint('interrupt', { text }), result });

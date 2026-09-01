@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import {
+  canonicalSha256,
   commitOpeningEvent,
   createInMemoryStoryRepository,
   createSeededRepository,
@@ -63,13 +64,28 @@ async function run() {
     repository, session_uuid: SESSION, cache_uuid: cache.cache_uuid,
     event: shown(events[0]), client_request_id: 'open-1', expected_revision: 0,
   });
-  assert.deepEqual(Object.keys(first.event).sort(), ['event_id', 'event_seq', 'event_type', 'origin', 'occurred_at', 'payload', 'source', 'source_sequence'].sort());
+  assert.deepEqual(Object.keys(first.event).sort(), ['client_request_id', 'created_at', 'event_id', 'event_seq', 'event_type', 'hash', 'origin', 'occurred_at', 'payload', 'prev_event_seq', 'source', 'source_sequence'].sort());
   assert.match(first.event.event_id, UUID_PATTERN);
   assert.equal(first.event.event_type, 'story_opening');
   assert.equal(first.event.origin, 'imported');
   assert.equal(first.event.source, 'opening_cache');
   assert.equal(first.event.source_sequence, 0);
   assert.equal(first.event.event_seq, 1);
+  assert.equal(first.event.prev_event_seq, null);
+  assert.equal(first.event.client_request_id, 'open-1');
+  assert.match(first.event.created_at, /^\d{4}-\d{2}-\d{2}T/);
+  assert.equal(first.event.hash, canonicalSha256({
+    event_id: first.event.event_id,
+    event_seq: first.event.event_seq,
+    prev_event_seq: first.event.prev_event_seq,
+    event_type: first.event.event_type,
+    origin: first.event.origin,
+    source: first.event.source,
+    source_sequence: first.event.source_sequence,
+    payload: first.event.payload,
+    occurred_at: first.event.occurred_at,
+    client_request_id: first.event.client_request_id,
+  }));
   assert.deepEqual(first.event.payload, { type: events[0].type, text: events[0].text });
   assert.equal(first.cursor, 1);
   assert.equal(first.revision, 1);
@@ -114,6 +130,9 @@ async function run() {
   assert.equal(interruptedAfterFirstOpening.cursor, 1);
   assert.equal(interruptedAfterFirstOpening.revision, 2);
   assert.equal(interruptedAfterFirstOpening.event.event_seq, 2);
+  assert.equal(interruptedAfterFirstOpening.event.prev_event_seq, 1);
+  assert.equal(interruptedAfterFirstOpening.event.client_request_id, null);
+  assert.match(interruptedAfterFirstOpening.event.created_at, /^\d{4}-\d{2}-\d{2}T/);
   assert.equal(recoverSession({ repository, session_uuid: OTHER_SESSION }).history.length, 2);
 
   const immediateInterruptSession = '00000000-0000-4000-8000-000000000105';
@@ -128,6 +147,8 @@ async function run() {
   assert.equal(immediateInterrupt.cursor, 0);
   assert.equal(immediateInterrupt.revision, 1);
   assert.equal(immediateInterrupt.event.event_seq, 1);
+  assert.equal(immediateInterrupt.event.prev_event_seq, null);
+  assert.equal(immediateInterrupt.event.client_request_id, null);
 
   let revision = first.revision;
   for (let i = 1; i < events.length; i += 1) {
@@ -148,6 +169,21 @@ async function run() {
   assert.equal(interrupted.event.source, 'player');
   assert.equal(interrupted.event.event_seq, interrupted.cursor + 1);
   assert.equal(interrupted.event.source_sequence, interrupted.event.event_seq);
+  assert.equal(interrupted.event.prev_event_seq, interrupted.event.event_seq - 1);
+  assert.equal(interrupted.event.client_request_id, 'input-1');
+  assert.match(interrupted.event.created_at, /^\d{4}-\d{2}-\d{2}T/);
+  assert.equal(interrupted.event.hash, canonicalSha256({
+    event_id: interrupted.event.event_id,
+    event_seq: interrupted.event.event_seq,
+    prev_event_seq: interrupted.event.prev_event_seq,
+    event_type: interrupted.event.event_type,
+    origin: interrupted.event.origin,
+    source: interrupted.event.source,
+    source_sequence: interrupted.event.source_sequence,
+    payload: interrupted.event.payload,
+    occurred_at: interrupted.event.occurred_at,
+    client_request_id: interrupted.event.client_request_id,
+  }));
   assert.deepEqual(interruptWithPlayerInput({ repository, session_uuid: SESSION, text: '我等一个答案', client_request_id: 'input-1', expected_revision: 0 }), interrupted);
   assert.throws(() => interruptWithPlayerInput({ repository, session_uuid: SESSION, text: '不同', client_request_id: 'input-1' }), /different request/);
   assert.equal(repository.findOpeningCacheByUuid(cache.cache_uuid).status, 'valid');
