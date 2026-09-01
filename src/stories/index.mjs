@@ -21,3 +21,11 @@ export {
   startSessionSnapshot,
 } from './storyService.mjs';
 export { createSeededRepository, FIXTURE_UUIDS } from './fixture.mjs';
+export {
+  commitOpeningEvent,
+  createSession,
+  getSession,
+  interruptWithPlayerInput,
+  listSessionEvents,
+  recoverSession,
+} from './sessionService.mjs';
