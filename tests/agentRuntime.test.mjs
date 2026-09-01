@@ -112,6 +112,21 @@ await test('tool calls validate options, summary, and classify as tool_call', as
   assert.equal(provider.callCount, 1);
 });
 
+await test('tool envelope carries session turn and revision metadata', async () => {
+  const provider = createMockAgentProvider({ responses: [{ tool_calls: [{ id: 'tool-meta', name: 'finish_story', arguments: { summary: 'done', ending: 'ending', original_difference: 'diff', key_choices: ['x'], character_outcomes: [{ character: 'A', fate: 'B' }] } }] }] });
+  const runtime = await buildRuntime(provider);
+  const state = recoverRuntime(runtime);
+  const result = await runTurn(runtime, { input: { a: 1 }, expected_revision: state.base_revision });
+  assert.match(result.turn_id, /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
+  assert.equal(result.tool_envelope.session_uuid, state.session_uuid);
+  assert.equal(result.tool_envelope.base_revision, state.base_revision);
+  assert.equal(result.tool_envelope.turn_id, result.turn_id);
+  assert.equal(result.tool_envelope.tool_call_id, 'tool-meta');
+  assert.equal(result.tool_result.session_uuid, state.session_uuid);
+  assert.equal(result.tool_result.turn_id, result.turn_id);
+  assert.equal(result.tool_result.base_revision, state.base_revision);
+});
+
 await test('provider tool calls reject unknown fields, duplicates, and missing ids', async () => {
   const cases = [
     [{ tool_calls: [{ id: 'tool-err', name: 'ask_player_choice', arguments: { question: 'q', options: [{ id: 'a', label: 'A' }, { id: 'b', label: 'B' }], extra: true } }] }, 'invalid_tool_call'],
@@ -143,6 +158,12 @@ await test('provider results reject empty, mixed, multi-tool, unknown, and bad p
     const runtime = await buildRuntime(createMockAgentProvider({ responses: [response] }));
     await assert.rejects(() => runTurn(runtime, { input: { a: 1 }, expected_revision: recoverRuntime(runtime).base_revision }), (error) => error instanceof AgentRuntimeError && error.code === code);
   }
+});
+
+await test('provider tool calls reject empty optional fields', async () => {
+  const badProvider = createMockAgentProvider({ responses: [{ tool_calls: [{ id: 'tool-empty', name: 'finish_story', arguments: { summary: 'done', ending: 'ending', original_difference: 'diff', key_choices: ['x'], character_outcomes: [{ character: 'A', fate: 'B', change: '' }] } }] }] });
+  const runtime = await buildRuntime(badProvider);
+  await assert.rejects(() => runTurn(runtime, { input: { a: 1 }, expected_revision: recoverRuntime(runtime).base_revision }), (error) => error instanceof AgentRuntimeError && error.code === 'invalid_tool_call');
 });
 
 await test('sensitive keys are rejected recursively and provider rejects are sanitized and retryable', async () => {

@@ -31,7 +31,7 @@ await test('ask_player_choice normalizes free text and choice_id', async () => {
   });
   assert.deepEqual(normalized, {
     question: '选一个',
-    options: [{ id: 'a', label: 'A', description: 'first' }, { id: 'b', label: 'B' }],
+    options: [{ id: 'a', label: 'A', description: 'first' }, { id: 'b', label: 'B', text: 'B' }],
     allow_free_text: true,
     choice_id: 'choice-1',
   });
@@ -42,6 +42,8 @@ await test('ask_player_choice rejects bad fields and duplicate ids', async () =>
   assert.throws(() => validateAskPlayerChoice({ question: 'q', options: [{ id: 'a', label: 'A' }, { id: 'a', label: 'B' }] }), (error) => error instanceof ToolValidationError && error.code === 'invalid_tool_call');
   assert.throws(() => validateAskPlayerChoice({ question: 'q', options: [{ id: 'a', label: 'A' }, { id: 'b', label: 'B' }], extra: 1 }), (error) => error instanceof ToolValidationError && error.code === 'invalid_tool_call');
   assert.throws(() => validateAskPlayerChoice({ question: 'q', options: [{ id: 'a', label: 'A', secret: 'x' }, { id: 'b', label: 'B' }] }), (error) => error instanceof ToolValidationError && error.code === 'invalid_input');
+  assert.throws(() => validateAskPlayerChoice({ question: 'q', options: [{ id: 'a', label: '' }, { id: 'b', label: 'B' }] }), (error) => error instanceof ToolValidationError && error.code === 'invalid_tool_call');
+  assert.throws(() => validateAskPlayerChoice({ question: 'q', options: [{ id: 'a', text: '' }, { id: 'b', label: 'B' }] }), (error) => error instanceof ToolValidationError && error.code === 'invalid_tool_call');
 });
 
 await test('finish_story validates required fields and deep clones', async () => {
@@ -62,6 +64,7 @@ await test('finish_story validates required fields and deep clones', async () =>
 await test('finish_story rejects unknown and empty fields', async () => {
   assert.throws(() => validateFinishStory({ summary: 'done', ending: 'ending', original_difference: 'diff', key_choices: ['x'], character_outcomes: [{ character: 'A', fate: 'B' }], extra: true }), (error) => error instanceof ToolValidationError && error.code === 'invalid_tool_call');
   assert.throws(() => validateFinishStory({ summary: 'done', ending: 'ending', original_difference: 'diff', key_choices: [], character_outcomes: [{ character: 'A', fate: 'B' }] }), (error) => error instanceof ToolValidationError && error.code === 'invalid_tool_call');
+  assert.throws(() => validateFinishStory({ summary: 'done', ending: 'ending', original_difference: 'diff', key_choices: ['x'], character_outcomes: [{ character: 'A', fate: 'B', change: '' }] }), (error) => error instanceof ToolValidationError && error.code === 'invalid_tool_call');
 });
 
 await test('executeToolCall returns choice_required and story_finished envelopes', async () => {
@@ -74,6 +77,14 @@ await test('executeToolCall returns choice_required and story_finished envelopes
   assert.equal(finish.kind, 'story_finished');
   assert.equal(finish.terminal, true);
   assert.equal(finish.requires_player, false);
+});
+
+await test('executeToolCall validates UUIDs, id alias, and finite JSON', async () => {
+  assert.throws(() => executeToolCall({ name: 'ask_player_choice', arguments: { question: 'q', options: [{ id: 'a', label: 'A' }, { id: 'b', label: 'B' }] }, session_uuid: 'not-a-uuid', tool_call_id: 'tool-1' }), (error) => error instanceof ToolValidationError && error.code === 'invalid_input');
+  assert.throws(() => executeToolCall({ name: 'ask_player_choice', arguments: { question: 'q', options: [{ id: 'a', label: 'A' }, { id: 'b', label: 'B' }], value: Number.NaN }, tool_call_id: 'tool-1' }), (error) => error instanceof ToolValidationError && error.code === 'invalid_input');
+  assert.throws(() => executeToolCall({ name: 'ask_player_choice', arguments: { question: 'q', options: [{ id: 'a', label: 'A' }, { id: 'b', label: 'B' }], loop: null }, id: 'alias-1' }), (error) => error instanceof ToolValidationError && error.code === 'invalid_tool_call');
+  const alias = executeToolCall({ name: 'finish_story', arguments: { summary: 'done', ending: 'ending', original_difference: 'diff', key_choices: ['x'], character_outcomes: [{ character: 'A', fate: 'B' }] }, id: 'tool-alias' });
+  assert.equal(alias.tool_call_id, 'tool-alias');
 });
 
 await test('createToolRegistry returns isolated definitions', async () => {

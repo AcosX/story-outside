@@ -83,10 +83,10 @@ function normalizeProviderResult(result) {
   if (messages && messages.length === 0) fail('provider_failure', 'provider result must include messages or tool_calls');
   const tool_calls = hasToolCalls ? assertObjectArray(result.tool_calls, 'tool_calls').map((call) => {
     if (!call || typeof call !== 'object') fail('invalid_tool_call', 'tool call must be an object');
-    const payload = { name: call.name, arguments: call.arguments, tool_call_id: call.tool_call_id ?? call.id };
+    const payload = { name: call.name, arguments: call.arguments, tool_call_id: call.tool_call_id ?? call.id, id: call.id };
     try {
       const normalized = executeToolCall(payload);
-      return { ...normalized, arguments: clone(normalized.payload), tool_envelope: clone(normalized) };
+      return { ...normalized, arguments: clone(normalized.payload), tool_envelope: clone(normalized), tool_result: clone(normalized.payload) };
     } catch (error) {
       if (error instanceof ToolValidationError) fail('invalid_tool_call', error.message);
       throw error;
@@ -172,13 +172,17 @@ export async function runTurn(runtime, { request_id, input, expected_revision } 
   if (session.revision !== state.base_revision) fail('revision_mismatch', 'revision mismatch');
   let rawResult;
   try {
+    const turn_id = randomUUID();
+    state.turn_id = turn_id;
     rawResult = await state.provider.complete(buildRequest(state, inputJson));
+    state.turn_id = turn_id;
   } catch {
     fail('provider_failure', 'agent provider failed');
   }
   const providerResult = normalizeProviderResult(rawResult);
-  const turn_id = randomUUID();
-  const result = { turn_id, request_id: key, base_revision: state.base_revision, base_cursor: state.base_cursor, kind: providerResult.tool_calls.length ? 'tool_call' : 'narrative', messages: providerResult.messages, tool_calls: providerResult.tool_calls, tool_result: providerResult.tool_calls[0] ? clone(providerResult.tool_calls[0].tool_envelope) : null, tool_envelope: providerResult.tool_calls[0] ? clone(providerResult.tool_calls[0].tool_envelope) : null, pending: providerResult.tool_calls.length > 0 };
+  const turn_id = state.turn_id;
+  const tool_call = providerResult.tool_calls[0];
+  const result = { turn_id, request_id: key, base_revision: state.base_revision, base_cursor: state.base_cursor, kind: providerResult.tool_calls.length ? 'tool_call' : 'narrative', messages: providerResult.messages, tool_calls: providerResult.tool_calls.map((call) => ({ ...call, session_uuid: state.session_uuid, turn_id, base_revision: state.base_revision, tool_envelope: { ...clone(call.tool_envelope), session_uuid: state.session_uuid, turn_id, base_revision: state.base_revision }, tool_result: { ...clone(call.tool_result), session_uuid: state.session_uuid, turn_id, base_revision: state.base_revision } })), tool_result: tool_call ? { ...clone(tool_call.tool_result), session_uuid: state.session_uuid, turn_id, base_revision: state.base_revision, kind: tool_call.kind, requires_player: tool_call.requires_player, terminal: tool_call.terminal } : null, tool_envelope: tool_call ? { ...clone(tool_call.tool_envelope), session_uuid: state.session_uuid, turn_id, base_revision: state.base_revision, kind: tool_call.kind, requires_player: tool_call.requires_player, terminal: tool_call.terminal } : null, pending: providerResult.tool_calls.length > 0 };
   state.pending = clone(result);
   state.successful_turns.push(clone(result));
   if (key) state.requestIndex.set(key, { fingerprint: fp, result: clone(result) });
