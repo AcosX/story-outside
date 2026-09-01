@@ -80,6 +80,10 @@ await test('executeToolCall returns choice_required and story_finished envelopes
 });
 
 await test('executeToolCall validates UUIDs, id alias, and finite JSON', async () => {
+  assert.throws(() => executeToolCall(null), (error) => error instanceof ToolValidationError && error.code === 'invalid_input');
+  assert.throws(() => executeToolCall(), (error) => error instanceof ToolValidationError && error.code === 'invalid_input');
+  assert.throws(() => executeToolCall(null), (error) => error instanceof ToolValidationError && error.code === 'invalid_input');
+  assert.throws(() => executeToolCall(), (error) => error instanceof ToolValidationError && error.code === 'invalid_input');
   assert.throws(() => executeToolCall({ name: 'ask_player_choice', arguments: { question: 'q', options: [{ id: 'a', label: 'A' }, { id: 'b', label: 'B' }] }, session_uuid: 'not-a-uuid', tool_call_id: 'tool-1' }), (error) => error instanceof ToolValidationError && error.code === 'invalid_input');
   assert.throws(() => executeToolCall({ name: 'ask_player_choice', arguments: { question: 'q', options: [{ id: 'a', label: 'A' }, { id: 'b', label: 'B' }], value: Number.NaN }, tool_call_id: 'tool-1' }), (error) => error instanceof ToolValidationError && error.code === 'invalid_input');
   assert.throws(() => executeToolCall({ name: 'ask_player_choice', arguments: { question: 'q', options: [{ id: 'a', label: 'A' }, { id: 'b', label: 'B' }], loop: null }, id: 'alias-1' }), (error) => error instanceof ToolValidationError && error.code === 'invalid_tool_call');
