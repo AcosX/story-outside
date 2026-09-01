@@ -15,6 +15,7 @@ import {
 const SESSION = '00000000-0000-4000-8000-000000000101';
 const OTHER_SESSION = '00000000-0000-4000-8000-000000000102';
 const WRONG_UUID = '00000000-0000-4000-8000-000000000999';
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 async function fixture() {
   const { repository, fixtures } = createSeededRepository();
@@ -63,9 +64,13 @@ async function run() {
     event: shown(events[0]), client_request_id: 'open-1', expected_revision: 0,
   });
   assert.deepEqual(Object.keys(first.event).sort(), ['event_id', 'event_seq', 'event_type', 'origin', 'occurred_at', 'payload', 'source', 'source_sequence'].sort());
-  assert.equal(first.event.origin, 'cache');
-  assert.equal(first.event.source, cache.cache_uuid);
-  assert.equal(first.event.event_seq, 0);
+  assert.match(first.event.event_id, UUID_PATTERN);
+  assert.equal(first.event.event_type, 'story_opening');
+  assert.equal(first.event.origin, 'imported');
+  assert.equal(first.event.source, 'opening_cache');
+  assert.equal(first.event.source_sequence, 0);
+  assert.equal(first.event.event_seq, 1);
+  assert.deepEqual(first.event.payload, { type: events[0].type, text: events[0].text });
   assert.equal(first.cursor, 1);
   assert.equal(first.revision, 1);
   assert.deepEqual(commitOpeningEvent({
@@ -106,7 +111,12 @@ async function run() {
   const beforeInterrupt = recoverSession({ repository, session_uuid: SESSION });
   const interrupted = interruptWithPlayerInput({ repository, session_uuid: SESSION, text: '我等一个答案', client_request_id: 'input-1', expected_revision: revision });
   assert.equal(interrupted.state, 'realtime');
+  assert.match(interrupted.event.event_id, UUID_PATTERN);
   assert.equal(interrupted.event.event_type, 'player_input');
+  assert.equal(interrupted.event.origin, 'user');
+  assert.equal(interrupted.event.source, 'player');
+  assert.equal(interrupted.event.event_seq, interrupted.cursor);
+  assert.equal(interrupted.event.source_sequence, interrupted.event.event_seq);
   assert.deepEqual(interruptWithPlayerInput({ repository, session_uuid: SESSION, text: '我等一个答案', client_request_id: 'input-1', expected_revision: 0 }), interrupted);
   assert.throws(() => interruptWithPlayerInput({ repository, session_uuid: SESSION, text: '不同', client_request_id: 'input-1' }), /different request/);
   assert.equal(repository.findOpeningCacheByUuid(cache.cache_uuid).status, 'valid');

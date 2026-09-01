@@ -2,6 +2,7 @@
 // to each repository instance so independent repositories cannot share a
 // session or accidentally observe one another's history.
 
+import { randomUUID } from 'node:crypto';
 import { canonicalJsonStringify } from './canonicalHash.mjs';
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -168,11 +169,11 @@ function normalizeCacheEvent(event, pinned, cache_uuid, session_uuid) {
     throw new Error('commitOpeningEvent: event payload does not match pinned cache');
   }
   return {
-    event_id: typeof event.event_id === 'string' && event.event_id ? event.event_id : `${session_uuid}:${event.sequence}`,
-    event_seq: event.sequence,
-    event_type: eventType,
-    origin: 'cache',
-    source: cache_uuid,
+    event_id: randomUUID(),
+    event_seq: event.sequence + 1,
+    event_type: 'story_opening',
+    origin: 'imported',
+    source: 'opening_cache',
     source_sequence: event.sequence,
     payload: clone(expectedPayload),
     occurred_at: typeof event.occurred_at === 'string' ? event.occurred_at : nowIso(),
@@ -289,12 +290,12 @@ export function interruptWithPlayerInput({ repository, session_uuid, text, clien
   }
   requiredString('text', text);
   const canonical = append(session, {
-    event_id: `${session.session_uuid}:${session.cursor}`,
-    event_seq: session.cursor,
+    event_id: randomUUID(),
+    event_seq: session.cursor + 1,
     event_type: 'player_input',
-    origin: 'player',
+    origin: 'user',
     source: 'player',
-    source_sequence: null,
+    source_sequence: session.cursor + 1,
     payload: { text },
     occurred_at: nowIso(),
   });
