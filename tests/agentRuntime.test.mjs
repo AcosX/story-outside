@@ -72,9 +72,10 @@ await test('runTurn supports async providers and records audit fields', async ()
   assert.equal(result.request_id, 'req-1');
   assert.equal(result.base_revision, state.base_revision);
   assert.equal(result.base_cursor, state.base_cursor);
-  assert.deepEqual(result.messages, [{ role: 'assistant', content: 'hello' }]);
-  assert.deepEqual(result.tool_calls, []);
+  assert.deepEqual(result.items, [{ type: 'narration', text: 'hello' }]);
+  assert.equal(result.tool_call, null);
   assert.equal(result.pending, false);
+  assert.match(result.pending_id, /^[0-9a-f-]{36}$/);
   assert.equal(provider.callCount, 1);
   const repeat = await runTurn(runtime, { request_id: 'req-1', input: { a: 1 }, expected_revision: state.base_revision });
   assert.deepEqual(repeat, result);
@@ -101,19 +102,33 @@ await test('external session revision advance fails closed and provider is not c
 });
 
 await test('tool calls validate options, summary, and classify as tool_call', async () => {
-  const provider = createMockAgentProvider({ responses: [{ tool_calls: [{ id: 'tool-123', name: 'ask_player_choice', arguments: { question: 'choose', options: [{ id: 'a', label: 'A' }, { id: 'b', text: 'B' }] } }] }] });
+  // ClickUp 08 P1.3: a tool_call MUST ride on a batch that already
+  // carries at least one narrative item. The runtime normalises the
+  // explicit items + tool_call shape into the same wire form as a
+  // batched narrative turn.
+  const provider = createMockAgentProvider({ responses: [{
+    items: [{ role: 'assistant', type: 'narration', text: 'line 1' }],
+    tool_call: { id: 'tool-123', name: 'ask_player_choice', arguments: { question: 'choose', options: [{ id: 'a', label: 'A' }, { id: 'b', text: 'B' }] } },
+  }] });
   const runtime = await buildRuntime(provider);
   const result = await runTurn(runtime, { input: { a: 1 }, expected_revision: recoverRuntime(runtime).base_revision });
   assert.equal(result.kind, 'tool_call');
   assert.equal(result.pending, true);
-  assert.equal(result.tool_calls.length, 1);
-  assert.equal(result.tool_calls[0].tool_call_id, 'tool-123');
+  assert.equal(result.tool_call.tool_call_id, 'tool-123');
+  assert.equal(result.tool_call.kind, 'choice_required');
   assert.equal(result.tool_result.kind, 'choice_required');
+  assert.equal(result.items.length, 1);
+  assert.equal(result.items[0].text, 'line 1');
   assert.equal(provider.callCount, 1);
 });
 
 await test('tool envelope carries session turn and revision metadata', async () => {
-  const provider = createMockAgentProvider({ responses: [{ tool_calls: [{ id: 'tool-meta', name: 'finish_story', arguments: { summary: 'done', ending: 'ending', original_difference: 'diff', key_choices: ['x'], character_outcomes: [{ character: 'A', fate: 'B' }] } }] }] });
+  // ClickUp 08 P1.3: tool_call rides on a batch with at least one
+  // narrative item.
+  const provider = createMockAgentProvider({ responses: [{
+    items: [{ role: 'assistant', type: 'narration', text: 'closing line' }],
+    tool_call: { id: 'tool-meta', name: 'finish_story', arguments: { summary: 'done', ending: 'ending', original_difference: 'diff', key_choices: ['x'], character_outcomes: [{ character: 'A', fate: 'B' }] } },
+  }] });
   const runtime = await buildRuntime(provider);
   const state = recoverRuntime(runtime);
   const result = await runTurn(runtime, { input: { a: 1 }, expected_revision: state.base_revision });
@@ -128,10 +143,14 @@ await test('tool envelope carries session turn and revision metadata', async () 
 });
 
 await test('provider tool calls reject unknown fields, duplicates, and missing ids', async () => {
+  // ClickUp 08 P1.3: a tool_call must ride on a batch with at least one
+  // narrative item, so each case below ships a minimal items[] alongside
+  // the bad tool_call envelope.
+  const narrative = [{ role: 'assistant', type: 'narration', text: 'before tool' }];
   const cases = [
-    [{ tool_calls: [{ id: 'tool-err', name: 'ask_player_choice', arguments: { question: 'q', options: [{ id: 'a', label: 'A' }, { id: 'b', label: 'B' }], extra: true } }] }, 'invalid_tool_call'],
-    [{ tool_calls: [{ id: 'tool-dup', name: 'ask_player_choice', arguments: { question: 'q', options: [{ id: 'a', label: 'A' }, { id: 'a', label: 'B' }] } }] }, 'invalid_tool_call'],
-    [{ tool_calls: [{ name: 'ask_player_choice', arguments: { question: 'q', options: [{ id: 'a', label: 'A' }, { id: 'b', label: 'B' }] } }] }, 'invalid_tool_call'],
+    [{ items: narrative, tool_call: { id: 'tool-err', name: 'ask_player_choice', arguments: { question: 'q', options: [{ id: 'a', label: 'A' }, { id: 'b', label: 'B' }], extra: true } } }, 'invalid_tool_call'],
+    [{ items: narrative, tool_call: { id: 'tool-dup', name: 'ask_player_choice', arguments: { question: 'q', options: [{ id: 'a', label: 'A' }, { id: 'a', label: 'B' }] } } }, 'invalid_tool_call'],
+    [{ items: narrative, tool_call: { name: 'ask_player_choice', arguments: { question: 'q', options: [{ id: 'a', label: 'A' }, { id: 'b', label: 'B' }] } } }, 'invalid_tool_call'],
   ];
   for (const [response, code] of cases) {
     const runtime = await buildRuntime(createMockAgentProvider({ responses: [response] }));
@@ -147,12 +166,21 @@ await test('provider tool calls reject unknown fields, duplicates, and missing i
 });
 
 await test('provider results reject empty, mixed, multi-tool, unknown, and bad payloads', async () => {
+  // ClickUp 08 P1.3: tool-only batches (tool_calls without messages/items)
+  // are explicitly rejected. The legacy messages + tool_calls mixed shape
+  // is also rejected; the legacy multi-tool_calls array is rejected;
+  // unknown tool names / bad payloads fail closed; a 5-item batch is
+  // rejected by the explicit cap.
   const cases = [
-    [{ messages: [] }, 'provider_failure'],
-    [{ messages: [{ role: 'assistant', content: 'hi' }], tool_calls: [{ name: 'finish_story', arguments: { summary: 'done' } }] }, 'invalid_tool_call'],
+    [{ messages: [] }, 'invalid_tool_call'],
+    // Legacy multi-tool_calls array (2 entries) is rejected even when 1..4
+    // messages are present: the batch contract allows exactly one OPTIONAL
+    // FINAL tool call.
+    [{ messages: [{ role: 'assistant', content: 'hi' }], tool_calls: [{ name: 'ask_player_choice', arguments: { question: 'q', options: [{ id: 'a', label: 'A' }, { id: 'b', label: 'B' }] } }, { name: 'finish_story', arguments: { summary: 'done', ending: 'e', original_difference: 'd', key_choices: ['x'], character_outcomes: [{ character: 'A', fate: 'B' }] } }] }, 'invalid_tool_call'],
     [{ tool_calls: [{ name: 'ask_player_choice', arguments: { options: [{ id: 'a', label: 'A' }, { id: 'b', label: 'B' }] } }, { name: 'finish_story', arguments: { summary: 'done' } }] }, 'invalid_tool_call'],
     [{ tool_calls: [{ name: 'unknown', arguments: {} }] }, 'invalid_tool_call'],
     [{ tool_calls: [{ name: 'finish_story', arguments: { summary: '' } }] }, 'invalid_tool_call'],
+    [{ items: [{ role: 'assistant', type: 'narration', text: 'hi' }, { role: 'assistant', type: 'narration', text: 'hi 2' }, { role: 'assistant', type: 'narration', text: 'hi 3' }, { role: 'assistant', type: 'narration', text: 'hi 4' }, { role: 'assistant', type: 'narration', text: 'hi 5' }] }, 'invalid_tool_call'],
   ];
   for (const [response, code] of cases) {
     const runtime = await buildRuntime(createMockAgentProvider({ responses: [response] }));
@@ -161,7 +189,42 @@ await test('provider results reject empty, mixed, multi-tool, unknown, and bad p
 });
 
 await test('provider tool calls reject empty optional fields', async () => {
-  const badProvider = createMockAgentProvider({ responses: [{ tool_calls: [{ id: 'tool-empty', name: 'finish_story', arguments: { summary: 'done', ending: 'ending', original_difference: 'diff', key_choices: ['x'], character_outcomes: [{ character: 'A', fate: 'B', change: '' }] } }] }] });
+  // ClickUp 08 P1.3: tool_call rides on a batch with at least one
+  // narrative item.
+  const badProvider = createMockAgentProvider({ responses: [{
+    items: [{ role: 'assistant', type: 'narration', text: 'closing' }],
+    tool_call: { id: 'tool-empty', name: 'finish_story', arguments: { summary: 'done', ending: 'ending', original_difference: 'diff', key_choices: ['x'], character_outcomes: [{ character: 'A', fate: 'B', change: '' }] } },
+  }] });
+  const runtime = await buildRuntime(badProvider);
+  await assert.rejects(() => runTurn(runtime, { input: { a: 1 }, expected_revision: recoverRuntime(runtime).base_revision }), (error) => error instanceof AgentRuntimeError && error.code === 'invalid_tool_call');
+});
+
+await test('legacy messages + single tool_call normalises unambiguously to items + final tool', async () => {
+  // ClickUp 08 P1.3: the legacy { messages: 1..4, tool_calls: [<one>] }
+  // shape is unambiguous — messages are the ordered narrative items and
+  // the single tool call rides the batch as the optional FINAL item.
+  const provider = createMockAgentProvider({ responses: [{
+    messages: [{ role: 'assistant', content: 'beat one' }, { role: 'assistant', content: 'beat two' }],
+    tool_calls: [{ id: 'legacy-tool', name: 'ask_player_choice', arguments: { question: 'choose', options: [{ id: 'a', label: 'A' }, { id: 'b', label: 'B' }] } }],
+  }] });
+  const runtime = await buildRuntime(provider);
+  const result = await runTurn(runtime, { input: { a: 1 }, expected_revision: recoverRuntime(runtime).base_revision });
+  assert.equal(result.kind, 'tool_call');
+  assert.equal(result.items.length, 2);
+  assert.equal(result.items[0].text, 'beat one');
+  assert.equal(result.items[1].text, 'beat two');
+  assert.equal(result.tool_call.tool_call_id, 'legacy-tool');
+  assert.equal(result.tool_call.kind, 'choice_required');
+  // The tool is NOT part of pending.events; it rides separately.
+  assert.equal(result.pending_total, 2);
+  assert.equal(provider.callCount, 1);
+});
+
+await test('tool_call-like entry inside items is rejected (tool must be final, never in narrative)', async () => {
+  // A tool may never hide inside the narrative items array.
+  const badProvider = createMockAgentProvider({ responses: [{
+    items: [{ role: 'assistant', type: 'tool_call', text: 'sneaky tool' }],
+  }] });
   const runtime = await buildRuntime(badProvider);
   await assert.rejects(() => runTurn(runtime, { input: { a: 1 }, expected_revision: recoverRuntime(runtime).base_revision }), (error) => error instanceof AgentRuntimeError && error.code === 'invalid_tool_call');
 });
@@ -230,13 +293,17 @@ await test('runtime does not alter canonical history', async () => {
 });
 
 await test('tool envelopes carry normalized tool results and preserve canonical history', async () => {
-  const provider = createMockAgentProvider({ responses: [{ tool_calls: [{ id: 'tool-123', name: 'ask_player_choice', arguments: { question: 'choose', options: [{ id: 'a', label: 'A' }, { id: 'b', text: 'B' }] } }] }] });
+  // ClickUp 08 P1.3: tool_call rides on a batch with at least one narrative item.
+  const provider = createMockAgentProvider({ responses: [{
+    items: [{ role: 'assistant', type: 'narration', text: 'preamble' }],
+    tool_call: { id: 'tool-123', name: 'ask_player_choice', arguments: { question: 'choose', options: [{ id: 'a', label: 'A' }, { id: 'b', text: 'B' }] } },
+  }] });
   const runtime = await buildRuntime(provider);
   const before = recoverRuntime(runtime);
   const result = await runTurn(runtime, { input: { a: 1 }, expected_revision: before.base_revision });
   assert.equal(result.kind, 'tool_call');
   assert.equal(result.pending, true);
-  assert.equal(result.tool_calls[0].tool_call_id, 'tool-123');
+  assert.equal(result.tool_call.tool_call_id, 'tool-123');
   assert.equal(result.tool_result.kind, 'choice_required');
   assert.equal(result.tool_envelope.terminal, false);
   const after = recoverRuntime(runtime);
@@ -244,13 +311,21 @@ await test('tool envelopes carry normalized tool results and preserve canonical 
 });
 
 await test('tool calls reject unknown fields and duplicate ids through runtime', async () => {
-  const badProvider = createMockAgentProvider({ responses: [{ tool_calls: [{ name: 'ask_player_choice', arguments: { question: 'q', options: [{ id: 'a', label: 'A' }, { id: 'a', label: 'B' }], extra: 1 } }] }] });
+  // ClickUp 08 P1.3: tool_call rides on a batch with at least one narrative item.
+  const badProvider = createMockAgentProvider({ responses: [{
+    items: [{ role: 'assistant', type: 'narration', text: 'bad prelude' }],
+    tool_call: { name: 'ask_player_choice', arguments: { question: 'q', options: [{ id: 'a', label: 'A' }, { id: 'a', label: 'B' }], extra: 1 } },
+  }] });
   const runtime = await buildRuntime(badProvider);
   await assert.rejects(() => runTurn(runtime, { input: { a: 1 }, expected_revision: recoverRuntime(runtime).base_revision }), (error) => error instanceof AgentRuntimeError && error.code === 'invalid_tool_call');
 });
 
 await test('finish_story tool result marks terminal', async () => {
-  const provider = createMockAgentProvider({ responses: [{ tool_calls: [{ id: 'tool-finish', name: 'finish_story', arguments: { summary: 'done', ending: 'ending', original_difference: 'diff', key_choices: ['x'], character_outcomes: [{ character: 'A', fate: 'B' }] } }] }] });
+  // ClickUp 08 P1.3: tool_call rides on a batch with at least one narrative item.
+  const provider = createMockAgentProvider({ responses: [{
+    items: [{ role: 'assistant', type: 'narration', text: 'final beat' }],
+    tool_call: { id: 'tool-finish', name: 'finish_story', arguments: { summary: 'done', ending: 'ending', original_difference: 'diff', key_choices: ['x'], character_outcomes: [{ character: 'A', fate: 'B' }] } },
+  }] });
   const runtime = await buildRuntime(provider);
   const result = await runTurn(runtime, { input: { a: 1 }, expected_revision: recoverRuntime(runtime).base_revision });
   assert.equal(result.tool_result.kind, 'story_finished');

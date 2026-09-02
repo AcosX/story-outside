@@ -339,18 +339,15 @@ check('recover after two interrupts: history grew by 2', rec4.data?.history?.len
   check('recover after interrupt has no pending', rec3.data?.pending === null);
   check('recover after interrupt history size correct', rec3.data?.history?.length === rec2.data.history.length + 1 + 1);
 
-  // ----- agentRuntime integration: invalid_tool_call fail-closed -----
-  // The original "bad provider" payload ({ messages: [{ role: 'assistant',
-  // content: 'ok' }] }) is actually well-formed by the runtime contract:
-  // assistant messages with non-empty string content are valid, and the
-  // shape does NOT constitute a mismatched schema. To preserve coverage
-  // of the runtime's fail-closed behaviour, feed it a provider result
-  // that IS rejected by normalizeProviderResult — an empty `messages`
-  // array without tool_calls falls into the `provider_failure` arm of
-  // the validator (the test asserts that code path).
+  // ----- agentRuntime integration: provider fail-closed -----
+  // The runtime must fail closed on a malformed provider result. A payload
+  // with NEITHER messages NOR tool_calls (nor items) falls into the
+  // `provider_failure` arm of normalizeProviderResult (ClickUp 08 runtime
+  // contract; the empty-messages payload is classified as
+  // invalid_tool_call there and covered by the 08 suite).
   const recovered = rec4.data;  // post-second-interrupt so expected_revision matches the live session
   const toolRegistry = createToolRegistry();
-  const badProvider = createMockAgentProvider({ responses: [{ messages: [] }] });
+  const badProvider = createMockAgentProvider({ responses: [{}] });
   const badRuntime = createAgentRuntime({
     repository: storyRepo,
     session_uuid: sessionUuid,
