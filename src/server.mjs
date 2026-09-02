@@ -13,6 +13,7 @@ import { readFile, stat } from 'node:fs/promises';
 import { extname, join, normalize, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { canonicalJsonStringify } from './stories/canonicalHash.mjs';
 import {
   getStoryProvider,
   ProviderError,
@@ -28,17 +29,135 @@ import {
   startSessionSnapshot,
 } from './stories/index.mjs';
 import {
+  commitNarrativeEvent,
   commitOpeningEvent,
   createSession,
+  discardPendingTail,
   interruptWithPlayerInput,
+  listSessionEvents,
   recoverSession,
+  stageNarrativeBatch,
 } from './stories/sessionService.mjs';
+import {
+  AgentRuntimeError,
+  createAgentRuntime,
+  createMockAgentProvider,
+  recoverRuntime,
+  resumeTurn,
+  runTurn,
+} from './agent/runtime.mjs';
+import { snapshotAll as snapshotMetricsAll, snapshotSession as snapshotMetricsSession } from './observability/metrics.mjs';
+import { snapshotAll as snapshotCacheStatsAll } from './observability/cacheStats.mjs';
+import { computeFrontendPlaybackMs } from './observability/timing.mjs';
+import {
+  createStoriesHookContext,
+  onSessionCreate,
+  onOpeningCommit,
+  onInterrupt,
+  onToolCommit,
+  onOpeningCacheHit,
+  onOpeningCacheMiss,
+} from './stories/observabilityHooks.mjs';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 const ROOT = resolve(__dirname, '..');
 const PUBLIC_DIR = resolve(ROOT, 'public');
 const PORT = Number(process.env.PORT || 4173);
 const HOST = process.env.HOST || '127.0.0.1';
+
+/**
+ * Build a deterministic, story-aware mock provider that satisfies the
+ * ClickUp 08 wire contract: 1..4 ordered narrative items plus an
+ * OPTIONAL final tool call (never both items and a tool call with the
+ * items array empty, and never without a tool_call riding the items).
+ *
+ * The mock parses the player's input.text to decide what to produce:
+ *   - default: a 3-item narration/dialogue batch;
+ *   - text begins with 'choice' → a 1-item batch + ask_player_choice;
+ *   - text begins with 'finish' → a 1-item batch + finish_story;
+ *   - text contains 'long'   → a 4-item batch;
+ *   - text contains 'short'  → a 1-item batch.
+ * It also auto-emits a choice every CHOICE_EVERY turns and a finish_story
+ * at FINISH_AFTER (ClickUp 09 demo arc, session-scoped counter).
+ */
+function buildDemoMockAgentProvider(input, sessionUuid = null) {
+  const text = typeof input === 'object' && input !== null && typeof input.text === 'string'
+    ? input.text.toLowerCase() : '';
+  const isLong = text.includes('long');
+  const isShort = text.includes('short');
+  const isChoice = text.startsWith('choice');
+  const isFinish = text.startsWith('finish');
+  // Session-local turn counter (ClickUp 09 demo arc): auto-emit a choice
+  // every CHOICE_EVERY turns and a finish_story at FINISH_AFTER so the
+  // player sees the choice + ending flows without typing magic words.
+  // Input-driven rules take precedence.
+  const sessionState = sessionUuid ? getDemoSessionState(sessionUuid) : { turnCount: 0 };
+  const turnIndex = (sessionState.turnCount || 0) + 1;
+  sessionState.turnCount = turnIndex;
+  // The auto arc only applies to the player frontend's DEFAULT input
+  // ('hello' — see public/scripts/player.js). Explicit 08-contract inputs
+  // ('default' / 'short' / 'long' / …) must keep their documented batch
+  // shapes regardless of the turn index.
+  const isAutoArcInput = text === 'hello' || text === '';
+  const autoTool = isAutoArcInput && !isChoice && !isFinish && turnIndex > 0 && turnIndex % CHOICE_EVERY === 0;
+  const autoFinish = isAutoArcInput && !isChoice && !isFinish && turnIndex === FINISH_AFTER;
+  const count = isChoice || isFinish || autoTool || autoFinish ? MIN_BATCH
+    : isLong ? MAX_BATCH
+    : isShort ? MIN_BATCH
+    : 3;
+  const items = [];
+  for (let i = 0; i < count; i += 1) {
+    items.push({
+      role: 'assistant',
+      type: i % 2 === 0 ? 'narration' : 'dialogue',
+      text: `demo ${i % 2 === 0 ? 'line' : 'utterance'} ${i + 1}`,
+      ...(i % 2 === 1 ? { speaker: 'stranger' } : {}),
+    });
+  }
+  let tool_call = null;
+  if (isChoice || autoTool) {
+    tool_call = {
+      id: `tool-${randomUUID()}`,
+      name: 'ask_player_choice',
+      arguments: { question: '接下来你想怎么做？', options: [{ id: 'a', label: '继续听下去' }, { id: 'b', label: '换个方向' }] },
+    };
+  } else if (isFinish || autoFinish) {
+    tool_call = {
+      id: `tool-${randomUUID()}`,
+      name: 'finish_story',
+      arguments: {
+        summary: 'demo summary',
+        ending: 'demo ending',
+        original_difference: 'demo diff',
+        key_choices: ['demo choice'],
+        character_outcomes: [{ character: 'demo', fate: 'demo fate' }],
+      },
+    };
+  }
+  return createMockAgentProvider({ responses: [{ items, tool_call }] });
+}
+
+// Demo pacing constants for buildDemoMockAgentProvider (ClickUp 09 arc).
+const MIN_BATCH = 1;
+const MAX_BATCH = 4;
+const CHOICE_EVERY = 2;     // emit a choice tool_call every N narrative batches
+const FINISH_AFTER = 5;     // emit a finish_story tool_call after N narrative batches
+
+/**
+ * Per-session turn counter for the deterministic demo provider. The map
+ * is intentionally process-local: a fresh process starts a fresh demo
+ * arc. The store mirrors the route layer pattern (sessionPinnedMetadata)
+ * and is wiped when the server restarts.
+ */
+const demoTurnCounter = new Map();
+function getDemoSessionState(sessionUuid) {
+  let state = demoTurnCounter.get(sessionUuid);
+  if (!state) {
+    state = { turnCount: 0 };
+    demoTurnCounter.set(sessionUuid, state);
+  }
+  return state;
+}
 
 const DEMO_FLAG = Object.freeze({
   mode: 'demo',
@@ -178,6 +297,10 @@ const { repository: storyRepo, fixtures: storyFixtures } = createSeededRepositor
 // route layer keeps only the request's non-secret pinned metadata so recovery
 // can return the same metadata without reaching into service internals.
 const sessionPinnedMetadata = new Map();
+// Per-session turn-level request idempotency map. Keyed by session_uuid,
+// then by request_id. The map intentionally lives outside the repository
+// because the runtime does not own it (the repository is process-shared
+// with other tests/routes); the route layer is the only producer.
 
 const SESSION_UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -511,6 +634,19 @@ const server = http.createServer(async (req, res) => {
           generation_profile: profile,
         };
         sessionPinnedMetadata.set(body.session_uuid, pinned);
+        // ClickUp 14 observability hooks (route layer, per docs/observability.md §5).
+        // A freshly created session pins a valid opening cache, so this counts
+        // as a cache hit for the pinned cache_uuid.
+        const sessionHookCtx = createStoriesHookContext({
+          session_uuid: body.session_uuid,
+          story_uuid: body.story_uuid,
+          story_version_uuid: body.story_version_uuid,
+          cache_uuid: body.generation_profile.cache_uuid,
+          generation_hash: pinnedCache.generation_hash,
+          state: 'opening',
+        });
+        onSessionCreate(sessionHookCtx);
+        onOpeningCacheHit(sessionHookCtx);
         return jsonResponse(res, 200, {
           demo: DEMO_FLAG, dev: DEV_FLAG, ...result, pinned,
           session: { ...result, pinned },
@@ -592,6 +728,7 @@ const server = http.createServer(async (req, res) => {
       });
     }
     try {
+      const openingCommitStartedAt = Date.now();
       const result = commitOpeningEvent({
         repository: storyRepo,
         session_uuid: openingEventsMatch[1],
@@ -600,7 +737,70 @@ const server = http.createServer(async (req, res) => {
         client_request_id: body.client_request_id,
         expected_revision: body.expected_revision,
       });
+      onOpeningCommit({
+        hookCtx: createStoriesHookContext({
+          session_uuid: openingEventsMatch[1],
+          cache_uuid: body.cache_uuid,
+        }),
+        event: body.event,
+        latency_ms: Date.now() - openingCommitStartedAt,
+      });
       return jsonResponse(res, 200, { demo: DEMO_FLAG, dev: DEV_FLAG, ...result });
+    } catch (err) {
+      return sessionErrorResponse(res, err);
+    }
+  }
+
+  // ClickUp 08 / 09 narrative-batch routes (unified after the 08 merge).
+  //
+  //   POST /generate          : runtime stages a 1..4 item batch + optional
+  //                             tool call on the session pending slot. The
+  //                             response carries the 08 contract fields
+  //                             (items / kind / pending_total / base_revision)
+  //                             plus 09 player aliases (events / revision /
+  //                             pending_remaining).
+  //   POST /narrative-events  : commit exactly one displayed item
+  //   GET  /recover           : read-only canonical + active pending
+  //   POST /discard-pending   : drop an unconsumed pending batch
+  //
+  // The demo provider (buildDemoMockAgentProvider) is deterministic and
+  // honours the 08 wire shape while pacing the 09 demo arc (auto choice /
+  // finish); see the helper near the top of this file.
+
+  // GET /api/dev/sessions/:uuid/recover — explicit read-only recovery.
+  // Surfaces canonical history + revision + cursor + opening_cursor +
+  // active pending snapshot. Never calls the provider, never replays,
+  // never mutates state. Same-process only: the repository is
+  // in-memory, so a fresh process does not know this session.
+  const recoverMatch = pathname.match(/^\/api\/dev\/sessions\/([0-9a-fA-F-]+)\/recover$/);
+  if (method === 'GET' && recoverMatch) {
+    try {
+      const recovered = recoverSession({ repository: storyRepo, session_uuid: recoverMatch[1] });
+      return jsonResponse(res, 200, {
+        demo: DEMO_FLAG, dev: DEV_FLAG,
+        ...recovered,
+        pinned: sessionPinnedMetadata.get(recoverMatch[1]) || null,
+      });
+    } catch (err) {
+      return sessionErrorResponse(res, err);
+    }
+  }
+
+  // POST /api/dev/sessions/:uuid/discard-pending — drop the active
+  // pending batch without committing. Used when the player wants to
+  // clear a stale batch (e.g. recovery picked up a half-committed one).
+  const discardMatch = pathname.match(/^\/api\/dev\/sessions\/([0-9a-fA-F-]+)\/discard-pending$/);
+  if (method === 'POST' && discardMatch) {
+    try {
+      const result = discardPendingTail({
+        repository: storyRepo,
+        session_uuid: discardMatch[1],
+      });
+      return jsonResponse(res, 200, {
+        demo: DEMO_FLAG, dev: DEV_FLAG,
+        session_uuid: discardMatch[1],
+        ...result,
+      });
     } catch (err) {
       return sessionErrorResponse(res, err);
     }
@@ -626,6 +826,7 @@ const server = http.createServer(async (req, res) => {
       });
     }
     try {
+      const interruptStartedAt = Date.now();
       const result = interruptWithPlayerInput({
         repository: storyRepo,
         session_uuid: interruptMatch[1],
@@ -633,6 +834,19 @@ const server = http.createServer(async (req, res) => {
         client_request_id: body.client_request_id,
         expected_revision: body.expected_revision,
       });
+      const interruptHookCtx = createStoriesHookContext({
+        session_uuid: interruptMatch[1],
+        state: 'realtime',
+      });
+      onInterrupt({
+        hookCtx: interruptHookCtx,
+        text_length: body.text.length,
+        latency_ms: Date.now() - interruptStartedAt,
+      });
+      // The interrupt is the supported fallback from the pinned opening
+      // cache into realtime generation — recorded as the cache miss the
+      // docs/observability.md sanity counter expects.
+      onOpeningCacheMiss(interruptHookCtx, 'player_interrupt_realtime');
       return jsonResponse(res, 200, {
         demo: DEMO_FLAG,
         dev: DEV_FLAG,
@@ -640,6 +854,136 @@ const server = http.createServer(async (req, res) => {
         player_event: result.event,
         realtime_transition: { state: result.state, cursor: result.cursor, revision: result.revision },
       });
+    } catch (err) {
+      return sessionErrorResponse(res, err);
+    }
+  }
+
+  // ClickUp 08 runtime-driven narrative-batch routes.
+  //
+  // The runtime's deterministic demo provider stages 1..4 narrative items
+  // per turn plus an optional final tool call (input-driven "choice" /
+  // "finish", or the session-scoped demo arc). The contract is the real
+  // ClickUp 08 wire shape; a future Real provider must obey the same
+  // invariants.
+
+  // POST /api/dev/sessions/:uuid/generate — call the runtime and STAGE
+  // the result on the canonical session pending slot. Returns the staged
+  // batch (items + optional tool call). Does NOT append to canonical
+  // history; the player must commit each item via the narrative-events
+  // route below. The runtime base_revision pins expected_revision to the
+  // session's current revision.
+  //
+  // Idempotency: the runtime instance is created per request, but
+  // request-level idempotency (request_id + input + expected_revision) is
+  // owned by the SESSION (sessionService.turnRequests). Replaying the
+  // same request_id + input + expected_revision returns the exact prior
+  // result (same turn_id / pending_id / tool envelope) without calling
+  // the provider again; the same request_id with a different input or
+  // revision fails closed with duplicate_request.
+  const generateMatch = pathname.match(/^\/api\/dev\/sessions\/([0-9a-fA-F-]+)\/generate$/);
+  if (method === 'POST' && generateMatch) {
+    const sessionUuid = generateMatch[1];
+    let body = {};
+    try {
+      body = await readJsonBody(req);
+    } catch (err) {
+      return sessionErrorResponse(res, err);
+    }
+    if (!validObject(body) || typeof body.input !== 'object' || body.input === null ||
+        !Number.isInteger(body.expected_revision) ||
+        (body.request_id !== undefined && (typeof body.request_id !== 'string' || !body.request_id.length))) {
+      return jsonResponse(res, 400, {
+        error: 'validation_failed', message: 'The generate request is invalid.',
+        demo: DEMO_FLAG, dev: DEV_FLAG,
+      });
+    }
+    let runtime;
+    try {
+      const recovered = recoverSession({ repository: storyRepo, session_uuid: sessionUuid });
+      runtime = createAgentRuntime({
+        repository: storyRepo,
+        session_uuid: sessionUuid,
+        provider: buildDemoMockAgentProvider(body.input, sessionUuid),
+        system_prompt: { kind: 'system', text: 'demo runtime prompt' },
+        tool_definitions: [
+          { type: 'function', function: { name: 'ask_player_choice', parameters: { type: 'object' } } },
+          { type: 'function', function: { name: 'finish_story', parameters: { type: 'object' } } },
+        ],
+        expected_story_version_uuid: recovered.story_version_uuid,
+        expected_story_version_checksum: recovered.story_version_checksum,
+        expected_model: recovered.model,
+        expected_generation_profile: recovered.generation_profile,
+      });
+    } catch (err) {
+      if (err instanceof AgentRuntimeError) {
+        return jsonResponse(res, 400, {
+          error: err.code, message: err.message, demo: DEMO_FLAG, dev: DEV_FLAG,
+        });
+      }
+      return sessionErrorResponse(res, err);
+    }
+    try {
+      const result = await runTurn(runtime, {
+        ...(body.request_id ? { request_id: body.request_id } : {}),
+        input: body.input,
+        expected_revision: body.expected_revision,
+      });
+      return jsonResponse(res, 200, {
+        demo: DEMO_FLAG, dev: DEV_FLAG,
+        ...result,
+        session_uuid: sessionUuid,
+        pending_id: result.pending_id,
+        // ClickUp 09 player aliases: the frontend reads events / revision /
+        // pending_remaining; the 08 contract keeps items / base_revision /
+        // pending_total. Both name the same staged batch.
+        events: result.items,
+        revision: result.base_revision,
+        pending_remaining: result.pending_total - result.pending_committed_count,
+      });
+    } catch (err) {
+      if (err instanceof AgentRuntimeError) {
+        return jsonResponse(res, 400, {
+          error: err.code, message: err.message, demo: DEMO_FLAG, dev: DEV_FLAG,
+        });
+      }
+      return sessionErrorResponse(res, err);
+    }
+  }
+
+  // POST /api/dev/sessions/:uuid/narrative-events — commit exactly ONE
+  // displayed narrative event from the active pending batch. The event
+  // is appended to canonical history; revision advances by 1. The optional
+  // final tool_call (if present) is exposed on the last commit result but
+  // never becomes a canonical event.
+  const narrativeMatch = pathname.match(/^\/api\/dev\/sessions\/([0-9a-fA-F-]+)\/narrative-events$/);
+  if (method === 'POST' && narrativeMatch) {
+    const sessionUuid = narrativeMatch[1];
+    let body = {};
+    try {
+      body = await readJsonBody(req);
+    } catch (err) {
+      return sessionErrorResponse(res, err);
+    }
+    if (!validObject(body) || typeof body.pending_id !== 'string' || !body.pending_id ||
+        !Number.isInteger(body.sequence) ||
+        !Number.isInteger(body.expected_revision) ||
+        (body.client_request_id !== undefined && (typeof body.client_request_id !== 'string' || !body.client_request_id.length))) {
+      return jsonResponse(res, 400, {
+        error: 'validation_failed', message: 'The narrative-event commit request is invalid.',
+        demo: DEMO_FLAG, dev: DEV_FLAG,
+      });
+    }
+    try {
+      const result = commitNarrativeEvent({
+        repository: storyRepo,
+        session_uuid: sessionUuid,
+        pending_id: body.pending_id,
+        sequence: body.sequence,
+        expected_revision: body.expected_revision,
+        ...(body.client_request_id ? { client_request_id: body.client_request_id } : {}),
+      });
+      return jsonResponse(res, 200, { demo: DEMO_FLAG, dev: DEV_FLAG, ...result });
     } catch (err) {
       return sessionErrorResponse(res, err);
     }
@@ -674,9 +1018,15 @@ const server = http.createServer(async (req, res) => {
       });
     }
     try {
+      const firstChoiceStartedAt = Date.now();
       const result = markFirstChoiceConsumed({
         repository: storyRepo,
         snapshot: body.snapshot,
+      });
+      onToolCommit({
+        hookCtx: createStoriesHookContext({ session_uuid: urlSessionUuid }),
+        tool_name: 'ask_player_choice',
+        latency_ms: Date.now() - firstChoiceStartedAt,
       });
       return jsonResponse(res, 200, { demo: DEMO_FLAG, dev: DEV_FLAG, result });
     } catch (err) {
@@ -688,6 +1038,86 @@ const server = http.createServer(async (req, res) => {
         dev: DEV_FLAG,
       });
     }
+  }
+
+  // -----------------------------------------------------------------------
+  // ClickUp 14 observability admin endpoints (read-only).
+  //
+  // Two GET routes expose per-session observability + a process-wide
+  // metrics summary. They are demo/dev-only and intentionally live
+  // under /api/admin/* next to the other admin tooling. They never
+  // mutate session state — see src/observability/* for the storage
+  // shape and docs/observability.md for the field contract.
+  // -----------------------------------------------------------------------
+
+  const observabilitySessionMatch = pathname.match(/^\/api\/admin\/observability\/sessions\/([0-9a-fA-F-]+)$/);
+  if (method === 'GET' && observabilitySessionMatch) {
+    const session_uuid = observabilitySessionMatch[1];
+    if (!isSessionUuid(session_uuid)) {
+      return jsonResponse(res, 400, {
+        error: 'validation_failed',
+        message: 'session_uuid must be a UUID',
+        demo: DEMO_FLAG,
+        dev: DEV_FLAG,
+      });
+    }
+    const session = snapshotMetricsSession(session_uuid);
+    if (!session) {
+      return jsonResponse(res, 404, {
+        error: 'session_not_observed',
+        message: 'No observability data recorded for this session yet.',
+        demo: DEMO_FLAG,
+        dev: DEV_FLAG,
+      });
+    }
+    // Pull canonical session state (recovery read) so the operator gets
+    // a single correlated view of "story pinned → tokens spent → cache
+    // hits" without having to issue a second request. The session is
+    // fetched only after the metrics lookup, so an unknown session_uuid
+    // 404s cheaply.
+    let pinnedSession = null;
+    try {
+      pinnedSession = recoverSession({ repository: storyRepo, session_uuid });
+    } catch {
+      // The session may exist in metrics but not in the in-memory
+      // repository (e.g. process restart between the metric write and
+      // the request). Fall through with pinnedSession=null so the
+      // metrics view still renders.
+      pinnedSession = null;
+    }
+    return jsonResponse(res, 200, {
+      demo: DEMO_FLAG,
+      dev: DEV_FLAG,
+      session_uuid,
+      pinned: pinnedSession ? {
+        session_uuid: pinnedSession.session_uuid,
+        story_uuid: pinnedSession.story_uuid,
+        story_version_uuid: pinnedSession.story_version_uuid,
+        cache_uuid: pinnedSession.cache_uuid,
+        state: pinnedSession.state,
+        cursor: pinnedSession.cursor,
+        revision: pinnedSession.revision,
+        model: pinnedSession.model,
+        role_id: pinnedSession.role_id,
+        opening_cache_status: pinnedSession.opening_cache_status,
+        user_ref: pinnedSession.user_ref,
+        generation_profile: pinnedSession.generation_profile,
+      } : null,
+      metrics: session,
+    });
+  }
+
+  if (method === 'GET' && pathname === '/api/admin/observability/metrics/summary') {
+    const metrics = snapshotMetricsAll();
+    const cacheStats = snapshotCacheStatsAll();
+    return jsonResponse(res, 200, {
+      demo: DEMO_FLAG,
+      dev: DEV_FLAG,
+      metrics,
+      cache_stats: cacheStats,
+      note: 'frontend_playback_ms can be computed per-commit from the events the client commits; this endpoint exposes storage only.',
+      compute_frontend_playback_ms: typeof computeFrontendPlaybackMs === 'function' ? 'available' : 'missing',
+    });
   }
 
   // Root → static
