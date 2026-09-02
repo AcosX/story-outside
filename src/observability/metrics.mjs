@@ -40,6 +40,12 @@
 
 /** @type {Map<string, SessionMetrics>} */
 const sessionMetrics = new Map();
+
+// Session keys are externally controllable (request bodies), so the store
+// must stay bounded: unbounded growth would let anonymous /api/dev traffic
+// balloon process memory. Eviction is insertion-order (oldest observed
+// session first); the global counters are NOT rolled back on eviction.
+const MAX_SESSION_METRICS = 1000;
 let globalMetrics = newGlobalMetrics();
 let mutationCount = 0;
 
@@ -101,6 +107,10 @@ function newGlobalMetrics() {
 function touchSession(session_uuid, record) {
   let prev = sessionMetrics.get(session_uuid);
   if (!prev) {
+    if (sessionMetrics.size >= MAX_SESSION_METRICS) {
+      const oldestKey = sessionMetrics.keys().next().value;
+      if (oldestKey !== undefined) sessionMetrics.delete(oldestKey);
+    }
     prev = newSessionMetrics();
     sessionMetrics.set(session_uuid, prev);
     globalMetrics.sessionsObserved += 1;

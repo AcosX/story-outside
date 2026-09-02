@@ -56,6 +56,11 @@ const SENSITIVE_NORMALIZED = new Set([
   'authorization', 'cookie', 'headers', 'header',
 ]);
 
+// Free-text carrier keys. A string value under any of these keys is always
+// reduced to { length, hash } regardless of its length — short prompts and
+// error bubbles leak just as much as long ones.
+const TEXT_KEY_PATTERN = /^(prompt|message|query|content|input|text|body)$/i;
+
 // Fields that callers commonly put strings into (text, player_input.text,
 // session_event.text, …). Strings longer than `MAX_TEXT_LENGTH` are
 // replaced by `{ length, hash }`. The hash is a stable sha256 of the
@@ -145,6 +150,32 @@ function isSensitiveKey(key) {
   return SENSITIVE_KEY_PATTERN.test(key) || SENSITIVE_NORMALIZED.has(normalized);
 }
 
+function isTextKey(key) {
+  return TEXT_KEY_PATTERN.test(String(key));
+}
+
+// Credential-shaped substrings that must never reach the log shipper even
+// inside error messages bubbled up from providers or HTTP layers.
+const SECRET_VALUE_PATTERN = /(sk-[A-Za-z0-9_-]{8,}|ghp_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{16,}|AKIA[0-9A-Z]{16}|Bearer[ \t]+[A-Za-z0-9._-]{8,}|[A-Za-z][A-Za-z0-9+.-]*:\/\/[^\/ \t:]+:[^@ \t]+@)/g;
+
+const MAX_ERROR_MESSAGE_LENGTH = 200;
+
+/**
+ * Scrub credential-shaped values and cap the length of an error message
+ * before it is attached to a log record. Fulfils the "sanitised error
+ * message" contract from the LogContext JSDoc.
+ * @param {unknown} value
+ * @returns {string}
+ */
+function sanitizeErrorMessage(value) {
+  let text = typeof value === 'string' ? value : String(value);
+  text = text.replace(SECRET_VALUE_PATTERN, '[REDACTED]');
+  if (text.length > MAX_ERROR_MESSAGE_LENGTH) {
+    text = `${text.slice(0, MAX_ERROR_MESSAGE_LENGTH)}…`;
+  }
+  return text;
+}
+
 /**
  * Stable, one-way digest for redacted strings. Operators can still
  * correlate matching values across lines without ever seeing the text.
@@ -177,12 +208,15 @@ function redactValue(value, path) {
   if (typeof value === 'object') {
     const out = {};
     for (const [key, child] of Object.entries(value)) {
-      const childPath = `${path}.${key}`;
       if (isSensitiveKey(key) && !isAllowListed(key)) {
         out[key] = '[REDACTED]';
         continue;
       }
-      out[key] = redactValue(child, childPath);
+      if (isTextKey(key) && !isAllowListed(key) && typeof child === 'string') {
+        out[key] = { length: child.length, hash: fingerprintText(child) };
+        continue;
+      }
+      out[key] = redactValue(child, `${path}.${key}`);
     }
     return out;
   }
@@ -214,10 +248,13 @@ export function buildLogRecord(ctx) {
   for (const key of [
     'session_uuid', 'component', 'model', 'prompt_version', 'request_id',
     'tool_name', 'latency_ms', 'in_tokens', 'out_tokens', 'cache_read_tokens',
-    'error_code', 'error_message', 'truncated', 'retried', 'cache_hit', 'from_cache',
+    'error_code', 'truncated', 'retried', 'cache_hit', 'from_cache',
     'kind', 'sequence', 'event_type', 'state',
   ]) {
     if (ctx[key] !== undefined) record[key] = ctx[key];
+  }
+  if (ctx.error_message !== undefined) {
+    record.error_message = sanitizeErrorMessage(ctx.error_message);
   }
   if (ctx.extra && typeof ctx.extra === 'object') {
     record.extra = redactValue(ctx.extra, 'extra');

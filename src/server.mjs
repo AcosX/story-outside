@@ -36,6 +36,15 @@ import {
 import { snapshotAll as snapshotMetricsAll, snapshotSession as snapshotMetricsSession } from './observability/metrics.mjs';
 import { snapshotAll as snapshotCacheStatsAll } from './observability/cacheStats.mjs';
 import { computeFrontendPlaybackMs } from './observability/timing.mjs';
+import {
+  createStoriesHookContext,
+  onSessionCreate,
+  onOpeningCommit,
+  onInterrupt,
+  onToolCommit,
+  onOpeningCacheHit,
+  onOpeningCacheMiss,
+} from './stories/observabilityHooks.mjs';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 const ROOT = resolve(__dirname, '..');
@@ -514,6 +523,19 @@ const server = http.createServer(async (req, res) => {
           generation_profile: profile,
         };
         sessionPinnedMetadata.set(body.session_uuid, pinned);
+        // ClickUp 14 observability hooks (route layer, per docs/observability.md §5).
+        // A freshly created session pins a valid opening cache, so this counts
+        // as a cache hit for the pinned cache_uuid.
+        const sessionHookCtx = createStoriesHookContext({
+          session_uuid: body.session_uuid,
+          story_uuid: body.story_uuid,
+          story_version_uuid: body.story_version_uuid,
+          cache_uuid: body.generation_profile.cache_uuid,
+          generation_hash: pinnedCache.generation_hash,
+          state: 'opening',
+        });
+        onSessionCreate(sessionHookCtx);
+        onOpeningCacheHit(sessionHookCtx);
         return jsonResponse(res, 200, {
           demo: DEMO_FLAG, dev: DEV_FLAG, ...result, pinned,
           session: { ...result, pinned },
@@ -595,6 +617,7 @@ const server = http.createServer(async (req, res) => {
       });
     }
     try {
+      const openingCommitStartedAt = Date.now();
       const result = commitOpeningEvent({
         repository: storyRepo,
         session_uuid: openingEventsMatch[1],
@@ -602,6 +625,14 @@ const server = http.createServer(async (req, res) => {
         event: body.event,
         client_request_id: body.client_request_id,
         expected_revision: body.expected_revision,
+      });
+      onOpeningCommit({
+        hookCtx: createStoriesHookContext({
+          session_uuid: openingEventsMatch[1],
+          cache_uuid: body.cache_uuid,
+        }),
+        event: body.event,
+        latency_ms: Date.now() - openingCommitStartedAt,
       });
       return jsonResponse(res, 200, { demo: DEMO_FLAG, dev: DEV_FLAG, ...result });
     } catch (err) {
@@ -629,6 +660,7 @@ const server = http.createServer(async (req, res) => {
       });
     }
     try {
+      const interruptStartedAt = Date.now();
       const result = interruptWithPlayerInput({
         repository: storyRepo,
         session_uuid: interruptMatch[1],
@@ -636,6 +668,19 @@ const server = http.createServer(async (req, res) => {
         client_request_id: body.client_request_id,
         expected_revision: body.expected_revision,
       });
+      const interruptHookCtx = createStoriesHookContext({
+        session_uuid: interruptMatch[1],
+        state: 'realtime',
+      });
+      onInterrupt({
+        hookCtx: interruptHookCtx,
+        text_length: body.text.length,
+        latency_ms: Date.now() - interruptStartedAt,
+      });
+      // The interrupt is the supported fallback from the pinned opening
+      // cache into realtime generation — recorded as the cache miss the
+      // docs/observability.md sanity counter expects.
+      onOpeningCacheMiss(interruptHookCtx, 'player_interrupt_realtime');
       return jsonResponse(res, 200, {
         demo: DEMO_FLAG,
         dev: DEV_FLAG,
@@ -677,9 +722,15 @@ const server = http.createServer(async (req, res) => {
       });
     }
     try {
+      const firstChoiceStartedAt = Date.now();
       const result = markFirstChoiceConsumed({
         repository: storyRepo,
         snapshot: body.snapshot,
+      });
+      onToolCommit({
+        hookCtx: createStoriesHookContext({ session_uuid: urlSessionUuid }),
+        tool_name: 'ask_player_choice',
+        latency_ms: Date.now() - firstChoiceStartedAt,
       });
       return jsonResponse(res, 200, { demo: DEMO_FLAG, dev: DEV_FLAG, result });
     } catch (err) {
