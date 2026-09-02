@@ -268,6 +268,7 @@ CREATE TABLE IF NOT EXISTS session_events (
   KEY idx_session_events_session_created (session_id, created_at),
   KEY idx_session_events_type_occurred (event_type, occurred_at),
   KEY idx_session_events_source_sequence (source, source_sequence),
+  KEY idx_session_events_session_event (session_id, event_id),
   CONSTRAINT fk_session_events_session FOREIGN KEY (session_id) REFERENCES game_sessions(id)
     ON DELETE RESTRICT ON UPDATE RESTRICT,
   CONSTRAINT fk_session_events_prev FOREIGN KEY (session_id, prev_event_seq)
@@ -298,8 +299,11 @@ CREATE TABLE IF NOT EXISTS pending_batches (
   status ENUM('queued', 'reserved', 'succeeded', 'failed', 'expired', 'superseded')
     NOT NULL DEFAULT 'queued',
   base_event_id CHAR(36) NULL,
+  expected_revision BIGINT UNSIGNED NOT NULL DEFAULT 0,
   request_uuid CHAR(36) NOT NULL,
+  source VARCHAR(64) NOT NULL DEFAULT 'runtime',
   request_payload JSON NOT NULL,
+  request_fingerprint CHAR(64) NULL,
   response_payload JSON NULL,
   error_code VARCHAR(64) NULL,
   error_message VARCHAR(500) NULL,
@@ -311,29 +315,88 @@ CREATE TABLE IF NOT EXISTS pending_batches (
   reserved_by VARCHAR(128) NULL,
   expires_at DATETIME(6) NULL,
   completed_at DATETIME(6) NULL,
+  committed_count INT UNSIGNED NOT NULL DEFAULT 0,
+  item_count INT UNSIGNED NOT NULL DEFAULT 0,
   promoted_event_id CHAR(36) NULL,
+  superseded_by CHAR(36) NULL,
   created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
   updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
   PRIMARY KEY (id),
   UNIQUE KEY uq_pending_batches_batch_uuid (batch_uuid),
   UNIQUE KEY uq_pending_batches_request_uuid (request_uuid),
+  UNIQUE KEY uq_pending_batches_fingerprint (request_fingerprint),
   KEY idx_pending_batches_queue (status, available_at, priority),
   KEY idx_pending_batches_session (session_id, created_at),
+  KEY idx_pending_batches_session_id_id (session_id, id),
   KEY idx_pending_batches_base_event (base_event_id),
   KEY idx_pending_batches_promoted_event (promoted_event_id),
+  KEY idx_pending_batches_fingerprint (request_fingerprint),
   CONSTRAINT fk_pending_batches_session FOREIGN KEY (session_id) REFERENCES game_sessions(id)
     ON DELETE CASCADE ON UPDATE RESTRICT,
   CONSTRAINT fk_pending_batches_base_event FOREIGN KEY (base_event_id) REFERENCES session_events(event_id)
     ON DELETE RESTRICT ON UPDATE RESTRICT,
   CONSTRAINT fk_pending_batches_promoted_event FOREIGN KEY (promoted_event_id) REFERENCES session_events(event_id)
     ON DELETE RESTRICT ON UPDATE RESTRICT,
+  CONSTRAINT fk_pending_batches_promoted_event_session FOREIGN KEY (session_id, promoted_event_id)
+    REFERENCES session_events(session_id, event_id) ON DELETE RESTRICT ON UPDATE RESTRICT,
   CONSTRAINT chk_pending_batches_request CHECK (JSON_VALID(request_payload)),
   CONSTRAINT chk_pending_batches_response CHECK (response_payload IS NULL OR JSON_VALID(response_payload)),
   CONSTRAINT chk_pending_batches_attempts CHECK (attempts <= max_attempts),
   CONSTRAINT chk_pending_batches_expires CHECK (expires_at IS NULL OR expires_at > available_at),
+  CONSTRAINT chk_pending_batches_source CHECK (CHAR_LENGTH(source) > 0),
+  CONSTRAINT chk_pending_batches_counts CHECK (committed_count <= item_count),
   CONSTRAINT chk_pending_batches_completed CHECK (
     (status IN ('succeeded', 'failed', 'expired', 'superseded') AND completed_at IS NOT NULL)
     OR status IN ('queued', 'reserved')
+  )
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- One row per ordered narrative beat in a staged batch. item_seq is the
+-- 0-based index inside the staged batch and is unique per batch. A future
+-- DAO persists the exact ordered payload the runtime handed over, plus the
+-- per-item status that lets a mid-batch interrupt land cleanly on the SQL
+-- contract.
+CREATE TABLE IF NOT EXISTS pending_batch_items (
+  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  batch_id BIGINT UNSIGNED NOT NULL,
+  session_id BIGINT UNSIGNED NOT NULL,
+  item_uuid CHAR(36) NOT NULL,
+  item_seq INT UNSIGNED NOT NULL,
+  item_type ENUM('narrative_beat', 'tool_call') NOT NULL,
+  status ENUM('pending', 'committed', 'discarded') NOT NULL DEFAULT 'pending',
+  payload JSON NOT NULL,
+  promoted_event_id CHAR(36) NULL,
+  occurred_at DATETIME(6) NULL,
+  created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+  updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+  PRIMARY KEY (id),
+  UNIQUE KEY uq_pending_batch_items_uuid (item_uuid),
+  UNIQUE KEY uq_pending_batch_items_batch_seq (batch_id, item_seq),
+  KEY idx_pending_batch_items_batch_status (batch_id, status, item_seq),
+  KEY idx_pending_batch_items_promoted_event (promoted_event_id),
+  CONSTRAINT fk_pending_batch_items_batch FOREIGN KEY (batch_id) REFERENCES pending_batches(id)
+    ON DELETE CASCADE ON UPDATE RESTRICT,
+  CONSTRAINT fk_pending_batch_items_session_batch FOREIGN KEY (session_id, batch_id)
+    REFERENCES pending_batches(session_id, id) ON DELETE CASCADE ON UPDATE RESTRICT,
+  CONSTRAINT fk_pending_batch_items_promoted_event FOREIGN KEY (promoted_event_id) REFERENCES session_events(event_id)
+    ON DELETE RESTRICT ON UPDATE RESTRICT,
+  CONSTRAINT fk_pending_batch_items_promoted_event_session FOREIGN KEY (session_id, promoted_event_id)
+    REFERENCES session_events(session_id, event_id) ON DELETE RESTRICT ON UPDATE RESTRICT,
+  CONSTRAINT chk_pending_batch_items_seq CHECK (item_seq >= 0),
+  CONSTRAINT chk_pending_batch_items_payload CHECK (JSON_VALID(payload)),
+  CONSTRAINT chk_pending_batch_items_committed CHECK (
+    (status = 'committed' AND promoted_event_id IS NOT NULL AND occurred_at IS NOT NULL)
+    OR status IN ('pending', 'discarded')
+  ),
+  CONSTRAINT chk_pending_batch_items_discarded CHECK (
+    (status = 'discarded' AND occurred_at IS NULL AND promoted_event_id IS NULL) OR status IN ('pending', 'committed')
+  ),
+  CONSTRAINT chk_pending_batch_items_pending CHECK (
+    (status = 'pending' AND promoted_event_id IS NULL AND occurred_at IS NULL)
+    OR status IN ('committed', 'discarded')
+  ),
+  CONSTRAINT chk_pending_batch_items_tool_commit CHECK (
+    item_type <> 'tool_call' OR status <> 'committed'
   )
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
@@ -508,4 +571,5 @@ INSERT IGNORE INTO schema_migrations (migration_name, applied_by)
 VALUES ('0001_initial_story_outside', NULL),
        ('0002_opening_cache_generation_profile', NULL),
        ('0003_session_playback', NULL),
+       ('0004_pending_batch_lifecycle', NULL),
        ('0005_compact_and_context', NULL);
