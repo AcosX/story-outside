@@ -139,8 +139,8 @@ mariadb --no-defaults "$DB" < db/migrations/0002_opening_cache_generation_profil
 mariadb --no-defaults "$DB" < db/migrations/0003_session_playback.sql
 mariadb --no-defaults "$DB" < db/migrations/0003_session_playback.sql
 mariadb --no-defaults "$DB" < db/migrations/0004_pending_batch_lifecycle.sql
-mariadb --no-defaults "$DB" < db/migrations/0004_pending_batch_lifecycle.sql
-mariadb --no-defaults "$DB" -e "SHOW TABLES; SELECT migration_name FROM schema_migrations; SHOW CREATE TABLE pending_batches\G; SHOW CREATE TABLE pending_batch_items\G"
+mariadb --no-defaults "$DB" < db/migrations/0005_compact_and_context.sql
+mariadb --no-defaults "$DB" -e "SHOW TABLES; SELECT migration_name FROM schema_migrations; SHOW CREATE TABLE pending_batches\G; SHOW CREATE TABLE compact_compacted_events\G"
 mariadb --no-defaults -e "DROP DATABASE \`$DB\`;"
 
 # 方式 B：全新环境直接使用 canonical 入口
@@ -150,7 +150,7 @@ mariadb --no-defaults < db/schema.sql
 mariadb --no-defaults story_outside -e "SHOW TABLES;"
 mariadb --no-defaults story_outside -e "SHOW TRIGGERS LIKE 'session_events';"
 mariadb --no-defaults story_outside -e "SHOW CREATE TABLE session_events\G"
-mariadb --no-defaults story_outside -e "SHOW CREATE TABLE pending_batches\G; SHOW CREATE TABLE pending_batch_items\G;"
+mariadb --no-defaults story_outside -e "SHOW CREATE TABLE pending_batches\G; SHOW CREATE TABLE pending_batch_items\G; SHOW CREATE TABLE compact_compacted_events\G; SELECT COUNT(*) AS model_context_windows FROM model_context_windows;"
 ```
 
 ### 6.1 负面约束探针（ClickUp 08 P1.4 / P1.7）
