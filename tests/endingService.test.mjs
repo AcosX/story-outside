@@ -57,7 +57,7 @@ async function driveToFinish(baseUrl, sessionUuid, expectedRevision) {
   // the FINAL narrative commit. Returns the final expected_revision.
   for (let turn = 1; turn <= 6; turn += 1) {
     const stagedRes = await postJson(baseUrl, `/api/dev/sessions/${sessionUuid}/generate`, {
-      input: { text: 'long' },
+      input: { text: 'hello' },
       expected_revision: expectedRevision,
       request_id: `ending-${sessionUuid}-${turn}`,
     });
@@ -280,7 +280,7 @@ async function main() {
       // is on session.pending (not in history). /replay must NOT include
       // those staged events.
       const stagedRes = await postJson(baseUrl, `/api/dev/sessions/${sessionUuid}/generate`, {
-        input: { text: 'long' },
+        input: { text: 'hello' },
         expected_revision: 0,
         request_id: `staged-${sessionUuid}`,
       });

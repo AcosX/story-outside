@@ -57,7 +57,7 @@ async function getJson(baseUrl, path) {
 async function driveToFinish(baseUrl, sessionUuid, expectedRevision) {
   for (let turn = 1; turn <= 6; turn += 1) {
     const stagedRes = await postJson(baseUrl, `/api/dev/sessions/${sessionUuid}/generate`, {
-      input: { text: 'long' },
+      input: { text: 'hello' },
       expected_revision: expectedRevision,
       request_id: `dom-end-${sessionUuid}-${turn}`,
     });
