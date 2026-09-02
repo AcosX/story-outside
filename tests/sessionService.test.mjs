@@ -187,12 +187,27 @@ async function run() {
   assert.deepEqual(interruptWithPlayerInput({ repository, session_uuid: SESSION, text: '我等一个答案', client_request_id: 'input-1', expected_revision: 0 }), interrupted);
   assert.throws(() => interruptWithPlayerInput({ repository, session_uuid: SESSION, text: '不同', client_request_id: 'input-1' }), /different request/);
   assert.equal(repository.findOpeningCacheByUuid(cache.cache_uuid).status, 'valid');
+  // At this point only one interrupt has succeeded (the idempotent replay
+  // reuses cached result, and the throw-on-conflict case throws).
   assert.equal(beforeInterrupt.history.length + 1, recoverSession({ repository, session_uuid: SESSION }).history.length);
-  assert.throws(() => interruptWithPlayerInput({ repository, session_uuid: SESSION, text: 'again' }), /not interruptible/);
+  // ClickUp 09 AC2: realtime is now interruptible; second interrupt must succeed
+  // and append another player_input while keeping state === 'realtime'.
+  const secondInterrupt = interruptWithPlayerInput({ repository, session_uuid: SESSION, text: 'again', client_request_id: 'input-2', expected_revision: interrupted.revision });
+  assert.equal(secondInterrupt.state, 'realtime');
+  assert.equal(secondInterrupt.event.event_type, 'player_input');
+  assert.equal(secondInterrupt.event.payload.text, 'again');
+  assert.equal(secondInterrupt.revision, interrupted.revision + 1);
+  // player_input appends but does not advance the opening cursor
+  // (the cursor only counts opening commits). History length does grow.
+  assert.equal(secondInterrupt.cursor, interrupted.cursor);
+  assert.equal(secondInterrupt.event.event_seq, interrupted.event.event_seq + 1);
+  // After the second interrupt, history is beforeInterrupt + 2.
+  assert.equal(beforeInterrupt.history.length + 2, recoverSession({ repository, session_uuid: SESSION }).history.length);
 
   const recovered = recoverSession({ repository, session_uuid: SESSION });
   assert.equal(recovered.cursor, interrupted.cursor);
-  assert.equal(recovered.revision, interrupted.revision);
+  // After both interrupts, revision is interrupted.revision + 1.
+  assert.equal(recovered.revision, interrupted.revision + 1);
   assert.deepEqual(recovered.history, listSessionEvents({ repository, session_uuid: SESSION }));
   assert.equal(recovered.generation_profile.cache_uuid, cache.cache_uuid);
   assert.equal(repository.findOpeningCacheByUuid(cache.cache_uuid).status, 'valid');

@@ -13,6 +13,7 @@ import { readFile, stat } from 'node:fs/promises';
 import { extname, join, normalize, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { canonicalJsonStringify } from './stories/canonicalHash.mjs';
 import {
   getStoryProvider,
   ProviderError,
@@ -28,17 +29,163 @@ import {
   startSessionSnapshot,
 } from './stories/index.mjs';
 import {
+  commitNarrativeEvent,
   commitOpeningEvent,
   createSession,
+  discardPendingTail,
   interruptWithPlayerInput,
   recoverSession,
+  stageNarrativeBatch,
 } from './stories/sessionService.mjs';
+import { executeToolCall } from './agent/tools.mjs';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 const ROOT = resolve(__dirname, '..');
 const PUBLIC_DIR = resolve(ROOT, 'public');
 const PORT = Number(process.env.PORT || 4173);
 const HOST = process.env.HOST || '127.0.0.1';
+
+// DEPENDENCY NOTE (ClickUp 09):
+//
+//   The /generate and /narrative-events routes below depend on the
+//   ClickUp 08 contract (1..4 narrative items per batch + optional final
+//   tool call). main does NOT include 08 yet, so this branch introduces
+//   the minimum needed seams in sessionService + a deterministic demo
+//   batch builder. When main integrates 08, these helpers should be
+//   replaced by the 08 implementation; the wire shape the frontend
+//   uses stays stable across both.
+
+const MIN_BATCH = 1;
+const MAX_BATCH = 4;
+
+/**
+ * Build a single deterministic demo batch from the player input.
+ *
+ * Wire shape (matches the ClickUp 08 / 09 contract):
+ *   { items: [{ type, text, speaker? } x 1..4],
+ *     tool_call: { id, name, arguments } | null }
+ *
+ * The mock parses the player's input.text to decide what to produce:
+ *   - default                  : 3-item narration/dialogue batch, no tool
+ *   - text begins "choice"     : 1-item batch + ask_player_choice
+ *   - text begins "finish"     : 1-item batch + finish_story
+ *   - text contains "long"     : 4-item batch
+ *   - text contains "short"    : 1-item batch
+ *
+ * To demonstrate the choice + ending flows without forcing the player to
+ * type "choice"/"finish", the mock also emits a choice after every
+ * CHOICE_EVERY batches and a finish after FINISH_AFTER, regardless of
+ * input. The input-driven rules above still take precedence.
+ */
+const CHOICE_EVERY = 2;     // emit a choice tool_call every N narrative batches
+const FINISH_AFTER = 5;     // emit a finish_story tool_call after N narrative batches
+
+function buildDemoBatch(input, request_id, sessionState) {
+  const text = typeof input === 'object' && input !== null && typeof input.text === 'string'
+    ? input.text.toLowerCase() : '';
+  const isLong = text.includes('long');
+  const isShort = text.includes('short');
+  const isChoice = text.startsWith('choice');
+  const isFinish = text.startsWith('finish');
+  // Track session-local turn count to decide when to emit tools even on
+  // a default "hello" input. The counter lives in sessionState so each
+  // session has its own progression. Read it BEFORE counting items so
+  // the auto-tool rule can trim the batch down to 1 item.
+  const turnIndex = (sessionState.turnCount || 0) + 1;
+  sessionState.turnCount = turnIndex;
+  const autoTool = !isChoice && !isFinish && turnIndex > 0 && turnIndex % CHOICE_EVERY === 0;
+  const autoFinish = !isChoice && !isFinish && turnIndex === FINISH_AFTER;
+  const count = isChoice || isFinish || autoTool || autoFinish ? MIN_BATCH
+    : isLong ? MAX_BATCH
+    : isShort ? MIN_BATCH
+    : 3;
+  const items = [];
+  for (let i = 0; i < count; i += 1) {
+    items.push({
+      type: i % 2 === 0 ? 'narration' : 'dialogue',
+      text: `demo ${i % 2 === 0 ? 'line' : 'utterance'} ${i + 1}`,
+      ...(i % 2 === 1 ? { speaker: 'stranger' } : {}),
+    });
+  }
+  let tool_call = null;
+  if (isChoice || autoTool) {
+    tool_call = {
+      id: `tool-${randomUUID()}`,
+      name: 'ask_player_choice',
+      arguments: { question: '接下来你想怎么做？', options: [{ id: 'a', label: '继续听下去' }, { id: 'b', label: '换个方向' }] },
+    };
+  } else if (isFinish || autoFinish) {
+    tool_call = {
+      id: `tool-${randomUUID()}`,
+      name: 'finish_story',
+      arguments: {
+        summary: 'demo summary',
+        ending: 'demo ending',
+        original_difference: 'demo diff',
+        key_choices: ['demo choice'],
+        character_outcomes: [{ character: 'demo', fate: 'demo fate' }],
+      },
+    };
+  }
+  let normalized_tool_call = null;
+  if (tool_call) {
+    try {
+      normalized_tool_call = executeToolCall({
+        name: tool_call.name,
+        arguments: tool_call.arguments,
+        tool_call_id: tool_call.id,
+        id: tool_call.id,
+      });
+    } catch (err) {
+      const e = new Error(`buildDemoBatch: tool validation failed (${err.message})`);
+      e.code = 'invalid_tool_call';
+      throw e;
+    }
+  }
+  return {
+    turn_id: randomUUID(),
+    request_id: request_id || null,
+    kind: normalized_tool_call ? (normalized_tool_call.terminal ? 'story_finished' : 'choice_required') : 'narrative',
+    items,
+    tool_call: normalized_tool_call,
+  };
+}
+
+/**
+ * Strip undefined / function / symbol fields from a value so it round-trips
+ * through tools.mjs's strict canonicalJsonStringify walker (which rejects
+ * any non-finite JSON token). The normalized tool envelope emitted by
+ * executeToolCall carries fields like `session_uuid` / `turn_id` /
+ * `base_revision` as undefined when those are not supplied by the
+ * caller; we strip them so the envelope is safe to hand to
+ * stageNarrativeBatch (which canonicalises the pending snapshot).
+ */
+function stripUnsupported(value) {
+  if (value === null || typeof value !== 'object') return value;
+  if (Array.isArray(value)) return value.map(stripUnsupported);
+  const out = {};
+  for (const [key, child] of Object.entries(value)) {
+    if (child === undefined || typeof child === 'function' || typeof child === 'symbol') continue;
+    out[key] = stripUnsupported(child);
+  }
+  return out;
+}
+
+/**
+ * Per-session turn counter for the deterministic demo provider. The map
+ * is intentionally process-local: a fresh process starts a fresh demo
+ * arc. The store mirrors the route layer pattern (sessionPinnedMetadata,
+ * sessionTurnIndex) and is wiped when the server restarts.
+ */
+const demoTurnCounter = new Map();
+function getDemoSessionState(sessionUuid) {
+  let state = demoTurnCounter.get(sessionUuid);
+  if (!state) {
+    state = { turnCount: 0 };
+    demoTurnCounter.set(sessionUuid, state);
+  }
+  return state;
+}
 
 const DEMO_FLAG = Object.freeze({
   mode: 'demo',
@@ -178,6 +325,11 @@ const { repository: storyRepo, fixtures: storyFixtures } = createSeededRepositor
 // route layer keeps only the request's non-secret pinned metadata so recovery
 // can return the same metadata without reaching into service internals.
 const sessionPinnedMetadata = new Map();
+// Per-session turn-level request idempotency map. Keyed by session_uuid,
+// then by request_id. The map intentionally lives outside the repository
+// because the runtime does not own it (the repository is process-shared
+// with other tests/routes); the route layer is the only producer.
+const sessionTurnIndex = new Map();
 
 const SESSION_UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -601,6 +753,188 @@ const server = http.createServer(async (req, res) => {
         expected_revision: body.expected_revision,
       });
       return jsonResponse(res, 200, { demo: DEMO_FLAG, dev: DEV_FLAG, ...result });
+    } catch (err) {
+      return sessionErrorResponse(res, err);
+    }
+  }
+
+  // ClickUp 09 narrative-batch routes. The wire shape matches the
+  // ClickUp 08 contract that the player frontend consumes:
+  //   POST /generate          : stage a 1..4 item batch + optional tool call
+  //   POST /narrative-events  : commit exactly one displayed item
+  //   GET  /recover           : read-only canonical + active pending
+  //   POST /discard-pending   : drop an unconsumed pending batch
+  //
+  // The runtime itself is bypassed here: main does not include 08 yet,
+  // so the demo uses buildDemoBatch (a deterministic mock that honours
+  // the 08 wire shape). When 08 lands in main, this block should be
+  // replaced by the 08 runtime+sessionService wiring.
+
+  // POST /api/dev/sessions/:uuid/generate — build the next demo batch
+  // and stage it as the active pending batch. The frontend commits each
+  // item via /narrative-events. Idempotent on (request_id, input,
+  // expected_revision): the same triple replays the prior staged batch
+  // without a fresh provider call; a different payload fails closed.
+  const generateMatch = pathname.match(/^\/api\/dev\/sessions\/([0-9a-fA-F-]+)\/generate$/);
+  if (method === 'POST' && generateMatch) {
+    const sessionUuid = generateMatch[1];
+    let body = {};
+    try {
+      body = await readJsonBody(req);
+    } catch (err) {
+      return sessionErrorResponse(res, err);
+    }
+    if (!validObject(body) || typeof body.input !== 'object' || body.input === null ||
+        !Number.isInteger(body.expected_revision) ||
+        (body.request_id !== undefined && (typeof body.request_id !== 'string' || !body.request_id.length))) {
+      return jsonResponse(res, 400, {
+        error: 'validation_failed', message: 'The generate request is invalid.',
+        demo: DEMO_FLAG, dev: DEV_FLAG,
+      });
+    }
+    // Turn-level idempotency: replay prior result when the same
+    // (request_id, input, expected_revision) triple arrives twice.
+    if (body.request_id) {
+      const prior = sessionTurnIndex.get(sessionUuid);
+      const priorEntry = prior && prior.get(body.request_id);
+      const fp = canonicalJsonStringify({ input: body.input, expected_revision: body.expected_revision });
+      if (priorEntry) {
+        if (priorEntry.fingerprint !== fp) {
+          return jsonResponse(res, 400, {
+            error: 'duplicate_request',
+            message: 'request_id already used for a different request.',
+            demo: DEMO_FLAG, dev: DEV_FLAG,
+          });
+        }
+        return jsonResponse(res, 200, { demo: DEMO_FLAG, dev: DEV_FLAG, ...priorEntry.result });
+      }
+    }
+    let batch;
+    try {
+      batch = buildDemoBatch(body.input, body.request_id || null, getDemoSessionState(sessionUuid));
+    } catch (err) {
+      const code = err.code || 'provider_failure';
+      return jsonResponse(res, 400, {
+        error: code,
+        message: String(err.message || err),
+        demo: DEMO_FLAG, dev: DEV_FLAG,
+      });
+    }
+    let staged;
+    try {
+      staged = stageNarrativeBatch({
+        repository: storyRepo,
+        session_uuid: sessionUuid,
+        items: batch.items,
+        tool_call: batch.tool_call ? stripUnsupported(batch.tool_call) : null,
+        ...(body.request_id ? { client_request_id: body.request_id } : {}),
+        expected_revision: body.expected_revision,
+      });
+    } catch (err) {
+      return sessionErrorResponse(res, err);
+    }
+    const turnResult = {
+      turn_id: batch.turn_id,
+      request_id: body.request_id || null,
+      kind: batch.kind,
+      pending_id: staged.pending_id,
+      events: staged.events,
+      tool_call: staged.tool_call,
+      pending_committed_count: staged.committed_count,
+      pending_remaining: staged.events.length - staged.committed_count,
+      cursor: staged.cursor,
+      opening_cursor: staged.opening_cursor,
+      revision: staged.revision,
+      state: staged.state,
+    };
+    if (body.request_id) {
+      const fp = canonicalJsonStringify({ input: body.input, expected_revision: body.expected_revision });
+      let prior = sessionTurnIndex.get(sessionUuid);
+      if (!prior) {
+        prior = new Map();
+        sessionTurnIndex.set(sessionUuid, prior);
+      }
+      prior.set(body.request_id, { fingerprint: fp, result: turnResult });
+    }
+    return jsonResponse(res, 200, {
+      demo: DEMO_FLAG, dev: DEV_FLAG,
+      ...turnResult,
+      session_uuid: sessionUuid,
+    });
+  }
+
+  // POST /api/dev/sessions/:uuid/narrative-events — commit exactly ONE
+  // displayed narrative event from the active pending batch. The event
+  // is appended to canonical history; revision advances by 1. The
+  // optional final tool_call (if present) is exposed on the last commit
+  // result via pending_tool_call but never becomes a canonical event.
+  const narrativeMatch = pathname.match(/^\/api\/dev\/sessions\/([0-9a-fA-F-]+)\/narrative-events$/);
+  if (method === 'POST' && narrativeMatch) {
+    const sessionUuid = narrativeMatch[1];
+    let body = {};
+    try {
+      body = await readJsonBody(req);
+    } catch (err) {
+      return sessionErrorResponse(res, err);
+    }
+    if (!validObject(body) || typeof body.pending_id !== 'string' || !body.pending_id ||
+        !Number.isInteger(body.sequence) ||
+        !Number.isInteger(body.expected_revision) ||
+        (body.client_request_id !== undefined && (typeof body.client_request_id !== 'string' || !body.client_request_id.length))) {
+      return jsonResponse(res, 400, {
+        error: 'validation_failed', message: 'The narrative-event commit request is invalid.',
+        demo: DEMO_FLAG, dev: DEV_FLAG,
+      });
+    }
+    try {
+      const result = commitNarrativeEvent({
+        repository: storyRepo,
+        session_uuid: sessionUuid,
+        pending_id: body.pending_id,
+        sequence: body.sequence,
+        expected_revision: body.expected_revision,
+        ...(body.client_request_id ? { client_request_id: body.client_request_id } : {}),
+      });
+      return jsonResponse(res, 200, { demo: DEMO_FLAG, dev: DEV_FLAG, ...result });
+    } catch (err) {
+      return sessionErrorResponse(res, err);
+    }
+  }
+
+  // GET /api/dev/sessions/:uuid/recover — explicit read-only recovery.
+  // Surfaces canonical history + revision + cursor + opening_cursor +
+  // active pending snapshot. Never calls the provider, never replays,
+  // never mutates state. Same-process only: the repository is
+  // in-memory, so a fresh process does not know this session.
+  const recoverMatch = pathname.match(/^\/api\/dev\/sessions\/([0-9a-fA-F-]+)\/recover$/);
+  if (method === 'GET' && recoverMatch) {
+    try {
+      const recovered = recoverSession({ repository: storyRepo, session_uuid: recoverMatch[1] });
+      return jsonResponse(res, 200, {
+        demo: DEMO_FLAG, dev: DEV_FLAG,
+        ...recovered,
+        pinned: sessionPinnedMetadata.get(recoverMatch[1]) || null,
+      });
+    } catch (err) {
+      return sessionErrorResponse(res, err);
+    }
+  }
+
+  // POST /api/dev/sessions/:uuid/discard-pending — drop the active
+  // pending batch without committing. Used when the player wants to
+  // clear a stale batch (e.g. recovery picked up a half-committed one).
+  const discardMatch = pathname.match(/^\/api\/dev\/sessions\/([0-9a-fA-F-]+)\/discard-pending$/);
+  if (method === 'POST' && discardMatch) {
+    try {
+      const result = discardPendingTail({
+        repository: storyRepo,
+        session_uuid: discardMatch[1],
+      });
+      return jsonResponse(res, 200, {
+        demo: DEMO_FLAG, dev: DEV_FLAG,
+        session_uuid: discardMatch[1],
+        ...result,
+      });
     } catch (err) {
       return sessionErrorResponse(res, err);
     }
