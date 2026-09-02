@@ -197,15 +197,24 @@ async function run() {
   assert.deepEqual(interruptWithPlayerInput({ repository, session_uuid: SESSION, text: '我等一个答案', client_request_id: 'input-1', expected_revision: 0 }), interrupted);
   assert.throws(() => interruptWithPlayerInput({ repository, session_uuid: SESSION, text: '不同', client_request_id: 'input-1' }), /different request/);
   assert.equal(repository.findOpeningCacheByUuid(cache.cache_uuid).status, 'valid');
+  // At this point only one interrupt has succeeded (the idempotent replay
+  // reuses cached result, and the throw-on-conflict case throws).
   assert.equal(beforeInterrupt.history.length + 1, recoverSession({ repository, session_uuid: SESSION }).history.length);
-  // ClickUp 08 P2.6: a realtime session IS interruptible again — the second
-  // interrupt stays realtime and appends another player_input (source_sequence
-  // 1, the per-(session, source) counter).
-  const reInterrupt = interruptWithPlayerInput({ repository, session_uuid: SESSION, text: 'again' });
+  // ClickUp 08 P2.6 / ClickUp 09 AC2: a realtime session IS interruptible
+  // again — the second interrupt stays realtime and appends another
+  // player_input (source_sequence 1, the per-(session, source) counter).
+  const reInterrupt = interruptWithPlayerInput({ repository, session_uuid: SESSION, text: 'again', client_request_id: 'input-2' });
   assert.equal(reInterrupt.state, 'realtime');
   assert.equal(reInterrupt.event.event_type, 'player_input');
+  assert.equal(reInterrupt.event.payload.text, 'again');
   assert.equal(reInterrupt.event.source_sequence, 1);
+  assert.equal(reInterrupt.event.event_seq, interrupted.event.event_seq + 1);
+  // Canonical cursor semantics (08 P1.1): cursor === revision === history
+  // length, and every commit — including player_input — advances both by 1.
   assert.equal(reInterrupt.revision, beforeInterrupt.revision + 2);
+  assert.equal(reInterrupt.cursor, interrupted.cursor + 1);
+  // After the second interrupt, history is beforeInterrupt + 2.
+  assert.equal(beforeInterrupt.history.length + 2, recoverSession({ repository, session_uuid: SESSION }).history.length);
 
   const recovered = recoverSession({ repository, session_uuid: SESSION });
   assert.equal(recovered.cursor, reInterrupt.cursor);

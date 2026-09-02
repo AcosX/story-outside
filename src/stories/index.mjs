@@ -41,14 +41,16 @@ export { createSeededRepository, FIXTURE_UUIDS } from './fixture.mjs';
 // authoritative commit hook (ClickUp 08 contract name); pendingLifecycle
 // exposes `commitDisplayedEvent` as an alias.
 export {
-  commitOpeningEvent,
   commitNarrativeEvent,
+  commitOpeningEvent,
   createSession,
   discardPendingTail,
   getSession,
   interruptWithPlayerInput,
   listSessionEvents,
+  lookupTurnRequest,
   recoverSession,
+  registerTurnRequest,
 } from './sessionService.mjs';
 
 // pendingLifecycle — strict facade. `stageNarrativeBatch` accepts both

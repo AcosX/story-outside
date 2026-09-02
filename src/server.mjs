@@ -13,6 +13,7 @@ import { readFile, stat } from 'node:fs/promises';
 import { extname, join, normalize, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { canonicalJsonStringify } from './stories/canonicalHash.mjs';
 import {
   getStoryProvider,
   ProviderError,
@@ -59,35 +60,56 @@ const HOST = process.env.HOST || '127.0.0.1';
  * items array empty, and never without a tool_call riding the items).
  *
  * The mock parses the player's input.text to decide what to produce:
- *   - default: a 3-item narration batch;
+ *   - default: a 3-item narration/dialogue batch;
  *   - text begins with 'choice' → a 1-item batch + ask_player_choice;
  *   - text begins with 'finish' → a 1-item batch + finish_story;
  *   - text contains 'long'   → a 4-item batch;
  *   - text contains 'short'  → a 1-item batch.
+ * It also auto-emits a choice every CHOICE_EVERY turns and a finish_story
+ * at FINISH_AFTER (ClickUp 09 demo arc, session-scoped counter).
  */
-function buildDemoMockAgentProvider(input) {
+function buildDemoMockAgentProvider(input, sessionUuid = null) {
   const text = typeof input === 'object' && input !== null && typeof input.text === 'string'
     ? input.text.toLowerCase() : '';
   const isLong = text.includes('long');
   const isShort = text.includes('short');
   const isChoice = text.startsWith('choice');
   const isFinish = text.startsWith('finish');
-  const count = isChoice || isFinish ? 1
-    : isLong ? 4
-    : isShort ? 1
+  // Session-local turn counter (ClickUp 09 demo arc): auto-emit a choice
+  // every CHOICE_EVERY turns and a finish_story at FINISH_AFTER so the
+  // player sees the choice + ending flows without typing magic words.
+  // Input-driven rules take precedence.
+  const sessionState = sessionUuid ? getDemoSessionState(sessionUuid) : { turnCount: 0 };
+  const turnIndex = (sessionState.turnCount || 0) + 1;
+  sessionState.turnCount = turnIndex;
+  // The auto arc only applies to the player frontend's DEFAULT input
+  // ('hello' — see public/scripts/player.js). Explicit 08-contract inputs
+  // ('default' / 'short' / 'long' / …) must keep their documented batch
+  // shapes regardless of the turn index.
+  const isAutoArcInput = text === 'hello' || text === '';
+  const autoTool = isAutoArcInput && !isChoice && !isFinish && turnIndex > 0 && turnIndex % CHOICE_EVERY === 0;
+  const autoFinish = isAutoArcInput && !isChoice && !isFinish && turnIndex === FINISH_AFTER;
+  const count = isChoice || isFinish || autoTool || autoFinish ? MIN_BATCH
+    : isLong ? MAX_BATCH
+    : isShort ? MIN_BATCH
     : 3;
   const items = [];
   for (let i = 0; i < count; i += 1) {
-    items.push({ role: 'assistant', type: i % 2 === 0 ? 'narration' : 'dialogue', text: `demo ${i % 2 === 0 ? 'line' : 'utterance'} ${i + 1}` });
+    items.push({
+      role: 'assistant',
+      type: i % 2 === 0 ? 'narration' : 'dialogue',
+      text: `demo ${i % 2 === 0 ? 'line' : 'utterance'} ${i + 1}`,
+      ...(i % 2 === 1 ? { speaker: 'stranger' } : {}),
+    });
   }
   let tool_call = null;
-  if (isChoice) {
+  if (isChoice || autoTool) {
     tool_call = {
       id: `tool-${randomUUID()}`,
       name: 'ask_player_choice',
-      arguments: { question: 'demo question', options: [{ id: 'a', label: 'A' }, { id: 'b', label: 'B' }] },
+      arguments: { question: '接下来你想怎么做？', options: [{ id: 'a', label: '继续听下去' }, { id: 'b', label: '换个方向' }] },
     };
-  } else if (isFinish) {
+  } else if (isFinish || autoFinish) {
     tool_call = {
       id: `tool-${randomUUID()}`,
       name: 'finish_story',
@@ -101,6 +123,28 @@ function buildDemoMockAgentProvider(input) {
     };
   }
   return createMockAgentProvider({ responses: [{ items, tool_call }] });
+}
+
+// Demo pacing constants for buildDemoMockAgentProvider (ClickUp 09 arc).
+const MIN_BATCH = 1;
+const MAX_BATCH = 4;
+const CHOICE_EVERY = 2;     // emit a choice tool_call every N narrative batches
+const FINISH_AFTER = 5;     // emit a finish_story tool_call after N narrative batches
+
+/**
+ * Per-session turn counter for the deterministic demo provider. The map
+ * is intentionally process-local: a fresh process starts a fresh demo
+ * arc. The store mirrors the route layer pattern (sessionPinnedMetadata)
+ * and is wiped when the server restarts.
+ */
+const demoTurnCounter = new Map();
+function getDemoSessionState(sessionUuid) {
+  let state = demoTurnCounter.get(sessionUuid);
+  if (!state) {
+    state = { turnCount: 0 };
+    demoTurnCounter.set(sessionUuid, state);
+  }
+  return state;
 }
 
 const DEMO_FLAG = Object.freeze({
@@ -241,6 +285,10 @@ const { repository: storyRepo, fixtures: storyFixtures } = createSeededRepositor
 // route layer keeps only the request's non-secret pinned metadata so recovery
 // can return the same metadata without reaching into service internals.
 const sessionPinnedMetadata = new Map();
+// Per-session turn-level request idempotency map. Keyed by session_uuid,
+// then by request_id. The map intentionally lives outside the repository
+// because the runtime does not own it (the repository is process-shared
+// with other tests/routes); the route layer is the only producer.
 
 const SESSION_UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -669,6 +717,61 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
+  // ClickUp 08 / 09 narrative-batch routes (unified after the 08 merge).
+  //
+  //   POST /generate          : runtime stages a 1..4 item batch + optional
+  //                             tool call on the session pending slot. The
+  //                             response carries the 08 contract fields
+  //                             (items / kind / pending_total / base_revision)
+  //                             plus 09 player aliases (events / revision /
+  //                             pending_remaining).
+  //   POST /narrative-events  : commit exactly one displayed item
+  //   GET  /recover           : read-only canonical + active pending
+  //   POST /discard-pending   : drop an unconsumed pending batch
+  //
+  // The demo provider (buildDemoMockAgentProvider) is deterministic and
+  // honours the 08 wire shape while pacing the 09 demo arc (auto choice /
+  // finish); see the helper near the top of this file.
+
+  // GET /api/dev/sessions/:uuid/recover — explicit read-only recovery.
+  // Surfaces canonical history + revision + cursor + opening_cursor +
+  // active pending snapshot. Never calls the provider, never replays,
+  // never mutates state. Same-process only: the repository is
+  // in-memory, so a fresh process does not know this session.
+  const recoverMatch = pathname.match(/^\/api\/dev\/sessions\/([0-9a-fA-F-]+)\/recover$/);
+  if (method === 'GET' && recoverMatch) {
+    try {
+      const recovered = recoverSession({ repository: storyRepo, session_uuid: recoverMatch[1] });
+      return jsonResponse(res, 200, {
+        demo: DEMO_FLAG, dev: DEV_FLAG,
+        ...recovered,
+        pinned: sessionPinnedMetadata.get(recoverMatch[1]) || null,
+      });
+    } catch (err) {
+      return sessionErrorResponse(res, err);
+    }
+  }
+
+  // POST /api/dev/sessions/:uuid/discard-pending — drop the active
+  // pending batch without committing. Used when the player wants to
+  // clear a stale batch (e.g. recovery picked up a half-committed one).
+  const discardMatch = pathname.match(/^\/api\/dev\/sessions\/([0-9a-fA-F-]+)\/discard-pending$/);
+  if (method === 'POST' && discardMatch) {
+    try {
+      const result = discardPendingTail({
+        repository: storyRepo,
+        session_uuid: discardMatch[1],
+      });
+      return jsonResponse(res, 200, {
+        demo: DEMO_FLAG, dev: DEV_FLAG,
+        session_uuid: discardMatch[1],
+        ...result,
+      });
+    } catch (err) {
+      return sessionErrorResponse(res, err);
+    }
+  }
+
   // POST /api/dev/sessions/:uuid/interrupt — explicitly switch to realtime
   // by appending player input. This route intentionally never invalidates a
   // shared opening cache.
@@ -708,13 +811,13 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
-  // ClickUp 08 narrative-batch routes.
+  // ClickUp 08 runtime-driven narrative-batch routes.
   //
-  // The runtime's Mock provider is used for the demo: it yields one
-  // narrative item per turn until input.text begins with "choice" or
-  // "finish", then yields the matching tool call. The contract is the
-  // real ClickUp 08 wire shape; a future Real provider must obey the
-  // same invariants.
+  // The runtime's deterministic demo provider stages 1..4 narrative items
+  // per turn plus an optional final tool call (input-driven "choice" /
+  // "finish", or the session-scoped demo arc). The contract is the real
+  // ClickUp 08 wire shape; a future Real provider must obey the same
+  // invariants.
 
   // POST /api/dev/sessions/:uuid/generate — call the runtime and STAGE
   // the result on the canonical session pending slot. Returns the staged
@@ -753,7 +856,7 @@ const server = http.createServer(async (req, res) => {
       runtime = createAgentRuntime({
         repository: storyRepo,
         session_uuid: sessionUuid,
-        provider: buildDemoMockAgentProvider(body.input),
+        provider: buildDemoMockAgentProvider(body.input, sessionUuid),
         system_prompt: { kind: 'system', text: 'demo runtime prompt' },
         tool_definitions: [
           { type: 'function', function: { name: 'ask_player_choice', parameters: { type: 'object' } } },
@@ -783,6 +886,12 @@ const server = http.createServer(async (req, res) => {
         ...result,
         session_uuid: sessionUuid,
         pending_id: result.pending_id,
+        // ClickUp 09 player aliases: the frontend reads events / revision /
+        // pending_remaining; the 08 contract keeps items / base_revision /
+        // pending_total. Both name the same staged batch.
+        events: result.items,
+        revision: result.base_revision,
+        pending_remaining: result.pending_total - result.pending_committed_count,
       });
     } catch (err) {
       if (err instanceof AgentRuntimeError) {
@@ -827,26 +936,6 @@ const server = http.createServer(async (req, res) => {
         ...(body.client_request_id ? { client_request_id: body.client_request_id } : {}),
       });
       return jsonResponse(res, 200, { demo: DEMO_FLAG, dev: DEV_FLAG, ...result });
-    } catch (err) {
-      return sessionErrorResponse(res, err);
-    }
-  }
-
-  // GET /api/dev/sessions/:uuid/recover — read-only canonical recovery.
-  // Returns canonical history + revision + cursor + active pending
-  // snapshot. Never calls the provider, never replays, never mutates.
-  // Same-process only: the repository is in-memory, so a fresh process
-  // does not know this session (persistence is a future MariaDB DAO's
-  // job; the SQL migrations only pin that contract).
-  const recoverMatch = pathname.match(/^\/api\/dev\/sessions\/([0-9a-fA-F-]+)\/recover$/);
-  if (method === 'GET' && recoverMatch) {
-    try {
-      const recovered = recoverSession({ repository: storyRepo, session_uuid: recoverMatch[1] });
-      return jsonResponse(res, 200, {
-        demo: DEMO_FLAG, dev: DEV_FLAG,
-        ...recovered,
-        pinned: sessionPinnedMetadata.get(recoverMatch[1]) || null,
-      });
     } catch (err) {
       return sessionErrorResponse(res, err);
     }

@@ -1,6 +1,6 @@
 // src/stories/sessionService.mjs — canonical session store.
 //
-// ClickUp 05 / 08 contract (unified):
+// ClickUp 05 / 08 / 09 contract (unified):
 //
 //   The sessionService IS the canonical store. It owns the per-session
 //   history, revision, cursor, state, idempotency map, and the active
@@ -47,9 +47,9 @@
 //       - switches the session state to 'realtime' (a realtime session
 //         may be interrupted again; the state stays 'realtime').
 //
-//   * recoverSession is read-only: returns canonical history + revision +
-//     cursor + the active pending snapshot. Never calls the provider,
-//     never replays, never mutates state.
+//   * recoverSession returns canonical history + revision + cursor +
+//     opening_cursor + the active pending snapshot. Read-only: never
+//     calls the provider, never replays, never mutates state.
 //
 //   * Every mutating call accepts a client_request_id and uses the same
 //     fingerprint contract as the application layer: a reused id with the
@@ -690,6 +690,10 @@ export function interruptWithPlayerInput({ repository, session_uuid, text, clien
   const prior = idempotentResult(session, id, 'interrupt', { text });
   if (prior) return prior;
   validateRevision(session, expected_revision);
+  // ClickUp 09 acceptance criterion: "用户在任意普通消息之间都能打断".
+  // Opening, awaiting_first_choice, and realtime are all interruptible.
+  // stageNarrativeBatch already accepts all three; mirrors it here so the
+  // input bar is never silently swallowed mid-narration.
   if (session.state !== 'opening' && session.state !== 'awaiting_first_choice' && session.state !== 'realtime') {
     throw new Error('interruptWithPlayerInput: session is not interruptible');
   }
