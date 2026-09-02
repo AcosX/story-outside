@@ -311,7 +311,9 @@ await test('metrics: missing or bad input is silently ignored', () => {
 await test('timing: timeAgentTurn and timeCommit are independent buckets', async () => {
   _resetMetricsForTests();
   await timeAgentTurn({ session_uuid: 's1' }, async () => {
-    await new Promise((r) => setTimeout(r, 5));
+    // 20ms sampling headroom: a 5ms sleep can round to <5ms on coarse
+    // clocks and flake the >= 5ms assertion below.
+    await new Promise((r) => setTimeout(r, 20));
   });
   await timeCommit({ session_uuid: 's1' }, async () => {
     await new Promise((r) => setTimeout(r, 1));
