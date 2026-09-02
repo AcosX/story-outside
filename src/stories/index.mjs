@@ -22,10 +22,15 @@ export {
 } from './storyService.mjs';
 export { createSeededRepository, FIXTURE_UUIDS } from './fixture.mjs';
 export {
+  commitNarrativeEvent,
   commitOpeningEvent,
   createSession,
+  discardPendingTail,
   getSession,
   interruptWithPlayerInput,
   listSessionEvents,
+  lookupTurnRequest,
   recoverSession,
+  registerTurnRequest,
+  stageNarrativeBatch,
 } from './sessionService.mjs';
