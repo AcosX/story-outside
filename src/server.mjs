@@ -33,6 +33,9 @@ import {
   interruptWithPlayerInput,
   recoverSession,
 } from './stories/sessionService.mjs';
+import { snapshotAll as snapshotMetricsAll, snapshotSession as snapshotMetricsSession } from './observability/metrics.mjs';
+import { snapshotAll as snapshotCacheStatsAll } from './observability/cacheStats.mjs';
+import { computeFrontendPlaybackMs } from './observability/timing.mjs';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 const ROOT = resolve(__dirname, '..');
@@ -688,6 +691,86 @@ const server = http.createServer(async (req, res) => {
         dev: DEV_FLAG,
       });
     }
+  }
+
+  // -----------------------------------------------------------------------
+  // ClickUp 14 observability admin endpoints (read-only).
+  //
+  // Two GET routes expose per-session observability + a process-wide
+  // metrics summary. They are demo/dev-only and intentionally live
+  // under /api/admin/* next to the other admin tooling. They never
+  // mutate session state — see src/observability/* for the storage
+  // shape and docs/observability.md for the field contract.
+  // -----------------------------------------------------------------------
+
+  const observabilitySessionMatch = pathname.match(/^\/api\/admin\/observability\/sessions\/([0-9a-fA-F-]+)$/);
+  if (method === 'GET' && observabilitySessionMatch) {
+    const session_uuid = observabilitySessionMatch[1];
+    if (!isSessionUuid(session_uuid)) {
+      return jsonResponse(res, 400, {
+        error: 'validation_failed',
+        message: 'session_uuid must be a UUID',
+        demo: DEMO_FLAG,
+        dev: DEV_FLAG,
+      });
+    }
+    const session = snapshotMetricsSession(session_uuid);
+    if (!session) {
+      return jsonResponse(res, 404, {
+        error: 'session_not_observed',
+        message: 'No observability data recorded for this session yet.',
+        demo: DEMO_FLAG,
+        dev: DEV_FLAG,
+      });
+    }
+    // Pull canonical session state (recovery read) so the operator gets
+    // a single correlated view of "story pinned → tokens spent → cache
+    // hits" without having to issue a second request. The session is
+    // fetched only after the metrics lookup, so an unknown session_uuid
+    // 404s cheaply.
+    let pinnedSession = null;
+    try {
+      pinnedSession = recoverSession({ repository: storyRepo, session_uuid });
+    } catch {
+      // The session may exist in metrics but not in the in-memory
+      // repository (e.g. process restart between the metric write and
+      // the request). Fall through with pinnedSession=null so the
+      // metrics view still renders.
+      pinnedSession = null;
+    }
+    return jsonResponse(res, 200, {
+      demo: DEMO_FLAG,
+      dev: DEV_FLAG,
+      session_uuid,
+      pinned: pinnedSession ? {
+        session_uuid: pinnedSession.session_uuid,
+        story_uuid: pinnedSession.story_uuid,
+        story_version_uuid: pinnedSession.story_version_uuid,
+        cache_uuid: pinnedSession.cache_uuid,
+        state: pinnedSession.state,
+        cursor: pinnedSession.cursor,
+        revision: pinnedSession.revision,
+        model: pinnedSession.model,
+        role_id: pinnedSession.role_id,
+        opening_cache_status: pinnedSession.opening_cache_status,
+        user_ref: pinnedSession.user_ref,
+        generation_profile: pinnedSession.generation_profile,
+      } : null,
+      metrics: session,
+    });
+  }
+
+  if (method === 'GET' && pathname === '/api/admin/observability/metrics/summary') {
+    const metrics = snapshotMetricsAll();
+    const cacheStats = snapshotCacheStatsAll();
+    return jsonResponse(res, 200, {
+      demo: DEMO_FLAG,
+      dev: DEV_FLAG,
+      metrics,
+      cache_stats: cacheStats,
+      note: 'frontend_playback_ms can be computed per-commit from the events the client commits; this endpoint exposes storage only.',
+      compute_frontend_playback_ms: typeof computeFrontendPlaybackMs === 'function' ? 'available' : 'missing',
+    });
   }
 
   // Root → static
