@@ -774,6 +774,26 @@ async function surfaceToolCall(toolCall) {
     renderEnding(toolCall);
     setText('#player-help', '');
     state.finished = true;
+    // ClickUp 11 hook: hand off to the dedicated ending page module,
+    // which fetches /ending + /original-timeline + /replay and renders
+    // the comparison + replay UI. We lazy-load so the player.js state
+    // machine does not depend on endingPage being available.
+    try {
+      const mod = await import('/scripts/endingPage.js');
+      if (mod && typeof mod.mount === 'function') {
+        await mod.mount({
+          sessionUuid: state.sessionUuid,
+          sessionMeta: {
+            storyTitle: state.story ? state.story.title : '',
+            roleLabel: state.role ? state.role.label : '',
+          },
+        });
+      }
+    } catch (err) {
+      // Non-fatal: keep the inline ending visible if the module is
+      // unreachable (e.g. dev environment without the new files).
+      showToast(`结局页加载失败：${err.message}`);
+    }
     return;
   }
   // Unknown tool: render the literal envelope so the player can see the
