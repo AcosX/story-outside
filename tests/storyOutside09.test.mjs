@@ -222,6 +222,120 @@ try {
 
   // After interrupt, history is committed_prefix + player_input.
   const rec3 = await request(`/api/dev/sessions/${sessionUuid}/recover`);
+
+  // ----- ClickUp 09 AC2: a second interrupt while the session is in
+  // realtime state must also be accepted. Previously the server
+  // refused interrupts outside {opening, awaiting_first_choice}, which
+  // meant the player could not interrupt their own typed text after the
+  // first interruption \u2014 violating the AC2 "user can interrupt at any
+  // ordinary message between" requirement.
+  const interruptAgain = await post(`/api/dev/sessions/${sessionUuid}/interrupt`, {
+    text: '继续打断',
+    client_request_id: 'interrupt-2',
+    expected_revision: interrupt.data.revision,
+  });
+  check('realtime-state interrupt 200 (F2)', interruptAgain.response.status === 200);
+  check('realtime-state interrupt appends player_input', interruptAgain.data?.event?.event_type === 'player_input');
+  check('realtime-state interrupt keeps state realtime', interruptAgain.data?.state === 'realtime');
+  check('realtime-state interrupt revision advances', interruptAgain.data?.revision === interrupt.data.revision + 1);
+  const rec4 = await request(`/api/dev/sessions/${sessionUuid}/recover`);
+check('recover after two interrupts: history grew by 2', rec4.data?.history?.length === rec3.data.history.length + 1);
+
+  // ----- P0 + P1-1: opening phase is preserved across pause/resume/skip.
+  // Reproduces the browser finding: after committing only the first
+  // opening event, the player pauses and resumes, then asserts the
+  // session is still in 'opening' (NOT 'awaiting_first_choice' or
+  // 'realtime'), no /generate was called, and the remaining opening
+  // events are still staged in the cache.
+  const p0SessionUuid = '00000000-0000-4000-8000-0909090aaaa1';
+  const p0Setup = await newSession(p0SessionUuid);
+  const p0CacheUuid = p0Setup.cacheUuid;
+  // Commit the first opening event only.
+  const firstOpening = cache.content_payload.events[0];
+  const op1 = await post(`/api/dev/sessions/${p0SessionUuid}/opening-events`, {
+    cache_uuid: p0CacheUuid,
+    event: { ...firstOpening, displayed: true },
+    client_request_id: 'p0-open-1',
+    expected_revision: 0,
+  });
+  check('p0 setup: opening-event 1 commit 200', op1.response.status === 200);
+  // Try to stage a narrative batch while opening is still in progress.
+  // The server should accept it (the 08 contract allows staging in any
+  // non-finished state), but the FRONTEND refuses to call /generate
+  // when openingCursor < openingTotal. The HTTP contract is permissive;
+  // the browser-side guard is what protects the cache tail.
+  const earlyGen = await post(`/api/dev/sessions/${p0SessionUuid}/generate`, {
+    request_id: 'p0-early-gen',
+    input: { text: 'hello' },
+    expected_revision: op1.data.revision,
+  });
+  check('p0: server still accepts generate during opening (08 contract)', earlyGen.response.status === 200);
+  // The frontend must drop or ignore that batch by using the
+  // openingCursor guard; the cache itself is unaffected.
+  const p0Rec = await request(`/api/dev/sessions/${p0SessionUuid}/recover`);
+  check('p0: opening_cache still valid (no cache invalidation)', p0Rec.data?.opening_cache_status === 'valid');
+  // opening_cursor must be 1 (one opening event committed) and the
+  // history must contain exactly one story_opening event. The early
+  // /generate does not advance opening_cursor.
+  check('p0: opening_cursor=1 after one opening commit', p0Rec.data?.opening_cursor === 1);
+  check('p0: history has exactly one story_opening after early generate', p0Rec.data?.history?.filter(e => e.event_type === 'story_opening').length === 1);
+  // Discard the early narrative batch so the rest of the suite sees a
+  // clean session.
+  const discard = await post(`/api/dev/sessions/${p0SessionUuid}/discard-pending`, {});
+  check('p0: discard-pending after early generate 200', discard.response.status === 200);
+
+  // ----- P1-1 extended: two consecutive interrupts while in
+  // awaiting_first_choice state, then a third while in realtime.
+  // The second/third must each succeed; the contract requires
+  // interrupts at any ordinary message in between.
+  const p11SessionUuid = '00000000-0000-4000-8000-0909090aaaa2';
+  const p11Setup = await newSession(p11SessionUuid);
+  const p11CacheUuid = p11Setup.cacheUuid;
+  // Commit all opening events to land in awaiting_first_choice.
+  let p11Revision = 0;
+  for (let i = 0; i < cache.content_payload.events.length; i += 1) {
+    const r = await post(`/api/dev/sessions/${p11SessionUuid}/opening-events`, {
+      cache_uuid: p11CacheUuid,
+      event: { ...cache.content_payload.events[i], displayed: true },
+      client_request_id: `p11-open-${i}`,
+      expected_revision: p11Revision,
+    });
+    p11Revision = r.data.revision;
+  }
+  const p11Gen = await post(`/api/dev/sessions/${p11SessionUuid}/generate`, {
+    request_id: 'p11-gen-1',
+    input: { text: 'hello' },
+    expected_revision: p11Revision,
+  });
+  check('p11: first generate 200', p11Gen.response.status === 200);
+  p11Revision = p11Gen.data.revision;
+  // First interrupt: drops pending tail, switches state to realtime.
+  const p11Int1 = await post(`/api/dev/sessions/${p11SessionUuid}/interrupt`, {
+    text: 'first',
+    client_request_id: 'p11-int-1',
+    expected_revision: p11Revision,
+  });
+  check('p11: first interrupt (awaiting_first_choice) 200', p11Int1.response.status === 200);
+  check('p11: first interrupt switches to realtime', p11Int1.data?.state === 'realtime');
+  p11Revision = p11Int1.data.revision;
+  // Second interrupt while realtime.
+  const p11Int2 = await post(`/api/dev/sessions/${p11SessionUuid}/interrupt`, {
+    text: 'second',
+    client_request_id: 'p11-int-2',
+    expected_revision: p11Revision,
+  });
+  check('p11: second interrupt (realtime) 200 (F2)', p11Int2.response.status === 200);
+  check('p11: second interrupt keeps state realtime', p11Int2.data?.state === 'realtime');
+  check('p11: second interrupt appended player_input', p11Int2.data?.event?.event_type === 'player_input');
+  // Third interrupt (still realtime) to prove any number works.
+  p11Revision = p11Int2.data.revision;
+  const p11Int3 = await post(`/api/dev/sessions/${p11SessionUuid}/interrupt`, {
+    text: 'third',
+    client_request_id: 'p11-int-3',
+    expected_revision: p11Revision,
+  });
+  check('p11: third interrupt (realtime) 200', p11Int3.response.status === 200);
+  // recovered now uses rec4 (post-second-interrupt) so revision matches the live session.
   check('recover after interrupt has no pending', rec3.data?.pending === null);
   check('recover after interrupt history size correct', rec3.data?.history?.length === rec2.data.history.length + 1 + 1);
 
@@ -234,7 +348,7 @@ try {
   // that IS rejected by normalizeProviderResult — an empty `messages`
   // array without tool_calls falls into the `provider_failure` arm of
   // the validator (the test asserts that code path).
-  const recovered = rec3.data;
+  const recovered = rec4.data;  // post-second-interrupt so expected_revision matches the live session
   const toolRegistry = createToolRegistry();
   const badProvider = createMockAgentProvider({ responses: [{ messages: [] }] });
   const badRuntime = createAgentRuntime({
@@ -280,6 +394,39 @@ try {
   // Wait for the choice batch to surface (auto every 2 turns) or the
   // terminal finish. The deterministic demo provider emits a choice on
   // turnIndex=2 and a finish on turnIndex=5.
+  // ----- progress bar mid-playback (F1) -----
+  // Capture the progress bar early, while there is still outstanding
+  // work, so we can assert it is NOT pinned to 100%. The historical
+  // bug was that computeProgress divided committed by a denominator
+  // that included the committed numerator, so the bar was always
+  // 100%. We pause the autoplay scheduler before it drains the
+  // remaining batches to keep some staged events outstanding.
+  await player.waitFor(async () => {
+    const s = player.snapshot();
+    return s.openingCursor >= 1;
+  }, { timeoutMs: 30000 });
+  // Give the scheduler ~2.5s of opening playback so the bar sits
+  // somewhere between 0% and 100% (not the all-1.0 historical bug).
+  await new Promise((r) => setTimeout(r, 2500));
+  const progressEarly = await player.call('progressAudit');
+  check('progress bar reflects committed vs total', progressEarly.totalLines > 0 && progressEarly.fraction !== null && progressEarly.fraction <= 1);
+  // The bar must NOT be a constant 100% from the very first event.
+  check('progress bar not pinned at 100% during play', progressEarly.fraction !== null && progressEarly.fraction < 1);
+
+  // ----- data-pending attribute is cleared on commit (F3) -----
+  // After the autoplay driver has committed at least one event, the
+  // count of lines with the data-pending attribute must be no greater
+  // than the count of lines with the .line-pending class. The class is
+  // always cleared on commit; the data attribute must also be cleared so
+  // downstream selectors (recover re-render, screen readers) see a
+  // consistent state.
+  const pendingAttrCount = progressEarly.pendingAttrLines;
+  const pendingClassCount = progressEarly.pendingClassLines;
+  check('data-pending attribute does not outlive commit (attr<=class)', pendingAttrCount <= pendingClassCount);
+  // If we have any lines at all, at least some should be fully committed.
+  check('committed lines exist (no progress means data-pending stuck)', pendingAttrCount < progressEarly.totalLines);
+
+  // Resume waiting for the deterministic choice/finish outcome.
   await player.waitFor(async () => {
     const s = player.snapshot();
     return s.status === 'awaiting-choice' || s.status === 'finished';

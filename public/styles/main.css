@@ -368,9 +368,15 @@ button, input, select, textarea { font: inherit; color: inherit; }
   max-width: 86%;
 }
 .line-pending {
-  opacity: 0.5;
+  opacity: 0.55;
   border-style: dashed;
   border-color: var(--line-strong);
+}
+/* The lineIn animation would otherwise end at opacity: 1, overriding
+   the .line-pending opacity. Suppress the animation on pending lines
+   so the dashed/lower-opacity placeholder state stays visible. */
+.line.line-pending {
+  animation: none;
 }
 
 @keyframes lineIn {
@@ -379,6 +385,7 @@ button, input, select, textarea { font: inherit; color: inherit; }
 }
 @media (prefers-reduced-motion: reduce) {
   .line, .status-bar-fill { animation: none; transition: none; }
+  .story-log { scroll-behavior: auto; }
 }
 
 .line-speaker {

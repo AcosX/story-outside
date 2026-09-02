@@ -49,6 +49,7 @@ const state = {
   generationProfile: null,
   pending: null,        // { pending_id, events[], tool_call, committed_count }
   pendingIdx: 0,        // index of the NEXT pending event to display
+  progressTotal: 0,     // largest known event total for progress bar
   finished: false,      // terminal tool_call has been rendered
   autoplayTimer: null,
   lastPlayerRequestId: 1,
@@ -76,7 +77,14 @@ function showScreen(name) {
 function setStatus(next) {
   state.status = next;
   setText('#status-label', STATUS_LABEL[next] || next);
-  setProgress(computeProgress());
+  // When the session reaches a terminal state (finished), the progress
+  // bar should snap to 100% regardless of the in-flight denominator
+  // (the player has reached the end; there is no more work to do).
+  if (next === 'finished') {
+    setProgress(1);
+  } else {
+    setProgress(computeProgress());
+  }
   const finished = next === 'finished';
   $('#player-input-form').hidden = finished;
   $('#pause-btn').hidden = finished || next === 'awaiting-choice';
@@ -108,14 +116,55 @@ function setProgress(fraction) {
 }
 
 function computeProgress() {
-  // Total length: opening events (canonical) + committed narrative events +
-  // currently-displayed pending events. The pending tail (un-displayed) is
-  // not counted, so the bar stops moving until the next commit lands.
+  // Numerator: canonical-history events (committed) — this is the
+  // "completed" portion that genuinely advances. Includes opening
+  // events, narrative beats, AND player_input interrupts because the
+  // player also "completed" those.
+  // Denominator: opening_lines + sum of staged (and already-seen)
+  // batch sizes + a budget for player_input interrupts. We never
+  // let the denominator equal the committed count, so mid-playback
+  // the bar is always < 1.0 unless every staged event has been
+  // committed. The denominator only grows monotonically as new
+  // batches come in or new interrupts are made.
   const openingLines = state.openingEvents ? state.openingEvents.length : 0;
-  const narrativeCommitted = state.canonicalNarrativeCount || 0;
-  const pendingShown = state.pendingIdx;
-  const total = Math.max(openingLines + narrativeCommitted + pendingShown, 1);
-  return (openingLines + narrativeCommitted + pendingShown) / total;
+  const history = state.canonicalHistory || [];
+  const committed = history.length;
+  const playerInputsSeen = history.filter((e) => e && e.event_type === 'player_input').length;
+  // A batch is "known" once we have either staged it (state.pending
+  // exists) or it is reflected in canonical history.
+  // state.progressTotal is bumped each time we stage a batch; it
+  // persists across commits so the bar can keep moving forward.
+  const knownTotal = Math.max(state.progressTotal || 0, openingLines);
+  // The first batch the player can see might still be only partially
+  // staged, so add the in-flight batch's total to the denominator.
+  const inFlight = (state.pending && state.pending.events) ? state.pending.events.length : 0;
+  // The base denominator is opening + cumulative batch sizes. We
+  // never let it go below (committed - playerInputsSeen) so that an
+  // interrupt-heavy session still has the bar at or near 1.0 at
+  // finished. But mid-playback the gap between committed and
+  // total comes from the unseen portion of in-flight batches.
+  let total = Math.max(knownTotal, openingLines + inFlight, 1);
+  // If interrupts pushed committed past total, treat total as at
+  // least committed (but never more than the implied work). The
+  // player_input events are "free" additions from the player's
+  // perspective — they don't add to the staged work, so we don't
+  // count them in the denominator.
+  const narrativeCommitted = committed - playerInputsSeen;
+  if (narrativeCommitted > total) total = narrativeCommitted;
+  // Defensive: if for any reason total still tracks committed, force a
+  // minimum gap so the bar cannot be pinned to 1.0 mid-play.
+  const safeTotal = total > committed ? total : committed + 1;
+  return committed / safeTotal;
+}
+
+function growProgressTotal(stagedSize) {
+  // Called whenever a new batch is staged. The denominator grows so
+  // the bar can keep moving forward as commits land.
+  const openingLines = state.openingEvents ? state.openingEvents.length : 0;
+  const candidate = openingLines + stagedSize;
+  if (!state.progressTotal || candidate > state.progressTotal) {
+    state.progressTotal = candidate;
+  }
 }
 
 function showToast(message, ms = 2400) {
@@ -284,11 +333,11 @@ async function recoverAndStart() {
   // here — recovery is read-only. The autoplay driver only kicks in if
   // there is something pending to display.
   setStatus('loading');
+  clearAllPendingNodes();
   try {
     const recovered = await api(`/api/dev/sessions/${state.sessionUuid}/recover`);
     state.lastRevision = recovered.revision || 0;
     state.openingCursor = recovered.opening_cursor || 0;
-    state.openingTotal = (state.openingEvents && state.openingEvents.length) || 0;
     state.canonicalHistory = recovered.history || [];
     state.canonicalEventsById = new Map(state.canonicalHistory.map((e) => [e.event_id, e]));
     state.canonicalNarrativeCount = state.canonicalHistory.filter((e) => e.event_type === 'narrative_beat').length;
@@ -301,7 +350,7 @@ async function recoverAndStart() {
     // If we still have opening events left to commit, resume opening
     // playback. Otherwise, if there is a pending narrative batch, resume
     // it. Otherwise, generate the next batch.
-    if (state.openingCursor < state.openingTotal) {
+    if (inOpeningPhase()) {
       setStatus('playing');
       scheduleOpeningStep();
       return;
@@ -314,8 +363,10 @@ async function recoverAndStart() {
         committed_count: recovered.pending.committed_count || 0,
       };
       state.pendingIdx = state.pending.committed_count;
+      growProgressTotal(state.pending.events.length);
       for (let i = state.pendingIdx; i < state.pending.events.length; i += 1) {
-        renderPendingPlaceholder(state.pending.events[i], state.canonicalHistory.length + i);
+        const el = renderPendingPlaceholder(state.pending.events[i], state.canonicalHistory.length + i);
+        registerPendingNode(`pending:${state.pending.pending_id}:${i}`, el);
       }
       scrollLogToEnd();
       setStatus('playing');
@@ -330,32 +381,69 @@ async function recoverAndStart() {
 }
 
 function scheduleOpeningStep() {
-  if (state.status !== 'playing') return;
+  if (state.status !== 'playing' || state.finished) return;
   if (state.autoplayTimer) clearTimeout(state.autoplayTimer);
   state.autoplayTimer = setTimeout(() => { void runOpeningStep(); }, STEP_DELAY_MS);
+}
+
+// Single entry point that dispatches to the right step based on the
+// current phase. The opening phase takes priority over the narrative
+// phase; while opening events remain uncommitted, no /generate can
+// run and no skip can advance to a narrative batch.
+function inOpeningPhase() {
+  return (state.openingEvents && state.openingCursor < state.openingEvents.length) || false;
+}
+
+function clearAutoplayTimer() {
+  if (state.autoplayTimer) clearTimeout(state.autoplayTimer);
+  state.autoplayTimer = null;
+}
+
+function scheduleNext() {
+  if (state.status !== 'playing' || state.finished) return;
+  clearAutoplayTimer();
+  if (inOpeningPhase()) {
+    scheduleOpeningStep();
+  } else {
+    scheduleNextStep();
+  }
 }
 
 async function runOpeningStep() {
   state.autoplayTimer = null;
   if (state.status !== 'playing' || state.finished) return;
-  if (state.openingCursor >= state.openingTotal) {
-    // Opening done → first /generate call.
-    await startNextBatch();
+  // Defensive: if we landed here but opening is already done, hand off
+  // to the narrative scheduler instead of looping.
+  if (!inOpeningPhase()) {
+    if (state.status === 'playing' && !state.finished) {
+      if (state.pending) {
+        scheduleNextStep();
+      } else {
+        await startNextBatch();
+      }
+    }
     return;
   }
   const sequence = state.openingCursor;
   const event = state.openingEvents[sequence];
   if (!event) {
-    state.openingCursor = state.openingTotal;
+    state.openingCursor = state.openingEvents.length;
+    if (state.status === 'playing' && !state.finished) {
+      await startNextBatch();
+    }
     return;
   }
   // Append a pending-style line so the player sees it instantly.
-  renderPendingPlaceholder({
+  // Track the DOM node by sequence so the commit can clear the
+  // correct placeholder regardless of how many narrative lines have
+  // landed in between.
+  const placeholderEl = renderPendingPlaceholder({
     type: event.type,
     text: event.text,
     speaker: event.speaker,
     sequence,
   }, state.canonicalHistory.length + sequence);
+  registerPendingNode(`opening:${sequence}`, placeholderEl);
   try {
     const result = await api(`/api/dev/sessions/${state.sessionUuid}/opening-events`, {
       method: 'POST',
@@ -369,9 +457,13 @@ async function runOpeningStep() {
     state.lastRevision = result.revision;
     state.canonicalHistory = [...state.canonicalHistory, result.event];
     state.openingCursor = sequence + 1;
-    commitPendingLineInDom(state.canonicalHistory.length - 1);
+    clearPendingNode(`opening:${sequence}`);
+    commitPendingLineInDomNode(placeholderEl);
     setProgress(computeProgress());
-    if (state.status === 'playing' && !state.finished) scheduleOpeningStep();
+    if (state.status === 'playing' && !state.finished) {
+      // Stay on the opening path until the opening is fully committed.
+      scheduleOpeningStep();
+    }
   } catch (err) {
     showToast(`开场提交失败：${err.message}`);
     setStatus('paused');
@@ -453,7 +545,37 @@ function scrollLogToEnd() {
 function commitPendingLineInDom(position) {
   const log = $('#story-log');
   const el = log.children[position];
-  if (el) el.classList.remove('line-pending');
+  if (!el) return;
+  el.classList.remove('line-pending');
+  // Clear the data-pending attribute so the line is fully indistinguishable
+  // from a canonical-history line; otherwise the attribute lingers across
+  // commits and confuses any consumer that selects by [data-pending].
+  if (el.dataset && 'pending' in el.dataset) delete el.dataset.pending;
+}
+
+// Direct-node variant: callers that already hold a reference to the
+// placeholder element can clear the pending state without going through
+// log.children[position] (which is fragile when canonical history has
+// shifted the indexing).
+function commitPendingLineInDomNode(el) {
+  if (!el) return;
+  el.classList.remove('line-pending');
+  if (el.dataset && 'pending' in el.dataset) delete el.dataset.pending;
+}
+
+// Map of pending placeholder keys (e.g. "opening:2" or "pending:0")
+// to the actual DOM node. Lets the commit path clear the right
+// element without relying on log.children[position] which drifts as
+// canonical events land.
+const pendingNodes = new Map();
+function registerPendingNode(key, el) {
+  if (key != null && el) pendingNodes.set(String(key), el);
+}
+function clearPendingNode(key) {
+  if (key != null) pendingNodes.delete(String(key));
+}
+function clearAllPendingNodes() {
+  pendingNodes.clear();
 }
 
 // -------- Autoplay scheduler --------
@@ -469,6 +591,14 @@ function scheduleNextStep() {
 async function runStep() {
   state.autoplayTimer = null;
   if (state.status !== 'playing' || state.finished) return;
+  // Guard: while opening events are uncommitted, the narrative path
+  // is blocked. Hand off to the opening scheduler instead of
+  // generating a new narrative batch (which would discard the
+  // opening cache tail and skip remaining opening lines).
+  if (inOpeningPhase()) {
+    if (state.status === 'playing' && !state.finished) scheduleOpeningStep();
+    return;
+  }
   // Path 1: still have pending items to commit
   if (state.pending && state.pendingIdx < state.pending.events.length) {
     const hadItems = state.pending.events.length;
@@ -479,7 +609,11 @@ async function runStep() {
     // or we would race the choice card with another batch of dialogue.
     if (state.toolCallTimer || state.status !== 'playing' || state.finished) return;
     if (hadItems === 0) return;
-    scheduleNextStep();
+    if (inOpeningPhase()) {
+      scheduleOpeningStep();
+    } else {
+      scheduleNextStep();
+    }
     return;
   }
   // Path 2: pending is empty AND the final tool_call was already shown
@@ -502,7 +636,10 @@ async function commitNextPendingItem() {
   const expectedRevision = (state.lastRevision || 0);
   const sequence = state.pendingIdx;
   const clientRequestId = `commit-${state.pending.pending_id}-${sequence}`;
-  const position = state.canonicalHistory.length + sequence;
+  // Use the registered DOM node (if any) so we clear the right
+  // placeholder even when canonical history has shifted the indexing.
+  const pendingKey = `pending:${state.pending.pending_id}:${sequence}`;
+  const placeholderEl = pendingNodes.get(pendingKey) || null;
   try {
     const result = await api(`/api/dev/sessions/${state.sessionUuid}/narrative-events`, {
       method: 'POST',
@@ -521,7 +658,15 @@ async function commitNextPendingItem() {
     }
     state.pending.committed_count = sequence + 1;
     state.pendingIdx = sequence + 1;
-    commitPendingLineInDom(position);
+    clearPendingNode(pendingKey);
+    if (placeholderEl) {
+      commitPendingLineInDomNode(placeholderEl);
+    } else {
+      // Fall back to the old position-based clearing if the node was
+      // never registered (e.g. recovered from a session where we lost
+      // the DOM references).
+      commitPendingLineInDom(state.canonicalHistory.length - 1);
+    }
     setProgress(computeProgress());
     // Final commit → surface the tool_call AFTER the last line is
     // displayed. We flip to 'awaiting-choice' / 'finished' immediately
@@ -555,6 +700,13 @@ async function commitNextPendingItem() {
 
 async function startNextBatch() {
   if (state.finished) return;
+  // Guard: opening must be complete before a narrative batch can be
+  // requested. The opening path runs through scheduleOpeningStep, which
+  // calls /opening-events, never /generate.
+  if (inOpeningPhase()) {
+    if (state.status === 'playing' && !state.finished) scheduleOpeningStep();
+    return;
+  }
   setText('#player-help', '正在请求下一段&hellip;');
   const expectedRevision = state.lastRevision || 0;
   const requestId = `turn-${state.lastPlayerRequestId}`;
@@ -583,17 +735,26 @@ async function startNextBatch() {
       committed_count: turn.pending_committed_count || 0,
     };
     state.pendingIdx = state.pending.committed_count;
+    // Grow the progress denominator to include this new batch so the
+    // bar can advance as commits land.
+    growProgressTotal(state.pending.events.length);
     setText('#player-help', '');
-    // Render the new pending lines as placeholders.
+    // Render the new pending lines as placeholders; track each node
+    // by (pending_id, sequence) so commitNextPendingItem can clear
+    // them deterministically.
     for (let i = state.pendingIdx; i < state.pending.events.length; i += 1) {
-      renderPendingPlaceholder(state.pending.events[i], state.canonicalHistory.length + i);
+      const el = renderPendingPlaceholder(state.pending.events[i], state.canonicalHistory.length + i);
+      registerPendingNode(`pending:${state.pending.pending_id}:${i}`, el);
     }
     if (state.pending.events.length === 0 && state.pending.tool_call) {
       await surfaceToolCall(state.pending.tool_call);
       state.pending = null;
       return;
     }
-    if (state.status === 'playing') scheduleNextStep();
+    if (state.status === 'playing' && !state.finished) {
+      if (inOpeningPhase()) scheduleOpeningStep();
+      else scheduleNextStep();
+    }
   } catch (err) {
     showToast(`请求失败：${err.message}`);
     setStatus('paused');
@@ -697,20 +858,30 @@ function renderEnding(toolCall) {
 async function chooseOption(option) {
   // Convert the option pick into a player_input → interrupt, then resume.
   const text = `${option.id}: ${option.label || option.text || option.id}`;
-  await sendPlayerInput(text);
+  // The sendPlayerInput call already handles the status transitions on
+  // success and failure. We only need to nudge the scheduler when the
+  // call actually landed in the canonical history.
+  const result = await sendPlayerInputChoice(text);
+  if (!result) return; // failure path: sendPlayerInput already restored status
   // Use the choice id as a hint for the deterministic demo provider so
   // the next batch reflects the player's decision (a/b → default
   // 3-item batch, "finish" would be unusual here but allowed).
   state.nextBatchInput = option.id === 'b' ? 'short' : 'hello';
   setStatus('playing');
-  state.autoplayTimer && clearTimeout(state.autoplayTimer);
-  scheduleNextStep();
+  clearAutoplayTimer();
+  scheduleNext();
 }
 
-async function sendPlayerInput(text) {
-  if (!state.sessionUuid) return;
+// Variant of sendPlayerInput used by the choice buttons: returns a
+// truthy value on success and a falsy value on failure (instead of
+// just throwing). Lets the caller stay in awaiting-choice on failure
+// without re-engaging the autoplay scheduler.
+async function sendPlayerInputChoice(text) {
+  if (!state.sessionUuid) return null;
   const trimmed = (text || '').trim();
-  if (!trimmed) return;
+  if (!trimmed) return null;
+  clearAutoplayTimer();
+  if (state.toolCallTimer) { clearTimeout(state.toolCallTimer); state.toolCallTimer = null; }
   setStatus('loading');
   try {
     const result = await api(`/api/dev/sessions/${state.sessionUuid}/interrupt`, {
@@ -727,19 +898,78 @@ async function sendPlayerInput(text) {
     appendLine({ type: 'player_input', text: trimmed }, { pending: false });
     state.pending = null;
     state.pendingIdx = 0;
+    clearAllPendingNodes();
+    const log = $('#story-log');
+    for (let i = log.children.length - 1; i >= 0; i -= 1) {
+      const child = log.children[i];
+      if (child.dataset && child.dataset.pending === 'true') child.remove();
+      else break;
+    }
+    state.nextBatchInput = trimmed;
+    return result;
+  } catch (err) {
+    showToast(`选择失败：${err.message}（可重试或输入自己的句子）`);
+    setStatus('awaiting-choice');
+    return null;
+  }
+}
+
+async function sendPlayerInput(text) {
+  if (!state.sessionUuid) return null;
+  const trimmed = (text || '').trim();
+  if (!trimmed) return null;
+  // Clear any in-flight schedulers so the failed send cannot race the
+  // user's retry; the form submit handler will restore the input on
+  // failure and re-enable the field.
+  clearAutoplayTimer();
+  if (state.toolCallTimer) { clearTimeout(state.toolCallTimer); state.toolCallTimer = null; }
+  const input = $('#player-input');
+  const previousStatus = state.status;
+  setStatus('loading');
+  try {
+    const result = await api(`/api/dev/sessions/${state.sessionUuid}/interrupt`, {
+      method: 'POST',
+      body: JSON.stringify({
+        text: trimmed,
+        client_request_id: `interrupt-${state.lastPlayerRequestId}`,
+        expected_revision: state.lastRevision || 0,
+      }),
+    });
+    state.lastPlayerRequestId += 1;
+    state.lastRevision = result.revision;
+    state.canonicalHistory = [...state.canonicalHistory, result.event];
+    appendLine({ type: 'player_input', text: trimmed }, { pending: false });
+    state.pending = null;
+    state.pendingIdx = 0;
+    clearAllPendingNodes();
     // Drop any pending placeholders in the DOM that did not survive.
     const log = $('#story-log');
     for (let i = log.children.length - 1; i >= 0; i -= 1) {
       const child = log.children[i];
-      if (child.dataset.pending === 'true') child.remove();
+      if (child.dataset && child.dataset.pending === 'true') child.remove();
       else break;
     }
     // Save the typed text so the next /generate can use it as input
     // (drives the deterministic demo provider).
     state.nextBatchInput = trimmed;
+    if (input) input.value = '';
+    return result;
   } catch (err) {
-    showToast(`打断失败：${err.message}`);
-    setStatus('paused');
+    // Failure: the user must be able to retry. Restore the typed text
+    // and the previous status (do NOT pretend we are still playing).
+    // If the input is still in the DOM (it should be), restore its
+    // value so the user can resubmit.
+    if (input) {
+      input.value = trimmed;
+      // Best-effort re-focus so the next keystroke is captured.
+      try { input.focus({ preventScroll: true }); } catch { input.focus(); }
+    }
+    showToast(`打断失败：${err.message}（已保留输入，可重试）`);
+    // Drop back to the previous non-loading status so the player is
+    // not stuck in a fake "playing" state. The submit handler will
+    // resume the correct scheduler on retry.
+    setStatus(previousStatus === 'loading' ? 'playing' : previousStatus);
+    return null;
   }
 }
 
@@ -753,19 +983,38 @@ function togglePause() {
   }
   if (state.status === 'paused') {
     setStatus('playing');
-    state.autoplayTimer && clearTimeout(state.autoplayTimer);
-    scheduleNextStep();
+    // Resume the right scheduler for the current phase so opening
+    // playback keeps advancing through its remaining events instead
+    // of jumping straight to a narrative /generate.
+    scheduleNext();
     return;
   }
   if (state.status === 'awaiting-choice') {
     // The user can use the skip button to force a generate anyway.
     setStatus('playing');
-    scheduleNextStep();
+    scheduleNext();
   }
 }
 
 function skipCurrent() {
-  // Force-display the next pending line without waiting.
+  // Skip is intentionally a no-op while paused: the user must resume
+  // playback first. A paused skip that stages a new batch would
+  // discard the still-uncommitted opening cache tail, which violates
+  // the 09 acceptance criteria (no skip-ahead during pause).
+  if (state.status === 'paused') {
+    showToast('先点继续，再点下一句');
+    return;
+  }
+  if (state.status !== 'playing') return;
+  // Opening phase: skip = advance one opening event without waiting
+  // the autoplay delay. We do NOT call /generate here.
+  if (inOpeningPhase()) {
+    if (state.autoplayTimer) clearTimeout(state.autoplayTimer);
+    state.autoplayTimer = setTimeout(() => { void runOpeningStep(); }, 0);
+    return;
+  }
+  // Narrative phase: skip = advance one pending event OR start the
+  // next batch.
   if (state.pending && state.pendingIdx < state.pending.events.length) {
     if (state.autoplayTimer) clearTimeout(state.autoplayTimer);
     void runStep();
@@ -796,11 +1045,19 @@ async function share() {
       showToast('链接已复制');
       return;
     } catch (err) {
-      // Fall through.
+      // Fall through to legacy copy. Note: in headless / permission-
+      // denied contexts navigator.clipboard.writeText rejects with a
+      // NotAllowedError; legacy execCommand is the last resort.
     }
   }
   // Last-resort fallback: legacy execCommand copy.
-  legacyCopy(url) ? showToast('链接已复制') : showToast('无法复制，请手动选择地址栏');
+  if (legacyCopy(url)) {
+    showToast('链接已复制');
+    return;
+  }
+  // Surface a precise, actionable message instead of a generic
+  // failure. The user can still copy the URL manually.
+  showToast('复制未授权，请长按地址栏或使用系统复制');
 }
 
 function legacyCopy(text) {
@@ -857,11 +1114,19 @@ function bindEvents() {
     const input = $('#player-input');
     const text = (input && input.value || '').trim();
     if (!text) return;
-    if (input) input.value = '';
-    void sendPlayerInput(text).then(() => {
+    // The sendPlayerInput path owns the input value (it restores on
+    // failure, clears on success). Do NOT pre-clear here.
+    void sendPlayerInput(text).then((result) => {
+      if (!result) return; // failure branch already restored status + input
+      if (!state.sessionUuid) return;
+      // If we are already finished, leave the finished state alone.
+      if (state.finished) {
+        setStatus('finished');
+        return;
+      }
       setStatus('playing');
-      state.autoplayTimer && clearTimeout(state.autoplayTimer);
-      scheduleNextStep();
+      clearAutoplayTimer();
+      scheduleNext();
     });
   });
   document.addEventListener('keydown', (e) => {

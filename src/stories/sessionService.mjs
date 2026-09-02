@@ -414,7 +414,11 @@ export function interruptWithPlayerInput({ repository, session_uuid, text, clien
   const prior = idempotentResult(session, id, 'interrupt', { text });
   if (prior) return prior;
   validateRevision(session, expected_revision);
-  if (session.state !== 'opening' && session.state !== 'awaiting_first_choice') {
+  // ClickUp 09 acceptance criterion: "用户在任意普通消息之间都能打断".
+  // Opening, awaiting_first_choice, and realtime are all interruptible.
+  // stageNarrativeBatch already accepts all three; mirrors it here so the
+  // input bar is never silently swallowed mid-narration.
+  if (session.state !== 'opening' && session.state !== 'awaiting_first_choice' && session.state !== 'realtime') {
     throw new Error('interruptWithPlayerInput: session is not interruptible');
   }
   requiredString('text', text);

@@ -412,6 +412,16 @@ export function createPlayerDom({ baseUrl, viewport = null }) {
           return { ok: false, error: String(err) };
         }
       },
+      progressAudit: async () => {
+        const fill = document.querySelector('#status-bar-fill');
+        const pendingAttrLines = document.querySelectorAll('#story-log .line[data-pending="true"]').length;
+        const pendingClassLines = document.querySelectorAll('#story-log .line.line-pending').length;
+        const totalLines = document.querySelectorAll('#story-log .line').length;
+        const width = fill ? fill.style.width : null;
+        // Parse "12.3%" into 0.123.
+        const fraction = (width && width.endsWith('%')) ? Number(width.slice(0, -1)) / 100 : null;
+        return { width, fraction, totalLines, pendingAttrLines, pendingClassLines };
+      },
       accessibilityAudit: async () => {
         const back = document.querySelector('#back-btn');
         const share = document.querySelector('#share-btn');
