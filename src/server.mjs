@@ -48,7 +48,6 @@ import {
 } from './agent/runtime.mjs';
 import { snapshotAll as snapshotMetricsAll, snapshotSession as snapshotMetricsSession } from './observability/metrics.mjs';
 import { snapshotAll as snapshotCacheStatsAll } from './observability/cacheStats.mjs';
-import { computeFrontendPlaybackMs } from './observability/timing.mjs';
 import {
   createStoriesHookContext,
   onSessionCreate,
@@ -1130,7 +1129,14 @@ const server = http.createServer(async (req, res) => {
   // shape and docs/observability.md for the field contract.
   // -----------------------------------------------------------------------
 
-  const observabilitySessionMatch = pathname.match(/^\/api\/admin\/observability\/sessions\/([0-9a-fA-F-]+)$/);
+  // The capture is intentionally loose ([^/]+) so that malformed uuids
+  // like "not-a-uuid" reach the isSessionUuid check below and get the
+  // endpoint's own 400 validation_failed instead of falling through to
+  // the static handler's 404. This path prefix is exclusive to this
+  // endpoint (the only other observability route lives under
+  // /api/admin/observability/metrics/…), so loosening the regex cannot
+  // shadow any other route.
+  const observabilitySessionMatch = pathname.match(/^\/api\/admin\/observability\/sessions\/([^/]+)$/);
   if (method === 'GET' && observabilitySessionMatch) {
     const session_uuid = observabilitySessionMatch[1];
     if (!isSessionUuid(session_uuid)) {
@@ -1196,7 +1202,6 @@ const server = http.createServer(async (req, res) => {
       metrics,
       cache_stats: cacheStats,
       note: 'frontend_playback_ms can be computed per-commit from the events the client commits; this endpoint exposes storage only.',
-      compute_frontend_playback_ms: typeof computeFrontendPlaybackMs === 'function' ? 'available' : 'missing',
     });
   }
 

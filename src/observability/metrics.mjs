@@ -43,8 +43,9 @@ const sessionMetrics = new Map();
 
 // Session keys are externally controllable (request bodies), so the store
 // must stay bounded: unbounded growth would let anonymous /api/dev traffic
-// balloon process memory. Eviction is insertion-order (oldest observed
-// session first); the global counters are NOT rolled back on eviction.
+// balloon process memory. Eviction is LRU (Map iteration order = least
+// recently touched first — touchSession re-inserts on every hit); the
+// global counters are NOT rolled back on eviction.
 const MAX_SESSION_METRICS = 1000;
 let globalMetrics = newGlobalMetrics();
 let mutationCount = 0;
@@ -106,7 +107,15 @@ function newGlobalMetrics() {
 
 function touchSession(session_uuid, record) {
   let prev = sessionMetrics.get(session_uuid);
-  if (!prev) {
+  if (prev) {
+    // LRU refresh: delete + re-set moves the key to the end of the Map's
+    // iteration order so eviction below targets the least recently
+    // ACTIVE session, not merely the oldest-inserted one. Without this,
+    // a long-lived busy session could be evicted by a burst of new keys.
+    // Snapshot shape is unchanged; only iteration order follows recency.
+    sessionMetrics.delete(session_uuid);
+    sessionMetrics.set(session_uuid, prev);
+  } else {
     if (sessionMetrics.size >= MAX_SESSION_METRICS) {
       const oldestKey = sessionMetrics.keys().next().value;
       if (oldestKey !== undefined) sessionMetrics.delete(oldestKey);
@@ -165,6 +174,32 @@ export const recordAgentTurn = safe(({ session_uuid, latency_ms, in_tokens = 0, 
   globalMetrics.outTokens += Number.isFinite(out_tokens) && out_tokens > 0 ? out_tokens : 0;
   globalMetrics.cacheReadTokens += Number.isFinite(cache_read_tokens) && cache_read_tokens > 0 ? cache_read_tokens : 0;
   if (Number.isFinite(latency_ms)) bumpLatency(globalMetrics.agentLatency, latency_ms);
+});
+
+// ---------------------------------------------------------------------------
+// SINGLE-RECORDER CONTRACT (agent turn)
+//
+// `recordAgentTurn` (turn counter + tokens + latency) must be called
+// EXACTLY ONCE per successful agent turn, by
+// agent/observabilityHooks.onTurnSuccess — the only place that has the
+// full usage / truncated / retry context. `timeAgentTurn`
+// (observability/timing.mjs) is a latency-only stopwatch and must use
+// `recordAgentLatency` below, never `recordAgentTurn`. If both ran for
+// the same turn, every agent counter and the latency histogram would be
+// double-counted. See docs/observability.md §3.
+// ---------------------------------------------------------------------------
+
+/**
+ * Latency-only recording for the `agent` timing category. Feeds the
+ * agentLatency histogram WITHOUT bumping turn/token counters — this is
+ * what `timeAgentTurn` calls so a stopwatch wrapper can coexist with
+ * the hooks layer without double-counting the turn.
+ */
+export const recordAgentLatency = safe(({ session_uuid, latency_ms } = {}) => {
+  if (typeof session_uuid !== 'string' || !session_uuid) return;
+  if (!Number.isFinite(latency_ms)) return;
+  bumpLatency(touchSession(session_uuid, {}).agentLatency, latency_ms);
+  bumpLatency(globalMetrics.agentLatency, latency_ms);
 });
 
 export const recordAgentFailure = safe(({ session_uuid, error_code = null } = {}) => {
@@ -249,14 +284,13 @@ export const recordCompact = safe(({ session_uuid } = {}) => {
 
 export const observeSession = safe(({ session_uuid, state = null } = {}) => {
   if (typeof session_uuid !== 'string' || !session_uuid) return;
+  // touchSession always inserts the record (and counts a new session in
+  // sessionsObserved exactly once), so there is nothing left to do for
+  // insertion here — only the state label below is conditional.
   const s = touchSession(session_uuid, {});
   if (typeof state === 'string' && Object.prototype.hasOwnProperty.call(globalMetrics.sessionsByState, state)) {
     globalMetrics.sessionsByState[state] += 1;
     s.lastState = state;
-  }
-  if (!sessionMetrics.has(session_uuid)) {
-    sessionMetrics.set(session_uuid, s);
-    globalMetrics.sessionsObserved += 1;
   }
 });
 
@@ -277,7 +311,9 @@ export function snapshotSession(session_uuid) {
 
 /**
  * Snapshot of all session metrics keyed by session_uuid, plus the
- * process-wide global counters. Order of `sessions` is insertion order.
+ * process-wide global counters. Order of `sessions` is LRU recency
+ * order (least recently touched first) — it follows the eviction order
+ * and is not part of the API contract.
  */
 export function snapshotAll() {
   const sessions = {};

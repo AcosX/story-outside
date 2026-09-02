@@ -88,6 +88,11 @@ Two aggregation axes:
 Storage is a process-local `Map`. Restart wipes everything. The
 production bridge (Prometheus / StatsD) is documented below in §7.
 
+The Map is **bounded and LRU-evicted**: at most 1000 sessions are kept.
+`touchSession` re-inserts a key on every hit, so eviction targets the
+least recently *active* session, not merely the oldest-inserted one.
+Global counters are never rolled back when a session record is evicted.
+
 ### Per-session fields
 
 ```
@@ -113,12 +118,23 @@ and the four latency histograms.
 
 ### Public mutators
 
-`recordAgentTurn`, `recordAgentFailure`, `recordToolCall`,
-`recordOpeningCacheHit`, `recordOpeningCacheMiss`,
+`recordAgentTurn`, `recordAgentLatency`, `recordAgentFailure`,
+`recordToolCall`, `recordOpeningCacheHit`, `recordOpeningCacheMiss`,
 `recordRealtimeTransition`, `recordCommit`, `recordProviderRequest`,
 `recordProviderRateLimit`, `recordDbQuery`, `recordCompact`,
 `recordCacheReadTokens`, `observeSession`. All are wrapped — they
 silently swallow invalid input.
+
+### Single-recorder contract (agent turn)
+
+`recordAgentTurn` (turn counter + tokens + latency) is called **exactly
+once per successful agent turn**, by
+`agent/observabilityHooks.onTurnSuccess` — the only place that owns the
+full usage / truncated / retry context. `timeAgentTurn`
+(`observability/timing.mjs`) is a latency-only stopwatch: it feeds the
+`agentLatency` histogram via `recordAgentLatency` and never bumps turn
+or token counters. Wiring both helpers around the same turn therefore
+cannot double-count.
 
 ---
 
@@ -137,7 +153,9 @@ The slow-point triage table maps a symptom to a category:
 The first four categories are measured server-side via the four
 `timeAgentTurn`, `timeCommit`, `timeProvider`, and `timeDb` wrappers.
 Each one returns a `Stopwatch` whose `elapsedMs()` is bucketed into
-the corresponding histogram in §2.
+the corresponding histogram in §2. Note the `agent` wrapper records
+latency only (see the single-recorder contract above) — turn counters
+come from the hooks layer.
 
 ### Why "frontend" is not server-side
 
@@ -147,8 +165,11 @@ timestamp and the browser's `client_playback_at` is meaningful. Use
 `computeFrontendPlaybackMs({ server_commit_at, client_playback_at })`
 to compute it; the helper returns `null` (not `0`) when either side is
 missing so callers can distinguish "never played" from "played
-instantly". The admin endpoint exposes the storage; the diff is
-computed per commit by whoever consumes the metrics.
+instantly". Negative diffs (client clock behind the server clock) are
+**clamped to 0**: this deliberately hides client clock skew in exchange
+for a non-negative value operators can aggregate without filtering.
+The admin endpoint exposes the storage; the diff is computed per
+commit by whoever consumes the metrics.
 
 ---
 
@@ -161,6 +182,12 @@ Tracks `opening_cache` hits per cache and globally.
   forwards to `metrics.recordOpeningCacheHit`.
 - `recordMiss({ session_uuid })` increments the global miss counter
   and forwards to `metrics.recordOpeningCacheMiss`.
+
+The per-cache store is **bounded**: at most 500 aggregates are kept
+(the cache_uuid is externally controllable via the rebuild endpoint).
+When the cap is reached the oldest-inserted aggregate is evicted; the
+global hit/miss counters are never rolled back, so the demo-path
+acceptance proof below survives eviction of individual aggregates.
 
 Snapshots:
 
@@ -202,7 +229,7 @@ observability-free.
 |---------------------------------------------------|-----------------------------------------------|
 | `createStoriesHookContext({ session_uuid, ... })` | once per request.                              |
 | `onSessionCreate(hookCtx)`                        | after `createSession(...)` succeeds.           |
-| `onOpeningCommit({ hookCtx, event, latency_ms })` | after `commitOpeningEvent(...)` succeeds.      |
+| `onOpeningCommit({ hookCtx, event, latency_ms })` | after `commitOpeningEvent(...)` succeeds. A missing/non-numeric `latency_ms` records the commit event without a latency sample — never a fake 0ms sample. |
 | `onInterrupt({ hookCtx, text_length, latency_ms })` | after `interruptWithPlayerInput(...)` succeeds. |
 | `onToolCommit({ hookCtx, tool_name, latency_ms })` | after a tool call has been recorded into the session. |
 | `onStateTransition({ hookCtx, from_state, to_state })` | for state-machine transitions not covered above. |
@@ -223,11 +250,15 @@ Two new GET routes live under `/api/admin/*`:
 
 - `GET /api/admin/observability/sessions/:uuid`
   Returns the per-session metrics snapshot + the canonical session
-  state (recovered from the repository). 404 when the session has no
+  state (recovered from the repository). A malformed uuid (the route
+  accepts any single path segment and validates it with
+  `isSessionUuid`) returns `400 validation_failed`; 404
+  (`session_not_observed`) is returned when the session has no
   recorded metrics yet.
 - `GET /api/admin/observability/metrics/summary`
   Returns the full metrics snapshot (global + every session) and the
-  cache-stats snapshot.
+  cache-stats snapshot. It exposes storage only — frontend playback
+  diffs are computed per commit from committed events, not here.
 
 Both routes are demo/dev-only (no auth), carry the standard `demo` and
 `dev` banners, and never mutate server state.

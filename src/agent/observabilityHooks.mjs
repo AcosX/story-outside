@@ -125,6 +125,13 @@ export function applyOutputLimits({ session_uuid, usage, result }) {
  * `agent.turn.success` log + metric aggregation. The runtime calls
  * this once per successful provider response.
  *
+ * SINGLE-RECORDER CONTRACT: this hook is the ONLY caller of
+ * metrics.recordAgentTurn. It must stay the single place that bumps
+ * agentTurns / token counters / the agentLatency histogram for a turn;
+ * the timing.mjs stopwatch (`timeAgentTurn`) is latency-only via
+ * recordAgentLatency and must never record the same turn again. See
+ * docs/observability.md §3.
+ *
  * @param {Object} args
  * @param {Object} args.hookCtx
  * @param {{ startedAt: number }} args.timer
@@ -253,7 +260,9 @@ export async function observeProviderCall({ hookCtx, provider, request, retry = 
 
 /**
  * Convenience passthrough so other modules can `timeAgentTurn` without
- * importing the timing module directly.
+ * importing the timing module directly. Remember: `timeAgentTurn` is a
+ * latency-only stopwatch (see the single-recorder contract on
+ * `onTurnSuccess`) — it never records turn counters.
  */
 export { timeAgentTurn };
 
