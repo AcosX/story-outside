@@ -167,7 +167,9 @@ try {
     interrupted.data?.player_event?.origin === 'user' &&
     interrupted.data?.player_event?.source === 'player' &&
     interrupted.data?.player_event?.event_seq === revision + 1 &&
-    interrupted.data?.player_event?.source_sequence === revision + 1);
+    // player source_sequence is the per-(session, source) counter: first
+    // player event of this session → 0 (never mirrors event_seq).
+    interrupted.data?.player_event?.source_sequence === 0);
   check('interrupt returns realtime transition', interrupted.data?.state === 'realtime' && interrupted.data?.realtime_transition?.state === 'realtime');
   const duplicateInterrupt = await post(`/api/dev/sessions/${sessionUuid}/interrupt`, {
     text: '我在等你。', client_request_id: 'interrupt-request-0', expected_revision: 0,
@@ -180,7 +182,11 @@ try {
     recovered.data?.history?.length === cacheEvents.length + 1 &&
     recovered.data.history[0].event_type === 'story_opening' &&
     recovered.data.history.at(-1).event_type === 'player_input');
-  check('recovery cursor/revision match displayed openings and history', recovered.data?.cursor === cacheEvents.length && recovered.data?.revision === cacheEvents.length + 1);
+  // Canonical cursor counts ALL committed events (openings + player_input).
+  check('recovery cursor/revision match displayed openings and history',
+    recovered.data?.cursor === cacheEvents.length + 1 &&
+    recovered.data?.revision === cacheEvents.length + 1 &&
+    recovered.data?.opening_cursor === cacheEvents.length);
   check('recovery is read-only and cache remains valid',
     recovered.data?.opening_cache_status === 'valid' &&
     (await request(`/api/dev/sessions/${sessionUuid}`)).data?.history?.length === recovered.data.history.length);

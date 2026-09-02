@@ -1,55 +1,68 @@
-// Session-local opening playback state. The state is deliberately attached
-// to each repository instance so independent repositories cannot share a
-// session or accidentally observe one another's history.
+// src/stories/sessionService.mjs — canonical session store.
 //
-// ClickUp 09 contract (player frontend, autoplay / commit / interrupt / recover):
+// ClickUp 05 / 08 / 09 contract (unified):
 //
-//   * The sessionService IS the canonical store. It owns the per-session
-//     history, revision, cursor, opening_cursor, state, idempotency map,
-//     and the active speculative pending batch. There is exactly one
-//     history per session.
+//   The sessionService IS the canonical store. It owns the per-session
+//   history, revision, cursor, state, idempotency map, and the active
+//   speculative pending batch. There is exactly one history per session,
+//   and every event committed to it is hash-pinned and append-only.
 //
-//   * Cursor semantics (ClickUp 09 P1.1):
-//       - cursor       = canonical event count (every commit advances it).
-//       - opening_cursor = count of committed OPENING events (separate,
-//         read-only, exposed so the client can keep driving the opening
-//         sequence while cursor stays consistent with the full chain).
-//       - revision     = cursor (canonical event count).
+//   * Opening events come from the pinned cache via commitOpeningEvent.
+//     They MUST be explicitly displayed before they reach canonical
+//     history, opening order is enforced against session.opening_cursor,
+//     and the revision check MUST pass.
 //
-//   * Narrative events arrive via stageNarrativeBatch followed by zero or
-//     more commitNarrativeEvent calls. Each commit appends EXACTLY ONE
-//     event (the one the player just saw) to canonical history. The
-//     speculative tail lives on session.pending and NEVER reaches
-//     canonical history unless the corresponding commitNarrativeEvent
-//     call lands.
+//   * Cursor semantics (ClickUp 08 P1.1): `cursor` is the CANONICAL
+//     cursor — the count of committed canonical events. It equals
+//     session.revision and the last committed event_seq, and advances on
+//     EVERY commit (opening, narrative, player_input). The opening
+//     playback position lives in a separate INTERNAL `opening_cursor`
+//     (only opening commits advance it); it is exposed read-only so
+//     clients can keep driving the opening sequence while `cursor`
+//     stays consistent with the full canonical chain.
 //
-//   * A batch may carry 1..4 narrative items plus an OPTIONAL final tool
-//     call. The tool call is validated, surfaced as part of the staged
-//     batch, and NEVER written to canonical history (it never advances
-//     the pending cursor and never becomes a committed event_seq).
+//   * Narrative events come from the runtime via stageNarrativeBatch + a
+//     sequence of commitNarrativeEvent calls. Each commit appends exactly
+//     ONE event to canonical history (the one the player just saw). The
+//     speculative tail is parked on session.pending and NEVER reaches
+//     canonical history unless the corresponding commitNarrativeEvent is
+//     called.
+//
+//   * source_sequence is a per (session, source) monotonic counter
+//     (0-based, contiguous, recoverable from history). It never resets
+//     between batches, so the SQL unique key
+//     uq_session_events_source_sequence(session_id, source, source_sequence)
+//     holds across consecutive runtime batches and repeated player
+//     interrupts. Opening events keep their pinned cache sequence (they
+//     use the 'opening_cache' source).
+//
+//   * A tool call may ride on a batch as the OPTIONAL FINAL item. It is
+//     validated, surfaced as part of the staged batch, and never written
+//     to canonical history as a narrative item (it never advances the
+//     pending cursor and never becomes a committed event_seq).
 //
 //   * interruptWithPlayerInput atomically:
 //       - discards the speculative pending tail;
 //       - appends the player_input as a NEW canonical event;
-//       - switches the session state to 'realtime'.
+//       - switches the session state to 'realtime' (a realtime session
+//         may be interrupted again; the state stays 'realtime').
 //
 //   * recoverSession returns canonical history + revision + cursor +
 //     opening_cursor + the active pending snapshot. Read-only: never
 //     calls the provider, never replays, never mutates state.
 //
-//   * Every mutating call accepts a client_request_id; a reused id with
-//     the same payload replays the prior result; a reused id with a
-//     different payload fails closed.
+//   * Every mutating call accepts a client_request_id and uses the same
+//     fingerprint contract as the application layer: a reused id with the
+//     same payload replays the prior result; a reused id with a different
+//     payload fails closed.
 //
-// IMPORTANT — DEPENDENCY NOTE (ClickUp 09):
+//   * Turn-level request idempotency (request_id + input + revision) is
+//     owned by the SESSION (session.turnRequests), not by any transient
+//     runtime instance, so the HTTP layer's per-request runtime creation
+//     still replays a stable result for the same request_id.
 //
-//   This file adds the minimum 09-batch lifecycle to sessionService.
-//   The shape matches the ClickUp 08 wire contract that the player
-//   frontend consumes (1..4 items + optional final tool call, pending
-//   snapshot with pending_id/committed_count/tool_call). It is NOT a
-//   cherry-pick of 08: the original 08 changes are not in this branch
-//   yet. When main eventually integrates 08, this layer should be
-//   replaced by the 08 implementation and these helpers removed.
+// Stale revision / wrong pending_id / out-of-order sequence / mixed
+// payloads / unknown event types fail closed.
 
 import { randomUUID } from 'node:crypto';
 import { canonicalJsonStringify, canonicalSha256 } from './canonicalHash.mjs';
@@ -60,8 +73,9 @@ const CACHE_EVENT_TYPES = new Set(['narration', 'dialogue', 'action', 'beat']);
 const NARRATIVE_EVENT_TYPES = new Set(['narration', 'dialogue', 'action', 'beat']);
 const NARRATIVE_ORIGIN = 'llm';
 const NARRATIVE_SOURCE = 'runtime';
-// ClickUp 08 / 09 contract: a staged batch carries 1..4 narrative items
-// plus an OPTIONAL final tool call.
+
+// Hard limits from ClickUp 08: a staged batch may carry 1..4 narrative
+// items plus an OPTIONAL final tool call.
 const MAX_NARRATIVE_ITEMS = 4;
 const MIN_NARRATIVE_ITEMS = 1;
 
@@ -79,6 +93,10 @@ function repositoryState(repository) {
   }
   return repository[SESSION_STATE];
 }
+
+// Public (read-only) access for cross-module helpers. Callers MUST NOT
+// mutate the returned object.
+export { repositoryState };
 
 function assertUuid(label, value) {
   if (typeof value !== 'string' || !UUID_PATTERN.test(value)) {
@@ -127,7 +145,13 @@ function requestId(value) {
 function requestFingerprint(kind, input) {
   return canonicalJsonStringify(kind === 'opening'
     ? { kind, event: input.event }
-    : { kind, text: input.text });
+    : kind === 'stage'
+      ? { kind, payload: input.payload }
+      : kind === 'commit'
+        ? { kind, pending_id: input.pending_id, sequence: input.sequence }
+        : kind === 'interrupt'
+          ? { kind, text: input.text }
+          : { kind, ...input });
 }
 
 function idempotentResult(session, id, kind, input) {
@@ -192,12 +216,6 @@ function validatePinnedCache(cache, story_uuid, story_version_uuid) {
   return events;
 }
 
-function cacheEvents(cache) {
-  const events = cache && cache.content_payload && cache.content_payload.events;
-  if (!Array.isArray(events)) throw new Error('sessionService: pinned cache events required');
-  return events;
-}
-
 function normalizeCacheEvent(event, pinned, cache_uuid, session_uuid) {
   if (!event || typeof event !== 'object') throw new Error('commitOpeningEvent: event required');
   if (event.displayed !== true && event.explicitly_displayed !== true) {
@@ -235,7 +253,7 @@ function normalizeCacheEvent(event, pinned, cache_uuid, session_uuid) {
   };
 }
 
-function append(session, canonical, advancesCursor, clientRequestId = null) {
+function append(session, canonical, clientRequestId = null) {
   const eventSeq = session.history.length + 1;
   const committed = {
     ...canonical,
@@ -257,25 +275,33 @@ function append(session, canonical, advancesCursor, clientRequestId = null) {
     client_request_id: committed.client_request_id,
   });
   session.history.push(committed);
-  if (advancesCursor) session.cursor += 1;
+  // Every committed canonical event advances the canonical cursor by 1:
+  // cursor === revision === max(event_seq) === history.length. This is the
+  // ClickUp 08 P1.1 invariant — the opening playback position is tracked
+  // separately in session.opening_cursor.
+  session.cursor += 1;
   session.revision += 1;
   return committed;
 }
 
 /**
- * Per-source source_sequence counter (ClickUp 09 / 08 surface — NOT
- * currently used by the canonical append path, which still uses the
- * Phase 4 history.position value so existing tests stay stable). Kept
- * for the runtime layer / future DAO; the helper stays here so the
- * contract is consistent if a future branch consolidates the two
- * conventions.
+ * Next source_sequence for a (session, source) pair. Per-source counters
+ * are 0-based, contiguous, and monotonic — they never reset between
+ * batches. The counter is seeded from canonical history on first use so
+ * a session object rebuilt from persisted history (future DAO) derives
+ * the same next value without extra state.
  */
 function nextSourceSequence(session, source) {
-  let count = 0;
-  for (const event of session.history) {
-    if (event.source === source) count += 1;
+  if (!session.sourceSeq.has(source)) {
+    let count = 0;
+    for (const event of session.history) {
+      if (event.source === source) count += 1;
+    }
+    session.sourceSeq.set(source, count);
   }
-  return count;
+  const next = session.sourceSeq.get(source);
+  session.sourceSeq.set(source, next + 1);
+  return next;
 }
 
 function publicSession(session, includeHistory = false) {
@@ -315,10 +341,17 @@ function publicPending(pending) {
 }
 
 function ensurePendingShape(pending) {
-  // Adapter hook so a future DAO can hand back a pending row that needs
-  // shape normalization; today the in-memory pending is already shaped
-  // correctly.
-  return pending;
+  if (!pending || typeof pending !== 'object') return null;
+  return {
+    pending_id: pending.pending_id,
+    events: Array.isArray(pending.events) ? pending.events.slice() : [],
+    tool_call: pending.tool_call || null,
+    committed_count: Number.isInteger(pending.committed_count) ? pending.committed_count : 0,
+    source: pending.source || NARRATIVE_SOURCE,
+    produced_at: pending.produced_at || nowIso(),
+    revision_at_stage: Number.isInteger(pending.revision_at_stage) ? pending.revision_at_stage : 0,
+    request_id: pending.request_id || null,
+  };
 }
 
 export function createSession({ repository, session_uuid, story_uuid, story_version_uuid, user_ref, role_id, model, prompt, generation_profile }) {
@@ -361,8 +394,9 @@ export function createSession({ repository, session_uuid, story_uuid, story_vers
     revision: 0,
     history: [],
     pending: null,
-    turnRequests: new Map(),
     requestIds: new Map(),
+    turnRequests: new Map(),
+    sourceSeq: new Map(),
   };
   state.sessions.set(session_uuid, session);
   return publicSession(session);
@@ -380,143 +414,67 @@ export function commitOpeningEvent({ repository, session_uuid, cache_uuid, event
   validateRevision(session, expected_revision);
   if (session.state !== 'opening') throw new Error('commitOpeningEvent: session is not in opening state');
   if (!Number.isInteger(event && event.sequence)) throw new Error('commitOpeningEvent: event.sequence must be an integer');
-  if (event.sequence !== session.cursor) throw new Error(`commitOpeningEvent: event.sequence must equal cursor ${session.cursor}`);
+  // Opening order is enforced against the OPENING cursor (the number of
+  // opening events already displayed), not the canonical cursor.
+  if (event.sequence !== session.opening_cursor) throw new Error(`commitOpeningEvent: event.sequence must equal opening cursor ${session.opening_cursor}`);
   const cache = repository.findOpeningCacheByUuid(session.cache_uuid);
   if (!cache || cache.status !== 'valid') throw new Error('commitOpeningEvent: pinned cache is no longer valid');
   const pinned = validatePinnedCache(cache, session.story_uuid, session.story_version_uuid)
     .find((candidate) => candidate && candidate.sequence === event.sequence);
   const canonical = normalizeCacheEvent(event, pinned, cache_uuid, session.session_uuid);
-  const committed = append(session, canonical, true, id);
-  // opening_cursor is the canonical opening position (incremented only on
-  // opening commits). session.cursor and session.revision follow the
-  // existing Phase 4 contract: cursor advances with opening events,
-  // revision advances on every commit.
+  const committed = append(session, canonical, id);
   session.opening_cursor += 1;
-  if (session.cursor >= cache.content_payload.event_count) session.state = 'awaiting_first_choice';
-  const result = {
-    session_uuid,
-    cache_uuid,
-    event: clone(committed),
-    cursor: session.cursor,
-    opening_cursor: session.opening_cursor,
-    revision: session.revision,
-    state: session.state,
-  };
+  if (session.opening_cursor >= cache.content_payload.event_count) session.state = 'awaiting_first_choice';
+  const result = { session_uuid, cache_uuid, event: clone(committed), cursor: session.cursor, opening_cursor: session.opening_cursor, revision: session.revision, state: session.state };
   if (id) session.requestIds.set(id, { kind: 'opening', fingerprint: requestFingerprint('opening', { event }), result });
   return clone(result);
 }
 
-export function interruptWithPlayerInput({ repository, session_uuid, text, client_request_id, expected_revision }) {
-  if (!repository) throw new Error('interruptWithPlayerInput: repository required');
-  assertUuid('session_uuid', session_uuid);
-  const session = sessionFor(repository, session_uuid);
-  const id = requestId(client_request_id);
-  const prior = idempotentResult(session, id, 'interrupt', { text });
-  if (prior) return prior;
-  validateRevision(session, expected_revision);
-  // ClickUp 09 acceptance criterion: "用户在任意普通消息之间都能打断".
-  // Opening, awaiting_first_choice, and realtime are all interruptible.
-  // stageNarrativeBatch already accepts all three; mirrors it here so the
-  // input bar is never silently swallowed mid-narration.
-  if (session.state !== 'opening' && session.state !== 'awaiting_first_choice' && session.state !== 'realtime') {
-    throw new Error('interruptWithPlayerInput: session is not interruptible');
-  }
-  requiredString('text', text);
-  // Discard speculative pending tail (if any). The tail never reaches
-  // canonical history; the player's input is the only canonical addition.
-  const dropped = session.pending;
-  session.pending = null;
-  const sourceSequence = session.history.length + 1;
-  const canonical = append(session, {
-    event_id: randomUUID(),
-    event_type: 'player_input',
-    origin: 'user',
-    source: 'player',
-    source_sequence: sourceSequence,
-    payload: { text },
-    occurred_at: nowIso(),
-  }, false, id);
-  session.state = 'realtime';
-  const result = {
-    session_uuid,
-    cache_uuid: session.cache_uuid,
-    event: clone(canonical),
-    cursor: session.cursor,
-    opening_cursor: session.opening_cursor,
-    revision: session.revision,
-    state: session.state,
-    dropped_pending_id: dropped ? dropped.pending_id : null,
-    dropped_pending_count: dropped ? dropped.events.length - dropped.committed_count : 0,
-  };
-  if (id) session.requestIds.set(id, { kind: 'interrupt', fingerprint: requestFingerprint('interrupt', { text }), result });
-  return clone(result);
-}
-
-export function getSession({ repository, session_uuid }) {
-  if (!repository) throw new Error('getSession: repository required');
-  assertUuid('session_uuid', session_uuid);
-  return publicSession(sessionFor(repository, session_uuid));
-}
-
-export function listSessionEvents({ repository, session_uuid }) {
-  if (!repository) throw new Error('listSessionEvents: repository required');
-  assertUuid('session_uuid', session_uuid);
-  return clone(sessionFor(repository, session_uuid).history);
-}
-
-export function recoverSession({ repository, session_uuid }) {
-  if (!repository) throw new Error('recoverSession: repository required');
-  assertUuid('session_uuid', session_uuid);
-  const session = sessionFor(repository, session_uuid);
-  return {
-    ...publicSession(session, true),
-    pending: publicPending(ensurePendingShape(session.pending)),
-  };
-}
-
 /**
- * Stage a narrative batch from the runtime. The session carries the
- * active speculative pending batch on session.pending; canonical history
- * is NOT mutated. The caller commits each displayed item via
- * commitNarrativeEvent.
+ * Stage a speculative narrative batch on a session. The batch MUST satisfy:
+ *   * 1..4 narrative items (narration / dialogue / action / beat), each with
+ *     a sequence 0..N-1 in order;
+ *   * an OPTIONAL final tool call (kind=choice_required | story_finished);
+ *   * the session must be in opening / awaiting_first_choice / realtime;
+ *   * any existing pending batch is REPLACED (the runtime is expected to
+ *     either re-stage after advancing revision or accept that the previous
+ *     batch is gone). Replacing is intentional — a duplicate or stale
+ *     stage must not silently keep dropped content alive.
  *
- * Strict invariants (fail closed):
- *   - session exists
- *   - expected_revision matches session.revision
- *   - items array carries 1..4 entries of allowed narrative types
- *   - tool_call (when present) is a non-empty object (full tool envelope
- *     validation is the runtime/tools layer's job)
- *   - if a different unconsumed pending is already staged, REJECT (callers
- *     must commit / interrupt / discard it first). Same payload is
- *     idempotent and replays the existing snapshot.
+ * The batch never touches canonical history. Its events keep their
+ * sequence numbers as staged; canonical event_seq is allocated only at
+ * commit time.
  */
-export function stageNarrativeBatch({ repository, session_uuid, items, tool_call, source, client_request_id, expected_revision }) {
+export function stageNarrativeBatch({ repository, session_uuid, items, tool_call, source, expected_revision, client_request_id }) {
   if (!repository) throw new Error('stageNarrativeBatch: repository required');
-  assertUuid('session_uuid', session_uuid);
-  if (!Array.isArray(items) || items.length < MIN_NARRATIVE_ITEMS || items.length > MAX_NARRATIVE_ITEMS) {
-    throw new Error(`stageNarrativeBatch: items must contain ${MIN_NARRATIVE_ITEMS}..${MAX_NARRATIVE_ITEMS} items`);
+  const hasToolCall = tool_call !== undefined && tool_call !== null;
+  if (!Array.isArray(items)) {
+    throw new Error('stageNarrativeBatch: items must be an array');
   }
-  if (tool_call !== undefined && tool_call !== null && (typeof tool_call !== 'object' || Array.isArray(tool_call))) {
+  if (items.length === 0 && !hasToolCall) {
+    throw new Error('stageNarrativeBatch: at least one narrative item or a tool_call is required');
+  }
+  if (items.length > MAX_NARRATIVE_ITEMS) {
+    throw new Error(`stageNarrativeBatch: items must contain at most ${MAX_NARRATIVE_ITEMS} narrative items`);
+  }
+  if (hasToolCall && (typeof tool_call !== 'object' || Array.isArray(tool_call))) {
     throw new Error('stageNarrativeBatch: tool_call must be an object when present');
   }
-  if (tool_call && typeof tool_call.name !== 'string') {
-    throw new Error('stageNarrativeBatch: tool_call.name required');
-  }
-  if (!Number.isInteger(expected_revision)) {
-    throw new Error('stageNarrativeBatch: expected_revision must be an integer');
-  }
-  const session = sessionFor(repository, session_uuid);
-  const id = requestId(client_request_id);
   const normalized = items.map((event, index) => {
     if (!event || typeof event !== 'object' || Array.isArray(event)) {
       throw new Error(`stageNarrativeBatch: items[${index}] must be an object`);
     }
+    if (event.sequence !== undefined && event.sequence !== index) {
+      throw new Error(`stageNarrativeBatch: items[${index}].sequence must equal ${index}`);
+    }
     const eventType = event.type || event.event_type;
     if (!NARRATIVE_EVENT_TYPES.has(eventType)) {
-      throw new Error(`stageNarrativeBatch: items[${index}].type '${eventType}' is not a narrative event type`);
+      throw new Error(
+        `stageNarrativeBatch: items[${index}].type must be one of ${[...NARRATIVE_EVENT_TYPES].join(',')}`,
+      );
     }
-    if (typeof event.text !== 'string') {
-      throw new Error(`stageNarrativeBatch: items[${index}].text required`);
+    if (typeof event.text !== 'string' || event.text.length === 0) {
+      throw new Error(`stageNarrativeBatch: items[${index}].text must be a non-empty string`);
     }
     if (event.speaker !== undefined && typeof event.speaker !== 'string') {
       throw new Error(`stageNarrativeBatch: items[${index}].speaker must be a string when present`);
@@ -528,37 +486,46 @@ export function stageNarrativeBatch({ repository, session_uuid, items, tool_call
       ...(event.speaker !== undefined ? { speaker: event.speaker } : {}),
     };
   });
-  // Idempotency lookup must happen BEFORE the active-pending guard so a
-  // request that retries with the same client_request_id replays even if
-  // there is already an unconsumed pending.
+  const session = sessionFor(repository, session_uuid);
+  const id = requestId(client_request_id);
+  const stageFingerprintInput = { payload: { items: normalized, tool_call: tool_call || null, source: source || NARRATIVE_SOURCE } };
   if (id) {
-    const stageFingerprint = canonicalJsonStringify({
-      items: normalized,
-      tool_call: tool_call || null,
-      source: source || NARRATIVE_SOURCE,
-    });
-    const prior = idempotentResult(session, id, 'stage', { payload: { items: normalized, tool_call: tool_call || null, source: source || NARRATIVE_SOURCE } });
+    const prior = idempotentResult(session, id, 'stage', stageFingerprintInput);
     if (prior) return prior;
   }
   validateRevision(session, expected_revision);
   if (session.state !== 'opening' && session.state !== 'awaiting_first_choice' && session.state !== 'realtime') {
     throw new Error(`stageNarrativeBatch: session is not accepting narrative batches (state=${session.state})`);
   }
-  // Active-pending concurrency guard: a fresh stage MUST NOT silently
-  // overwrite an unconsumed batch. Same payload replays the existing
-  // snapshot; different payload fails closed.
+  // Active-pending concurrency guard (ClickUp 08 P1.2): if there is an
+  // unconsumed pending batch (some items committed, but the final commit
+  // has not landed), a fresh stage MUST NOT silently overwrite it. The
+  // payload either matches the active pending (idempotent return) or it
+  // is rejected. The only escape hatches for the caller are
+  //   * commitNarrativeEvent to drain the active batch, or
+  //   * interruptWithPlayerInput / discardPendingTail to drop it.
+  // The same rule applies whether or not the caller supplied a
+  // client_request_id: payload equality is the contract, not the request
+  // id. A late-arriving provider with a different result for the same
+  // logical request therefore fails closed instead of corrupting the
+  // active pending.
   if (session.pending) {
     const active = session.pending;
-    const samePayload = canonicalJsonStringify({
-      items: normalized,
-      tool_call: tool_call || null,
-      source: source || NARRATIVE_SOURCE,
-    }) === canonicalJsonStringify({
-      items: active.events,
-      tool_call: active.tool_call || null,
-      source: active.source,
-    });
+    const samePayload = canonicalJsonStringify(stageFingerprintInput.payload)
+      === canonicalJsonStringify({
+        items: active.events.map((event) => ({
+          type: event.type,
+          sequence: event.sequence,
+          text: event.text,
+          ...(event.speaker !== undefined ? { speaker: event.speaker } : {}),
+        })),
+        tool_call: active.tool_call || null,
+        source: active.source,
+      });
     if (samePayload) {
+      // Idempotent re-stage: surface the existing pending snapshot
+      // instead of mutating it. The committed_count, produced_at, and
+      // pending_id stay stable.
       return {
         session_uuid,
         pending_id: active.pending_id,
@@ -605,7 +572,7 @@ export function stageNarrativeBatch({ repository, session_uuid, items, tool_call
   if (id) {
     session.requestIds.set(id, {
       kind: 'stage',
-      fingerprint: canonicalJsonStringify({ kind: 'stage', payload: { items: normalized, tool_call: tool_call || null, source: pending.source } }),
+      fingerprint: requestFingerprint('stage', { payload: { items: normalized, tool_call: tool_call || null, source: pending.source } }),
       result,
     });
   }
@@ -622,12 +589,14 @@ export function stageNarrativeBatch({ repository, session_uuid, items, tool_call
  *   - pending matches session.pending.pending_id
  *   - sequence equals pending.committed_count (next un-committed index)
  *   - expected_revision equals session.revision
- *   - client_request_id (when present) replays identical calls; a reused
- *     id with a different payload fails closed.
+ *   - client_request_id (when present) replays identical calls and rejects
+ *     different payloads under the same id.
  *
  * The optional final tool call is NEVER committed as a narrative event.
- * The application surfaces it to the player separately. The result of
- * the FINAL commit exposes the staged tool_call under pending_tool_call.
+ * The application surfaces it to the player separately (it is part of
+ * the staged batch but is not part of session.history). The result of the
+ * FINAL commit exposes the staged tool_call under pending_tool_call so
+ * callers can render it.
  */
 export function commitNarrativeEvent({ repository, session_uuid, pending_id, sequence, expected_revision, client_request_id }) {
   if (!repository) throw new Error('commitNarrativeEvent: repository required');
@@ -640,9 +609,11 @@ export function commitNarrativeEvent({ repository, session_uuid, pending_id, seq
   }
   const session = sessionFor(repository, session_uuid);
   const id = requestId(client_request_id);
-  // Idempotency lookup FIRST: after the final commit clears session.pending,
-  // a replay of that same commit must still return the original result
-  // instead of failing the pending_id check.
+  // Idempotency lookup comes FIRST: after the final commit clears
+  // session.pending, a replay of that same commit must still return the
+  // original result instead of failing the pending_id check (ClickUp 08
+  // P1.5 final-commit idempotency). A reused id with a different
+  // pending_id/sequence still fails closed via the fingerprint.
   if (id) {
     const prior = idempotentResult(session, id, 'commit', { pending_id, sequence });
     if (prior) return prior;
@@ -661,9 +632,10 @@ export function commitNarrativeEvent({ repository, session_uuid, pending_id, seq
       `commitNarrativeEvent: sequence must equal pending.committed_count (${session.pending.committed_count}); out-of-order commits fail closed`,
     );
   }
-  if (expected_revision !== session.revision) {
+  const current = session.revision;
+  if (expected_revision !== current) {
     throw new Error(
-      `commitNarrativeEvent: revision mismatch, expected ${expected_revision} but current is ${session.revision}`,
+      `commitNarrativeEvent: revision mismatch, expected ${expected_revision} but current is ${current}`,
     );
   }
   const canonical = append(session, {
@@ -671,10 +643,10 @@ export function commitNarrativeEvent({ repository, session_uuid, pending_id, seq
     event_type: 'narrative_beat',
     origin: NARRATIVE_ORIGIN,
     source: session.pending.source,
-    source_sequence: session.history.length + 1,
+    source_sequence: nextSourceSequence(session, session.pending.source),
     payload: clone(staged),
     occurred_at: nowIso(),
-  }, false, id);
+  }, id);
   session.pending.committed_count += 1;
   const totalCommitted = session.pending.committed_count;
   const totalEvents = session.pending.events.length;
@@ -696,7 +668,7 @@ export function commitNarrativeEvent({ repository, session_uuid, pending_id, seq
   if (id) {
     session.requestIds.set(id, {
       kind: 'commit',
-      fingerprint: canonicalJsonStringify({ kind: 'commit', pending_id, sequence }),
+      fingerprint: requestFingerprint('commit', { pending_id, sequence }),
       result,
     });
   }
@@ -704,28 +676,66 @@ export function commitNarrativeEvent({ repository, session_uuid, pending_id, seq
 }
 
 /**
- * Discard any speculative pending batch without committing.
+ * Player interrupts the session. Atomically:
+ *   - discards the speculative pending tail (no canonical events added);
+ *   - appends the player_input as a new canonical event;
+ *   - switches state to 'realtime'.
+ * After this call, the session has NO active pending batch.
  */
-export function discardPendingTail({ repository, session_uuid }) {
-  if (!repository) throw new Error('discardPendingTail: repository required');
+export function interruptWithPlayerInput({ repository, session_uuid, text, client_request_id, expected_revision }) {
+  if (!repository) throw new Error('interruptWithPlayerInput: repository required');
+  assertUuid('session_uuid', session_uuid);
   const session = sessionFor(repository, session_uuid);
+  const id = requestId(client_request_id);
+  const prior = idempotentResult(session, id, 'interrupt', { text });
+  if (prior) return prior;
+  validateRevision(session, expected_revision);
+  // ClickUp 09 acceptance criterion: "用户在任意普通消息之间都能打断".
+  // Opening, awaiting_first_choice, and realtime are all interruptible.
+  // stageNarrativeBatch already accepts all three; mirrors it here so the
+  // input bar is never silently swallowed mid-narration.
+  if (session.state !== 'opening' && session.state !== 'awaiting_first_choice' && session.state !== 'realtime') {
+    throw new Error('interruptWithPlayerInput: session is not interruptible');
+  }
+  requiredString('text', text);
+  // Discard speculative pending tail. If the runtime kept an un-displayed
+  // tool call, it is dropped with the rest of the tail and never reaches
+  // canonical history.
   const dropped = session.pending;
   session.pending = null;
-  return {
+  const canonical = append(session, {
+    event_id: randomUUID(),
+    event_type: 'player_input',
+    origin: 'user',
+    source: 'player',
+    source_sequence: nextSourceSequence(session, 'player'),
+    payload: { text },
+    occurred_at: nowIso(),
+  }, id);
+  session.state = 'realtime';
+  const result = {
+    session_uuid,
+    cache_uuid: session.cache_uuid,
+    event: clone(canonical),
+    cursor: session.cursor,
+    opening_cursor: session.opening_cursor,
+    revision: session.revision,
+    state: session.state,
     dropped_pending_id: dropped ? dropped.pending_id : null,
     dropped_pending_count: dropped ? dropped.events.length - dropped.committed_count : 0,
-    state: session.state,
   };
+  if (id) session.requestIds.set(id, { kind: 'interrupt', fingerprint: requestFingerprint('interrupt', { text }), result });
+  return clone(result);
 }
 
 /**
- * Session-owned turn-level idempotency store. The HTTP layer creates a
- * fresh runtime per request, so request_id dedup MUST live on the
- * session, not on a transient runtime instance. The runtime registers
- * the full turn result (turn_id / items / tool envelope / pending_id)
- * here after a successful stage; a later request with the same
- * request_id + input + revision replays that exact result without
- * calling the provider again.
+ * Session-owned turn-level idempotency store (ClickUp 08 P1.5 HTTP
+ * cross-request idempotency). The HTTP layer creates a fresh runtime per
+ * request, so request_id dedup MUST live on the session, not on a
+ * transient runtime instance. The runtime registers the full turn result
+ * (turn_id / items / tool envelope / pending_id) here after a successful
+ * stage; a later request with the same request_id + input + revision
+ * replays that exact result without calling the provider again.
  */
 export function lookupTurnRequest({ repository, session_uuid, request_id }) {
   if (!repository) throw new Error('lookupTurnRequest: repository required');
@@ -737,6 +747,11 @@ export function lookupTurnRequest({ repository, session_uuid, request_id }) {
   return prior ? { fingerprint: prior.fingerprint, result: clone(prior.result) } : null;
 }
 
+/**
+ * Register (or replay) a turn-level request result on the session. A
+ * reused request_id with the SAME fingerprint replays the prior result; a
+ * reused request_id with a DIFFERENT fingerprint fails closed.
+ */
 export function registerTurnRequest({ repository, session_uuid, request_id, fingerprint, result }) {
   if (!repository) throw new Error('registerTurnRequest: repository required');
   assertUuid('session_uuid', session_uuid);
@@ -756,8 +771,60 @@ export function registerTurnRequest({ repository, session_uuid, request_id, fing
 }
 
 /**
- * Adapter hook used by tests that need to inspect the raw session row.
- * Not part of the public HTTP surface.
+ * Discard any speculative pending batch without committing.
+ */
+export function discardPendingTail({ repository, session_uuid }) {
+  if (!repository) throw new Error('discardPendingTail: repository required');
+  const session = sessionFor(repository, session_uuid);
+  const dropped = session.pending;
+  session.pending = null;
+  return {
+    dropped_pending_id: dropped ? dropped.pending_id : null,
+    dropped_pending_count: dropped ? dropped.events.length - dropped.committed_count : 0,
+    state: session.state,
+  };
+}
+
+export function getSession({ repository, session_uuid }) {
+  if (!repository) throw new Error('getSession: repository required');
+  assertUuid('session_uuid', session_uuid);
+  return publicSession(sessionFor(repository, session_uuid));
+}
+
+export function listSessionEvents({ repository, session_uuid }) {
+  if (!repository) throw new Error('listSessionEvents: repository required');
+  assertUuid('session_uuid', session_uuid);
+  return clone(sessionFor(repository, session_uuid).history);
+}
+
+/**
+ * Read-only recovery. Returns the canonical session projection, the full
+ * canonical history, and the active pending snapshot (if any). Never calls
+ * the provider, never replays, never mutates state.
+ *
+ * ClickUp 08 P1.6 persistence boundary: the application-layer in-memory
+ * repository (src/stories/repository.mjs) does NOT persist sessions
+ * across process restarts, so `recoverSession` is only safe to call from
+ * the SAME process that originally staged the session. It is NOT
+ * cross-process recovery. A future MariaDB-backed DAO will replace the
+ * in-memory map with the `game_sessions` table; until that DAO lands,
+ * callers MUST NOT claim that the SQL migrations provide runtime
+ * persistence — the migrations only pin the schema the future DAO will
+ * write through. Tests and docs must not describe this as cross-process.
+ */
+export function recoverSession({ repository, session_uuid }) {
+  if (!repository) throw new Error('recoverSession: repository required');
+  assertUuid('session_uuid', session_uuid);
+  const session = sessionFor(repository, session_uuid);
+  return {
+    ...publicSession(session, true),
+    pending: publicPending(ensurePendingShape(session.pending)),
+  };
+}
+
+/**
+ * Adapter hook used by tests and future DAOs that need to snapshot the
+ * raw session row. Not part of the public HTTP surface.
  */
 export function _peekSession({ repository, session_uuid }) {
   return sessionFor(repository, session_uuid);
