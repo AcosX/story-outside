@@ -198,8 +198,16 @@ async function run() {
       expected_revision: revision,
     });
     assert.equal(interrupt.state, 'realtime');
-    assert.equal(getSession({ repository, session_uuid }).cursor, 2, 'opening cursor frozen');
-    assert.equal(getSession({ repository, session_uuid }).state, 'realtime');
+    // ClickUp 08 P1.1 unified cursor semantics: `cursor` is the CANONICAL
+    // cursor (2 opening commits + 1 player_input commit = 3) and always
+    // equals revision / history.length; the OPENING playback position is
+    // the separate `opening_cursor`, which stays frozen at 2 — the
+    // un-drained opening tail is abandoned, not silently advanced.
+    const afterInterrupt = getSession({ repository, session_uuid });
+    assert.equal(afterInterrupt.opening_cursor, 2, 'opening cursor frozen');
+    assert.equal(afterInterrupt.cursor, 3, 'canonical cursor = 2 opening + 1 player_input');
+    assert.equal(afterInterrupt.revision, 3, 'cursor === revision');
+    assert.equal(afterInterrupt.state, 'realtime');
     // The next opening commit must throw — the opening tail is abandoned.
     assert.throws(
       () =>
@@ -254,18 +262,31 @@ async function run() {
       const expectedPrev = i === 0 ? null : history[i - 1].event_seq;
       assert.equal(history[i].prev_event_seq, expectedPrev, `prev_event_seq at ${i}`);
     }
-    // The interrupt at the end is event_type=player_input and its
-    // source_sequence continues the canonical numbering.
+    // The interrupt at the end is event_type=player_input. Under the
+    // unified 08/09 semantics source_sequence is a per-(session, source)
+    // 0-based contiguous counter: the opening events carry the
+    // 'opening_cache' source with their pinned cache sequences, and the
+    // FIRST player event starts the 'player' counter at 0.
     const last = history[history.length - 1];
     assert.equal(last.event_type, 'player_input');
     assert.equal(last.event_seq, history.length);
-    assert.equal(last.source_sequence, history.length);
+    assert.equal(last.source, 'player');
+    assert.equal(last.source_sequence, 0, 'first player_input starts the per-source counter at 0');
+    const openingSeqs = history
+      .filter((event) => event.source === 'opening_cache')
+      .map((event) => event.source_sequence);
+    assert.deepEqual(openingSeqs, [0, 1, 2, 3], 'opening events keep their pinned cache sequence');
     assert.match(last.event_id, UUID_PATTERN);
     assert.equal(last.origin, 'user');
     assert.equal(last.source, 'player');
-    // Cursor remained 4 (opening fully drained) before interrupt.
-    assert.equal(getSession({ repository, session_uuid }).cursor, 4);
-    assert.equal(interruptRevision, getSession({ repository, session_uuid }).revision);
+    // Unified cursor semantics: opening_cursor stayed at the fully drained
+    // cache count (4); the canonical cursor advanced to 5 (4 opening + 1
+    // player_input) and equals revision.
+    const after = getSession({ repository, session_uuid });
+    assert.equal(after.opening_cursor, 4, 'opening cursor stayed at the drained cache count');
+    assert.equal(after.cursor, 5, 'canonical cursor = 4 opening + 1 player_input');
+    assert.equal(after.cursor, after.revision, 'cursor === revision');
+    assert.equal(interruptRevision, after.revision);
   });
 
   await test('5. recoverSession rebuilds exact cursor, revision, and history after disconnect', async () => {
@@ -294,7 +315,12 @@ async function run() {
     // Snapshot the full session state at the disconnect moment.
     const beforeSnapshot = recoverSession({ repository, session_uuid });
     assert.equal(beforeSnapshot.session_uuid, session_uuid);
-    assert.equal(beforeSnapshot.cursor, lastResult.cursor);
+    // Unified cursor semantics: cursor === revision === history.length
+    // (4 opening commits + 1 interrupt commit = 5); opening_cursor is
+    // rebuilt at the drained cache count (4).
+    assert.equal(beforeSnapshot.cursor, beforeSnapshot.revision, 'cursor === revision === history.length');
+    assert.equal(beforeSnapshot.cursor, lastResult.cursor + 1, '+1 for the interrupt');
+    assert.equal(beforeSnapshot.opening_cursor, lastResult.opening_cursor, 'opening cursor rebuilt');
     assert.equal(beforeSnapshot.revision, lastResult.revision + 1); // +1 for the interrupt
     assert.equal(beforeSnapshot.history.length, events.length + 1);
     assert.equal(beforeSnapshot.history[beforeSnapshot.history.length - 1].event_type, 'player_input');

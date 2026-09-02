@@ -1,6 +1,14 @@
 # 测试策略（Task 12）
 
 > 适用: ClickUp 12 — 自动测试、回归 Fixture 与故障场景。本文件描述 `story-outside` 在 main 上的测试分层、固定测试故事契约、以及 CI 跑法。
+>
+> **08/09/10 合编后的契约适配（已完成）**: 本清单中的 5 个套件最初针对 08 合并前的旧契约编写，现已全部适配到 08（pending 批次硬化 + 统一 cursor）/ 09（单屏播放器别名）/ 10（compact）合并后的统一契约，并已接入 `package.json` 的 `npm test` 链（追加在 `storyOutside09` 之后）。适配要点：
+>
+> * **provider 批次形状**: tool call 必须骑在 1..4 个 narrative item 批次的末尾（`{ items, tool_call }` 或 legacy `{ messages, tool_calls }`）；**tool-only 批次被拒绝**（`invalid_tool_call`）。provider 返回 `{}` → `provider_failure`；空 `messages` 数组 → `invalid_tool_call`。
+> * **turn 结果面**: runtime 返回单个 tool envelope（`result.tool_call` / `tool_envelope` / `tool_result.payload`），不再有 `result.tool_calls[]` 数组；恢复快照的 pending 字段是 `recoverRuntime().staged`。
+> * **cursor 语义**: `cursor === revision === history.length`，所有 commit（含 player_input）双增；开场播放位置独立在 `opening_cursor`（仅 opening commit 推进）。
+> * **source_sequence**: per-(session, source) 0-based 连续计数器——runtime 批次跨批连续，第一条 player_input 从 0 开始。
+> * **pending 生命周期**: 存在未消费 pending 时 `stageNarrativeBatch` fail-closed；多次 agent turn 之间测试需先 commit 或 `discardPendingTail`。
 
 ## 1. 测试套件清单
 
@@ -12,7 +20,7 @@
 | `tests/integrationFullChain.test.mjs` | Integration 全链路 | 3 | `node tests/integrationFullChain.test.mjs` |
 | `tests/agentRegression.test.mjs` | Agent 回归 | 7 | `node tests/agentRegression.test.mjs` |
 
-合计 40 用例，全部通过。原有套件（health/providers/http/schema-contract/canonicalHash/cacheKey/openingGenerator/storyService/sessionService/sessionHttp/agentTools/agentRuntime/adminRoutes）保持原样。
+合计 40 用例，全部通过（已按统一契约适配并接入 `npm test`）。原有套件（health/providers/http/schema-contract/canonicalHash/cacheKey/openingGenerator/storyService/sessionService/sessionHttp/agentTools/agentRuntime/adminRoutes/observability/observabilityHttp/pendingLifecycle/storyOutside08/storyOutside09）与 PR #10 的三个 compact 套件（tokenEstimator/contextBuilder/agentCompact）一并挂在同一条 `npm test` 链上。
 
 ## 2. 唯一固定测试故事
 
@@ -40,9 +48,9 @@
 
 1. **逐句 commit** — 每次 `commitOpeningEvent` 严格递增 `event_seq`，`prev_event_seq` 形成单链。
 2. **重复点击幂等** — 同 `client_request_id` 重放返回原值；同 id 不同 payload 抛 `different request`。
-3. **打断删除 pending** — `interruptWithPlayerInput` 后状态切到 `realtime`，任何后续 `commitOpeningEvent` 抛 `not in opening`。
-4. **sequence 唯一** — 整个会话历史 `event_seq` 是 1..N 连续无重复。
-5. **Session recover** — `recoverSession` 在跨次读取下字节级一致。
+3. **打断删除 pending** — `interruptWithPlayerInput` 后状态切到 `realtime`，任何后续 `commitOpeningEvent` 抛 `not in opening`。统一 cursor 语义下：canonical `cursor` 随 player_input 双增（`cursor === revision === history.length`），开场播放位置冻结在 `opening_cursor`。
+4. **sequence 唯一** — 整个会话历史 `event_seq` 是 1..N 连续无重复；`source_sequence` 是 per-(session, source) 0-based 连续计数器（opening 事件沿用 pinned cache sequence，第一条 player_input 从 0 开始）。
+5. **Session recover** — `recoverSession` 在跨次读取下字节级一致，并重建 cursor / revision / opening_cursor / history。
 
 ### 3.3 Integration
 
@@ -90,38 +98,40 @@ importStory
 | 10 | 自动播放期间输入框 focus | failureScenarios #10 |
 | 11 | pending 尚未播完时发送玩家输入 | failureScenarios #11 |
 | 12 | commit 后客户端断线再重试 | failureScenarios #12 + dbTransactions #2 |
-| 13 | compact 触发时服务重启 | failureScenarios #13（R1 收编后覆盖） |
-| 14 | compact 触发时模型失败 | failureScenarios #14（R1 收编后覆盖） |
+| 13 | compact 触发时服务重启 | failureScenarios #13（10 已合编：正断言 canonical history 单独重建等价快照） |
+| 14 | compact 触发时模型失败 | failureScenarios #14（10 已合编：正断言 recordCompactFailure 标记 + retry 不被污染） |
 | 15 | finish_story 尚未 commit 前玩家打断 | failureScenarios #15 |
 
-## 4. R1 收编后的覆盖路径（#13 / #14）
+## 4. 10 合编后的现状（#13 / #14 已是正断言）
 
-`feat/story-outside-10` 在 `src/agent/` 下新增 `tokenEstimator.mjs` + `contextBuilder.mjs`，并在 `src/stories/sessionService.mjs` 上加 4 个函数:
+`feat/story-outside-10` 的 compact 交付物已合入 main：`src/agent/tokenEstimator.mjs` + `src/agent/contextBuilder.mjs`，以及 `src/stories/sessionService.mjs` 上的 4 个函数：
 
 * `recordCompact` — 持久化 compact 快照
 * `recordCompactFailure` — 持久化 compact 失败
 * `getSessionCompact` — 读取 compact 快照
 * `rebuildCompactFromHistory` — 从 canonical history 重生成
 
-合编到 main 后，`failureScenarios.test.mjs` 的 #13 / #14 应改为:
+`failureScenarios.test.mjs` 的 #13 / #14 已从"negative assertion（未合并）"改成"positive assertion（已合并）"：
 
-* **#13 (compact + 服务重启)**: 触发一次 compact → 模拟服务重启 (`_resetForTests()` + 新建 repository) → `rebuildCompactFromHistory` 必须重新生成与重启前等价的快照。
-* **#14 (compact + 模型失败)**: provider 抛 `provider_failure` → `recordCompactFailure(session_uuid, reason)` 必须在 `pending_batches` 或 session-local marker 上写入失败原因；后续 retry 调用 `rebuildCompactFromHistory` 不被该次失败污染。
-
-合编时不要修改本套件编号 — 直接把 #13 / #14 现在的"negative assertion (未合并)" 改成"positive assertion (已合并)"。
+* **#13 (compact + 服务重启)**: 断言 4 个 compact 函数存在于 sessionService、`src/stories/index.mjs` 的 re-export 面完整（sessionService 10 个导出 + pendingLifecycle 门面 6 个导出）；recordCompact 不触碰 canonical history；用新 repository 模拟"重启后进程"，`rebuildCompactFromHistory` 仅凭 canonical history 重建出与重启前等价的快照（同 through_seq / event_count / payload / token_estimate）。进程内边界声明见 §6 —— 内存 repository 不跨真实进程存活。
+* **#14 (compact + 模型失败)**: `recordCompactFailure` 写入 session-local 失败标记（`last_compact_status='failed'`），不推进 `compacted_through_seq`、不清空既有快照、不失效共享 opening cache；更高 `through_seq` 的 retry 照常成功并清除失败状态。
 
 ## 5. CI 跑法（不依赖真实 API）
 
 ```bash
 cd /srv/lmdo/story-outside-work-12
 
-# 1. 全套现有测试
+# 1. 全套测试（一条链跑完，含 Task 12 的 5 个套件与 PR #10 的 3 个 compact 套件）
 npm test
 # → health, providers, http, schema-contract, canonicalHash, cacheKey,
 #   openingGenerator, storyService, sessionService, sessionHttp,
-#   agentTools, agentRuntime, adminRoutes
+#   agentTools, agentRuntime, adminRoutes, observability, observabilityHttp,
+#   pendingLifecycle, storyOutside08, storyOutside09,
+#   tokenEstimator, contextBuilder, agentCompact,
+#   providerAdapter, dbTransactions, failureScenarios,
+#   integrationFullChain, agentRegression
 
-# 2. 新增 5 套件（顺序无关）
+# 2. 单独跑任意套件（顺序无关）
 node tests/dbTransactions.test.mjs
 node tests/providerAdapter.test.mjs
 node tests/failureScenarios.test.mjs
@@ -135,7 +145,7 @@ npm run check
 git diff --check
 ```
 
-> Task 12 范围不在 `package.json` 的 `npm test` 链里追加新套件 — R1 合编时统一收编。本文档描述的 CI 命令即"用户日常跑法"，合编后会被 `npm test` 自动覆盖。
+> Task 12 的 5 个套件与 PR #10 的 3 个 compact 套件现已全部接入 `package.json` 的 `npm test` 链（追加在 `storyOutside09` 之后）——"合编时统一收编"已完成，`npm test` 即用户日常跑法。
 
 ## 6. 真实边界声明
 
@@ -155,5 +165,5 @@ git diff --check
 * 不要 mutate `tests/fixtures/seed-stories/cafe-rain.mjs` — 用新 slug / 新 fixture 文件。
 * 不要让 suite 依赖网络 / 真实 LLM / MariaDB。
 * 不要在 suite 里 echo `process.env.STORY_OUTSIDE_PROVIDER` 之外的任何 env key。
-* 不要修改 `package.json` 的 `scripts` 段（合编时统一处理）。
+* 新增套件时同步追加到 `package.json` 的 `test` 链尾（"合编时统一收编"已完成，链内现有 26 个套件）。
 * 4–8 个 commit 粒度，每个 commit 末尾加 `Co-authored-by: OpenClaw <claw@acosx.top>`。

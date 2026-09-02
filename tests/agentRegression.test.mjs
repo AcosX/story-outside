@@ -21,6 +21,7 @@ import { ensureOpeningCache } from '../src/stories/storyService.mjs';
 import {
   commitOpeningEvent,
   createSession,
+  discardPendingTail,
   interruptWithPlayerInput,
   listSessionEvents,
 } from '../src/stories/sessionService.mjs';
@@ -114,13 +115,15 @@ async function run() {
     const { runtime, repository, session_uuid } = await pinnedRuntimeFixture({
       responses: [
         {
-          tool_calls: [
-            {
-              id: 'tool-ask-cafe-rain-1',
-              name: 'ask_player_choice',
-              arguments: CAFE_RAIN_FIXTURE.ask_player_choice_envelope.arguments,
-            },
-          ],
+          // ClickUp 08 unified contract: the tool call rides as the OPTIONAL
+          // FINAL item on a 1..4 narrative-item batch (tool-only batches are
+          // rejected by the runtime).
+          items: [{ type: 'narration', text: '她把杯沿又朝你推近了一点。' }],
+          tool_call: {
+            id: 'tool-ask-cafe-rain-1',
+            name: 'ask_player_choice',
+            arguments: CAFE_RAIN_FIXTURE.ask_player_choice_envelope.arguments,
+          },
         },
       ],
     });
@@ -130,10 +133,13 @@ async function run() {
     assert.equal(result.kind, 'tool_call');
     assert.equal(result.tool_result.kind, 'choice_required');
     assert.equal(result.tool_envelope.kind, 'choice_required');
-    // 2. tool_call_id presence and uniqueness
-    assert.equal(result.tool_calls.length, 1);
-    assert.equal(result.tool_calls[0].tool_call_id, 'tool-ask-cafe-rain-1');
+    // 2. tool_call_id presence: exactly ONE tool envelope per turn.
+    assert.ok(result.tool_call && !Array.isArray(result.tool_call), 'a single tool envelope is surfaced');
+    assert.equal(result.tool_call.tool_call_id, 'tool-ask-cafe-rain-1');
     assert.equal(result.tool_envelope.tool_call_id, 'tool-ask-cafe-rain-1');
+    // The narrative batch still rides along (1 item) ahead of the tool.
+    assert.equal(result.items.length, 1);
+    assert.equal(result.pending_total, 1);
     // 3. canonical history untouched by agent turn
     const history = listSessionEvents({ repository, session_uuid });
     assert.equal(history.length, 0, 'agent turn must not append canonical events');
@@ -152,13 +158,13 @@ async function run() {
     const { runtime } = await pinnedRuntimeFixture({
       responses: [
         {
-          tool_calls: [
-            {
-              id: 'tool-finish-cafe-rain',
-              name: 'finish_story',
-              arguments: CAFE_RAIN_FIXTURE.finish_story_envelope.arguments,
-            },
-          ],
+          // 08 contract: finish_story also rides on a narrative batch.
+          items: [{ type: 'narration', text: '雨停之前，她终于开了口。' }],
+          tool_call: {
+            id: 'tool-finish-cafe-rain',
+            name: 'finish_story',
+            arguments: CAFE_RAIN_FIXTURE.finish_story_envelope.arguments,
+          },
         },
       ],
     });
@@ -170,13 +176,17 @@ async function run() {
     assert.equal(result.tool_result.requires_player, false);
     assert.equal(result.tool_envelope.terminal, true);
     // The fixture character_outcomes survives normalisation (no truncation,
-    // no field reordering, no extra defaults).
-    assert.equal(result.tool_result.character_outcomes.length, 1);
-    assert.equal(result.tool_result.character_outcomes[0].character, 'old-friend');
-    assert.equal(result.tool_result.character_outcomes[0].fate, '留下名片');
-    assert.equal(result.tool_result.character_outcomes[0].change, '沉默多年后终于开口');
-    assert.equal(result.tool_result.ending_key, 'cafe-rain/rain-stays');
-    assert.equal(result.tool_result.key_choices.length, 2);
+    // no field reordering, no extra defaults). The validated tool arguments
+    // live on tool_result.payload.
+    assert.equal(result.tool_result.payload.character_outcomes.length, 1);
+    assert.equal(result.tool_result.payload.character_outcomes[0].character, 'old-friend');
+    assert.equal(result.tool_result.payload.character_outcomes[0].fate, '留下名片');
+    assert.equal(result.tool_result.payload.character_outcomes[0].change, '沉默多年后终于开口');
+    assert.equal(result.tool_result.payload.ending_key, 'cafe-rain/rain-stays');
+    assert.equal(result.tool_result.payload.key_choices.length, 2);
+    // The narrative batch rides ahead of the terminal tool call.
+    assert.equal(result.items.length, 1);
+    assert.equal(result.items[0].type, 'narration');
   });
 
   await test('R3. revision_mismatch: a turn that arrives after the session advanced fails closed', async () => {
@@ -220,24 +230,31 @@ async function run() {
     // The agent MUST be read-only against session_events regardless of how
     // many turns it runs. The canonical history only grows when the
     // player commits an opening event or a player input.
+    // ClickUp 08 pending hardening: there is exactly ONE active pending
+    // per session, so the application layer must drain (commit) or drop
+    // (discardPendingTail) the staged batch before the next turn can be
+    // staged. We drop it here — discarding appends nothing, which keeps
+    // the "agent is read-only" invariant directly observable.
     const { runtime, repository, session_uuid } = await pinnedRuntimeFixture({
       responses: [
         { messages: [{ role: 'assistant', content: 'narration 1' }] },
         { messages: [{ role: 'assistant', content: 'narration 2' }] },
         {
-          tool_calls: [
-            {
-              id: 'tool-ask-3',
-              name: 'ask_player_choice',
-              arguments: { question: 'q', options: [{ id: 'a', label: 'A' }, { id: 'b', label: 'B' }] },
-            },
-          ],
+          items: [{ type: 'narration', text: '她抬起头等你开口。' }],
+          tool_call: {
+            id: 'tool-ask-3',
+            name: 'ask_player_choice',
+            arguments: { question: 'q', options: [{ id: 'a', label: 'A' }, { id: 'b', label: 'B' }] },
+          },
         },
       ],
     });
     for (let i = 0; i < 3; i += 1) {
       const revision = recoverRuntime(runtime).base_revision;
       await runTurn(runtime, { input: { turn: i }, expected_revision: revision });
+      // App-layer cleanup between turns: drop the unconsumed staged batch.
+      const dropped = discardPendingTail({ repository, session_uuid });
+      assert.ok(dropped.dropped_pending_id, 'each agent turn staged a pending batch that is now dropped');
     }
     assert.equal(listSessionEvents({ repository, session_uuid }).length, 0);
     // Runtime pinned snapshot also reflects no canonical events.
@@ -248,13 +265,13 @@ async function run() {
     const { runtime } = await pinnedRuntimeFixture({
       responses: [
         {
-          tool_calls: [
-            {
-              id: 'tool-1',
-              name: 'ask_player_choice',
-              arguments: { question: 'q', options: [{ id: 'a', label: 'A' }, { id: 'b', label: 'B' }] },
-            },
-          ],
+          // 08 contract: tool call rides on a 1..4 item batch.
+          items: [{ type: 'narration', text: '她等你先开口。' }],
+          tool_call: {
+            id: 'tool-1',
+            name: 'ask_player_choice',
+            arguments: { question: 'q', options: [{ id: 'a', label: 'A' }, { id: 'b', label: 'B' }] },
+          },
         },
       ],
     });

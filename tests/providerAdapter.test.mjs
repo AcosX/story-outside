@@ -19,8 +19,10 @@
 //   5. Timeout: a provider that hangs past the deadline raises; the
 //      runtime maps it to provider_failure without leaking the underlying
 //      timer.
-//   6. Empty body: a provider that resolves with no messages and no
-//      tool_calls is rejected as provider_failure.
+//   6. Empty body: under the ClickUp 08 unified contract the two "empty
+//      body" shapes fail closed with DIFFERENT codes — {} (no messages /
+//      tool_calls / items at all) is provider_failure, while a present
+//      but empty messages array is invalid_tool_call (batch-size guard).
 
 import assert from 'node:assert/strict';
 
@@ -324,10 +326,11 @@ async function run() {
       () => runTurn(runtime, { input: { a: 1 }, expected_revision: recoverRuntime(runtime).base_revision }),
       (err) => err instanceof AgentRuntimeError && err.code === 'provider_failure',
     );
-    // The runtime must not record the failed turn as successful.
+    // The runtime must not record the failed turn as successful, and no
+    // pending batch may be left staged behind it.
     const snap = recoverRuntime(runtime);
     assert.equal(snap.successful_turns.length, 0);
-    assert.equal(snap.pending, null);
+    assert.equal(snap.staged, null);
     assert.equal(provider.callCount, 1);
   });
 
@@ -370,18 +373,21 @@ async function run() {
       (err) => err instanceof AgentRuntimeError && err.code === 'provider_failure',
     );
     assert.equal(recoverRuntime(runtime).successful_turns.length, 0);
-    assert.equal(recoverRuntime(runtime).pending, null);
+    assert.equal(recoverRuntime(runtime).staged, null);
   });
 
   // -------- 6. Empty body ---------------------------------------------------
-  await test('6. provider empty body ({}) → provider_failure; provider returns NO messages/tool_calls', async () => {
-    // Two "empty body" shapes the runtime must reject as provider_failure:
-    //   (a) {}                — neither messages nor tool_calls present
-    //   (b) { messages: [] }  — messages array present but empty
-    // Both fail with code 'provider_failure' (the runtime refuses to
-    // treat the response as a successful turn). A non-empty but
-    // malformed tool_calls list (e.g. []) is rejected with
-    // 'invalid_tool_call' — that path is exercised in tests/agentTools.test.mjs.
+  await test('6. provider empty body: {} → provider_failure; empty messages [] → invalid_tool_call', async () => {
+    // ClickUp 08 unified contract — the two "empty body" shapes the
+    // runtime must reject, each with its own code:
+    //   (a) {}                — neither messages nor tool_calls nor items
+    //                           present → provider_failure
+    //   (b) { messages: [] }  — messages array present but 0 items →
+    //                           invalid_tool_call ("messages must contain
+    //                           1 to 4 narrative items")
+    // Both refuse the turn. A non-empty but malformed tool_calls list
+    // (e.g. []) is rejected with 'invalid_tool_call' — that path is
+    // exercised in tests/agentTools.test.mjs.
     const { runtime } = await runtimeFixture({
       handler: async (request) => {
         const idx = (request.input && request.input.phase) || 0;
@@ -389,19 +395,31 @@ async function run() {
       },
     });
     let revision = recoverRuntime(runtime).base_revision;
-    for (let phase = 0; phase < 2; phase += 1) {
-      await assert.rejects(
-        () =>
-          runTurn(runtime, {
-            input: { phase },
-            expected_revision: revision,
-          }),
-        (err) => err instanceof AgentRuntimeError && err.code === 'provider_failure',
-      );
-      assert.equal(recoverRuntime(runtime).base_revision, revision);
-    }
+    // (a) {} → provider_failure.
+    await assert.rejects(
+      () =>
+        runTurn(runtime, {
+          input: { phase: 0 },
+          expected_revision: revision,
+        }),
+      (err) => err instanceof AgentRuntimeError && err.code === 'provider_failure',
+    );
+    assert.equal(recoverRuntime(runtime).base_revision, revision);
+    // (b) { messages: [] } → invalid_tool_call (empty batch).
+    await assert.rejects(
+      () =>
+        runTurn(runtime, {
+          input: { phase: 1 },
+          expected_revision: revision,
+        }),
+      (err) =>
+        err instanceof AgentRuntimeError
+        && err.code === 'invalid_tool_call'
+        && /messages must contain 1 to 4 narrative items/.test(err.message),
+    );
+    assert.equal(recoverRuntime(runtime).base_revision, revision);
     assert.equal(recoverRuntime(runtime).successful_turns.length, 0);
-    assert.equal(recoverRuntime(runtime).pending, null);
+    assert.equal(recoverRuntime(runtime).staged, null);
   });
 }
 

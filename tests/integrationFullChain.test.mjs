@@ -190,22 +190,24 @@ async function run() {
     assert.equal(stillValid.status, 'valid', 'shared cache must NOT be invalidated by first-choice');
 
     // 8. Player submits free text → agent.runTurn → ask_player_choice.
+    //    ClickUp 08 unified contract: the tool call rides as the OPTIONAL
+    //    FINAL item on a 1..4 narrative-item batch (tool-only batches are
+    //    rejected by the runtime).
     const agentProvider = createMockAgentProvider({
       responses: [
         {
-          tool_calls: [
-            {
-              id: 'tool-ask-cafe-rain-1',
-              name: 'ask_player_choice',
-              arguments: {
-                question: '你要怎么回答她？',
-                options: [
-                  { id: 'wait', label: '在等人' },
-                  { id: 'leave', label: '起身离开' },
-                ],
-              },
+          items: [{ type: 'narration', text: '她抬起头，像是在等你先开口。' }],
+          tool_call: {
+            id: 'tool-ask-cafe-rain-1',
+            name: 'ask_player_choice',
+            arguments: {
+              question: '你要怎么回答她？',
+              options: [
+                { id: 'wait', label: '在等人' },
+                { id: 'leave', label: '起身离开' },
+              ],
             },
-          ],
+          },
         },
       ],
     });
@@ -230,6 +232,9 @@ async function run() {
     assert.equal(agentTurn1.tool_result.requires_player, true);
     assert.equal(agentTurn1.tool_result.terminal, false);
     assert.equal(agentTurn1.pending, true);
+    assert.equal(agentTurn1.tool_call.tool_call_id, 'tool-ask-cafe-rain-1');
+    // The narrative batch rides ahead of the tool call.
+    assert.equal(agentTurn1.items.length, 1);
     // The agent turn does NOT touch canonical history; the runtime is
     // read-only against session_events.
     const historyAfterAgentTurn1 = listSessionEvents({ repository, session_uuid });
@@ -263,20 +268,19 @@ async function run() {
     const finishProvider = createMockAgentProvider({
       responses: [
         {
-          tool_calls: [
-            {
-              id: 'tool-finish-cafe-rain',
-              name: 'finish_story',
-              arguments: {
-                summary: '你在雨夜咖啡馆留下了自己的答案。',
-                ending: '雨停了，她把名片留在桌上。',
-                original_difference: '原结局里，她没有开口。',
-                key_choices: ['回答她「在等」'],
-                character_outcomes: [{ character: 'old-friend', fate: '留下名片' }],
-                ending_key: 'cafe-rain/rain-stays',
-              },
+          items: [{ type: 'narration', text: '你回答了「在等」。雨声忽然变得很轻。' }],
+          tool_call: {
+            id: 'tool-finish-cafe-rain',
+            name: 'finish_story',
+            arguments: {
+              summary: '你在雨夜咖啡馆留下了自己的答案。',
+              ending: '雨停了，她把名片留在桌上。',
+              original_difference: '原结局里，她没有开口。',
+              key_choices: ['回答她「在等」'],
+              character_outcomes: [{ character: 'old-friend', fate: '留下名片' }],
+              ending_key: 'cafe-rain/rain-stays',
             },
-          ],
+          },
         },
       ],
     });
@@ -301,7 +305,10 @@ async function run() {
     assert.equal(finishTurn.tool_result.terminal, true);
     assert.equal(finishTurn.tool_result.requires_player, false);
     assert.equal(finishTurn.tool_envelope.terminal, true);
-    assert.equal(finishTurn.tool_calls[0].tool_call_id, 'tool-finish-cafe-rain');
+    // A single tool envelope (no tool_calls array on the turn result).
+    assert.ok(finishTurn.tool_call && !Array.isArray(finishTurn.tool_call));
+    assert.equal(finishTurn.tool_call.tool_call_id, 'tool-finish-cafe-rain');
+    assert.equal(finishTurn.tool_result.payload.ending_key, 'cafe-rain/rain-stays');
 
     // Pin invariants: the entire chain preserved story_version_checksum
     // and the shared cache row.
@@ -405,16 +412,18 @@ async function run() {
       provider: createMockAgentProvider({
         responses: [
           {
-            tool_calls: [
-              {
-                id: 'tool-invalid-1',
-                name: 'ask_player_choice',
-                arguments: {
-                  question: 'q',
-                  options: [{ id: 'a', label: 'A' }],
-                },
+            // ClickUp 08: the tool rides on a narrative batch, so the tool
+            // schema validation (options needs 2..6 items) is what rejects
+            // this turn — not the tool-only-batch guard.
+            items: [{ type: 'narration', text: '她等你回答。' }],
+            tool_call: {
+              id: 'tool-invalid-1',
+              name: 'ask_player_choice',
+              arguments: {
+                question: 'q',
+                options: [{ id: 'a', label: 'A' }],
               },
-            ],
+            },
           },
         ],
       }),
