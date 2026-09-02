@@ -127,7 +127,11 @@ async function run() {
   const interruptedAfterFirstOpening = interruptWithPlayerInput({
     repository, session_uuid: OTHER_SESSION, text: '先打断', expected_revision: 1,
   });
-  assert.equal(interruptedAfterFirstOpening.cursor, 1);
+  // Canonical cursor counts ALL committed canonical events (1 opening + 1
+  // player_input), so it is 2, not 1; the opening playback position is the
+  // separate internal opening_cursor (still 1 here).
+  assert.equal(interruptedAfterFirstOpening.cursor, 2);
+  assert.equal(interruptedAfterFirstOpening.opening_cursor, 1);
   assert.equal(interruptedAfterFirstOpening.revision, 2);
   assert.equal(interruptedAfterFirstOpening.event.event_seq, 2);
   assert.equal(interruptedAfterFirstOpening.event.prev_event_seq, 1);
@@ -144,7 +148,8 @@ async function run() {
   const immediateInterrupt = interruptWithPlayerInput({
     repository, session_uuid: immediateInterruptSession, text: '立即打断', expected_revision: 0,
   });
-  assert.equal(immediateInterrupt.cursor, 0);
+  assert.equal(immediateInterrupt.cursor, 1);
+  assert.equal(immediateInterrupt.opening_cursor, 0);
   assert.equal(immediateInterrupt.revision, 1);
   assert.equal(immediateInterrupt.event.event_seq, 1);
   assert.equal(immediateInterrupt.event.prev_event_seq, null);
@@ -167,8 +172,13 @@ async function run() {
   assert.equal(interrupted.event.event_type, 'player_input');
   assert.equal(interrupted.event.origin, 'user');
   assert.equal(interrupted.event.source, 'player');
-  assert.equal(interrupted.event.event_seq, interrupted.cursor + 1);
-  assert.equal(interrupted.event.source_sequence, interrupted.event.event_seq);
+  // Canonical cursor equals the committed event count: the player_input
+  // event_seq equals the post-interrupt cursor exactly.
+  assert.equal(interrupted.event.event_seq, interrupted.cursor);
+  // player source_sequence is the per-(session, source) counter: this is
+  // the FIRST player event of this session, so it is 0 (it never mirrors
+  // event_seq / opening count).
+  assert.equal(interrupted.event.source_sequence, 0);
   assert.equal(interrupted.event.prev_event_seq, interrupted.event.event_seq - 1);
   assert.equal(interrupted.event.client_request_id, 'input-1');
   assert.match(interrupted.event.created_at, /^\d{4}-\d{2}-\d{2}T/);
@@ -187,12 +197,28 @@ async function run() {
   assert.deepEqual(interruptWithPlayerInput({ repository, session_uuid: SESSION, text: '我等一个答案', client_request_id: 'input-1', expected_revision: 0 }), interrupted);
   assert.throws(() => interruptWithPlayerInput({ repository, session_uuid: SESSION, text: '不同', client_request_id: 'input-1' }), /different request/);
   assert.equal(repository.findOpeningCacheByUuid(cache.cache_uuid).status, 'valid');
+  // At this point only one interrupt has succeeded (the idempotent replay
+  // reuses cached result, and the throw-on-conflict case throws).
   assert.equal(beforeInterrupt.history.length + 1, recoverSession({ repository, session_uuid: SESSION }).history.length);
-  assert.throws(() => interruptWithPlayerInput({ repository, session_uuid: SESSION, text: 'again' }), /not interruptible/);
+  // ClickUp 08 P2.6 / ClickUp 09 AC2: a realtime session IS interruptible
+  // again — the second interrupt stays realtime and appends another
+  // player_input (source_sequence 1, the per-(session, source) counter).
+  const reInterrupt = interruptWithPlayerInput({ repository, session_uuid: SESSION, text: 'again', client_request_id: 'input-2' });
+  assert.equal(reInterrupt.state, 'realtime');
+  assert.equal(reInterrupt.event.event_type, 'player_input');
+  assert.equal(reInterrupt.event.payload.text, 'again');
+  assert.equal(reInterrupt.event.source_sequence, 1);
+  assert.equal(reInterrupt.event.event_seq, interrupted.event.event_seq + 1);
+  // Canonical cursor semantics (08 P1.1): cursor === revision === history
+  // length, and every commit — including player_input — advances both by 1.
+  assert.equal(reInterrupt.revision, beforeInterrupt.revision + 2);
+  assert.equal(reInterrupt.cursor, interrupted.cursor + 1);
+  // After the second interrupt, history is beforeInterrupt + 2.
+  assert.equal(beforeInterrupt.history.length + 2, recoverSession({ repository, session_uuid: SESSION }).history.length);
 
   const recovered = recoverSession({ repository, session_uuid: SESSION });
-  assert.equal(recovered.cursor, interrupted.cursor);
-  assert.equal(recovered.revision, interrupted.revision);
+  assert.equal(recovered.cursor, reInterrupt.cursor);
+  assert.equal(recovered.revision, reInterrupt.revision);
   assert.deepEqual(recovered.history, listSessionEvents({ repository, session_uuid: SESSION }));
   assert.equal(recovered.generation_profile.cache_uuid, cache.cache_uuid);
   assert.equal(repository.findOpeningCacheByUuid(cache.cache_uuid).status, 'valid');

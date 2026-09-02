@@ -2,197 +2,188 @@
 <html lang="zh-CN">
   <head>
     <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width,initial-scale=1" />
-    <title>故事之外 — 如果当时，由你来选</title>
-    <meta
-      name="description"
-      content="《故事之外》知乎黑客松 MVP。如果当时，由你来选——进入故事，看看另一条世界线。"
-    />
+    <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+    <meta name="color-scheme" content="light dark" />
+    <title>故事之外</title>
+    <meta name="description" content="《故事之外》——一个分支互动叙事 demo。" />
     <link rel="icon" href="/mascot/liu-kaishan-idle.gif" />
     <link rel="stylesheet" href="/styles/main.css" />
   </head>
   <body>
+    <a class="skip-link" href="#player-main">跳到正文</a>
+
     <header class="topbar" aria-label="页头">
-      <div class="brand">
-        <span class="brand-mark" aria-hidden="true">另一条世界线</span>
-        <span class="brand-name">故事之外</span>
+      <button
+        class="icon-btn"
+        id="back-btn"
+        type="button"
+        aria-label="返回"
+        title="返回"
+      >
+        <span class="icon-arrow" aria-hidden="true">&larr;</span>
+        <span class="visually-hidden">返回</span>
+      </button>
+      <div class="topbar-meta">
+        <div class="story-name" id="story-name" aria-live="polite">故事之外</div>
+        <div class="role-name" id="role-name">未选择角色</div>
       </div>
-      <span class="mode-tag" title="本项目当前为 demo 模式" data-mode-tag>
-        demo · 未连接知乎官方 API
-      </span>
+      <button
+        class="icon-btn"
+        id="share-btn"
+        type="button"
+        aria-label="分享"
+        title="分享"
+      >
+        <span class="icon-share" aria-hidden="true">&#x2197;</span>
+        <span class="visually-hidden">分享</span>
+      </button>
     </header>
 
-    <main id="stage" class="stage" aria-live="polite">
-      <!-- Section 1: Hero -->
-      <section id="screen-hero" class="screen screen-hero active" data-screen="hero">
-        <div class="hero-grid">
-          <div class="hero-copy">
-            <h1 class="hero-title">故事之外</h1>
-            <p class="hero-tagline">如果当时，由你来选——进入故事，看看另一条世界线。</p>
-            <p class="hero-sub">
-              一次只有一句台词的群聊。一条被改写的人生。在这里没有标准答案。
+    <main id="player-main" class="player-main" aria-live="polite" tabindex="-1">
+      <section
+        class="screen screen-picker active"
+        id="screen-picker"
+        data-screen="picker"
+        aria-label="故事选择"
+      >
+        <div class="picker-shell">
+          <header class="picker-head">
+            <h1 class="picker-title">如果当时，由你来选</h1>
+            <p class="picker-sub">
+              选一个起点，挑一个视角，剩下的我们替你一句一句播出来。
             </p>
-            <div class="hero-actions">
-              <button class="btn btn-primary" data-action="goto" data-target="stories">
-                进入故事
-              </button>
-              <button class="btn btn-ghost" data-action="goto" data-target="chat">
-                先试一下群聊
-              </button>
-            </div>
-            <p class="hero-meta" data-demo-meta></p>
-          </div>
-          <figure class="hero-mascot" aria-label="刘看山招一招手">
-            <img
-              src="/mascot/liu-kaishan-waving.gif"
-              alt="刘看山在招呼你进入故事"
-              width="220"
-              height="220"
-              loading="eager"
-              decoding="async"
-            />
-            <figcaption>刘看山 · 知乎 IP</figcaption>
-          </figure>
+          </header>
+
+          <section class="picker-block" aria-labelledby="picker-stories-label">
+            <h2 id="picker-stories-label" class="picker-label">故事</h2>
+            <ul
+              class="chip-list"
+              id="story-list"
+              aria-busy="true"
+              role="listbox"
+              aria-label="故事列表"
+            >
+              <li class="chip-placeholder">加载中&hellip;</li>
+            </ul>
+          </section>
+
+          <section
+            class="picker-block"
+            id="role-block"
+            aria-labelledby="picker-roles-label"
+            hidden
+          >
+            <h2 id="picker-roles-label" class="picker-label">视角</h2>
+            <ul
+              class="chip-list"
+              id="role-list"
+              role="listbox"
+              aria-label="角色列表"
+            ></ul>
+          </section>
+
+          <p
+            class="picker-status"
+            id="picker-status"
+            role="status"
+            aria-live="polite"
+          ></p>
         </div>
       </section>
 
-      <!-- Section 2: Story picker -->
       <section
-        id="screen-stories"
-        class="screen screen-stories"
-        data-screen="stories"
-        hidden
-      >
-        <header class="screen-head">
-          <h2>选一个故事起点</h2>
-          <p class="screen-sub">每个故事都开放两到三种视角。</p>
-        </header>
-        <ul id="story-list" class="story-list" aria-busy="true">
-          <li class="story-card placeholder">加载中…</li>
-        </ul>
-        <div class="screen-foot">
-          <button class="btn btn-ghost" data-action="goto" data-target="hero">
-            返回上一页
-          </button>
-        </div>
-      </section>
-
-      <!-- Section 3: Role picker -->
-      <section
-        id="screen-roles"
-        class="screen screen-roles"
-        data-screen="roles"
-        hidden
-      >
-        <header class="screen-head">
-          <h2 id="role-title">选一个角色</h2>
-          <p class="screen-sub" id="role-hook"></p>
-        </header>
-        <ul id="role-list" class="role-list"></ul>
-        <div class="screen-foot">
-          <button class="btn btn-ghost" data-action="goto" data-target="stories">
-            重选故事
-          </button>
-        </div>
-      </section>
-
-      <!-- Section 4: Player -->
-      <section
-        id="screen-player"
         class="screen screen-player"
+        id="screen-player"
         data-screen="player"
+        aria-label="故事播放"
         hidden
       >
-        <header class="screen-head">
-          <h2 id="player-title">正在播放</h2>
-          <p class="screen-sub" id="player-context"></p>
-        </header>
-        <ol id="beat-list" class="beat-list" aria-label="剧情节拍"></ol>
-        <div class="player-actions">
-          <button class="btn btn-primary" id="advance-btn">下一句</button>
-          <button class="btn btn-ghost" data-action="goto" data-target="chat">
-            进入群聊
-          </button>
-        </div>
-        <div class="screen-foot">
-          <button class="btn btn-ghost" data-action="goto" data-target="roles">
-            换一个视角
-          </button>
-          <button class="btn btn-ghost" data-action="goto" data-target="stories">
-            重选故事
-          </button>
-        </div>
-      </section>
+        <div class="player-shell">
+          <header class="player-head">
+            <h2 class="visually-hidden">故事正文</h2>
+            <div class="player-status">
+              <span class="status-label" id="status-label">载入中</span>
+              <span class="status-bar" aria-hidden="true">
+                <span class="status-bar-fill" id="status-bar-fill"></span>
+              </span>
+            </div>
+          </header>
 
-      <!-- Section 5: Group chat placeholder -->
-      <section
-        id="screen-chat"
-        class="screen screen-chat"
-        data-screen="chat"
-        hidden
-      >
-        <header class="screen-head">
-          <h2>群聊 · 占位流程</h2>
-          <p class="screen-sub">
-            demo 模式：你说一句，前端把它原样回显。下一阶段会接入群聊逐句播放。
-          </p>
-        </header>
-        <div class="chat-shell">
-          <ol id="chat-log" class="chat-log" aria-live="polite"></ol>
-          <form id="chat-form" class="chat-form" autocomplete="off">
+          <ol
+            class="story-log"
+            id="story-log"
+            aria-label="故事正文"
+            tabindex="0"
+          ></ol>
+
+          <div class="player-controls">
+            <button
+              class="btn"
+              id="pause-btn"
+              type="button"
+              aria-label="暂停自动播放"
+              title="暂停"
+            >
+              <span class="icon-pause" aria-hidden="true">&#9612;&#9612;</span>
+              <span id="pause-btn-label">暂停</span>
+            </button>
+            <button
+              class="btn"
+              id="skip-btn"
+              type="button"
+              aria-label="立即展示下一句"
+              title="下一句"
+              hidden
+            >
+              <span aria-hidden="true">&raquo;</span>
+              <span>下一句</span>
+            </button>
+            <span class="player-help" id="player-help" aria-live="polite"></span>
+          </div>
+
+          <form
+            class="player-input"
+            id="player-input-form"
+            autocomplete="off"
+            hidden
+          >
+            <label class="visually-hidden" for="player-input">说一句</label>
             <input
               type="text"
-              id="chat-input"
+              id="player-input"
               name="text"
-              placeholder="随便说一句…"
+              placeholder="说一句..."
               maxlength="200"
               required
             />
-            <button type="submit" class="btn btn-primary">发送</button>
+            <button class="btn btn-primary" type="submit" id="player-input-btn">
+              发送
+            </button>
           </form>
-        </div>
-        <div class="screen-foot">
-          <button class="btn btn-ghost" data-action="goto" data-target="hero">
-            回到首页
-          </button>
-        </div>
-      </section>
 
-      <!-- Section 6: Done -->
-      <section
-        id="screen-done"
-        class="screen screen-done"
-        data-screen="done"
-        hidden
-      >
-        <header class="screen-head">
-          <h2>这一条线到这里</h2>
-          <p class="screen-sub">
-            故事没有真正结束。换个角色、再选一个起点，看看另一条世界线。
-          </p>
-        </header>
-        <div class="screen-foot">
-          <button class="btn btn-primary" data-action="goto" data-target="stories">
-            再选一个故事
-          </button>
-          <button class="btn btn-ghost" data-action="goto" data-target="hero">
-            回到首页
-          </button>
+          <section
+            class="player-choices"
+            id="player-choices"
+            aria-label="选项"
+            hidden
+          ></section>
+
+          <section
+            class="player-ending"
+            id="player-ending"
+            aria-label="结局"
+            hidden
+          ></section>
         </div>
       </section>
     </main>
 
-    <aside id="toast" class="toast" hidden></aside>
+    <aside id="toast" class="toast" hidden role="status" aria-live="polite"></aside>
 
     <footer class="bottombar">
-      <span>《故事之外》· 知乎黑客松 MVP · Phase 1 demo</span>
-      <span class="bottombar-meta">
-        <a href="/api/health" target="_blank" rel="noopener">/api/health</a>
-        ·
-        <a href="/api/stories" target="_blank" rel="noopener">/api/stories</a>
-      </span>
+      <span class="bottombar-meta">demo · 进程内会话</span>
     </footer>
 
-    <script type="module" src="/scripts/app.js"></script>
+    <script type="module" src="/scripts/player.js"></script>
   </body>
 </html>
