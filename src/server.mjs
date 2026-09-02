@@ -46,6 +46,18 @@ import {
   resumeTurn,
   runTurn,
 } from './agent/runtime.mjs';
+import { snapshotAll as snapshotMetricsAll, snapshotSession as snapshotMetricsSession } from './observability/metrics.mjs';
+import { snapshotAll as snapshotCacheStatsAll } from './observability/cacheStats.mjs';
+import { computeFrontendPlaybackMs } from './observability/timing.mjs';
+import {
+  createStoriesHookContext,
+  onSessionCreate,
+  onOpeningCommit,
+  onInterrupt,
+  onToolCommit,
+  onOpeningCacheHit,
+  onOpeningCacheMiss,
+} from './stories/observabilityHooks.mjs';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 const ROOT = resolve(__dirname, '..');
@@ -622,6 +634,19 @@ const server = http.createServer(async (req, res) => {
           generation_profile: profile,
         };
         sessionPinnedMetadata.set(body.session_uuid, pinned);
+        // ClickUp 14 observability hooks (route layer, per docs/observability.md §5).
+        // A freshly created session pins a valid opening cache, so this counts
+        // as a cache hit for the pinned cache_uuid.
+        const sessionHookCtx = createStoriesHookContext({
+          session_uuid: body.session_uuid,
+          story_uuid: body.story_uuid,
+          story_version_uuid: body.story_version_uuid,
+          cache_uuid: body.generation_profile.cache_uuid,
+          generation_hash: pinnedCache.generation_hash,
+          state: 'opening',
+        });
+        onSessionCreate(sessionHookCtx);
+        onOpeningCacheHit(sessionHookCtx);
         return jsonResponse(res, 200, {
           demo: DEMO_FLAG, dev: DEV_FLAG, ...result, pinned,
           session: { ...result, pinned },
@@ -703,6 +728,7 @@ const server = http.createServer(async (req, res) => {
       });
     }
     try {
+      const openingCommitStartedAt = Date.now();
       const result = commitOpeningEvent({
         repository: storyRepo,
         session_uuid: openingEventsMatch[1],
@@ -710,6 +736,14 @@ const server = http.createServer(async (req, res) => {
         event: body.event,
         client_request_id: body.client_request_id,
         expected_revision: body.expected_revision,
+      });
+      onOpeningCommit({
+        hookCtx: createStoriesHookContext({
+          session_uuid: openingEventsMatch[1],
+          cache_uuid: body.cache_uuid,
+        }),
+        event: body.event,
+        latency_ms: Date.now() - openingCommitStartedAt,
       });
       return jsonResponse(res, 200, { demo: DEMO_FLAG, dev: DEV_FLAG, ...result });
     } catch (err) {
@@ -792,6 +826,7 @@ const server = http.createServer(async (req, res) => {
       });
     }
     try {
+      const interruptStartedAt = Date.now();
       const result = interruptWithPlayerInput({
         repository: storyRepo,
         session_uuid: interruptMatch[1],
@@ -799,6 +834,19 @@ const server = http.createServer(async (req, res) => {
         client_request_id: body.client_request_id,
         expected_revision: body.expected_revision,
       });
+      const interruptHookCtx = createStoriesHookContext({
+        session_uuid: interruptMatch[1],
+        state: 'realtime',
+      });
+      onInterrupt({
+        hookCtx: interruptHookCtx,
+        text_length: body.text.length,
+        latency_ms: Date.now() - interruptStartedAt,
+      });
+      // The interrupt is the supported fallback from the pinned opening
+      // cache into realtime generation — recorded as the cache miss the
+      // docs/observability.md sanity counter expects.
+      onOpeningCacheMiss(interruptHookCtx, 'player_interrupt_realtime');
       return jsonResponse(res, 200, {
         demo: DEMO_FLAG,
         dev: DEV_FLAG,
@@ -970,9 +1018,15 @@ const server = http.createServer(async (req, res) => {
       });
     }
     try {
+      const firstChoiceStartedAt = Date.now();
       const result = markFirstChoiceConsumed({
         repository: storyRepo,
         snapshot: body.snapshot,
+      });
+      onToolCommit({
+        hookCtx: createStoriesHookContext({ session_uuid: urlSessionUuid }),
+        tool_name: 'ask_player_choice',
+        latency_ms: Date.now() - firstChoiceStartedAt,
       });
       return jsonResponse(res, 200, { demo: DEMO_FLAG, dev: DEV_FLAG, result });
     } catch (err) {
@@ -984,6 +1038,86 @@ const server = http.createServer(async (req, res) => {
         dev: DEV_FLAG,
       });
     }
+  }
+
+  // -----------------------------------------------------------------------
+  // ClickUp 14 observability admin endpoints (read-only).
+  //
+  // Two GET routes expose per-session observability + a process-wide
+  // metrics summary. They are demo/dev-only and intentionally live
+  // under /api/admin/* next to the other admin tooling. They never
+  // mutate session state — see src/observability/* for the storage
+  // shape and docs/observability.md for the field contract.
+  // -----------------------------------------------------------------------
+
+  const observabilitySessionMatch = pathname.match(/^\/api\/admin\/observability\/sessions\/([0-9a-fA-F-]+)$/);
+  if (method === 'GET' && observabilitySessionMatch) {
+    const session_uuid = observabilitySessionMatch[1];
+    if (!isSessionUuid(session_uuid)) {
+      return jsonResponse(res, 400, {
+        error: 'validation_failed',
+        message: 'session_uuid must be a UUID',
+        demo: DEMO_FLAG,
+        dev: DEV_FLAG,
+      });
+    }
+    const session = snapshotMetricsSession(session_uuid);
+    if (!session) {
+      return jsonResponse(res, 404, {
+        error: 'session_not_observed',
+        message: 'No observability data recorded for this session yet.',
+        demo: DEMO_FLAG,
+        dev: DEV_FLAG,
+      });
+    }
+    // Pull canonical session state (recovery read) so the operator gets
+    // a single correlated view of "story pinned → tokens spent → cache
+    // hits" without having to issue a second request. The session is
+    // fetched only after the metrics lookup, so an unknown session_uuid
+    // 404s cheaply.
+    let pinnedSession = null;
+    try {
+      pinnedSession = recoverSession({ repository: storyRepo, session_uuid });
+    } catch {
+      // The session may exist in metrics but not in the in-memory
+      // repository (e.g. process restart between the metric write and
+      // the request). Fall through with pinnedSession=null so the
+      // metrics view still renders.
+      pinnedSession = null;
+    }
+    return jsonResponse(res, 200, {
+      demo: DEMO_FLAG,
+      dev: DEV_FLAG,
+      session_uuid,
+      pinned: pinnedSession ? {
+        session_uuid: pinnedSession.session_uuid,
+        story_uuid: pinnedSession.story_uuid,
+        story_version_uuid: pinnedSession.story_version_uuid,
+        cache_uuid: pinnedSession.cache_uuid,
+        state: pinnedSession.state,
+        cursor: pinnedSession.cursor,
+        revision: pinnedSession.revision,
+        model: pinnedSession.model,
+        role_id: pinnedSession.role_id,
+        opening_cache_status: pinnedSession.opening_cache_status,
+        user_ref: pinnedSession.user_ref,
+        generation_profile: pinnedSession.generation_profile,
+      } : null,
+      metrics: session,
+    });
+  }
+
+  if (method === 'GET' && pathname === '/api/admin/observability/metrics/summary') {
+    const metrics = snapshotMetricsAll();
+    const cacheStats = snapshotCacheStatsAll();
+    return jsonResponse(res, 200, {
+      demo: DEMO_FLAG,
+      dev: DEV_FLAG,
+      metrics,
+      cache_stats: cacheStats,
+      note: 'frontend_playback_ms can be computed per-commit from the events the client commits; this endpoint exposes storage only.',
+      compute_frontend_playback_ms: typeof computeFrontendPlaybackMs === 'function' ? 'available' : 'missing',
+    });
   }
 
   // Root → static
