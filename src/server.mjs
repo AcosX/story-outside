@@ -37,6 +37,11 @@ import {
   recoverSession,
   stageNarrativeBatch,
 } from './stories/sessionService.mjs';
+import {
+  buildEnding,
+  buildOriginalTimeline,
+  buildReplay,
+} from './stories/endingService.mjs';
 import { executeToolCall } from './agent/tools.mjs';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
@@ -934,6 +939,81 @@ const server = http.createServer(async (req, res) => {
         demo: DEMO_FLAG, dev: DEV_FLAG,
         session_uuid: discardMatch[1],
         ...result,
+      });
+    } catch (err) {
+      return sessionErrorResponse(res, err);
+    }
+  }
+
+  // ---------------------------------------------------------------------
+  // ClickUp 11 ending-page read-only routes. These three endpoints are
+  // pure projections over (session_events + story_version + opening_cache)
+  // and never mutate the repository. They are safe to call after a page
+  // reload (in the same process) and return a deterministic shape the
+  // ending page can rebuild the full result from.
+  //
+  //  GET /api/dev/sessions/:uuid/ending             — derived ending
+  //  GET /api/dev/sessions/:uuid/original-timeline  — original key facts
+  //  GET /api/dev/sessions/:uuid/replay             — committed history
+  // ---------------------------------------------------------------------
+
+  // GET /api/dev/sessions/:uuid/ending — surface the finish_story tool
+  // envelope plus derived fields (first_deviation, total_analysis,
+  // category). Returns 404 ending_not_committed when finish_story has
+  // not yet committed for this session.
+  const endingMatch = pathname.match(/^\/api\/dev\/sessions\/([0-9a-fA-F-]+)\/ending$/);
+  if (method === 'GET' && endingMatch) {
+    try {
+      const ending = buildEnding({ repository: storyRepo, session_uuid: endingMatch[1] });
+      return jsonResponse(res, 200, {
+        demo: DEMO_FLAG, dev: DEV_FLAG,
+        session_uuid: endingMatch[1],
+        ...ending,
+      });
+    } catch (err) {
+      if (err && err.code === 'ending_not_committed') {
+        return jsonResponse(res, 404, {
+          error: 'ending_not_committed',
+          message: 'finish_story has not yet committed for this session.',
+          session_uuid: endingMatch[1],
+          demo: DEMO_FLAG, dev: DEV_FLAG,
+        });
+      }
+      return sessionErrorResponse(res, err);
+    }
+  }
+
+  // GET /api/dev/sessions/:uuid/original-timeline — original story
+  // version key facts (title / hook / roles / opening cache highlights
+  // / choice boundary). NEVER sourced from the AI-parallel timeline.
+  // Includes a `source_attribution` label so the UI can mark these
+  // entries as "来自原作 …".
+  const originalTimelineMatch = pathname.match(/^\/api\/dev\/sessions\/([0-9a-fA-F-]+)\/original-timeline$/);
+  if (method === 'GET' && originalTimelineMatch) {
+    try {
+      const timeline = buildOriginalTimeline({ repository: storyRepo, session_uuid: originalTimelineMatch[1] });
+      return jsonResponse(res, 200, {
+        demo: DEMO_FLAG, dev: DEV_FLAG,
+        session_uuid: originalTimelineMatch[1],
+        ...timeline,
+      });
+    } catch (err) {
+      return sessionErrorResponse(res, err);
+    }
+  }
+
+  // GET /api/dev/sessions/:uuid/replay — strict replay of committed
+  // session_events in event_seq order. Excludes tool_call /
+  // pending_tool_call / pending / discarded rows (08 contract). Does
+  // NOT include pending_batch items with status='staged'.
+  const replayMatch = pathname.match(/^\/api\/dev\/sessions\/([0-9a-fA-F-]+)\/replay$/);
+  if (method === 'GET' && replayMatch) {
+    try {
+      const replay = buildReplay({ repository: storyRepo, session_uuid: replayMatch[1] });
+      return jsonResponse(res, 200, {
+        demo: DEMO_FLAG, dev: DEV_FLAG,
+        session_uuid: replayMatch[1],
+        ...replay,
       });
     } catch (err) {
       return sessionErrorResponse(res, err);
