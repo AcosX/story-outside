@@ -362,6 +362,18 @@ export function createInMemoryStoryRepository() {
         existing.invalidated_reason = input.invalidated_reason ?? existing.invalidated_reason;
         existing.expires_at = input.expires_at ?? existing.expires_at;
         existing.updated_at = now;
+        // A previously failed/invalidated row that is now valid must join
+        // the scope index so a later lookup/retry sees it under the same
+        // generation_hash instead of accumulating orphan rows.
+        if (existing.status === 'valid') {
+          const key = makeOpeningScopeKey(
+            existing.story_uuid,
+            existing.story_version_uuid,
+            existing.opening_key,
+            existing.generation_hash,
+          );
+          state.openingCachesByScope.set(key, existing.cache_uuid);
+        }
         return existing;
       }
       const cache_uuid = uuidv4();
@@ -385,9 +397,11 @@ export function createInMemoryStoryRepository() {
         updated_at: now,
       };
       state.openingCaches.set(cache_uuid, row);
-      // Only the valid row participates in scope-based lookup so that a
-      // failed attempt does not mask a freshly-generated valid row.
-      if (row.status === 'valid') {
+      // A failed attempt can be re-found by the SAME generation_hash so a
+      // retry reuses/updates the row instead of leaving an orphan. A valid
+      // row is still the only row that "wins" the scope key over an older
+      // failed row.
+      if (row.status === 'valid' || row.status === 'failed') {
         const key = makeOpeningScopeKey(
           input.story_uuid,
           input.story_version_uuid,

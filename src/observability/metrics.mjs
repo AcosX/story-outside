@@ -289,8 +289,14 @@ export const observeSession = safe(({ session_uuid, state = null } = {}) => {
   // insertion here — only the state label below is conditional.
   const s = touchSession(session_uuid, {});
   if (typeof state === 'string' && Object.prototype.hasOwnProperty.call(globalMetrics.sessionsByState, state)) {
-    globalMetrics.sessionsByState[state] += 1;
-    s.lastState = state;
+    // Count STATE TRANSITIONS, not raw observations: the same session that
+    // spends many turns in `realtime` would otherwise be recounted on every
+    // hook call and `sessionsByState` would never equal "sessions currently
+    // in that state".
+    if (s.lastState !== state) {
+      globalMetrics.sessionsByState[state] += 1;
+      s.lastState = state;
+    }
   }
 });
 

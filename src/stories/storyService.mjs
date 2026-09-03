@@ -223,7 +223,7 @@ export async function ensureOpeningCache({ repository, story_version_uuid, optio
       }));
   let payload;
   try {
-    payload = generator({ story, profile });
+    payload = await generator({ story, profile });
   } catch (err) {
     // Record the failure so subsequent retries can observe it. The valid
     // cache (if any) for this scope is NOT overwritten: the call will throw

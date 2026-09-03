@@ -106,8 +106,12 @@ const MAX_TRACKED_REQUESTS_PER_SESSION = 1000;
 // Mirror of uq_session_events_client_request (db/schema.sql): the column
 // is GLOBALLY unique across sessions, not per session. This registry maps
 // client_request_id -> session_uuid for every id that produced a canonical
-// event. Unlike the per-session replay maps it is never evicted — it is a
-// uniqueness index, not a cache (same lifetime as the DB index it mirrors).
+// event. Unlike the per-session replay maps it is a uniqueness index, not
+// a cache — in the real DB its lifetime matches the table. In this
+// in-memory demo the map is still bounded so anonymous API traffic cannot
+// grow it without limit; evicting the oldest id shrinks the uniqueness
+// window (callers then re-validate against the normal request gauntlet).
+const MAX_TRACKED_CLIENT_REQUEST_IDS = 50000;
 function repositoryState(repository) {
   if (!repository || typeof repository !== 'object') {
     throw new Error('sessionService: repository required');
@@ -224,6 +228,10 @@ function registerCanonicalRequestId(state, session, clientRequestId) {
     throw new Error(
       `sessionService: client_request_id '${clientRequestId}' was already committed by another session (${owner}) — uq_session_events_client_request is globally unique`,
     );
+  }
+  if (!state.clientRequestIndex.has(clientRequestId) && state.clientRequestIndex.size >= MAX_TRACKED_CLIENT_REQUEST_IDS) {
+    const oldestKey = state.clientRequestIndex.keys().next().value;
+    if (oldestKey !== undefined) state.clientRequestIndex.delete(oldestKey);
   }
   state.clientRequestIndex.set(clientRequestId, session.session_uuid);
 }
@@ -553,10 +561,14 @@ export function commitOpeningEvent({ repository, session_uuid, cache_uuid, event
 export function stageNarrativeBatch({ repository, session_uuid, items, tool_call, source, expected_revision, client_request_id }) {
   if (!repository) throw new Error('stageNarrativeBatch: repository required');
   const hasToolCall = tool_call !== undefined && tool_call !== null;
+  const normalizedSource = typeof source === 'string' && source ? source : NARRATIVE_SOURCE;
   if (!Array.isArray(items)) {
     throw new Error('stageNarrativeBatch: items must be an array');
   }
-  if (items.length === 0 && !hasToolCall) {
+  if (items.length === 0) {
+    if (hasToolCall) {
+      throw new Error('stageNarrativeBatch: at least one narrative item is required; tool-only batches are not allowed');
+    }
     throw new Error('stageNarrativeBatch: at least one narrative item or a tool_call is required');
   }
   if (items.length > MAX_NARRATIVE_ITEMS) {
@@ -593,7 +605,7 @@ export function stageNarrativeBatch({ repository, session_uuid, items, tool_call
   });
   const session = sessionFor(repository, session_uuid);
   const id = requestId(client_request_id);
-  const stageFingerprintInput = { payload: { items: normalized, tool_call: tool_call || null, source: source || NARRATIVE_SOURCE } };
+  const stageFingerprintInput = { payload: { items: normalized, tool_call: tool_call || null, source: normalizedSource } };
   if (id) {
     const prior = idempotentResult(session, id, 'stage', stageFingerprintInput);
     if (prior) return prior;
@@ -655,7 +667,7 @@ export function stageNarrativeBatch({ repository, session_uuid, items, tool_call
     events: clone(normalized),
     tool_call: tool_call ? clone(tool_call) : null,
     committed_count: 0,
-    source: typeof source === 'string' && source ? source : NARRATIVE_SOURCE,
+    source: normalizedSource,
     produced_at: nowIso(),
     revision_at_stage: session.revision,
     request_id: id || null,

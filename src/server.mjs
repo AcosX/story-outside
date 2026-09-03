@@ -10,7 +10,7 @@
 import http from 'node:http';
 import { randomUUID } from 'node:crypto';
 import { readFile, stat } from 'node:fs/promises';
-import { extname, join, normalize, resolve } from 'node:path';
+import { extname, isAbsolute, join, normalize, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { canonicalJsonStringify } from './stories/canonicalHash.mjs';
@@ -154,9 +154,17 @@ const FINISH_AFTER = 5;     // emit a finish_story tool_call after N narrative b
  * and is wiped when the server restarts.
  */
 const demoTurnCounter = new Map();
+// The demo counter and pinned-metadata maps are keyed by externally
+// supplied session UUIDs, so both must stay bounded to avoid unbounded
+// memory growth from anonymous /api/dev traffic.
+const MAX_DEMO_SESSION_STATES = 2000;
 function getDemoSessionState(sessionUuid) {
   let state = demoTurnCounter.get(sessionUuid);
   if (!state) {
+    if (demoTurnCounter.size >= MAX_DEMO_SESSION_STATES) {
+      const oldestKey = demoTurnCounter.keys().next().value;
+      if (oldestKey !== undefined) demoTurnCounter.delete(oldestKey);
+    }
     state = { turnCount: 0 };
     demoTurnCounter.set(sessionUuid, state);
   }
@@ -224,10 +232,21 @@ function sendText(res, status, text, contentType = 'text/plain; charset=utf-8') 
 }
 
 async function serveStatic(req, res, urlPath) {
-  let safePath = normalize(decodeURIComponent(urlPath.split('?')[0]));
+  const isHead = (req.method || 'GET').toUpperCase() === 'HEAD';
+  let decoded;
+  try {
+    decoded = decodeURIComponent(urlPath.split('?')[0]);
+  } catch {
+    sendText(res, 400, 'Bad Request');
+    return;
+  }
+  let safePath = normalize(decoded);
   if (safePath === '/' || safePath === '') safePath = '/index.html';
   const absolutePath = join(PUBLIC_DIR, safePath);
-  if (!absolutePath.startsWith(PUBLIC_DIR)) {
+  // Compare with a path-relative boundary so a sibling directory named
+  // `public-…` cannot be mistaken for being inside PUBLIC_DIR.
+  const rel = relative(PUBLIC_DIR, absolutePath);
+  if (rel.startsWith('..') || isAbsolute(rel)) {
     sendText(res, 403, 'Forbidden');
     return;
   }
@@ -244,7 +263,8 @@ async function serveStatic(req, res, urlPath) {
       'content-length': data.length,
       'cache-control': 'no-store',
     });
-    res.end(data);
+    if (isHead) res.end();
+    else res.end(data);
   } catch (err) {
     if (err.code === 'ENOENT') sendText(res, 404, 'Not Found');
     else sendText(res, 500, 'Internal Server Error');
@@ -255,16 +275,24 @@ async function readJsonBody(req) {
   return new Promise((resolveBody, reject) => {
     const chunks = [];
     let total = 0;
+    let rejected = false;
     req.on('data', (chunk) => {
+      if (rejected) return;
       total += chunk.length;
       if (total > 64 * 1024) {
+        rejected = true;
+        // Do NOT destroy the socket: the route layer needs to send a
+        // structured 400/413 response. Resume the stream so the request
+        // does not stall the keep-alive connection, and drop any further
+        // data events.
+        req.resume();
         reject(new ValidationError('payload_too_large'));
-        req.destroy();
         return;
       }
       chunks.push(chunk);
     });
     req.on('end', () => {
+      if (rejected) return;
       const raw = Buffer.concat(chunks).toString('utf-8');
       if (!raw) return resolveBody({});
       try {
@@ -301,6 +329,14 @@ const { repository: storyRepo, fixtures: storyFixtures } = createSeededRepositor
 // route layer keeps only the request's non-secret pinned metadata so recovery
 // can return the same metadata without reaching into service internals.
 const sessionPinnedMetadata = new Map();
+const MAX_SESSION_PINNED_METADATA = 2000;
+function rememberSessionPinnedMetadata(session_uuid, pinned) {
+  if (!sessionPinnedMetadata.has(session_uuid) && sessionPinnedMetadata.size >= MAX_SESSION_PINNED_METADATA) {
+    const oldestKey = sessionPinnedMetadata.keys().next().value;
+    if (oldestKey !== undefined) sessionPinnedMetadata.delete(oldestKey);
+  }
+  sessionPinnedMetadata.set(session_uuid, pinned);
+}
 // Per-session turn-level request idempotency map. Keyed by session_uuid,
 // then by request_id. The map intentionally lives outside the repository
 // because the runtime does not own it (the repository is process-shared
@@ -326,12 +362,36 @@ function sessionError(err) {
   if (/already exists/i.test(text)) {
     return { status: 400, code: 'duplicate_session', message: 'The session already exists.' };
   }
-  return { status: 400, code: 'validation_failed', message: 'The session request is invalid.' };
+  // Plain programming / infrastructure mistakes must surface as 500, not
+  // masquerade as client validation failures.
+  if (/repository required|builder function required|index corruption|cannot read|undefined is not|sessionService: unknown error code/i.test(text)) {
+    return { status: 500, code: 'internal_error', message: 'Internal server error.' };
+  }
+  // Everything below is a defensive whitelist of the sessionService and
+  // endingService validation messages that the public route layers expose.
+  if (
+    /sessionService:|endingService:/i.test(text) ||
+    /must be a UUID|must be an integer|must be a non-negative integer|must be a positive integer|must be a non-empty string|must be an array|must be an object|must contain|must return|must equal|sequence must|out of range|not allowed|does not match|not present|not interruptible|not accepting|already has an unconsumed|at least one|required|invalid/i.test(text)
+  ) {
+    return { status: 400, code: 'validation_failed', message: 'The session request is invalid.' };
+  }
+  return { status: 500, code: 'internal_error', message: 'Internal server error.' };
 }
 
 function sessionErrorResponse(res, err) {
   const { status, code, message } = sessionError(err);
   return jsonResponse(res, status, { error: code, message, demo: DEMO_FLAG, dev: DEV_FLAG });
+}
+
+function rejectInvalidSessionUuid(res, session_uuid) {
+  if (isSessionUuid(session_uuid)) return false;
+  jsonResponse(res, 400, {
+    error: 'validation_failed',
+    message: 'session_uuid must be a UUID',
+    demo: DEMO_FLAG,
+    dev: DEV_FLAG,
+  });
+  return true;
 }
 
 function validObject(value) {
@@ -348,7 +408,7 @@ function listFixtureStorySlugs() {
   return storyFixtures.slice();
 }
 
-const server = http.createServer(async (req, res) => {
+async function handleRequest(req, res) {
   const method = req.method || 'GET';
   const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
   const pathname = url.pathname;
@@ -637,7 +697,7 @@ const server = http.createServer(async (req, res) => {
           prompt: body.prompt,
           generation_profile: profile,
         };
-        sessionPinnedMetadata.set(body.session_uuid, pinned);
+        rememberSessionPinnedMetadata(body.session_uuid, pinned);
         // ClickUp 14 observability hooks (route layer, per docs/observability.md §5).
         // A freshly created session pins a valid opening cache, so this counts
         // as a cache hit for the pinned cache_uuid.
@@ -778,6 +838,7 @@ const server = http.createServer(async (req, res) => {
   // in-memory, so a fresh process does not know this session.
   const recoverMatch = pathname.match(/^\/api\/dev\/sessions\/([0-9a-fA-F-]+)\/recover$/);
   if (method === 'GET' && recoverMatch) {
+    if (rejectInvalidSessionUuid(res, recoverMatch[1])) return;
     try {
       const recovered = recoverSession({ repository: storyRepo, session_uuid: recoverMatch[1] });
       return jsonResponse(res, 200, {
@@ -795,6 +856,7 @@ const server = http.createServer(async (req, res) => {
   // clear a stale batch (e.g. recovery picked up a half-committed one).
   const discardMatch = pathname.match(/^\/api\/dev\/sessions\/([0-9a-fA-F-]+)\/discard-pending$/);
   if (method === 'POST' && discardMatch) {
+    if (rejectInvalidSessionUuid(res, discardMatch[1])) return;
     try {
       const result = discardPendingTail({
         repository: storyRepo,
@@ -828,6 +890,7 @@ const server = http.createServer(async (req, res) => {
   // not yet committed for this session.
   const endingMatch = pathname.match(/^\/api\/dev\/sessions\/([0-9a-fA-F-]+)\/ending$/);
   if (method === 'GET' && endingMatch) {
+    if (rejectInvalidSessionUuid(res, endingMatch[1])) return;
     try {
       const ending = buildEnding({ repository: storyRepo, session_uuid: endingMatch[1] });
       return jsonResponse(res, 200, {
@@ -855,6 +918,7 @@ const server = http.createServer(async (req, res) => {
   // entries as "来自原作 …".
   const originalTimelineMatch = pathname.match(/^\/api\/dev\/sessions\/([0-9a-fA-F-]+)\/original-timeline$/);
   if (method === 'GET' && originalTimelineMatch) {
+    if (rejectInvalidSessionUuid(res, originalTimelineMatch[1])) return;
     try {
       const timeline = buildOriginalTimeline({ repository: storyRepo, session_uuid: originalTimelineMatch[1] });
       return jsonResponse(res, 200, {
@@ -873,6 +937,7 @@ const server = http.createServer(async (req, res) => {
   // NOT include pending_batch items with status='staged'.
   const replayMatch = pathname.match(/^\/api\/dev\/sessions\/([0-9a-fA-F-]+)\/replay$/);
   if (method === 'GET' && replayMatch) {
+    if (rejectInvalidSessionUuid(res, replayMatch[1])) return;
     try {
       const replay = buildReplay({ repository: storyRepo, session_uuid: replayMatch[1] });
       return jsonResponse(res, 200, {
@@ -963,6 +1028,7 @@ const server = http.createServer(async (req, res) => {
   const generateMatch = pathname.match(/^\/api\/dev\/sessions\/([0-9a-fA-F-]+)\/generate$/);
   if (method === 'POST' && generateMatch) {
     const sessionUuid = generateMatch[1];
+    if (rejectInvalidSessionUuid(res, sessionUuid)) return;
     let body = {};
     try {
       body = await readJsonBody(req);
@@ -1038,6 +1104,7 @@ const server = http.createServer(async (req, res) => {
   const narrativeMatch = pathname.match(/^\/api\/dev\/sessions\/([0-9a-fA-F-]+)\/narrative-events$/);
   if (method === 'POST' && narrativeMatch) {
     const sessionUuid = narrativeMatch[1];
+    if (rejectInvalidSessionUuid(res, sessionUuid)) return;
     let body = {};
     try {
       body = await readJsonBody(req);
@@ -1073,6 +1140,7 @@ const server = http.createServer(async (req, res) => {
   // marker. The shared opening cache is NOT invalidated for other sessions.
   const firstChoiceMatch = pathname.match(/^\/api\/dev\/sessions\/([0-9a-fA-F-]+)\/first-choice$/);
   if (method === 'POST' && firstChoiceMatch) {
+    if (rejectInvalidSessionUuid(res, firstChoiceMatch[1])) return;
     let body = {};
     try {
       body = await readJsonBody(req);
@@ -1209,7 +1277,34 @@ const server = http.createServer(async (req, res) => {
   if (method === 'GET' && (pathname === '/' || pathname === '/index.html')) {
     return serveStatic(req, res, '/index.html');
   }
-  return serveStatic(req, res, pathname);
+  if (method === 'GET' || method === 'HEAD') {
+    return serveStatic(req, res, pathname);
+  }
+  // Anything else (e.g. POST /index.html, DELETE /api/stories) is not a
+  // readable static resource and must not be served as a 200 document.
+  return jsonResponse(res, 405, {
+    error: 'method_not_allowed',
+    message: `Method ${method} is not allowed for ${pathname}.`,
+    demo: DEMO_FLAG,
+  });
+}
+
+const server = http.createServer((req, res) => {
+  handleRequest(req, res).catch((err) => {
+    // Last-resort guard: an async route must never crash the process.
+    const message = String(err && err.message ? err.message : err);
+    if (!res.headersSent) {
+      jsonResponse(res, 500, {
+        error: 'internal_error',
+        message: 'Internal server error.',
+        demo: DEMO_FLAG,
+      });
+    } else {
+      try { res.end(); } catch { /* response already failed */ }
+    }
+    // eslint-disable-next-line no-console
+    console.error('[story-outside] unhandled request error:', message);
+  });
 });
 
 server.on('clientError', (err, socket) => {
@@ -1226,10 +1321,20 @@ const isMainModule =
   import.meta.url.endsWith(`/${process.argv[1]}`);
 
 if (isMainModule) {
+  // Validate the provider config before accepting traffic so a
+  // misconfigured STORY_OUTSIDE_PROVIDER fails loudly at startup rather
+  // than only when the first /api/stories request arrives.
+  try {
+    getStoryProvider();
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.error(`[story-outside] provider config error: ${String(err && err.message ? err.message : err)}`);
+    process.exit(1);
+  }
   server.listen(PORT, HOST, () => {
     // eslint-disable-next-line no-console
     console.log(`[story-outside] listening on http://${HOST}:${PORT} (demo mode)`);
   });
 }
 
-export { server, DEMO_FLAG, DEV_FLAG, classifyProviderError, storyRepo, storyFixtures, listFixtureStorySlugs };
+export { server, DEMO_FLAG, DEV_FLAG, classifyProviderError, sessionError, storyRepo, storyFixtures, listFixtureStorySlugs };
