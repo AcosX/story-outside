@@ -4,6 +4,9 @@
 // sections after finish_story commits:
 //
 //   * finish_story commit + DOM hook reaches the ending screen
+//   * the player's lazy `import('/scripts/endingPage.js')` wiring: a
+//     real player-driven finish flow mounts the ending page (and the
+//     reload-recovery + ?s=ending deep-link paths mount it too)
 //   * page rebuilds identical DOM after a full page reload (read-only)
 //   * original timeline column + AI-parallel timeline column are
 //     visually distinct (.timeline-source vs .timeline-ai)
@@ -11,9 +14,10 @@
 //   * dedicated screen is hidden in the picker / playing states
 //
 // The test reuses tests/_player-dom.mjs (the 09 DOM harness) so we do
-// not duplicate the harness. The ending module is loaded via dynamic
-// import from the live HTTP server's static file (so the same path the
-// browser uses), not via require.
+// not duplicate the harness. In the player-driven section the module is
+// loaded through the player's own dynamic-import path (rewritten by the
+// harness to evaluate the same real endingPage.js source); the pure
+// rendering sections load it directly.
 
 import assert_ from 'node:assert/strict';
 import http from 'node:http';
@@ -386,70 +390,91 @@ async function appendEndingScreen(dom) {
       check('empty state rendered when ending not committed', !!empty);
     }
 
-    // ----- 10) Player hook reaches endingPage.mount on finish_story -----
+    // ----- 10) Player lazy-import wiring: real finish flow reaches endingPage.mount -----
     {
-      // Tear down + re-bootstrap player DOM, then simulate a finish
-      // event by driving /generate via a forced finish input.
+      // Drive the player state machine itself (picker → opening →
+      // choice → typed "finish") and observe that player.js's lazy
+      // `import('/scripts/endingPage.js')` + mount() wiring populates
+      // #screen-ending. The module is NOT pre-loaded here: the harness
+      // serves it through the same dynamic-import hook the player uses.
       delete globalThis.__ENDING_PAGE__;
       delete globalThis.__PLAYER_TEST_API__;
-      installEndingPageGlobals();
+      delete globalThis.__PLAYER_STATE__;
       const dom = createPlayerDom({ baseUrl });
       await appendEndingScreen(dom);
-      await globalThis.__ENDING_PAGE_LOAD__();
-      // Create a session via the live server, drive it through the
-      // "finish" path by sending "finish" as input (deterministic
-      // demo provider).
-      const sessionUuid = '00000000-0000-4000-8000-110000000020';
-      const adminList = await (await fetch(`${baseUrl}/api/admin/stories`)).json();
-      const entry = adminList.stories.find((s) => s.slug === 'cafe-rain');
-      const version = entry.versions.find((v) => v.status === 'published') || entry.versions[0];
-      const rebuilt = await postJson(baseUrl, '/api/admin/opening-cache/rebuild', {
-        story_version_uuid: version.story_version_uuid,
-      });
-      const cache = rebuilt.body.result.cache;
-      const generationProfile = { ...cache.generation_profile, cache_uuid: cache.cache_uuid };
-      await postJson(baseUrl, '/api/dev/sessions', {
-        session_uuid: sessionUuid,
-        story_uuid: entry.story_uuid,
-        story_version_uuid: version.story_version_uuid,
-        user_ref: 'dom-test-hook',
-        role_id: 'stranger',
-        model: 'mock-11',
-        prompt: '11 prompt',
-        generation_profile: generationProfile,
-      });
-      // Drive ONE generate batch with "finish" input to trigger the
-      // finish_story tool call directly.
-      const stagedRes = await postJson(baseUrl, `/api/dev/sessions/${sessionUuid}/generate`, {
-        input: { text: 'finish' },
-        expected_revision: 0,
-        request_id: `dom-finish-${sessionUuid}`,
-      });
-      check('forced finish generate returned 200', stagedRes.status === 200);
-      let committedToolCall = false;
-      for (let seq = stagedRes.body.pending_committed_count || 0; seq < stagedRes.body.events.length; seq += 1) {
-        const commitRes = await postJson(baseUrl, `/api/dev/sessions/${sessionUuid}/narrative-events`, {
-          pending_id: stagedRes.body.pending_id,
-          sequence: seq,
-          expected_revision: stagedRes.body.revision,
-          client_request_id: `dom-finish-commit-${sessionUuid}-${seq}`,
-        });
-        const commitJson = commitRes.body;
-        if (commitJson.pending_tool_call && commitJson.pending_tool_call.name === 'finish_story') {
-          committedToolCall = true;
-          break;
-        }
-      }
-      check('finish_story tool_call committed via forced input', committedToolCall);
-      // Confirm /ending is now 200.
-      const endingRes = await getJson(baseUrl, `/api/dev/sessions/${sessionUuid}/ending`);
-      check('GET /ending returns 200 after forced finish', endingRes.status === 200);
-      // The player DOM does not actually drive the session via the
-      // canvas (state-machine wiring is heavy), so we manually invoke
-      // mount to simulate the hook.
-      await globalThis.__ENDING_PAGE__.mount({ sessionUuid });
+      await dom.waitFor(() => document.querySelectorAll('#story-list .chip').length > 0, { timeoutMs: 10000, intervalMs: 100 });
+      await dom.call('simulatePickerSelect', { storyId: fixture.slug, roleId: 'stranger' });
+      // The deterministic demo arc auto-emits a choice on turn 2.
+      await dom.waitFor(() => (globalThis.__PLAYER_STATE__ || {}).status === 'awaiting-choice', { timeoutMs: 90000, intervalMs: 200 });
+      check('player flow reached awaiting-choice', (globalThis.__PLAYER_STATE__ || {}).status === 'awaiting-choice');
+      // Type the finish input and submit TWICE: the second submit must
+      // be swallowed by the in-flight guard instead of replaying the
+      // same client_request_id.
+      const input = document.querySelector('#player-input');
+      const form = document.querySelector('#player-input-form');
+      input.value = 'finish';
+      form.dispatch('submit', { preventDefault: () => {} });
+      check('player input disabled while interrupt in flight', input.disabled === true);
+      form.dispatch('submit', { preventDefault: () => {} });
+      await dom.waitFor(() => (globalThis.__PLAYER_STATE__ || {}).status === 'finished', { timeoutMs: 30000, intervalMs: 100 });
+      check('player flow reached finished', (globalThis.__PLAYER_STATE__ || {}).status === 'finished');
+      check('player input re-enabled after interrupt settles', input.disabled === false);
+      // The finish tool call triggered the player's lazy import → real
+      // endingPage.mount → #screen-ending is populated by the module.
       const endingScreen = document.body.querySelector('#screen-ending');
-      check('player hook reaches endingPage.mount (forced mount succeeds)', endingScreen && endingScreen.children.length > 0);
+      check('player hook reaches endingPage.mount (real lazy import)', endingScreen && endingScreen.children.length > 0);
+      check('ending screen shows title after player finish', !!document.body.querySelector('#screen-ending #ending-title'));
+      check('ending screen takes over from the player screen', document.body.querySelector('#screen-player').hidden === true);
+      // Server-side: exactly ONE player_input landed despite the double
+      // submit (the guard prevented a duplicate client_request_id).
+      const finishedUuid = globalThis.__PLAYER_STATE__.sessionUuid;
+      const rec = await getJson(baseUrl, `/api/dev/sessions/${finishedUuid}/recover`);
+      const playerInputs = (rec.body.history || []).filter((e) => e.event_type === 'player_input');
+      check('double submit produced exactly one player_input', playerInputs.length === 1);
+      check('finish session has committed ending projection', (await getJson(baseUrl, `/api/dev/sessions/${finishedUuid}/ending`)).status === 200);
+
+      // ----- 11) Reload recovery: finished session lands on the ending page -----
+      // A fresh player (simulated reload) with the finished session uuid
+      // and no active pending must mount the ending page and NOT resume
+      // generating batches.
+      delete globalThis.__PLAYER_TEST_API__;
+      const reloadDom = createPlayerDom({ baseUrl });
+      await appendEndingScreen(reloadDom);
+      const beforeRecover = await getJson(baseUrl, `/api/dev/sessions/${finishedUuid}/recover`);
+      globalThis.__PLAYER_STATE__.sessionUuid = finishedUuid;
+      await globalThis.__PLAYER_INTERNALS__.recoverAndStart();
+      const reloadedScreen = document.body.querySelector('#screen-ending');
+      check('reload of finished session mounts the ending page', reloadedScreen && reloadedScreen.children.length > 0);
+      check('reload of finished session shows the ending title', !!document.body.querySelector('#screen-ending #ending-title'));
+      check('reload of finished session reaches finished status', globalThis.__PLAYER_STATE__.status === 'finished');
+      await new Promise((r) => setTimeout(r, 2000));
+      const afterRecover = await getJson(baseUrl, `/api/dev/sessions/${finishedUuid}/recover`);
+      check('reload of finished session does not generate further', afterRecover.body.history.length === beforeRecover.body.history.length);
+
+      // ----- 12) Deep link ?s=ending mounts the ending page at bootstrap -----
+      // showScreen writes ?s=ending; a reload with that URL must go
+      // straight to the ending page. Without a remembered session the
+      // module renders its own empty state; with the session context
+      // restored from sessionStorage the real ending renders.
+      delete globalThis.__PLAYER_TEST_API__;
+      const deepDom = createPlayerDom({ baseUrl, startScreen: 'ending' });
+      await appendEndingScreen(deepDom);
+      // The load-time bootstrap ran before #screen-ending existed (it is
+      // appended by appendEndingScreen), so re-run bootstrap now that the
+      // dedicated screen is in the DOM — first without a remembered
+      // session, then with one.
+      await deepDom.call('bootstrap');
+      check('deep link without session context renders empty state', !!document.body.querySelector('#screen-ending .ending-empty'));
+      check('deep link keeps the picker hidden', document.body.querySelector('#screen-picker').hidden === true);
+      globalThis.sessionStorage.setItem('story-outside:last-session', JSON.stringify({
+        sessionUuid: finishedUuid,
+        storyTitle: '雨夜咖啡馆',
+        roleLabel: '陌生人',
+      }));
+      await deepDom.call('bootstrap');
+      check('deep link with session context mounts the real ending', !!document.body.querySelector('#screen-ending #ending-title'));
+      check('deep link with session context reaches finished status', globalThis.__PLAYER_STATE__.status === 'finished');
+      check('deep link ending header carries remembered story title', /雨夜咖啡馆/.test(document.body.querySelector('#screen-ending .ending-subtitle').textContent));
     }
   } finally {
     server.close();
