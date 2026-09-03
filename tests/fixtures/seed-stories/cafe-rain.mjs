@@ -30,7 +30,10 @@ export const CAFE_RAIN_FIXTURE = Object.freeze({
   slug: 'cafe-rain',
   story_uuid: FIXTURE_UUIDS['cafe-rain'].story_uuid,
   story_version_uuid: FIXTURE_UUIDS['cafe-rain'].story_version_uuid,
-  story_version_checksum: null, // populated by the helper below (matches seeded fixture)
+  // The fixture never pins a checksum: the seeded repository is the single
+  // source of truth for it, so suites that assert checksums must resolve it
+  // at runtime with resolveChecksum(repository) below.
+  story_version_checksum: null,
   title: '雨夜咖啡馆',
   hook: '凌晨的咖啡馆只剩你和她。',
   roles: Object.freeze([

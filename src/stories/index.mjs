@@ -39,16 +39,22 @@ export { createSeededRepository, FIXTURE_UUIDS } from './fixture.mjs';
 
 // sessionService — the canonical store. `commitNarrativeEvent` is the
 // authoritative commit hook (ClickUp 08 contract name); pendingLifecycle
-// exposes `commitDisplayedEvent` as an alias.
+// exposes `commitDisplayedEvent` as an alias. The ClickUp 10 compact
+// functions are re-exported here too so callers of the application layer
+// do not have to reach into sessionService.mjs directly.
 export {
   commitNarrativeEvent,
   commitOpeningEvent,
   createSession,
   discardPendingTail,
   getSession,
+  getSessionCompact,
   interruptWithPlayerInput,
   listSessionEvents,
   lookupTurnRequest,
+  recordCompact,
+  recordCompactFailure,
+  rebuildCompactFromHistory,
   recoverSession,
   registerTurnRequest,
 } from './sessionService.mjs';

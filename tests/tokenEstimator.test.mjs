@@ -17,7 +17,7 @@ import {
   __testing,
 } from '../src/agent/tokenEstimator.mjs';
 
-const { countCjkChars, stringTokenEstimate, walkValue } = __testing;
+const { countCjkChars, analyzeText, stringTokenEstimate, walkValue } = __testing;
 
 test('default model windows are frozen and bounded', () => {
   assert.ok(Object.isFrozen(DEFAULT_MODEL_CONTEXT_WINDOWS));
@@ -45,6 +45,34 @@ test('countCjkChars: counts CJK Unified Ideographs only', () => {
   assert.equal(countCjkChars('ア'), 0); // Katakana
   assert.equal(countCjkChars('한'), 0); // Hangul
   assert.equal(countCjkChars('hello世界'), 2); // 2 CJK chars, 'hello' is latin
+});
+
+test('countCjkChars: counts CJK Extension B via code points (surrogate pairs)', () => {
+  // U+20000 (𠀀) is the first CJK Ext B ideograph. It is encoded as a
+  // surrogate pair, so a charCodeAt-based scan can never see it — the
+  // implementation must iterate code points.
+  assert.equal(countCjkChars('\u{20000}'), 1); // 𠀀
+  assert.equal(countCjkChars('\u{2A6DF}'), 1); // last char of the Ext B block
+  assert.equal(countCjkChars('a\u{20000}b'), 1); // mixed with latin
+  assert.equal(countCjkChars('汉\u{20000}'), 2); // BMP CJK + Ext B CJK
+  assert.equal(countCjkChars('\u{2B000}'), 0); // U+2B000 is Extension C — out of range
+  assert.equal(countCjkChars('\uD800'), 0); // lone high surrogate is not a character
+  assert.equal(countCjkChars('\uDC00\uD800'), 0); // lone surrogates are not counted
+});
+
+test('analyzeText: splits CJK code points from remaining UTF-16 units', () => {
+  assert.deepEqual(analyzeText('a\u{20000}b'), { cjk: 1, otherUnits: 2 });
+  assert.deepEqual(analyzeText('汉字'), { cjk: 2, otherUnits: 0 });
+  assert.deepEqual(analyzeText('abcd'), { cjk: 0, otherUnits: 4 });
+});
+
+test('stringTokenEstimate: astral CJK chars count as CJK, not as latin units', () => {
+  // 𠀀𠀀𠀀 = 3 Ext B ideographs → 3 tokens (old surrogate-blind scan
+  // counted 6 latin units → ceil(6/4) = 2 tokens — an underestimate).
+  assert.equal(stringTokenEstimate('\u{20000}\u{20000}\u{20000}'), 3);
+  // 1 BMP CJK + 3 Ext B CJK = 4 tokens (surrogate units must not leak into
+  // the latin bucket).
+  assert.equal(stringTokenEstimate('汉\u{20000}\u{20000}\u{20000}'), 4);
 });
 
 test('stringTokenEstimate: latin (4 chars/token) + CJK (1 char/token) + whitespace', () => {
@@ -208,4 +236,16 @@ test('createTokenEstimator: estimate catches estimator errors and returns 0', ()
   });
   // safe() wraps and catches — should return 0, not throw
   assert.equal(est.estimate({ recent_events: [{}] }), 0);
+});
+
+test('createTokenEstimator: estimate walks the value as-is (no stringify/parse round-trip)', () => {
+  // The estimator must receive the ORIGINAL value, not a JSON round-tripped
+  // clone. The old safe() did JSON.parse(canonicalJsonStringify(value)) on
+  // every call — a wasteful full-payload copy for large contexts.
+  const sentinel = { recent_events: [{ text: 'original reference' }] };
+  const est = createTokenEstimator({
+    model: 'openai/gpt-4o',
+    estimator: (value) => (value === sentinel ? 7 : 0),
+  });
+  assert.equal(est.estimate(sentinel), 7, 'estimator must observe the original value reference');
 });

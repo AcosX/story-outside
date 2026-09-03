@@ -18,7 +18,7 @@
 // canonical history; rebuildCompactFromHistory() can rebuild the compact
 // purely from session_events rows.
 
-import { canonicalJsonStringify } from '../stories/canonicalHash.mjs';
+// (no imports — this module is intentionally dependency-free)
 
 /**
  * Default model context windows. These are safe public defaults used when
@@ -58,26 +58,41 @@ export const DEFAULT_RESERVED_COMPLETION_TOKENS = 1_024;
 export const FALLBACK_CHARS_PER_TOKEN_LATIN = 4;
 export const FALLBACK_CHARS_PER_TOKEN_CJK = 1;
 
-function countCjkChars(text) {
-  let count = 0;
-  for (let i = 0; i < text.length; i += 1) {
-    const code = text.charCodeAt(i);
+/**
+ * Split a string into CJK code-point count and the number of remaining
+ * UTF-16 code units. Uses codePointAt so CJK Extension B (U+20000..U+2A6DF,
+ * encoded as a surrogate pair) is counted correctly — charCodeAt would only
+ * ever see the lone surrogates and miss those characters entirely.
+ */
+function analyzeText(text) {
+  let cjk = 0;
+  let otherUnits = 0;
+  for (let i = 0; i < text.length;) {
+    const code = text.codePointAt(i);
+    const units = code > 0xFFFF ? 2 : 1; // surrogate pair = 2 UTF-16 units
     if (
       (code >= 0x4E00 && code <= 0x9FFF) || // CJK Unified Ideographs
       (code >= 0x3400 && code <= 0x4DBF) || // CJK Extension A
       (code >= 0x20000 && code <= 0x2A6DF) // CJK Extension B
     ) {
-      count += 1;
+      cjk += 1;
+    } else {
+      otherUnits += units;
     }
+    i += units;
   }
-  return count;
+  return { cjk, otherUnits };
+}
+
+function countCjkChars(text) {
+  if (typeof text !== 'string' || text.length === 0) return 0;
+  return analyzeText(text).cjk;
 }
 
 function stringTokenEstimate(text) {
   if (typeof text !== 'string' || text.length === 0) return 0;
-  const cjk = countCjkChars(text);
-  const latin = text.length - cjk;
-  const latinTokens = Math.ceil(latin / FALLBACK_CHARS_PER_TOKEN_LATIN);
+  const { cjk, otherUnits } = analyzeText(text);
+  const latinTokens = Math.ceil(otherUnits / FALLBACK_CHARS_PER_TOKEN_LATIN);
   const cjkTokens = cjk; // 1 char ~ 1 token worst-case
   // Add a small overhead per whitespace boundary to model sub-word splits.
   const whitespaceTokens = (text.match(/\s+/g) || []).length;
@@ -173,20 +188,19 @@ export function createTokenEstimator(options = {}) {
   const threshold = Math.max(1, Math.floor(window * (1 - safetyRatio)) - reservedCompletionTokens);
 
   function safe(value) {
+    // The estimator runs on the value AS IS: the former
+    // JSON.parse(canonicalJsonStringify(value)) round-trip copied the whole
+    // payload on every estimate (measurably wasteful for large contexts)
+    // without changing the result for any JSON-safe input. Non-JSON values
+    // (non-finite numbers, functions, …) were only ever rescued by the
+    // fallback walk anyway, so hand them straight to the estimator. Any
+    // estimator error still collapses to 0 so a malformed payload never
+    // blocks the request.
     try {
-      // canonicalJsonStringify throws on non-finite values; if so we fall
-      // back to walking the original value so the estimator still produces
-      // a number instead of failing the whole pipeline.
-      const json = JSON.parse(canonicalJsonStringify(value));
-      const result = estimator(json);
+      const result = estimator(value);
       return Number.isFinite(result) && result >= 0 ? Math.floor(result) : 0;
     } catch {
-      try {
-        const result = estimator(value);
-        return Number.isFinite(result) && result >= 0 ? Math.floor(result) : 0;
-      } catch {
-        return 0;
-      }
+      return 0;
     }
   }
 
@@ -202,6 +216,7 @@ export function createTokenEstimator(options = {}) {
 
 export const __testing = {
   countCjkChars,
+  analyzeText,
   stringTokenEstimate,
   fallbackEstimateTokens,
   walkValue,

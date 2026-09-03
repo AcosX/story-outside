@@ -91,15 +91,30 @@ const NARRATIVE_SOURCE = 'runtime';
 // Hard limits from ClickUp 08: a staged batch may carry 1..4 narrative
 // items plus an OPTIONAL final tool call.
 const MAX_NARRATIVE_ITEMS = 4;
-const MIN_NARRATIVE_ITEMS = 1;
 
+// Idempotency-store bound. Per session we keep at most this many entries
+// in `requestIds` / `turnRequests`; inserting beyond the bound evicts the
+// OLDEST entry (Map insertion order). Semantic boundary (fail-closed):
+// a request whose id has been evicted is no longer REPLAYED — the call is
+// re-processed from scratch and must then pass the normal validation
+// gauntlet (opening sequence, pending_id match, revision check). For
+// commits / interrupts that gauntlet rejects stale replays, so an evicted
+// id can never silently re-append content; callers get an error instead
+// of a stale cached result.
+const MAX_TRACKED_REQUESTS_PER_SESSION = 1000;
+
+// Mirror of uq_session_events_client_request (db/schema.sql): the column
+// is GLOBALLY unique across sessions, not per session. This registry maps
+// client_request_id -> session_uuid for every id that produced a canonical
+// event. Unlike the per-session replay maps it is never evicted — it is a
+// uniqueness index, not a cache (same lifetime as the DB index it mirrors).
 function repositoryState(repository) {
   if (!repository || typeof repository !== 'object') {
     throw new Error('sessionService: repository required');
   }
   if (!repository[SESSION_STATE]) {
     Object.defineProperty(repository, SESSION_STATE, {
-      value: { sessions: new Map() },
+      value: { sessions: new Map(), clientRequestIndex: new Map() },
       enumerable: false,
       writable: false,
       configurable: false,
@@ -175,6 +190,42 @@ function idempotentResult(session, id, kind, input) {
     throw new Error('sessionService: client_request_id was already used for a different request');
   }
   return clone(prior.result);
+}
+
+/**
+ * Record a request result on the session's replay map with an LRU-style
+ * insertion-order cap (see MAX_TRACKED_REQUESTS_PER_SESSION). Overwriting
+ * an existing id keeps its original insertion position (Map semantics),
+ * so eviction always removes the least recently INSERTED entry.
+ */
+function rememberRequest(session, id, entry) {
+  if (!id) return;
+  const map = session.requestIds;
+  map.set(id, entry);
+  while (map.size > MAX_TRACKED_REQUESTS_PER_SESSION) {
+    const oldest = map.keys().next().value;
+    map.delete(oldest);
+  }
+}
+
+/**
+ * Enforce the cross-session uniqueness of client_request_id on canonical
+ * events (mirror of uq_session_events_client_request). Called from append()
+ * — the only writer of canonical events — so a duplicate id used by a
+ * DIFFERENT session fails closed exactly like the SQL unique key would.
+ * Same-session replays never reach this path (they return earlier through
+ * the idempotency lookup and do not append a second event).
+ */
+function registerCanonicalRequestId(state, session, clientRequestId) {
+  if (!clientRequestId) return;
+  if (!state.clientRequestIndex) state.clientRequestIndex = new Map();
+  const owner = state.clientRequestIndex.get(clientRequestId);
+  if (owner && owner !== session.session_uuid) {
+    throw new Error(
+      `sessionService: client_request_id '${clientRequestId}' was already committed by another session (${owner}) — uq_session_events_client_request is globally unique`,
+    );
+  }
+  state.clientRequestIndex.set(clientRequestId, session.session_uuid);
 }
 
 function getPinnedVersion(repository, story_uuid, story_version_uuid) {
@@ -267,7 +318,8 @@ function normalizeCacheEvent(event, pinned, cache_uuid, session_uuid) {
   };
 }
 
-function append(session, canonical, clientRequestId = null) {
+function append(state, session, canonical, clientRequestId = null) {
+  registerCanonicalRequestId(state, session, clientRequestId);
   const eventSeq = session.history.length + 1;
   const committed = {
     ...canonical,
@@ -430,6 +482,10 @@ export function createSession({ repository, session_uuid, story_uuid, story_vers
     requestIds: new Map(),
     turnRequests: new Map(),
     sourceSeq: new Map(),
+    // ClickUp 11 ending page: direct reference to the terminal finish_story
+    // envelope set by the FINAL narrative commit (see commitNarrativeEvent).
+    // Null until the story finishes; never cleared afterwards.
+    finish_envelope: null,
     // ClickUp 10 compact state. See DEPENDENCY NOTE at top of file.
     context_compact_text: null,
     context_compact_payload: null,
@@ -471,11 +527,11 @@ export function commitOpeningEvent({ repository, session_uuid, cache_uuid, event
   const pinned = validatePinnedCache(cache, session.story_uuid, session.story_version_uuid)
     .find((candidate) => candidate && candidate.sequence === event.sequence);
   const canonical = normalizeCacheEvent(event, pinned, cache_uuid, session.session_uuid);
-  const committed = append(session, canonical, id);
+  const committed = append(repositoryState(repository), session, canonical, id);
   session.opening_cursor += 1;
   if (session.opening_cursor >= cache.content_payload.event_count) session.state = 'awaiting_first_choice';
   const result = { session_uuid, cache_uuid, event: clone(committed), cursor: session.cursor, opening_cursor: session.opening_cursor, revision: session.revision, state: session.state };
-  if (id) session.requestIds.set(id, { kind: 'opening', fingerprint: requestFingerprint('opening', { event }), result });
+  if (id) rememberRequest(session, id, { kind: 'opening', fingerprint: requestFingerprint('opening', { event }), result });
   return clone(result);
 }
 
@@ -619,7 +675,7 @@ export function stageNarrativeBatch({ repository, session_uuid, items, tool_call
     state: session.state,
   };
   if (id) {
-    session.requestIds.set(id, {
+    rememberRequest(session, id, {
       kind: 'stage',
       fingerprint: requestFingerprint('stage', { payload: { items: normalized, tool_call: tool_call || null, source: pending.source } }),
       result,
@@ -687,7 +743,7 @@ export function commitNarrativeEvent({ repository, session_uuid, pending_id, seq
       `commitNarrativeEvent: revision mismatch, expected ${expected_revision} but current is ${current}`,
     );
   }
-  const canonical = append(session, {
+  const canonical = append(repositoryState(repository), session, {
     event_id: randomUUID(),
     event_type: 'narrative_beat',
     origin: NARRATIVE_ORIGIN,
@@ -701,6 +757,22 @@ export function commitNarrativeEvent({ repository, session_uuid, pending_id, seq
   const totalEvents = session.pending.events.length;
   const cleared = totalCommitted >= totalEvents;
   const toolCallSurface = cleared ? clone(session.pending.tool_call) : null;
+  if (cleared && toolCallSurface && toolCallSurface.name === 'finish_story') {
+    // Keep a DIRECT reference to the terminal envelope on the session
+    // (ClickUp 11 ending page). session.pending is cleared right after the
+    // final commit, and callers that omit client_request_id leave no trace
+    // in the idempotency map — without this reference the finish_story
+    // envelope would be unreachable and GET /ending would 404 forever.
+    // Only finish_story (the terminal tool) writes it, so a later
+    // ask_player_choice batch can never clobber a finished story.
+    session.finish_envelope = {
+      tool_call: toolCallSurface,
+      pending_id,
+      committed_event_seq: canonical.event_seq,
+      revision: session.revision,
+      committed_at: nowIso(),
+    };
+  }
   if (cleared) session.pending = null;
   const result = {
     session_uuid,
@@ -715,7 +787,7 @@ export function commitNarrativeEvent({ repository, session_uuid, pending_id, seq
     pending_tool_call: toolCallSurface,
   };
   if (id) {
-    session.requestIds.set(id, {
+    rememberRequest(session, id, {
       kind: 'commit',
       fingerprint: requestFingerprint('commit', { pending_id, sequence }),
       result,
@@ -752,7 +824,7 @@ export function interruptWithPlayerInput({ repository, session_uuid, text, clien
   // canonical history.
   const dropped = session.pending;
   session.pending = null;
-  const canonical = append(session, {
+  const canonical = append(repositoryState(repository), session, {
     event_id: randomUUID(),
     event_type: 'player_input',
     origin: 'user',
@@ -773,7 +845,7 @@ export function interruptWithPlayerInput({ repository, session_uuid, text, clien
     dropped_pending_id: dropped ? dropped.pending_id : null,
     dropped_pending_count: dropped ? dropped.events.length - dropped.committed_count : 0,
   };
-  if (id) session.requestIds.set(id, { kind: 'interrupt', fingerprint: requestFingerprint('interrupt', { text }), result });
+  if (id) rememberRequest(session, id, { kind: 'interrupt', fingerprint: requestFingerprint('interrupt', { text }), result });
   return clone(result);
 }
 
@@ -800,6 +872,11 @@ export function lookupTurnRequest({ repository, session_uuid, request_id }) {
  * Register (or replay) a turn-level request result on the session. A
  * reused request_id with the SAME fingerprint replays the prior result; a
  * reused request_id with a DIFFERENT fingerprint fails closed.
+ *
+ * The store is bounded (see MAX_TRACKED_REQUESTS_PER_SESSION): inserting
+ * beyond the cap evicts the oldest request_id. Beyond the window a turn is
+ * no longer replayed — it is re-processed from scratch (fail-closed: the
+ * normal revision / pending validation applies to the re-run).
  */
 export function registerTurnRequest({ repository, session_uuid, request_id, fingerprint, result }) {
   if (!repository) throw new Error('registerTurnRequest: repository required');
@@ -816,6 +893,10 @@ export function registerTurnRequest({ repository, session_uuid, request_id, fing
     return clone(prior.result);
   }
   session.turnRequests.set(request_id, { fingerprint, result: clone(result) });
+  while (session.turnRequests.size > MAX_TRACKED_REQUESTS_PER_SESSION) {
+    const oldest = session.turnRequests.keys().next().value;
+    session.turnRequests.delete(oldest);
+  }
   return clone(result);
 }
 
@@ -871,14 +952,6 @@ export function recoverSession({ repository, session_uuid }) {
   };
 }
 
-/**
- * Adapter hook used by tests and future DAOs that need to snapshot the
- * raw session row. Not part of the public HTTP surface.
- */
-export function _peekSession({ repository, session_uuid }) {
-  return sessionFor(repository, session_uuid);
-}
-
 // ---------------------------------------------------------------------------
 // ClickUp 10 — long-context compact
 // ---------------------------------------------------------------------------
@@ -908,11 +981,22 @@ function positiveInt(label, value) {
   return value;
 }
 
-function assertCompactInput({ summary_text, summary_payload, through_seq, folded_event_seqs, token_estimate, context_window, safety_ratio, reserved_completion_tokens, schema_version, prompt_version }) {
-  if (typeof summary_text !== 'string' || summary_text.length === 0) {
+// Mirror of game_sessions.last_compact_error VARCHAR(500) (db/schema.sql).
+const MAX_LAST_COMPACT_ERROR_LENGTH = 500;
+
+function truncateCompactError(message) {
+  return typeof message === 'string' ? message.slice(0, MAX_LAST_COMPACT_ERROR_LENGTH) : null;
+}
+
+function assertCompactInput({ summary_text, summary_payload, through_seq, folded_event_seqs, token_estimate, context_window, safety_ratio, reserved_completion_tokens, schema_version, prompt_version }, status = 'compacted') {
+  // A 'skipped' attempt records that nothing new was foldable; there may be
+  // no summary to persist (empty history or an already up-to-date compact),
+  // so the summary fields are optional for that status only.
+  const skipped = status === 'skipped';
+  if ((!skipped || summary_text !== undefined) && (typeof summary_text !== 'string' || (!skipped && summary_text.length === 0))) {
     throw new Error('sessionService.recordCompact: summary_text required');
   }
-  if (!summary_payload || typeof summary_payload !== 'object') {
+  if ((!skipped || summary_payload !== undefined) && (!summary_payload || typeof summary_payload !== 'object')) {
     throw new Error('sessionService.recordCompact: summary_payload required');
   }
   requiredFiniteInt('through_seq', through_seq);
@@ -937,10 +1021,16 @@ function assertCompactInput({ summary_text, summary_payload, through_seq, folded
  * The function:
  *   - Verifies `through_seq` is strictly greater than the previously
  *     recorded `compacted_through_seq` (the monotonic invariant enforced by
- *     trg_game_sessions_compact_monotonic in db/schema.sql).
- *   - Replaces the compact snapshot in one logical step.
+ *     trg_game_sessions_compact_monotonic in db/schema.sql). A 'skipped'
+ *     attempt is the one exception: it records "nothing new to fold" and
+ *     may repeat the current cursor, but never move it backwards.
+ *   - Replaces the compact snapshot in one logical step (status
+ *     'compacted' only — 'skipped' / 'failed' attempts leave the previous
+ *     compact snapshot intact).
  *   - Appends a record to `session.compact_history` (audit log).
  *   - Leaves `session.history` untouched.
+ *   - Truncates `last_compact_error` to 500 chars, mirroring the
+ *     VARCHAR(500) column in db/schema.sql.
  *
  * Returns a deep-cloned snapshot of the new compact state.
  *
@@ -950,12 +1040,16 @@ export function recordCompact(args) {
   if (!args || typeof args !== 'object') throw new Error('recordCompact: args required');
   if (!args.repository) throw new Error('recordCompact: repository required');
   assertUuid('session_uuid', args.session_uuid);
-  assertCompactInput(args);
-  const session = sessionFor(args.repository, args.session_uuid);
-  if (Number.isInteger(session.compacted_through_seq) && args.through_seq <= session.compacted_through_seq) {
-    throw new Error(`sessionService.recordCompact: through_seq must be strictly greater than current ${session.compacted_through_seq}`);
-  }
   const status = args.status === 'skipped' || args.status === 'failed' ? args.status : 'compacted';
+  assertCompactInput(args, status);
+  const session = sessionFor(args.repository, args.session_uuid);
+  if (Number.isInteger(session.compacted_through_seq)) {
+    const strictlyGreaterRequired = status !== 'skipped';
+    if (args.through_seq < session.compacted_through_seq
+      || (strictlyGreaterRequired && args.through_seq === session.compacted_through_seq)) {
+      throw new Error(`sessionService.recordCompact: through_seq must be strictly greater than current ${session.compacted_through_seq}`);
+    }
+  }
   const occurredAt = typeof args.occurred_at === 'string' ? args.occurred_at : nowIso();
   const attemptUuid = typeof args.attempt_uuid === 'string' && args.attempt_uuid.length > 0 ? args.attempt_uuid : randomUUID();
   const record = {
@@ -969,7 +1063,7 @@ export function recordCompact(args) {
     prompt_version: args.prompt_version,
     context_schema_version: args.schema_version,
     error_code: typeof args.error_code === 'string' ? args.error_code : null,
-    error_message: typeof args.error_message === 'string' ? args.error_message : null,
+    error_message: truncateCompactError(args.error_message),
     folded_event_seqs: clone(args.folded_event_seqs),
     summary_excerpt: typeof args.summary_text === 'string' ? args.summary_text.slice(0, 500) : null,
     created_at: occurredAt,
@@ -990,7 +1084,11 @@ export function recordCompact(args) {
   session.last_compact_attempt_at = occurredAt;
   session.last_compact_status = status;
   session.last_compact_error = status === 'failed'
-    ? (typeof args.error_message === 'string' ? args.error_message : (typeof args.error_code === 'string' ? args.error_code : 'unknown'))
+    ? truncateCompactError(
+      typeof args.error_message === 'string'
+        ? args.error_message
+        : (typeof args.error_code === 'string' ? args.error_code : 'unknown'),
+    )
     : null;
   if (!Array.isArray(session.compact_history)) session.compact_history = [];
   session.compact_history.push(record);
@@ -1023,14 +1121,14 @@ export function recordCompactFailure(args) {
     prompt_version: Number.isInteger(session.prompt_version) ? session.prompt_version : 1,
     context_schema_version: Number.isInteger(session.context_schema_version) ? session.context_schema_version : 1,
     error_code: errorCode,
-    error_message: errorMessage,
+    error_message: truncateCompactError(errorMessage),
     folded_event_seqs: [],
     summary_excerpt: null,
     created_at: occurredAt,
   };
   session.last_compact_attempt_at = occurredAt;
   session.last_compact_status = 'failed';
-  session.last_compact_error = errorMessage;
+  session.last_compact_error = truncateCompactError(errorMessage);
   if (!Array.isArray(session.compact_history)) session.compact_history = [];
   session.compact_history.push(record);
   return publicCompact(session);
@@ -1052,10 +1150,19 @@ export function getSessionCompact({ repository, session_uuid }) {
  * (typically buildCompactSummary + renderCompactSummary from
  * src/agent/contextBuilder.mjs).
  *
+ * Force-recompute contract: the builder ALWAYS receives the full canonical
+ * prefix (every event before the recent verbatim tail), INCLUDING events
+ * that a previous compact already folded. Rebuilding from only the
+ * post-cursor delta would silently drop the facts captured by the previous
+ * summary — the same loss the incremental assembleContext path guards
+ * against by merging existing.summary_text.
+ *
  * The function is read-only against session.history; it only writes a
  * fresh compact via recordCompact. If the rebuilt summary would not
  * strictly advance compacted_through_seq (e.g. nothing new to fold), it
- * records a 'skipped' attempt instead and returns it.
+ * records a 'skipped' attempt instead (last_compact_status='skipped'; the
+ * previous compact snapshot stays intact) and returns it — it never throws
+ * for the "nothing to do" case.
  *
  * @param {{ repository, session_uuid, builder: (events: object[]) => { summary_text: string, summary_payload: object, folded_event_seqs: number[] }, kept_recent?: number, estimator_snapshot?: { context_window: number, safety_ratio: number, reserved_completion_tokens: number, token_estimate: number, schema_version: number, prompt_version: number } }} args
  */
@@ -1068,29 +1175,41 @@ export function rebuildCompactFromHistory(args) {
   }
   const session = sessionFor(args.repository, args.session_uuid);
   const history = session.history;
-  const keptRecent = Number.isInteger(args.kept_recent) ? args.kept_recent : 8;
+  const keptRecent = Number.isInteger(args.kept_recent) && args.kept_recent >= 0 ? args.kept_recent : 8;
   const tailStart = history.length > keptRecent ? history.length - keptRecent : history.length;
-  const prefix = history.slice(0, tailStart);
+  // Full-history recompute: everything before the recent verbatim tail is
+  // eligible, regardless of the current compact cursor.
+  const prefix = history.filter((event) => Number.isInteger(event.event_seq) && event.event_seq > 0)
+    .slice(0, tailStart);
   const already = Number.isInteger(session.compacted_through_seq) ? session.compacted_through_seq : 0;
-  const eligible = prefix.filter((event) => Number.isInteger(event.event_seq) && event.event_seq > already);
-  if (eligible.length === 0) {
-    return recordCompact({
-      repository: args.repository,
-      session_uuid: args.session_uuid,
-      status: 'skipped',
-      summary_text: session.context_compact_text || '',
-      summary_payload: session.context_compact_payload || {},
-      through_seq: already,
-      folded_event_seqs: [],
-      token_estimate: 0,
-      context_window: (args.estimator_snapshot && args.estimator_snapshot.context_window) || 1,
-      safety_ratio: (args.estimator_snapshot && args.estimator_snapshot.safety_ratio) || 0,
-      reserved_completion_tokens: (args.estimator_snapshot && args.estimator_snapshot.reserved_completion_tokens) || 0,
-      schema_version: (args.estimator_snapshot && args.estimator_snapshot.schema_version) || 1,
-      prompt_version: (args.estimator_snapshot && args.estimator_snapshot.prompt_version) || 1,
-    });
+  const estimatorSnapshot = args.estimator_snapshot || {};
+  const skippedAttempt = (summaryText, summaryPayload) => recordCompact({
+    repository: args.repository,
+    session_uuid: args.session_uuid,
+    status: 'skipped',
+    summary_text: typeof summaryText === 'string' ? summaryText : (session.context_compact_text || ''),
+    summary_payload: summaryPayload && typeof summaryPayload === 'object'
+      ? summaryPayload
+      : (session.context_compact_payload || {}),
+    through_seq: already,
+    folded_event_seqs: [],
+    token_estimate: 0,
+    context_window: Number.isInteger(estimatorSnapshot.context_window) && estimatorSnapshot.context_window > 0
+      ? estimatorSnapshot.context_window
+      : 1,
+    safety_ratio: typeof estimatorSnapshot.safety_ratio === 'number' && estimatorSnapshot.safety_ratio >= 0 && estimatorSnapshot.safety_ratio < 1
+      ? estimatorSnapshot.safety_ratio
+      : 0,
+    reserved_completion_tokens: Number.isInteger(estimatorSnapshot.reserved_completion_tokens) ? estimatorSnapshot.reserved_completion_tokens : 0,
+    schema_version: Number.isInteger(estimatorSnapshot.schema_version) ? estimatorSnapshot.schema_version : 1,
+    prompt_version: Number.isInteger(estimatorSnapshot.prompt_version) ? estimatorSnapshot.prompt_version : 1,
+  });
+  if (prefix.length === 0) {
+    // Nothing foldable at all (empty history, or every event is inside the
+    // recent verbatim tail): record the skipped attempt and return.
+    return skippedAttempt();
   }
-  const built = args.builder(eligible);
+  const built = args.builder(prefix);
   if (!built || typeof built !== 'object') {
     throw new Error('rebuildCompactFromHistory: builder must return an object');
   }
@@ -1100,14 +1219,20 @@ export function rebuildCompactFromHistory(args) {
   if (!Array.isArray(built.folded_event_seqs)) {
     throw new Error('rebuildCompactFromHistory: builder must return folded_event_seqs');
   }
-  const snapshot = args.estimator_snapshot || {};
-  const tokenEstimate = Number.isInteger(snapshot.token_estimate) ? snapshot.token_estimate : eligible.length;
+  const snapshot = estimatorSnapshot;
+  const tokenEstimate = Number.isInteger(snapshot.token_estimate) ? snapshot.token_estimate : prefix.length;
   const contextWindow = Number.isInteger(snapshot.context_window) && snapshot.context_window > 0 ? snapshot.context_window : 1;
   const safetyRatio = typeof snapshot.safety_ratio === 'number' && snapshot.safety_ratio >= 0 && snapshot.safety_ratio < 1 ? snapshot.safety_ratio : 0;
   const reservedTokens = Number.isInteger(snapshot.reserved_completion_tokens) ? snapshot.reserved_completion_tokens : 0;
   const schemaVersion = Number.isInteger(snapshot.schema_version) ? snapshot.schema_version : 1;
   const promptVersion = Number.isInteger(snapshot.prompt_version) ? snapshot.prompt_version : 1;
   const lastSeq = built.folded_event_seqs[built.folded_event_seqs.length - 1];
+  if (!Number.isInteger(lastSeq) || lastSeq <= already) {
+    // The rebuilt summary does not strictly advance the compact cursor —
+    // nothing new to fold. Record a skipped attempt (keeps the existing
+    // compact intact) instead of failing the monotonic invariant.
+    return skippedAttempt(built.summary_text, built.summary_payload);
+  }
   return recordCompact({
     repository: args.repository,
     session_uuid: args.session_uuid,
