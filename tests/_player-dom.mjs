@@ -12,9 +12,44 @@ import { dirname, resolve } from 'node:path';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PLAYER_PATH = resolve(__dirname, '..', 'public', 'scripts', 'player.js');
+const ENDING_PAGE_PATH = resolve(__dirname, '..', 'public', 'scripts', 'endingPage.js');
 
 export async function loadFixtureScript() {
   return readFile(PLAYER_PATH, 'utf-8');
+}
+
+let endingPageSourceCache = null;
+async function readEndingPageSource() {
+  if (!endingPageSourceCache) endingPageSourceCache = readFile(ENDING_PAGE_PATH, 'utf-8');
+  return endingPageSourceCache;
+}
+
+// The player lazy-loads the ending page via `import('/scripts/endingPage.js')`.
+// Inside the harness (player source evaluated via `new Function`) a real
+// dynamic import cannot resolve that URL, so the source is rewritten to
+// call this hook instead, which evaluates the REAL endingPage.js source
+// (exports stripped) and returns its module namespace. This keeps the
+// lazy-import wiring — and everything downstream of it (mount on finish,
+// the reload recovery mount, the ?s=ending deep link) — under real test
+// coverage.
+const PLAYER_ENDING_IMPORT = "import('/scripts/endingPage.js')";
+const PLAYER_ENDING_HOOK = 'globalThis.__HARNESS_IMPORT_ENDING_PAGE__()';
+
+async function importEndingPageForHarness() {
+  const source = await readEndingPageSource();
+  const stripped = source.replace(/export\s*\{[^}]*\}\s*;?\s*$/m, '');
+  const fn = new Function(`${stripped}\nreturn { mount, teardown, STATE };`);
+  return fn();
+}
+
+function applyHarnessPatches(source) {
+  if (!source.includes(PLAYER_ENDING_IMPORT)) {
+    throw new Error(
+      'player harness: the dynamic import of /scripts/endingPage.js was not found '
+      + 'in player.js source — update PLAYER_ENDING_IMPORT in tests/_player-dom.mjs'
+    );
+  }
+  return source.replaceAll(PLAYER_ENDING_IMPORT, PLAYER_ENDING_HOOK);
 }
 
 // --- Minimal DOM polyfill ---
@@ -305,9 +340,16 @@ if (typeof nativeFetch !== 'function') {
   throw new Error('player harness requires Node global fetch (Node 18+)');
 }
 
-export function createPlayerDom({ baseUrl, viewport = null }) {
+export function createPlayerDom({ baseUrl, viewport = null, stepDelayMs = null, startScreen = null } = {}) {
   // Build the DOM tree the player.js expects. Mirrors public/index.html.
   function buildDom() {
+    // The document/body/head elements are shared by every harness
+    // instance in the process. Assigning innerHTML only stores a string
+    // in the polyfill — it does NOT clear the children array — so stale
+    // subtrees from earlier harnesses would shadow every
+    // querySelector(All) first-match. Detach them explicitly.
+    document.body.children.length = 0;
+    document.head.children.length = 0;
     document.body.innerHTML = '';
     document.body.appendChild(new Element('a')); // skip-link
     const topbar = new Element('header'); document.body.appendChild(topbar);
@@ -373,6 +415,8 @@ export function createPlayerDom({ baseUrl, viewport = null }) {
           activeScreen: (() => {
             const sp = document.querySelector('#screen-picker');
             const pp = document.querySelector('#screen-player');
+            const se = document.querySelector('#screen-ending');
+            if (se && !se.hidden) return 'ending';
             if (sp && !sp.hidden) return 'picker';
             if (pp && !pp.hidden) return 'player';
             return null;
@@ -380,6 +424,9 @@ export function createPlayerDom({ baseUrl, viewport = null }) {
           openingCursor: playerState ? playerState.openingCursor : 0,
           canonicalNarrativeCount: playerState ? playerState.canonicalNarrativeCount : 0,
           historyLines: playerState ? (playerState.canonicalHistory || []).length : 0,
+          finished: playerState ? !!playerState.finished : false,
+          hasQueuedToolCall: playerState ? !!playerState.queuedToolCall : false,
+          inputInFlight: playerState ? !!playerState.inputInFlight : false,
         };
       },
       simulatePickerSelect: async ({ storyId, roleId }) => {
@@ -442,11 +489,51 @@ export function createPlayerDom({ baseUrl, viewport = null }) {
         return { pickerTitle: title?.textContent || '', storyChipCount: chips.length };
       },
       layoutOverflow: async () => {
-        // The harness does not implement actual layout, so we report
-        // scrollWidth/clientWidth as the viewport width (a non-zero
-        // value) so the test can assert overflow = 0.
+        // The harness has no layout engine, so "no horizontal overflow"
+        // is asserted against a REAL proxy metric derived from the
+        // actual rendered content: the widest unbreakable text run on
+        // any visible element (CJK glyphs act as break points; runs of
+        // latin/digits/punctuation cannot wrap in a browser either).
+        // If any such run is wider than the viewport, a real browser
+        // would overflow too, so scrollWidth exceeds clientWidth and
+        // the assertion can genuinely fail.
         const vp = globalThis.window?.innerWidth || 1280;
-        return { scrollWidth: vp, clientWidth: vp };
+        const CJK_PX = 16;    // full-width glyph ≈ 1em at the 16px base font
+        const LATIN_PX = 8;   // average half-width advance
+        const CHROME_PX = 32; // padding/borders allowance around content
+        const CJK = /[\u1100-\u11FF\u2E80-\u9FFF\uAC00-\uD7AF\uF900-\uFAFF\uFF00-\uFF60\u3000-\u303F]/;
+        function widestRunPx(text) {
+          let best = 0;
+          let run = 0;
+          for (const ch of String(text || '')) {
+            if (CJK.test(ch)) {
+              best = Math.max(best, run, CJK_PX);
+              run = 0; // a CJK glyph is a break point (its own 16px run fits)
+            } else if (/\s/.test(ch)) {
+              best = Math.max(best, run);
+              run = 0;
+            } else {
+              run += LATIN_PX;
+            }
+          }
+          return Math.max(best, run);
+        }
+        function walk(node) {
+          let widest = 0;
+          if (node.hidden !== true) {
+            // Leaf content is set via textContent; chips/cards via
+            // innerHTML — measure both (tags stripped).
+            const content = `${node.textContent || ''} ${String(node.innerHTML || '').replace(/<[^>]*>/g, ' ')}`;
+            widest = Math.max(widest, widestRunPx(content));
+            for (const child of node.children || []) {
+              widest = Math.max(widest, walk(child));
+            }
+          }
+          return widest;
+        }
+        const widestRun = Math.ceil(walk(document.body));
+        const scrollWidth = Math.max(vp, widestRun + CHROME_PX);
+        return { scrollWidth, clientWidth: vp, widestRunPx: widestRun, viewportWidth: vp };
       },
     };
     globalThis.__PLAYER_TEST_API__ = api;
@@ -476,16 +563,28 @@ export function createPlayerDom({ baseUrl, viewport = null }) {
   // as a non-writable global, so we only set the keys we need.
   const setupGlobals = () => {
     globalThis.document = document;
+    // Fresh sessionStorage per harness instance — each createPlayerDom()
+    // stands for a fresh tab, so the player's persisted last-session
+    // context never leaks across harnesses.
+    const sessionStore = new Map();
+    globalThis.sessionStorage = {
+      getItem: (k) => (sessionStore.has(k) ? sessionStore.get(k) : null),
+      setItem: (k, v) => { sessionStore.set(String(k), String(v)); },
+      removeItem: (k) => { sessionStore.delete(k); },
+      clear: () => { sessionStore.clear(); },
+    };
     // The viewport option lets a test simulate mobile widths by
-    // overriding the inner clientWidth used by `layoutOverflow`. We do
-    // not set innerWidth/innerHeight (they're not consulted here).
+    // overriding the inner clientWidth used by `layoutOverflow`.
+    const search = startScreen ? `?s=${startScreen}` : '';
     globalThis.window = {
-      location: { href: `${baseUrl}/`, search: '' },
+      location: { href: `${baseUrl}/${search}`, search },
       scrollTo: () => {},
       innerWidth: viewport?.width || 1280,
       innerHeight: viewport?.height || 800,
     };
     globalThis.fetch = fetchStub;
+    // Lazy ending-page import hook (see importEndingPageForHarness).
+    globalThis.__HARNESS_IMPORT_ENDING_PAGE__ = importEndingPageForHarness;
     if (!globalThis.crypto) globalThis.crypto = {};
     if (typeof globalThis.crypto.randomUUID !== 'function') {
       globalThis.crypto.randomUUID = () => '00000000-0000-4000-8000-000000000099';
@@ -500,16 +599,45 @@ export function createPlayerDom({ baseUrl, viewport = null }) {
   async function ready() {
     setupGlobals();
     buildDom();
+    // Each harness instance models a fresh page load: drop any
+    // document-level listeners registered by earlier harnesses in this
+    // process (otherwise the delegated role-chip handler fires once per
+    // harness and races duplicate session creations against each other).
+    if (document.eventListeners) document.eventListeners.clear();
     bindTestApi();
-    const source = await loadFixtureScript();
+    let source = await loadFixtureScript();
+    if (stepDelayMs != null) {
+      // Optionally slow the autoplay cadence so tests can reliably
+      // land inside the deferred tool-call window (STEP_DELAY_MS / 2).
+      const pattern = 'const STEP_DELAY_MS = 1100;';
+      if (!source.includes(pattern)) {
+        throw new Error('player harness: STEP_DELAY_MS declaration not found in player.js source');
+      }
+      source = source.replace(pattern, `const STEP_DELAY_MS = ${Number(stepDelayMs)};`);
+    }
+    source = applyHarnessPatches(source);
     // Wrap the player.js source so its top-level `bootstrap()` call is
-    // captured on globalThis alongside the state singleton. We use
+    // captured on globalThis alongside the state singleton and the
+    // internal functions the suites need to drive directly. We use
     // Function() with an explicit body to keep the script in the
     // module's lexical scope.
-    const wrapped = `${source}\nglobalThis.__PLAYER_STATE__ = state; globalThis.__PLAYER_BOOTSTRAP__ = bootstrap;`;
+    const wrapped = `${source}\n`
+      + 'globalThis.__PLAYER_STATE__ = state; globalThis.__PLAYER_BOOTSTRAP__ = bootstrap; '
+      + 'globalThis.__PLAYER_INTERNALS__ = { recoverAndStart, scheduleNextStep, runStep, startNextBatch, surfaceToolCall, sendPlayerInput, sendPlayerInputChoice };';
     const fn = new Function(wrapped);
-    try { fn(); }
-    catch (err) { /* bootstrap may surface partial DOM errors; continue */ }
+    // Do NOT swallow execution errors: if player.js does not even run,
+    // every downstream assertion would pass vacuously. Surface the
+    // error (recorded + ready() rejects) so the calling suite fails
+    // loudly and only a genuinely executing player passes ready().
+    try {
+      fn();
+    } catch (err) {
+      const loadError = new Error(`player.js failed to execute in the harness: ${err && err.message}`);
+      loadError.cause = err;
+      globalThis.__PLAYER_LOAD_ERROR__ = loadError;
+      throw loadError;
+    }
+    globalThis.__PLAYER_LOAD_ERROR__ = null;
     // Wait for the picker to populate.
     await new Promise((r) => setTimeout(r, 200));
   }

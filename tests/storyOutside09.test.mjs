@@ -450,9 +450,13 @@ check('recover after two interrupts: history grew by 2', rec4.data?.history?.len
   check('share fallback does not throw', shareResult?.ok !== false);
   check('share fallback picked a path', typeof shareResult?.path === 'string');
 
-  // ----- layout sanity: scrollWidth ≤ clientWidth -----
+  // ----- layout sanity: no horizontal overflow -----
+  // layoutOverflow derives scrollWidth from the widest unbreakable text
+  // run actually rendered on a visible screen (see tests/_player-dom.mjs),
+  // so this assertion can genuinely fail when content cannot wrap.
   const layout = await player.call('layoutOverflow');
   check('layout: scrollWidth ≤ clientWidth', layout.scrollWidth <= layout.clientWidth + 1);
+  check('layout metric is content-derived', typeof layout.widestRunPx === 'number' && layout.widestRunPx >= 0);
 
   // ----- idempotency: replay /generate with same request_id -----
   const idemSession = '00000000-0000-4000-8000-09090909aaaa';
@@ -551,6 +555,79 @@ check('recover after two interrupts: history grew by 2', rec4.data?.history?.len
   await pausePlayer.call('simulateResume');
   const afterResume = pausePlayer.snapshot();
   check('resume flips status to playing', afterResume.status === 'playing');
+
+  // ----- F4: pause inside the deferred tool-call window -----
+  // Regression: the final commit of a batch schedules surfaceToolCall on
+  // a setTimeout (~STEP_DELAY_MS/2) and clears state.pending. Pausing
+  // inside that window used to clearTimeout the envelope away; resume
+  // then fell through to startNextBatch and the choice/finish node was
+  // skipped for good. The envelope must now be queued in state and
+  // surface on resume.
+  {
+    const raceSession = '00000000-0000-4000-8000-0909090a3333';
+    await newSession(raceSession);
+    const raceGen = await post(`/api/dev/sessions/${raceSession}/generate`, {
+      request_id: 'race-turn-1', input: { text: 'finish' }, expected_revision: 0,
+    });
+    check('F4 setup: finish batch staged', raceGen.data?.tool_call?.name === 'finish_story');
+    const raceEvents = raceGen.data.events;
+    let raceRevision = raceGen.data.revision;
+    // Commit all but the last item server-side so the player's next
+    // (and only) commit is the final one, in order.
+    for (let i = 0; i < raceEvents.length - 1; i += 1) {
+      const c = await post(`/api/dev/sessions/${raceSession}/narrative-events`, {
+        pending_id: raceGen.data.pending_id, sequence: i, expected_revision: raceRevision,
+        client_request_id: `race-commit-${i}`,
+      });
+      raceRevision = c.data.revision;
+    }
+    const raceRecover = await request(`/api/dev/sessions/${raceSession}/recover`);
+    const racePlayer = createPlayerDom({ baseUrl, stepDelayMs: 1600 });
+    await racePlayer.ready();
+    const raceState = globalThis.__PLAYER_STATE__;
+    raceState.sessionUuid = raceSession;
+    raceState.lastRevision = raceRevision;
+    raceState.canonicalHistory = raceRecover.data.history;
+    raceState.canonicalEventsById = new Map(raceState.canonicalHistory.map((e) => [e.event_id, e]));
+    raceState.openingEvents = [];
+    raceState.openingCursor = 0;
+    raceState.pending = {
+      pending_id: raceGen.data.pending_id,
+      events: raceEvents,
+      tool_call: raceGen.data.tool_call,
+      committed_count: raceEvents.length - 1,
+    };
+    raceState.pendingIdx = raceEvents.length - 1;
+    raceState.status = 'playing';
+    // Kick exactly one scheduler step: it commits the final item and
+    // arms the ~800ms deferred tool-call render.
+    globalThis.__PLAYER_INTERNALS__.scheduleNextStep();
+    await racePlayer.waitFor(
+      () => (globalThis.__PLAYER_STATE__.canonicalHistory || []).length === raceRecover.data.history.length + 1,
+      { timeoutMs: 15000, intervalMs: 25 }
+    );
+    // Pause inside the deferred window, before the timer fires.
+    await racePlayer.call('simulatePause');
+    check('F4: pause lands inside the tool-call window', globalThis.__PLAYER_STATE__.status === 'paused');
+    check('F4: finish envelope queued after pause', globalThis.__PLAYER_STATE__.queuedToolCall?.name === 'finish_story');
+    // Hold past the original 800ms deadline: nothing may surface while
+    // paused, and the envelope must NOT be lost.
+    await new Promise((r) => setTimeout(r, 1300));
+    check(
+      'F4: envelope stays queued while paused (timer did not leak a surface)',
+      globalThis.__PLAYER_STATE__.status === 'paused' && globalThis.__PLAYER_STATE__.queuedToolCall?.name === 'finish_story'
+    );
+    // Resume: the queued finish envelope must surface (status finished)
+    // instead of a fresh /generate skipping the terminal node.
+    await racePlayer.call('simulateResume');
+    await racePlayer.waitFor(() => globalThis.__PLAYER_STATE__.status === 'finished', { timeoutMs: 10000, intervalMs: 50 });
+    check('F4: resume surfaces the queued finish envelope', globalThis.__PLAYER_STATE__.status === 'finished');
+    const raceAfter = await request(`/api/dev/sessions/${raceSession}/recover`);
+    check(
+      'F4: no extra batch generated across the pause',
+      raceAfter.data?.history?.length === raceRecover.data.history.length + 1
+    );
+  }
 
   // ----- commit failure does NOT advance the player -----
   // A commit returning 400 should leave the pending line in place and
