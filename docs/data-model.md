@@ -8,7 +8,8 @@
 > - `db/migrations/0002_opening_cache_generation_profile.sql` — 开场缓存 generation profile 与 session-local first choice
 > - `db/migrations/0003_session_playback.sql` — session playback 快照、canonical event provenance 与 story/version/cache 复合关系
 > - `db/migrations/0004_pending_batch_lifecycle.sql` — pending batch 生命周期字段与 `pending_batch_items` 表
-> - `db/schema.sql` — 全新环境一键建库入口（0001 + 0002 + 0003 + 0004 的最终 DDL）
+> - `db/migrations/0005_compact_and_context.sql` — long-context compact 状态列、`compact_compacted_events` 审计表与 `model_context_windows` 注册表
+> - `db/schema.sql` — 全新环境一键建库入口（0001 + 0002 + 0003 + 0004 + 0005 的最终 DDL）
 > - `tests/schema-contract.test.mjs` — 不依赖真实数据库凭据的 schema/SQL 契约测试
 
 ## 1. 设计原则
@@ -34,6 +35,8 @@
 | `pending_batches` | 推测生成队列；保留 speculative request/response 与提正记录；0004 补充 `expected_revision` / `request_fingerprint` / `committed_count` / `item_count` / `source` / `superseded_by` |
 | `pending_batch_items` | 推测生成队列的逐项有序 beat；item_seq 0-based 唯一；status=pending/committed/discarded |
 | `session_checkpoints` | context/checkpoint 投影；可由 `session_events` 重建 |
+| `compact_compacted_events` | compact 尝试的 append-only 审计日志；(session, attempt) 一行，记录 fold 进该次 compact 的 `folded_event_seqs` |
+| `model_context_windows` | 模型上下文窗口注册表；与 `src/agent/tokenEstimator.mjs` 的 `DEFAULT_MODEL_CONTEXT_WINDOWS` 镜像，作为 compact 管线的窗口来源 |
 | `schema_migrations` | 迁移台账；`INSERT IGNORE` 记录已应用迁移 |
 
 ## 3. 核心语义
@@ -101,6 +104,14 @@
 - 提供 `kind`（canonical/secret/failure/abandoned）、展示字段、`conditions_payload` 和排序。
 - `game_sessions.ending_id` 记录会话最终到达的结局；`ended_at` 与 `status` 约束保证结束状态有时间。
 
+### 3.8 compact 与模型上下文窗口
+
+- compact 摘要落在 `game_sessions` 上：`context_compact_text`（渲染文本）+ `context_compact_payload`（结构化 payload），并以 `compacted_through_seq` / `compacted_event_count` 记录 fold 覆盖范围；快照列（`token_estimate` / `context_window` / `context_safety_ratio` / `reserved_completion_tokens` / `context_schema_version` / `prompt_version`）在每次 compact 尝试时固化当时的决策。
+- `compacted_through_seq` 单调不回退：由 `trg_game_sessions_compact_monotonic`（schema.sql 与 0005 同名同体）在 UPDATE 前拒绝向后回退的写入。
+- 五个命名 CHECK 与 schema.sql 逐字一致：`chk_game_sessions_token_estimate` / `chk_game_sessions_context_window` / `chk_game_sessions_safety_ratio` / `chk_game_sessions_compact_seq` / `chk_game_sessions_compact_payload`。
+- `compact_compacted_events` 是每次尝试一行的 append-only 审计日志（`attempt_uuid` 唯一）；失败行保留供排障，只有 `status='compacted'` 的行代表一次生效的 fold；`folded_event_seqs` 恒为 JSON（`chk_compact_compacted_events_folded_seqs`）。
+- `model_context_windows` 是 compact 管线的窗口注册表（`context_window` > 0、`0 <= safety_ratio < 1`、`reserved_completion_tokens` >= 0）；seed 行与 `src/agent/tokenEstimator.mjs` 的默认值镜像；应用层在 compact 时把窗口快照固化到 `game_sessions`，注册表后续 UPDATE 不做版本化。
+
 ## 4. 时间语义
 
 - `created_at` / `updated_at`：数据库自动维护（`CURRENT_TIMESTAMP(6)` / `ON UPDATE CURRENT_TIMESTAMP(6)`），UTC。
@@ -115,9 +126,10 @@
 - `0001` 可重复执行：`CREATE TABLE IF NOT EXISTS`、`DROP TRIGGER IF EXISTS`、`INSERT IGNORE` 都不产生重复错误。
 - `0002` 可重复执行：使用 `ADD COLUMN IF NOT EXISTS`、`ADD UNIQUE INDEX IF NOT EXISTS`、`DROP INDEX IF EXISTS`、`ADD CONSTRAINT IF NOT EXISTS` 与 drop-before-create trigger；旧 0001 的 `uq_story_opening_caches_scope` 被移除，旧行以 legacy generation 回填。
 - `0003` 可重复执行：先为复合外键暴露父表复合索引，再回填旧 session/event 行的 playback/provenance 默认值；事件枚举扩展后，命名 CHECK/外键按名称 drop/recreate（MariaDB 不支持 `ADD FOREIGN KEY IF NOT EXISTS`），最后完成非空与幂等约束；旧事件的 `source='legacy'`、`source_sequence=event_seq` 只在空值时回填。
-- `0004` 可重复执行：扩展 `pending_batches` 生命周期字段（`expected_revision` 默认 0 / `request_fingerprint` / `committed_count` / `item_count` / `source` / `superseded_by`），先 backfill NULL 值，再 MODIFY 为 NOT NULL；补 `chk_pending_batches_source` / `chk_pending_batches_counts` 两个 CHECK 与 schema.sql 对齐；新增 `pending_batch_items` 表表达逐项有序 payload 与三态机（含 `session_id` 冗余列、`chk_pending_batch_items_pending`、`chk_pending_batch_items_tool_commit` 与同 session 复合外键）；新增/重建命名 CHECK 与索引。MariaDB 不支持 `ADD FOREIGN KEY IF NOT EXISTS`，所以外键仍按 drop-by-name + create 模式。
+- `0004` 可重复执行：扩展 `pending_batches` 生命周期字段（`expected_revision` 默认 0 / `request_fingerprint` / `committed_count` / `item_count` / `source` / `superseded_by`），先 backfill NULL 值，再 MODIFY 为 NOT NULL；`ADD COLUMN` 的 `AFTER` 链复现 schema.sql 的列顺序（仅观感，但保证 0001→0004 升级与全新安装物理一致）；补 `chk_pending_batches_source` / `chk_pending_batches_counts` 两个 CHECK 与 schema.sql 对齐；新增 `pending_batch_items` 表表达逐项有序 payload 与三态机（含 `session_id` 冗余列、`chk_pending_batch_items_pending`、`chk_pending_batch_items_tool_commit` 与同 session 复合外键）；新增/重建命名 CHECK 与索引。在 `chk_pending_batches_completed` 之前先做幂等 backfill（终态行缺失 `completed_at` 时以 `updated_at` 补齐，只填 NULL），避免存量数据让迁移失败。MariaDB 不支持 `ADD FOREIGN KEY IF NOT EXISTS`，所以外键仍按 drop-by-name + create 模式。
+- `0005` 可重复执行：为 `game_sessions` 增加 compact/context 列（`context_compact_text` / `context_compact_payload` / `compacted_through_seq` / `compacted_event_count` / token 快照列 / `last_compact_*`），按 drop-by-name + create 模式补齐与 schema.sql 逐字一致的五个命名 CHECK，重建 `trg_game_sessions_compact_monotonic`（先 DROP 旧名 `trg_game_sessions_no_compact_overwrite` 以升级已跑过旧版迁移的库），并新增 `compact_compacted_events` 与 `model_context_windows` 两张表及 seed 行。
 - 已应用迁移在部署环境中**不要编辑**；结构变更必须新增迁移文件。`0001` 是历史基线，其中的旧 trigger 级联行为由 `0002` 替换，不回头修改。
-- `schema.sql` 是当前 canonical 全量入口，包含建库与 0001+0002+0003+0004 合并后的最终 DDL；`tests/schema-contract.test.mjs` 会校验它与迁移集合保持一致。
+- `schema.sql` 是当前 canonical 全量入口，包含建库与 0001+0002+0003+0004+0005 合并后的最终 DDL；`tests/schema-contract.test.mjs` 会校验它与迁移集合保持一致（含 0005 两张新表与 schema.sql 的逐字对比）。
 - schema 不创建应用账号、不写入任何密钥。应用账号权限由部署环境负责，推荐：普通读写账号不授予 `session_events` 的 `UPDATE` / `DELETE`，与 trigger 形成双重防线。
 
 ## 6. 真实 MariaDB 验证
@@ -143,7 +155,10 @@ mariadb --no-defaults "$DB" < db/migrations/0005_compact_and_context.sql
 mariadb --no-defaults "$DB" -e "SHOW TABLES; SELECT migration_name FROM schema_migrations; SHOW CREATE TABLE pending_batches\G; SHOW CREATE TABLE compact_compacted_events\G"
 mariadb --no-defaults -e "DROP DATABASE \`$DB\`;"
 
-# 方式 B：全新环境直接使用 canonical 入口
+# 方式 B：全新环境直接使用 canonical 入口（schema.sql 内部固定
+# CREATE DATABASE / USE story_outside —— 只在确认本机没有同名真实库的
+# 全新环境使用；不确定时参照方式 A 建唯一命名的 scratch 库，把库名替换
+# 后再执行，scripts/mariadb-probes.sh 就是这么做的）
 mariadb --no-defaults < db/schema.sql
 
 # 应用后检查关键对象
@@ -155,7 +170,7 @@ mariadb --no-defaults story_outside -e "SHOW CREATE TABLE pending_batches\G; SHO
 
 ### 6.1 负面约束探针（ClickUp 08 P1.4 / P1.7）
 
-仓库提供一键脚本 `scripts/mariadb-probes.sh`，在 scratch 库上验证：0001→0004 每步重复 3 次幂等 + 额外重复 0004 + 全新 `schema.sql` 独立可建 + 下列负面约束确实拒绝非法行（用两 session 探针证明跨 session promotion 被拒）。脚本结束自动 DROP 临时库：
+仓库提供一键脚本 `scripts/mariadb-probes.sh`，在 scratch 库上验证：0001→0004 每步重复 3 次幂等 + 额外重复 0004 + 全新 `schema.sql` 独立可建 + 下列负面约束确实拒绝非法行（用两 session 探针证明跨 session promotion 被拒）。脚本只使用唯一命名的 scratch 库（进程号后缀）：验证 `schema.sql` 时把文件内的 `CREATE DATABASE story_outside` / `USE story_outside` 两条语句替换成 scratch 库名再执行，**从不创建或 DROP 固定名的 `story_outside` 库**；临时文件走 `mktemp`，EXIT trap 保证失败路径也清理 scratch 库与临时文件：
 
 ```bash
 bash scripts/mariadb-probes.sh /path/to/story-outside
@@ -182,7 +197,7 @@ node tests/schema-contract.test.mjs
 
 该测试不连接数据库、不读取任何凭据，只做文本/结构断言：
 
-- `db/migrations/0001_initial_story_outside.sql`、`db/migrations/0002_opening_cache_generation_profile.sql`、`db/migrations/0003_session_playback.sql`、`db/migrations/0004_pending_batch_lifecycle.sql` 与 `db/schema.sql` 存在，且 schema 代表 0001+0002+0003+0004 的最终形态；
+- `db/migrations/0001_initial_story_outside.sql`、`db/migrations/0002_opening_cache_generation_profile.sql`、`db/migrations/0003_session_playback.sql`、`db/migrations/0004_pending_batch_lifecycle.sql`、`db/migrations/0005_compact_and_context.sql` 与 `db/schema.sql` 存在，且 schema 代表 0001+0002+0003+0004+0005 的最终形态；
 - 必备表与必备列齐全；
 - 版本、事件序列、幂等键、opening cache generation 复合唯一键等约束存在；
 - 外键覆盖 story/version/session/event 关系，并以复合外键保证 session/version/cache 不串线；

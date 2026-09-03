@@ -5,7 +5,7 @@ import { executeToolCall, ToolValidationError } from './tools.mjs';
 
 const RUNTIME_STATE = Symbol('agentRuntimeState');
 const SENSITIVE_KEY_PATTERN = /^(password|token|access[_-]?token|secret|api[_-]?key|app[_-]?key|authorization|cookie|headers?)$/i;
-const ERROR_CODES = new Set(['pin_mismatch', 'invalid_input', 'provider_failure', 'unknown_tool', 'invalid_tool_call', 'revision_mismatch', 'duplicate_request']);
+const ERROR_CODES = new Set(['pin_mismatch', 'invalid_input', 'provider_failure', 'unknown_tool', 'invalid_tool_call', 'pending_conflict', 'revision_mismatch', 'duplicate_request']);
 
 // ClickUp 08 contract: a provider turn MAY return 1..4 ordered narrative
 // items and OPTIONALLY a single tool call as the FINAL item. The runtime
@@ -337,7 +337,17 @@ export async function runTurn(runtime, { request_id, input, expected_revision } 
       client_request_id: key ? `${key}:stage` : undefined,
     });
   } catch (error) {
-    fail('invalid_tool_call', error && error.message ? error.message : String(error));
+    const message = error && error.message ? error.message : String(error);
+    // An active-pending conflict is NOT a malformed provider payload: the
+    // provider result normalised fine, but the session still holds an
+    // unconsumed pending batch that this stage would have to overwrite.
+    // Map it to the dedicated pending_conflict code so HTTP clients can
+    // distinguish "commit / interrupt / discard the pending batch first"
+    // from "fix your provider output". The message text is unchanged —
+    // callers and tests match on /unconsumed pending/. Every other stage
+    // failure stays invalid_tool_call.
+    if (message.includes('unconsumed pending')) fail('pending_conflict', message);
+    fail('invalid_tool_call', message);
   }
   state.staged = staged;
   // The "items" we hand back to callers mirror the staged order so the

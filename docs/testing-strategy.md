@@ -119,7 +119,7 @@ importStory
 ## 5. CI 跑法（不依赖真实 API）
 
 ```bash
-cd /srv/lmdo/story-outside-work-12
+cd /path/to/story-outside   # 仓库根目录（以 package.json 所在处为准，不要硬编码机器路径）
 
 # 1. 全套测试（一条链跑完，含 Task 12 的 5 个套件与 PR #10 的 3 个 compact 套件）
 npm test

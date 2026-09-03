@@ -2,16 +2,29 @@
 # Scratch MariaDB verification for Story Outside 08 remaining P1 (issues 7 & 8).
 # - 0001→0004 applied, each migration repeated 3x to prove idempotency
 # - repeat 0004 after full chain
-# - fresh schema.sql applies standalone
+# - fresh schema.sql applies standalone: the CREATE DATABASE / USE statements
+#   inside schema.sql are rewritten to a uniquely-named scratch DB, so a
+#   pre-existing story_outside database on this machine is NEVER touched or
+#   dropped (same approach as docs/data-model.md §6 方式 A)
 # - negative probes: source='', committed_count>item_count, pending+promoted_event,
 #   cross-session promotion (two sessions), tool_call committed, item/batch mismatch
-# - drops the scratch DB at the end
+# - drops the scratch DBs at the end (and on early failure, via the EXIT trap)
 set -u
 REPO="${1:-$(pwd)}"
 cd "$REPO" || { echo "repo not found: $REPO"; exit 1; }
 
 DB="story_outside_scratch_$$"
+SCHEMA_DB="story_outside_schema_check_$$"
+ERR_LOG="$(mktemp)"
+SCHEMA_SQL="$(mktemp)"
 FAIL=0
+
+cleanup() {
+  # Never leave a scratch DB or temp file behind, even on an early exit.
+  mariadb --no-defaults -e "DROP DATABASE IF EXISTS \`$DB\`; DROP DATABASE IF EXISTS \`$SCHEMA_DB\`;" >/dev/null 2>&1
+  rm -f "$ERR_LOG" "$SCHEMA_SQL"
+}
+trap cleanup EXIT
 
 say()  { printf '%s\n' "$*"; }
 fail() { say "PROBE-FAILED: $*"; FAIL=1; }
@@ -26,14 +39,14 @@ mariadb --no-defaults -e "CREATE DATABASE \`$DB\` CHARACTER SET utf8mb4 COLLATE 
 # --- 0001 -> 0004, each migration applied 3 times (idempotency) ---
 for m in 0001_initial_story_outside 0002_opening_cache_generation_profile 0003_session_playback 0004_pending_batch_lifecycle; do
   for i in 1 2 3; do
-    if ! mariadb --no-defaults "$DB" < "db/migrations/$m.sql" 2>err.log; then
-      fail "migration $m pass $i failed: $(cat err.log)"
+    if ! mariadb --no-defaults "$DB" < "db/migrations/$m.sql" 2>"$ERR_LOG"; then
+      fail "migration $m pass $i failed: $(cat "$ERR_LOG")"
     fi
   done
 done
 
 # --- repeat 0004 once more explicitly ---
-mariadb --no-defaults "$DB" < db/migrations/0004_pending_batch_lifecycle.sql 2>err.log || fail "repeat 0004 failed: $(cat err.log)"
+mariadb --no-defaults "$DB" < db/migrations/0004_pending_batch_lifecycle.sql 2>"$ERR_LOG" || fail "repeat 0004 failed: $(cat "$ERR_LOG")"
 
 # Ledger must record exactly 4 migrations.
 LEDGER=$(mariadb --no-defaults -N -e "SELECT COUNT(*) FROM \`$DB\`.schema_migrations;")
@@ -41,14 +54,22 @@ LEDGER=$(mariadb --no-defaults -N -e "SELECT COUNT(*) FROM \`$DB\`.schema_migrat
 say "ok   ledger: 4 migrations recorded after 3x apply + repeat"
 
 # --- fresh schema.sql standalone ---
-mariadb --no-defaults < db/schema.sql 2>err.log || fail "schema.sql apply failed: $(cat err.log)"
-SCHEMA_TABLES=$(mariadb --no-defaults -N -e "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='story_outside';")
-[ "$SCHEMA_TABLES" = "10" ] || fail "schema.sql table count=$SCHEMA_TABLES (want 10)"
-say "ok   fresh schema.sql standalone (10 tables)"
-mariadb --no-defaults -e "DROP DATABASE IF EXISTS story_outside;"
+# schema.sql hardcodes CREATE DATABASE story_outside + USE story_outside.
+# Rewriting those two statements to the scratch name keeps the standalone
+# check intact without ever creating or dropping a fixed-name database.
+sed -e "s/CREATE DATABASE IF NOT EXISTS story_outside/CREATE DATABASE IF NOT EXISTS \`$SCHEMA_DB\`/" \
+    -e "s/^USE story_outside;/USE \`$SCHEMA_DB\`;/" \
+    db/schema.sql > "$SCHEMA_SQL"
+mariadb --no-defaults < "$SCHEMA_SQL" 2>"$ERR_LOG" || fail "schema.sql apply failed: $(cat "$ERR_LOG")"
+SCHEMA_TABLES=$(mariadb --no-defaults -N -e "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='$SCHEMA_DB';")
+[ "$SCHEMA_TABLES" = "12" ] || fail "schema.sql table count=$SCHEMA_TABLES (want 12)"
+SCHEMA_LEDGER=$(mariadb --no-defaults -N -e "SELECT COUNT(*) FROM \`$SCHEMA_DB\`.schema_migrations;")
+[ "$SCHEMA_LEDGER" = "5" ] || fail "schema.sql ledger count=$SCHEMA_LEDGER (want 5)"
+say "ok   fresh schema.sql standalone (12 tables, 5 migrations)"
+mariadb --no-defaults -e "DROP DATABASE \`$SCHEMA_DB\`;"
 
 # --- fixture seed (two sessions, one canonical event each) ---
-mariadb --no-defaults "$DB" <<'SQL' 2>err.log || fail "fixture seed failed: $(cat err.log)"
+mariadb --no-defaults "$DB" <<'SQL' 2>"$ERR_LOG" || fail "fixture seed failed: $(cat "$ERR_LOG")"
 INSERT INTO stories (story_uuid, slug, title, hook) VALUES
   ('00000000-0000-4000-8000-000000000001', 'probe', 'Probe', 'hook');
 INSERT INTO story_versions (version_uuid, story_id, version_no, title, hook, content_payload, roles_payload, checksum)
@@ -117,7 +138,6 @@ VALUES (1, $S2, '00000000-0000-4000-8000-00000000000d', 1, 'narrative_beat', 'pe
 echo "$OUT" | grep -qE "fk_pending_batch_items_session_batch|constraint" && say "ok   probe: item session/batch mismatch rejected" || fail "item session/batch mismatch not rejected: $OUT"
 
 mariadb --no-defaults -e "DROP DATABASE \`$DB\`;"
-rm -f err.log
 if [ "$FAIL" = "0" ]; then
   say "all MariaDB scratch probes passed"
 else
