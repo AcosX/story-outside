@@ -316,6 +316,120 @@ async function main() {
       check('GET /replay 200 after narrative batch', replayRes.status === 200);
       check('GET /replay still has events after narrative batch', replayRes.body.events.length > 0);
     }
+
+    // ----- 8) finish envelope survives a final commit WITHOUT client_request_id -----
+    {
+      // A caller that omits client_request_id leaves no trace in the
+      // idempotency map, and the final commit clears session.pending.
+      // The session-owned finish envelope must keep /ending reachable.
+      const sessionUuid = '00000000-0000-4000-8000-110000000008';
+      const created = await postJson(baseUrl, '/api/dev/sessions', {
+        session_uuid: sessionUuid,
+        story_uuid: fixture.story_uuid,
+        story_version_uuid: fixture.story_version_uuid,
+        user_ref: 'ending-service-test-8',
+        role_id: 'stranger',
+        model: 'mock-11',
+        prompt: '11 prompt',
+        generation_profile: generationProfile,
+      });
+      check('createSession 8 returned 200', created.status === 200);
+      // 'finish' → demo provider stages a 1-item batch + finish_story.
+      const stagedRes = await postJson(baseUrl, `/api/dev/sessions/${sessionUuid}/generate`, {
+        input: { text: 'finish' },
+        expected_revision: 0,
+      });
+      check('generate 8 (finish) returned 200', stagedRes.status === 200 && Array.isArray(stagedRes.body.events) && stagedRes.body.events.length === 1);
+      const finalCommit = await postJson(baseUrl, `/api/dev/sessions/${sessionUuid}/narrative-events`, {
+        pending_id: stagedRes.body.pending_id,
+        sequence: 0,
+        expected_revision: stagedRes.body.revision,
+        // NO client_request_id here — this is the regression under test.
+      });
+      check('final commit without client_request_id returns 200', finalCommit.status === 200);
+      check('final commit surfaces finish_story pending_tool_call', finalCommit.body.pending_tool_call && finalCommit.body.pending_tool_call.name === 'finish_story');
+      const endingRes = await getJson(baseUrl, `/api/dev/sessions/${sessionUuid}/ending`);
+      check('GET /ending returns 200 after a finish commit WITHOUT client_request_id', endingRes.status === 200);
+      check('GET /ending 8 has ending_title', endingRes.status === 200 && typeof endingRes.body.ending_title === 'string' && endingRes.body.ending_title.length > 0);
+    }
+
+    // ----- 9) first_deviation is anchored on the opening events actually committed -----
+    {
+      // The player interrupts mid-opening (2 of the 4 cache sentences are
+      // committed), then drives two narrative beats before finishing. The
+      // first deviation is the FIRST narrative beat (event_seq 4) — not
+      // the cache-length offset (which pointed at event_seq 5).
+      const sessionUuid = '00000000-0000-4000-8000-110000000009';
+      const created = await postJson(baseUrl, '/api/dev/sessions', {
+        session_uuid: sessionUuid,
+        story_uuid: fixture.story_uuid,
+        story_version_uuid: fixture.story_version_uuid,
+        user_ref: 'ending-service-test-9',
+        role_id: 'stranger',
+        model: 'mock-11',
+        prompt: '11 prompt',
+        generation_profile: generationProfile,
+      });
+      check('createSession 9 returned 200', created.status === 200);
+      const cacheEvents = cache.content_payload.events;
+      let revision = 0;
+      for (let i = 0; i < 2; i += 1) {
+        const commitRes = await postJson(baseUrl, `/api/dev/sessions/${sessionUuid}/opening-events`, {
+          cache_uuid: cache.cache_uuid,
+          event: { ...cacheEvents[i], displayed: true },
+          client_request_id: `ending-9-open-${sessionUuid}-${i}`,
+          expected_revision: revision,
+        });
+        if (commitRes.status !== 200) throw new Error(`opening commit ${i} failed: ${commitRes.status}`);
+        revision = commitRes.body.revision;
+      }
+      const interrupted = await postJson(baseUrl, `/api/dev/sessions/${sessionUuid}/interrupt`, {
+        text: '开场一半我就想改剧情',
+        client_request_id: `ending-9-interrupt-${sessionUuid}`,
+        expected_revision: revision,
+      });
+      check('interrupt mid-opening returned 200', interrupted.status === 200 && interrupted.body.state === 'realtime');
+      revision = interrupted.body.revision;
+      // Two narrative beats after the interrupt (two 1-item batches).
+      for (let turn = 0; turn < 2; turn += 1) {
+        const stagedRes = await postJson(baseUrl, `/api/dev/sessions/${sessionUuid}/generate`, {
+          input: { text: 'short' },
+          expected_revision: revision,
+          request_id: `ending-9-turn-${sessionUuid}-${turn}`,
+        });
+        if (stagedRes.status !== 200) throw new Error(`turn ${turn} generate failed: ${stagedRes.status}`);
+        const commitRes = await postJson(baseUrl, `/api/dev/sessions/${sessionUuid}/narrative-events`, {
+          pending_id: stagedRes.body.pending_id,
+          sequence: 0,
+          expected_revision: stagedRes.body.revision,
+          client_request_id: `ending-9-commit-${sessionUuid}-${turn}`,
+        });
+        if (commitRes.status !== 200) throw new Error(`turn ${turn} commit failed: ${commitRes.status}`);
+        revision = commitRes.body.revision;
+      }
+      // Finish the story (1-item batch + finish_story, final commit
+      // without client_request_id — also exercises scenario 8's path).
+      const stagedRes = await postJson(baseUrl, `/api/dev/sessions/${sessionUuid}/generate`, {
+        input: { text: 'finish' },
+        expected_revision: revision,
+        request_id: `ending-9-finish-${sessionUuid}`,
+      });
+      if (stagedRes.status !== 200) throw new Error(`finish generate failed: ${stagedRes.status}`);
+      const finalCommit = await postJson(baseUrl, `/api/dev/sessions/${sessionUuid}/narrative-events`, {
+        pending_id: stagedRes.body.pending_id,
+        sequence: 0,
+        expected_revision: stagedRes.body.revision,
+      });
+      check('finish commit 9 returned 200', finalCommit.status === 200);
+      const endingRes = await getJson(baseUrl, `/api/dev/sessions/${sessionUuid}/ending`);
+      check('GET /ending 9 returns 200', endingRes.status === 200);
+      const deviation = endingRes.body.first_deviation;
+      check('GET /ending 9 has first_deviation', deviation && typeof deviation === 'object');
+      check('first_deviation anchors on the first post-opening narrative beat (event_seq 4)', deviation && deviation.event_seq === 4,
+        `got ${deviation && deviation.event_seq}`);
+      check('first_deviation after_opening_sequence reflects the 2 committed opening beats', deviation && deviation.after_opening_sequence === 1,
+        `got ${deviation && deviation.after_opening_sequence}`);
+    }
   } finally {
     server.close();
   }

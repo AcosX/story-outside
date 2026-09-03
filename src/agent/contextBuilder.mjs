@@ -71,7 +71,12 @@ function isEventProtected(event) {
  *   2. Take the prefix *up to* (compacted_through_seq + 1) — i.e. everything
  *      that has NOT yet been compact is eligible.
  *   3. Never fold any event whose event_type is in
- *      EVENT_TYPES_THAT_NEVER_COMPACT. We stop just before such an event.
+ *      EVENT_TYPES_THAT_NEVER_COMPACT. Folding STOPS at the first such
+ *      event: the protected event itself and everything after it stays out
+ *      of the summary (it remains visible in canonical history — folding
+ *      past an unresolved choice or a recent player input would both
+ *      misorder the summary and make the protected event silently
+ *      disappear from the compact view).
  *   4. Always keep at least KEPT_RECENT_MIN recent committed events
  *      verbatim, so the provider can still see the latest voice.
  *   5. Returned array preserves canonical order.
@@ -112,17 +117,20 @@ export function selectCompactWindow(canonicalHistory, options = {}) {
   // live on session.context_compact and folding them again would double-count).
   const eligiblePool = compactPool.filter((event) => event.event_seq > alreadyCompactedThrough);
 
-  // Walk through eligible pool in order; stop at the first protected event.
+  // Walk through eligible pool in order; STOP at the first protected event.
+  // The protected event and everything after it stays un-folded (kept
+  // verbatim in canonical history instead of vanishing into the summary).
   const selected = [];
   let skippedProtected = 0;
   let lastSelectedSeq = alreadyCompactedThrough;
   for (const event of eligiblePool) {
     if (isEventProtected(event)) {
-      // We do NOT compact protected events; leave them to be retained
-      // verbatim (they will end up in kept_recent anyway once enough events
-      // accumulate, or stay in canonical history in the meantime).
-      skippedProtected += 1;
-      continue;
+      // Folding stops here: we do NOT compact this event, and we do NOT
+      // fold anything after it either — the summary must never overtake an
+      // unresolved choice / recent player input. The span between the fold
+      // point and the recent tail stays raw (visible) in canonical history.
+      skippedProtected = 1;
+      break;
     }
     selected.push(event);
     lastSelectedSeq = event.event_seq;
@@ -382,7 +390,24 @@ export function assembleContext(args) {
     kept_recent: keptRecent,
   });
   const summaryPayload = buildCompactSummary(window.selected);
-  const summaryText = renderCompactSummary(summaryPayload);
+  const windowText = renderCompactSummary(summaryPayload);
+  // Merge contract: the PREVIOUS summary is never discarded. The old
+  // summary text comes first, the newly folded window facts are appended
+  // after it — incremental compact EXTENDS the summary instead of
+  // replacing it. When nothing new was foldable (e.g. the window stopped
+  // at a protected event) the previous summary is carried over verbatim
+  // and the previous payload (when present) stays authoritative.
+  const previousText = existing && typeof existing.summary_text === 'string'
+    ? existing.summary_text.trim()
+    : '';
+  const nothingNewFolded = window.selected.length === 0;
+  const mergedPayload = nothingNewFolded
+    && existing && existing.summary_payload && typeof existing.summary_payload === 'object'
+    ? existing.summary_payload
+    : summaryPayload;
+  const summaryText = previousText.length > 0
+    ? (nothingNewFolded ? previousText : `${previousText}\n${windowText}`)
+    : windowText;
   const assembled = {
     compact_text: summaryText,
     compact_through_seq: window.next_through_seq,
@@ -401,7 +426,7 @@ export function assembleContext(args) {
     canonical_history: clone(history),
     input: clone(input),
     envelope: clone(envelope),
-    summary_payload: Object.freeze(summaryPayload),
+    summary_payload: Object.freeze(mergedPayload),
     tokens: Object.freeze({ window: estimator.contextWindow(), threshold: estimator.compactThreshold(), estimated }),
     decision: 'compact',
     folded_event_count: window.selected.length,

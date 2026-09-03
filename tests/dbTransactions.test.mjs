@@ -29,16 +29,17 @@ import {
   createSeededRepository,
 } from '../src/stories/fixture.mjs';
 import {
-  defaultGenerationProfile,
   ensureOpeningCache,
 } from '../src/stories/storyService.mjs';
 import {
+  commitNarrativeEvent,
   commitOpeningEvent,
   createSession,
   getSession,
   interruptWithPlayerInput,
   listSessionEvents,
   recoverSession,
+  stageNarrativeBatch,
 } from '../src/stories/sessionService.mjs';
 
 import { CAFE_RAIN_FIXTURE } from './fixtures/seed-stories/cafe-rain.mjs';
@@ -337,6 +338,121 @@ async function run() {
     // sessions — recovery never pollutes cross-session state.
     assert.equal(repository.findOpeningCacheByUuid(cache.cache_uuid).status, 'valid');
   });
+
+  await test('6. client_request_id is globally unique across sessions (uq_session_events_client_request mirror)', async () => {
+    // The SQL unique key on session_events.client_request_id is GLOBAL —
+    // not scoped per session. The in-memory mirror must fail closed the
+    // same way when a second session reuses an id that already produced a
+    // canonical event.
+    const sessionA = '00000000-0000-4000-8000-0000000a0006';
+    const sessionB = '00000000-0000-4000-8000-0000000a0007';
+    const { repository, cache, profile } = await sessionFixture({ session_uuid: sessionA });
+    // Second session on the SAME repository (same "database").
+    createSession({
+      repository,
+      session_uuid: sessionB,
+      story_uuid: CAFE_RAIN_FIXTURE.story_uuid,
+      story_version_uuid: CAFE_RAIN_FIXTURE.story_version_uuid,
+      user_ref: 'u-tx-b',
+      role_id: 'stranger',
+      model: 'gpt-tx',
+      prompt: 'fixed prompt',
+      generation_profile: profile,
+    });
+    const events = cache.content_payload.events;
+    const first = commitOpeningEvent({
+      repository,
+      session_uuid: sessionA,
+      cache_uuid: cache.cache_uuid,
+      event: shown(events[0]),
+      client_request_id: 'tx-shared-open-1',
+      expected_revision: 0,
+    });
+    // Same session + same payload: still a plain idempotent replay (no new
+    // event, no uniqueness violation).
+    const replay = commitOpeningEvent({
+      repository,
+      session_uuid: sessionA,
+      cache_uuid: cache.cache_uuid,
+      event: shown(events[0]),
+      client_request_id: 'tx-shared-open-1',
+      expected_revision: 0,
+    });
+    assert.deepEqual(replay, first);
+    // A DIFFERENT session reusing the id fails closed — even with an
+    // identical payload — mirroring the global unique key.
+    assert.throws(
+      () =>
+        commitOpeningEvent({
+          repository,
+          session_uuid: sessionB,
+          cache_uuid: cache.cache_uuid,
+          event: shown(events[0]),
+          client_request_id: 'tx-shared-open-1',
+          expected_revision: 0,
+        }),
+      /another session/,
+    );
+    // The failed cross-session commit appended nothing anywhere.
+    assert.equal(listSessionEvents({ repository, session_uuid: sessionA }).length, 1);
+    assert.equal(listSessionEvents({ repository, session_uuid: sessionB }).length, 0);
+    assert.equal(getSession({ repository, session_uuid: sessionB }).revision, 0);
+  });
+
+  await test('7. final-commit retry with the same client_request_id replays the prior result (response-lost regression)', async () => {
+    // Regression lock for the ClickUp 08 P1.5 final-commit idempotency: the
+    // last commit clears session.pending; a retry of that same commit
+    // (client never got the response) must return the ORIGINAL result
+    // instead of failing the pending_id check with a 400.
+    const session_uuid = '00000000-0000-4000-8000-0000000a0008';
+    const { repository } = await sessionFixture({ session_uuid });
+    const staged = stageNarrativeBatch({
+      repository,
+      session_uuid,
+      items: [{ type: 'narration', text: '唯一的剧情句' }],
+      client_request_id: 'tx-stage-final',
+      expected_revision: 0,
+    });
+    const commit = commitNarrativeEvent({
+      repository,
+      session_uuid,
+      pending_id: staged.pending_id,
+      sequence: 0,
+      expected_revision: 0,
+      client_request_id: 'tx-final-commit',
+    });
+    assert.equal(commit.pending_remaining, 0);
+    assert.equal(commit.pending_tool_call, null);
+    // Retry AFTER the pending was cleared: same client_request_id, same
+    // payload → replay the prior result verbatim.
+    const retry = commitNarrativeEvent({
+      repository,
+      session_uuid,
+      pending_id: staged.pending_id,
+      sequence: 0,
+      expected_revision: 0,
+      client_request_id: 'tx-final-commit',
+    });
+    assert.deepEqual(retry, commit);
+    assert.equal(retry.event.event_id, commit.event.event_id);
+    // No duplicate append.
+    assert.equal(listSessionEvents({ repository, session_uuid }).length, 1);
+    assert.equal(getSession({ repository, session_uuid }).revision, 1);
+    // Same id with a different payload still fails closed.
+    assert.throws(
+      () =>
+        commitNarrativeEvent({
+          repository,
+          session_uuid,
+          pending_id: staged.pending_id,
+          sequence: 1,
+          expected_revision: 1,
+          client_request_id: 'tx-final-commit',
+        }),
+      /different request/,
+    );
+    assert.equal(listSessionEvents({ repository, session_uuid }).length, 1);
+  });
 }
 
 run()
@@ -351,7 +467,3 @@ run()
     console.error(`\nunexpected error: ${err && err.message ? err.message : err}`);
     process.exit(1);
   });
-
-// Re-export the default profile helper for any suite that wants to
-// import via this file rather than reach into storyService directly.
-export { defaultGenerationProfile };

@@ -20,17 +20,12 @@ import {
   interruptWithPlayerInput,
   commitOpeningEvent,
   listSessionEvents,
-} from '../src/stories/index.mjs';
-
-// compact API is exported from sessionService.mjs but not yet re-exported
-// from src/stories/index.mjs (ClickUp 10 only added the new functions to
-// sessionService; index.mjs surface is the next integration point).
-import {
+  // ClickUp 10 compact API — re-exported from the application-layer surface.
   recordCompact,
   recordCompactFailure,
   getSessionCompact,
   rebuildCompactFromHistory,
-} from '../src/stories/sessionService.mjs';
+} from '../src/stories/index.mjs';
 
 import { assembleContext } from '../src/agent/contextBuilder.mjs';
 import { createTokenEstimator } from '../src/agent/tokenEstimator.mjs';
@@ -298,6 +293,159 @@ test('rebuildCompactFromHistory: works on session with committed opening events'
   assert.ok(rebuilt.compacted_through_seq >= 1);
 });
 
+test('rebuildCompactFromHistory: empty history records a skipped attempt instead of throwing', async () => {
+  const { repository } = await fixture();
+  // No compact, no history: the old implementation passed an empty
+  // summary_text into recordCompact and blew up on assertCompactInput.
+  const result = rebuildCompactFromHistory({
+    repository,
+    session_uuid: SESSION_UUID,
+    builder: () => ({ summary_text: 'x', summary_payload: {}, folded_event_seqs: [] }),
+  });
+  assert.equal(result.last_compact_status, 'skipped');
+  assert.equal(result.last_compact_error, null);
+  // No compact snapshot was written (the cursor stays unset).
+  assert.equal(result.compacted_through_seq, null);
+  assert.equal(result.context_compact_text, null);
+  const session = _peekRawSession(repository);
+  assert.equal(session.compact_history.length, 1);
+  assert.equal(session.compact_history[0].status, 'skipped');
+});
+
+test('rebuildCompactFromHistory: existing compact + no new events records a skipped attempt and keeps the snapshot', async () => {
+  const { repository, cache } = await fixture();
+  await commitFirstNEvents({ repository, cache, n: 3 });
+  const first = rebuildCompactFromHistory({
+    repository,
+    session_uuid: SESSION_UUID,
+    kept_recent: 0,
+    builder: (events) => ({
+      summary_text: `folded ${events.length} events`,
+      summary_payload: { folded_event_seqs: events.map((e) => e.event_seq) },
+      folded_event_seqs: events.map((e) => e.event_seq),
+      token_estimate: 100,
+      context_window: 8_000,
+      safety_ratio: 0.10,
+      reserved_completion_tokens: 1024,
+      schema_version: 1,
+      prompt_version: 1,
+    }),
+  });
+  assert.equal(first.last_compact_status, 'compacted');
+  assert.equal(first.compacted_through_seq, 3);
+  // Re-run with nothing new to fold: the rebuilt summary would NOT
+  // strictly advance compacted_through_seq, so a 'skipped' attempt is
+  // recorded and the previous compact snapshot stays intact — no throw.
+  const second = rebuildCompactFromHistory({
+    repository,
+    session_uuid: SESSION_UUID,
+    kept_recent: 0,
+    builder: (events) => ({
+      summary_text: `folded ${events.length} events again`,
+      summary_payload: { folded_event_seqs: events.map((e) => e.event_seq) },
+      folded_event_seqs: events.map((e) => e.event_seq),
+      token_estimate: 100,
+      context_window: 8_000,
+      safety_ratio: 0.10,
+      reserved_completion_tokens: 1024,
+      schema_version: 1,
+      prompt_version: 1,
+    }),
+  });
+  assert.equal(second.last_compact_status, 'skipped');
+  assert.equal(second.last_compact_error, null);
+  assert.equal(second.compacted_through_seq, 3, 'cursor must not move');
+  assert.equal(second.context_compact_text, 'folded 3 events', 'previous summary must stay intact');
+  const session = _peekRawSession(repository);
+  assert.equal(session.compact_history.length, 2);
+  assert.deepEqual(session.compact_history.map((record) => record.status), ['compacted', 'skipped']);
+});
+
+test('rebuildCompactFromHistory: full recompute folds the whole prefix, not just the post-cursor delta', async () => {
+  const { repository, cache } = await fixture();
+  await commitFirstNEvents({ repository, cache, n: 3 });
+  // Fold everything so far (kept_recent 0 → the whole history is prefix).
+  rebuildCompactFromHistory({
+    repository,
+    session_uuid: SESSION_UUID,
+    kept_recent: 0,
+    builder: (events) => ({
+      summary_text: 'v1',
+      summary_payload: { folded_event_seqs: events.map((e) => e.event_seq) },
+      folded_event_seqs: events.map((e) => e.event_seq),
+    }),
+  });
+  // One more canonical event lands after the compact.
+  const events = cache.content_payload.events;
+  commitOpeningEvent({
+    repository,
+    session_uuid: SESSION_UUID,
+    cache_uuid: cache.cache_uuid,
+    event: { ...events[3], displayed: true },
+    client_request_id: 'rebuild-full-4',
+    expected_revision: 3,
+  });
+  // Force-recompute: the builder must see ALL 4 events (the full prefix),
+  // not only the delta after compacted_through_seq=3.
+  let seen = null;
+  const rebuilt = rebuildCompactFromHistory({
+    repository,
+    session_uuid: SESSION_UUID,
+    kept_recent: 0,
+    builder: (prefixEvents) => {
+      seen = prefixEvents.map((e) => e.event_seq);
+      return {
+        summary_text: 'v2 full recompute',
+        summary_payload: { folded_event_seqs: seen },
+        folded_event_seqs: seen,
+        token_estimate: 200,
+        context_window: 8_000,
+        safety_ratio: 0.10,
+        reserved_completion_tokens: 1024,
+        schema_version: 2,
+        prompt_version: 2,
+      };
+    },
+  });
+  assert.deepEqual(seen, [1, 2, 3, 4], 'builder must receive the full prefix including already-compacted events');
+  assert.equal(rebuilt.last_compact_status, 'compacted');
+  assert.equal(rebuilt.compacted_through_seq, 4);
+  assert.equal(rebuilt.compacted_event_count, 4);
+  assert.equal(rebuilt.context_compact_text, 'v2 full recompute');
+});
+
+test('recordCompact: truncates last_compact_error to the VARCHAR(500) schema bound', async () => {
+  const { repository } = await fixture();
+  const longError = 'x'.repeat(900);
+  const result = recordCompact({
+    repository,
+    session_uuid: SESSION_UUID,
+    status: 'failed',
+    summary_text: 'unused',
+    summary_payload: {},
+    through_seq: 1,
+    folded_event_seqs: [1],
+    token_estimate: 10,
+    context_window: 8_000,
+    safety_ratio: 0.10,
+    reserved_completion_tokens: 1024,
+    schema_version: 1,
+    prompt_version: 1,
+    error_code: 'estimator_boom',
+    error_message: longError,
+  });
+  assert.equal(result.last_compact_status, 'failed');
+  assert.equal(result.last_compact_error.length, 500, 'must match last_compact_error VARCHAR(500)');
+  assert.ok(longError.startsWith(result.last_compact_error));
+  const failed = recordCompactFailure({
+    repository,
+    session_uuid: SESSION_UUID,
+    error_code: 'estimator_boom',
+    error_message: longError,
+  });
+  assert.equal(failed.last_compact_error.length, 500);
+});
+
 test('assembleContext + recordCompact integration: roundtrip usable', async () => {
   const { repository, cache } = await fixture();
   await commitFirstNEvents({ repository, cache, n: 3 });
@@ -387,6 +535,14 @@ test('interrupt (opening state) does not block subsequent compact', async () => 
   assert.equal(result.last_compact_status, 'compacted');
 });
 
+// Read the raw session row (same access pattern as tests/sessionService.test.mjs)
+// for assertions on the internal compact audit log.
+function _peekRawSession(repository) {
+  const session = repository.sessionState.sessions.get(SESSION_UUID);
+  if (!session) throw new Error('agentCompact fixture: session missing');
+  return session;
+}
+
 test('token estimator: threshold math is correct', () => {
   const est = createTokenEstimator({ model: 'openai/gpt-4o' });
   // 128000 * 0.9 = 115200, - 1024 = 114176
@@ -394,7 +550,3 @@ test('token estimator: threshold math is correct', () => {
   assert.equal(est.contextWindow(), 128_000);
   assert.equal(est.reservedCompletionTokens(), 1024);
 });
-
-function GetSession(_repository) {
-  return getSession({ repository: _repository, session_uuid: SESSION_UUID });
-}

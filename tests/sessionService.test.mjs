@@ -7,10 +7,14 @@ import {
   createSession,
   defaultGenerationProfile,
   ensureOpeningCache,
+  discardPendingTail,
   getSession,
   interruptWithPlayerInput,
   listSessionEvents,
+  lookupTurnRequest,
   recoverSession,
+  registerTurnRequest,
+  stageNarrativeBatch,
 } from '../src/stories/index.mjs';
 
 const SESSION = '00000000-0000-4000-8000-000000000101';
@@ -222,6 +226,63 @@ async function run() {
   assert.deepEqual(recovered.history, listSessionEvents({ repository, session_uuid: SESSION }));
   assert.equal(recovered.generation_profile.cache_uuid, cache.cache_uuid);
   assert.equal(repository.findOpeningCacheByUuid(cache.cache_uuid).status, 'valid');
+
+  // ---- Idempotency-window cap: requestIds / turnRequests are bounded per
+  // session (1000 entries, insertion-order eviction). Beyond the window a
+  // request id is no longer REPLAYED — the call re-runs through the normal
+  // validation gauntlet (fail-closed), so a stale replay can never
+  // silently re-append content.
+  const capSession = '00000000-0000-4000-8000-000000000106';
+  createSession({
+    repository, session_uuid: capSession, story_uuid: story.story_uuid,
+    story_version_uuid: story.story_version_uuid, user_ref: 'u-cap', role_id: 'stranger',
+    model: 'test-model', prompt: 'fixed prompt', generation_profile: profile,
+  });
+  const CAP = 1000;
+  let lastStaged = null;
+  for (let i = 0; i <= CAP; i += 1) {
+    // Each distinct batch replaces the pending slot, so the previous
+    // speculative tail is dropped first (a different payload while an
+    // unconsumed pending exists would fail closed before reaching the
+    // idempotency store).
+    discardPendingTail({ repository, session_uuid: capSession });
+    lastStaged = stageNarrativeBatch({
+      repository, session_uuid: capSession,
+      items: [{ type: 'narration', text: `cap batch ${i}` }],
+      client_request_id: `cap-${i}`,
+    });
+  }
+  const capRawSession = repository.sessionState.sessions.get(capSession);
+  assert.equal(capRawSession.requestIds.size, CAP, 'requestIds capped at 1000 entries');
+  // The newest id is still inside the window: same payload replays the
+  // prior result (same pending_id, no re-stage).
+  const newestReplay = stageNarrativeBatch({
+    repository, session_uuid: capSession,
+    items: [{ type: 'narration', text: `cap batch ${CAP}` }],
+    client_request_id: `cap-${CAP}`,
+  });
+  assert.equal(newestReplay.pending_id, lastStaged.pending_id);
+  // The oldest id was evicted: it is NOT replayed. The retry re-processes
+  // and hits the active-pending guard (different payload than the batch
+  // staged by cap-1000) — fail-closed, not a stale cached result.
+  assert.throws(() => stageNarrativeBatch({
+    repository, session_uuid: capSession,
+    items: [{ type: 'narration', text: 'cap batch 0' }],
+    client_request_id: 'cap-0',
+  }), /unconsumed pending/);
+  // turnRequests share the same bound.
+  for (let i = 0; i <= CAP; i += 1) {
+    registerTurnRequest({
+      repository, session_uuid: capSession,
+      request_id: `turn-${i}`, fingerprint: 'fp-cap', result: { turn_id: `t-${i}` },
+    });
+  }
+  assert.equal(capRawSession.turnRequests.size, CAP, 'turnRequests capped at 1000 entries');
+  assert.equal(lookupTurnRequest({ repository, session_uuid: capSession, request_id: 'turn-0' }), null);
+  const newestTurn = lookupTurnRequest({ repository, session_uuid: capSession, request_id: `turn-${CAP}` });
+  assert.equal(newestTurn.fingerprint, 'fp-cap');
+  assert.deepEqual(newestTurn.result, { turn_id: `t-${CAP}` });
+
   console.log('sessionService tests: ok');
 }
 

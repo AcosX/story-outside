@@ -98,7 +98,19 @@ export function dropPendingAfterLegacyInterrupt(input) {
   return sessionServiceDiscardPendingTail(input);
 }
 
+/**
+ * List the session uuids that currently hold an ACTIVE (un-consumed)
+ * pending batch. Despite the name, earlier revisions returned every
+ * session uuid; that was misleading (callers used it to resume players
+ * stuck on an un-drained batch) and it now filters to sessions where
+ * session.pending is set, matching the listPending* contract.
+ */
 export function listPendingSessionUuids(repository) {
   if (!repository) throw new Error('listPendingSessionUuids: repository required');
-  return [...repositoryState(repository).sessions.keys()];
+  const state = repositoryState(repository);
+  const uuids = [];
+  for (const [session_uuid, session] of state.sessions) {
+    if (session && session.pending) uuids.push(session_uuid);
+  }
+  return uuids;
 }

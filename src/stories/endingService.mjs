@@ -59,17 +59,28 @@ function sessionFor(repository, session_uuid) {
 }
 
 /**
- * Locate the finish_story tool envelope in the session. The envelope is
- * stored on session.pending.tool_call at the moment the FINAL narrative
- * commit lands; the service also reads it from session.requestIds so a
- * process restart that lost the in-memory pending still surfaces the
- * last committed envelope via the idempotency store.
+ * Locate the finish_story tool envelope in the session. Sources, in order:
+ *
+ *   1. session.finish_envelope — the DIRECT reference the canonical store
+ *      (sessionService.commitNarrativeEvent) keeps on the session when the
+ *      FINAL narrative commit surfaces a finish_story tool call. This is
+ *      the primary source: it exists even when the caller committed without
+ *      a client_request_id (a replay-map miss would otherwise make the
+ *      envelope unreachable and GET /ending 404 forever).
+ *   2. session.pending.tool_call — a finish batch that is still being
+ *      committed (some items not yet drained).
+ *   3. session.requestIds scan — last-resort fallback that replays the most
+ *      recent committed envelope from the idempotency store.
  *
  * Returns the tool envelope payload (the normalized args passed to
  * finish_story by the runtime) plus the kind, or null when the session
  * has not yet committed a finish_story.
  */
 function findFinishStoryToolCall(session) {
+  const direct = session.finish_envelope;
+  if (direct && direct.tool_call && direct.tool_call.name === 'finish_story') {
+    return direct.tool_call;
+  }
   const pendingToolCall = session.pending && session.pending.tool_call;
   if (pendingToolCall && pendingToolCall.name === 'finish_story') {
     return pendingToolCall;
@@ -108,17 +119,29 @@ function deriveCategory({ story, version, cache }) {
  * event that is NOT in the opening cache's event stream AND was authored
  * AFTER the last opening cache event had been consumed.
  *
+ * The offset into canonical history is the number of story_opening events
+ * that were ACTUALLY committed to this session — NOT the full length of
+ * the opening cache. When the player interrupts mid-opening, only part of
+ * the cache is committed, and using the cache length would skip real
+ * narrative events (and report the wrong sentence as the first deviation).
+ *
  * The output is intentionally a structured diff hint (no full-text
  * comparison): the UI highlights this in the ending summary and as the
  * red anchor in the comparison view.
  */
 function findFirstDeviation({ canonicalHistory, openingEvents }) {
   if (!Array.isArray(canonicalHistory) || canonicalHistory.length === 0) return null;
-  const openingLength = Array.isArray(openingEvents) ? openingEvents.length : 0;
+  // Count how many opening-cache events actually reached canonical history
+  // (they are always the head of the stream: opening commits stop the
+  // moment the session is interrupted).
+  const committedOpeningCount = canonicalHistory.filter(
+    (ev) => ev && ev.event_type === 'story_opening',
+  ).length;
+  const cacheLength = Array.isArray(openingEvents) ? openingEvents.length : 0;
   // The first N canonical events correspond to opening cache events
   // (story_opening). The (N+1)th canonical event that is NOT a
   // player_input is the first author-driven deviation.
-  for (let i = openingLength; i < canonicalHistory.length; i += 1) {
+  for (let i = committedOpeningCount; i < canonicalHistory.length; i += 1) {
     const ev = canonicalHistory[i];
     if (!ev || typeof ev !== 'object') continue;
     if (ev.event_type === 'player_input') continue; // player-driven; ignore
@@ -131,8 +154,9 @@ function findFirstDeviation({ canonicalHistory, openingEvents }) {
         speaker: payload.speaker || null,
         occurred_at: ev.occurred_at,
         // For UI display: a short label comparing to the next opening
-        // beat ("after beat X").
-        after_opening_sequence: Math.max(0, openingLength - 1),
+        // beat ("after beat X"). Anchored on the opening events actually
+        // committed to this session, capped by the cache length.
+        after_opening_sequence: Math.max(0, Math.min(committedOpeningCount, cacheLength) - 1),
       };
     }
   }

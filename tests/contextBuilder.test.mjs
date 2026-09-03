@@ -113,14 +113,54 @@ test('selectCompactWindow: ask_player_choice stops compact window', () => {
     makeEvent({ event_seq: 7, event_type: 'narrative', text: 'after choice' }),
   ];
   const result = selectCompactWindow(events, { kept_recent: 2 });
-  // Compact stops before seq 5
+  // Compact stops AT the first protected event (seq 5): 1..4 folded, the
+  // protected event itself and everything after it stays un-folded.
   assert.equal(result.next_through_seq, 4);
+  assert.deepEqual(result.selected.map((e) => e.event_seq), [1, 2, 3, 4]);
   // Recent = last 2 (seq 6, 7)
   assert.equal(result.kept_recent.length, 2);
   assert.equal(result.kept_recent[0].event_seq, 6);
   assert.equal(result.kept_recent[1].event_seq, 7);
-  // skipped_protected counts the protected events we passed over
-  assert.ok(result.skipped_protected >= 1);
+  // Folding stopped at exactly one protected event (no skip-over).
+  assert.equal(result.skipped_protected, 1);
+});
+
+test('selectCompactWindow: protected event in the MIDDLE of the pool stops folding after it', () => {
+  // 10 events, kept_recent 3 → recent tail = [8,9,10], pool = [1..7].
+  // The protected player_input sits at seq 5, in the middle of the pool.
+  const events = [];
+  for (let seq = 1; seq <= 10; seq += 1) {
+    events.push(seq === 5
+      ? makeEvent({ event_seq: seq, event_type: 'player_input', text: 'player speaks' })
+      : makeEvent({ event_seq: seq, event_type: 'narrative', text: `beat ${seq}` }));
+  }
+  const result = selectCompactWindow(events, { kept_recent: 3 });
+  assert.deepEqual(result.selected.map((e) => e.event_seq), [1, 2, 3, 4]);
+  assert.equal(result.next_through_seq, 4);
+  // Events 6 and 7 come AFTER the protected event: they are NOT folded
+  // (they stay raw in canonical history instead of silently vanishing).
+  assert.equal(result.selected.some((e) => e.event_seq === 6), false);
+  assert.equal(result.selected.some((e) => e.event_seq === 7), false);
+  assert.equal(result.kept_recent.length, 3);
+  assert.equal(result.kept_recent[0].event_seq, 8);
+  assert.equal(result.skipped_protected, 1);
+});
+
+test('selectCompactWindow: protected event at the head of the pool folds nothing', () => {
+  const events = [
+    makeEvent({ event_seq: 1, event_type: 'narrative', text: 'a' }),
+    makeEvent({ event_seq: 2, event_type: 'ask_player_choice' }),
+    makeEvent({ event_seq: 3, event_type: 'narrative', text: 'b' }),
+    makeEvent({ event_seq: 4, event_type: 'narrative', text: 'c' }),
+    makeEvent({ event_seq: 5, event_type: 'narrative', text: 'd' }),
+  ];
+  // kept_recent 2 → tail [4,5], pool [1..3], compacted through 1 → the
+  // first eligible event IS the protected choice (seq 2).
+  const result = selectCompactWindow(events, { kept_recent: 2, compacted_through_seq: 1 });
+  assert.equal(result.selected.length, 0);
+  assert.equal(result.next_through_seq, 1);
+  assert.equal(result.skipped_protected, 1);
+  assert.equal(result.kept_recent[0].event_seq, 4);
 });
 
 test('selectCompactWindow: respects already-compacted compacted_through_seq', () => {
@@ -267,6 +307,72 @@ test('assembleContext: existingCompact is used for the no-compact path', () => {
   assert.equal(result.decision, 'no_compact');
   assert.equal(result.compact_text, 'prior summary here');
   assert.equal(result.compact_through_seq, 1);
+});
+
+test('assembleContext: compact path MERGES the existing summary (old first, new facts appended)', () => {
+  const events = Array.from({ length: 20 }, (_, i) =>
+    makeEvent({ event_seq: i + 1, event_type: 'narrative_beat', text: `old beat ${i + 1}` }),
+  );
+  const estimator = {
+    estimate: () => 999_999, // always over threshold → compact path
+    contextWindow: () => 128_000,
+    compactThreshold: () => 100_000,
+  };
+  const result = assembleContext({
+    estimator,
+    canonicalHistory: events,
+    existingCompact: {
+      summary_text: '旧摘要：此前已折叠第 1-2 句。',
+      summary_payload: { sections: { facts: ['旧事实'] }, event_count: 2 },
+      through_seq: 2,
+    },
+    kept_recent: 4,
+  });
+  assert.equal(result.decision, 'compact');
+  // The previous summary survives the incremental compact — it is NOT
+  // replaced by the newly rendered window summary.
+  assert.ok(result.compact_text.startsWith('旧摘要：此前已折叠第 1-2 句。'),
+    `compact_text dropped the previous summary: ${result.compact_text.slice(0, 120)}`);
+  // New window facts are APPENDED after the old summary.
+  const previousAt = result.compact_text.indexOf('旧摘要');
+  const newBlockAt = result.compact_text.indexOf('# compact summary');
+  assert.ok(newBlockAt > previousAt, 'new summary block must be appended after the previous summary');
+  assert.ok(result.compact_text.includes('old beat 3'), 'newly folded window facts must be present');
+  // The cursor advances past the newly folded window only.
+  assert.equal(result.compact_through_seq, 20 - 4);
+  assert.equal(result.folded_event_count, 20 - 4 - 2);
+});
+
+test('assembleContext: nothing new foldable keeps the previous summary and payload verbatim', () => {
+  // Pool starts at the protected event → folding stops immediately.
+  const events = [
+    makeEvent({ event_seq: 1, event_type: 'narrative', text: 'already folded' }),
+    makeEvent({ event_seq: 2, event_type: 'ask_player_choice' }),
+    makeEvent({ event_seq: 3, event_type: 'narrative', text: 'b' }),
+    makeEvent({ event_seq: 4, event_type: 'narrative', text: 'c' }),
+    makeEvent({ event_seq: 5, event_type: 'narrative', text: 'd' }),
+  ];
+  const previousPayload = { sections: { facts: ['旧事实'] }, event_count: 1 };
+  const estimator = {
+    estimate: () => 999_999,
+    contextWindow: () => 128_000,
+    compactThreshold: () => 100_000,
+  };
+  const result = assembleContext({
+    estimator,
+    canonicalHistory: events,
+    existingCompact: { summary_text: '旧摘要：只折叠了第 1 句。', summary_payload: previousPayload, through_seq: 1 },
+    kept_recent: 2,
+    force_compact: true,
+  });
+  assert.equal(result.decision, 'compact');
+  // Protected event at the head of the eligible pool → nothing folded.
+  assert.equal(result.folded_event_count, 0);
+  assert.equal(result.skipped_protected, 1);
+  // Previous summary + payload carried over verbatim (no empty header appended).
+  assert.equal(result.compact_text, '旧摘要：只折叠了第 1 句。');
+  assert.equal(result.compact_through_seq, 1);
+  assert.deepEqual(result.summary_payload, previousPayload);
 });
 
 test('assembleContext: force_compact=true always compacts even when under threshold', () => {
