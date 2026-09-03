@@ -336,21 +336,27 @@ async function run() {
 
   // -------- 4. 429 ----------------------------------------------------------
   await test('4. provider 429 → provider_failure (same channel as 5xx; runtime is provider-agnostic)', async () => {
-    const { runtime } = await runtimeFixture({
+    const { runtime, provider } = await runtimeFixture({
       failure: new Error('HTTP 429 Too Many Requests — rate limited'),
     });
+    const request_id = 'req-429-retry';
     await assert.rejects(
-      () => runTurn(runtime, { input: { a: 1 }, expected_revision: recoverRuntime(runtime).base_revision }),
+      () => runTurn(runtime, { request_id, input: { a: 1 }, expected_revision: recoverRuntime(runtime).base_revision }),
       (err) => err instanceof AgentRuntimeError && err.code === 'provider_failure',
     );
-    // A retry with the SAME request_id is rejected — the failed turn did
-    // not consume the request budget. Callers use a fresh request_id to
-    // signal a new attempt.
+    // A retry with the SAME request_id is NOT an idempotent replay: the
+    // failed turn never registered the request_id (registration only
+    // happens after a successful turn), so the runtime re-attempts the
+    // provider and fails closed with provider_failure again — the failed
+    // attempt did not consume the request budget, and no duplicate_request
+    // is invented for it.
     const before = recoverRuntime(runtime);
     await assert.rejects(
-      () => runTurn(runtime, { input: { a: 1 }, expected_revision: before.base_revision }),
+      () => runTurn(runtime, { request_id, input: { a: 1 }, expected_revision: before.base_revision }),
       (err) => err instanceof AgentRuntimeError && err.code === 'provider_failure',
     );
+    // Both attempts really reached the provider (no replay short-circuit).
+    assert.equal(provider.callCount, 2);
     // successful_turns still empty — no partial state escapes the runtime.
     assert.equal(recoverRuntime(runtime).successful_turns.length, 0);
   });

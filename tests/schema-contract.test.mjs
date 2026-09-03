@@ -1,8 +1,12 @@
 // tests/schema-contract.test.mjs — dependency-free schema/SQL contract checks.
 // Validates db/migrations/0001_initial_story_outside.sql,
 // db/migrations/0002_opening_cache_generation_profile.sql,
-// db/migrations/0003_session_playback.sql, db/schema.sql, and
+// db/migrations/0003_session_playback.sql, db/migrations/0004_pending_batch_lifecycle.sql,
+// db/migrations/0005_compact_and_context.sql, db/schema.sql, and
 // docs/data-model.md without needing database credentials or a running server.
+// The point of this suite is to keep the migration set and the canonical
+// schema.sql entrypoint in lockstep — column drift, a missing CHECK, or a
+// renamed trigger in either direction turns the suite red.
 
 import { readFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
@@ -13,6 +17,7 @@ const MIGRATION_0001_PATH = join(ROOT, "db/migrations/0001_initial_story_outside
 const MIGRATION_0002_PATH = join(ROOT, "db/migrations/0002_opening_cache_generation_profile.sql");
 const MIGRATION_0003_PATH = join(ROOT, "db/migrations/0003_session_playback.sql");
 const MIGRATION_0004_PATH = join(ROOT, "db/migrations/0004_pending_batch_lifecycle.sql");
+const MIGRATION_0005_PATH = join(ROOT, "db/migrations/0005_compact_and_context.sql");
 const SCHEMA_PATH = join(ROOT, "db/schema.sql");
 const DOCS_PATH = join(ROOT, "docs/data-model.md");
 
@@ -25,7 +30,10 @@ const REQUIRED_TABLES = [
   "game_sessions",
   "session_events",
   "pending_batches",
+  "pending_batch_items",
   "session_checkpoints",
+  "compact_compacted_events",
+  "model_context_windows",
 ];
 
 const REQUIRED_COLUMNS = {
@@ -84,6 +92,17 @@ const REQUIRED_COLUMNS = {
     "session_revision BIGINT UNSIGNED NOT NULL DEFAULT 0",
     "ending_id BIGINT UNSIGNED NULL",
     "ended_at DATETIME(6) NULL",
+    "context_compact_text MEDIUMTEXT NULL",
+    "context_compact_payload JSON NULL",
+    "compacted_through_seq BIGINT UNSIGNED NULL",
+    "compacted_event_count INT UNSIGNED NULL",
+    "token_estimate INT UNSIGNED NULL",
+    "context_window INT UNSIGNED NULL",
+    "context_safety_ratio DECIMAL(5,4) NULL",
+    "reserved_completion_tokens INT UNSIGNED NULL",
+    "context_schema_version INT UNSIGNED NOT NULL DEFAULT 1",
+    "prompt_version INT UNSIGNED NOT NULL DEFAULT 1",
+    "last_compact_status ENUM('idle', 'compacted', 'skipped', 'failed') NOT NULL DEFAULT 'idle'",
   ],
   session_events: [
     "event_id CHAR(36) NOT NULL",
@@ -135,6 +154,23 @@ const REQUIRED_COLUMNS = {
     "projection_status ENUM('synced', 'stale', 'rebuilding', 'failed') NOT NULL DEFAULT 'stale'",
     "is_dirty TINYINT(1) NOT NULL DEFAULT 1",
   ],
+  compact_compacted_events: [
+    "session_id BIGINT UNSIGNED NOT NULL",
+    "attempt_uuid CHAR(36) NOT NULL",
+    "status ENUM('compacted', 'skipped', 'failed') NOT NULL",
+    "compacted_through_seq BIGINT UNSIGNED NOT NULL",
+    "event_count INT UNSIGNED NOT NULL DEFAULT 0",
+    "context_window INT UNSIGNED NULL",
+    "folded_event_seqs JSON NOT NULL",
+    "summary_excerpt VARCHAR(500) NULL",
+  ],
+  model_context_windows: [
+    "model VARCHAR(128) NOT NULL",
+    "context_window INT UNSIGNED NOT NULL",
+    "safety_ratio DECIMAL(5,4) NOT NULL DEFAULT 0.1000",
+    "reserved_completion_tokens INT UNSIGNED NOT NULL DEFAULT 1024",
+    "is_active TINYINT(1) NOT NULL DEFAULT 1",
+  ],
   schema_migrations: [
     "migration_name VARCHAR(255) NOT NULL",
     "applied_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)",
@@ -160,6 +196,8 @@ const REQUIRED_KEYS = [
   "uq_pending_batch_items_uuid",
   "uq_pending_batch_items_batch_seq",
   "uq_session_checkpoints_uuid",
+  "uq_compact_compacted_events_attempt",
+  "uq_model_context_windows_model",
   "uq_endings_uuid",
   "uq_endings_version_key",
   "uq_schema_migrations_name",
@@ -177,6 +215,7 @@ const REQUIRED_INDEXES = [
   "idx_game_sessions_user_status",
   "idx_game_sessions_playback",
   "idx_game_sessions_story_version_cache",
+  "idx_game_sessions_compact_status",
   "idx_session_events_session_created",
   "idx_session_events_source_sequence",
   "idx_session_events_session_event",
@@ -185,6 +224,7 @@ const REQUIRED_INDEXES = [
   "idx_pending_batches_fingerprint",
   "idx_pending_batch_items_batch_status",
   "idx_session_checkpoints_dirty",
+  "idx_compact_compacted_events_session_status",
   "idx_endings_story_version_public",
 ];
 
@@ -283,6 +323,53 @@ const REQUIRED_0004_FRAGMENTS = [
   "0004_pending_batch_lifecycle",
 ];
 
+// 0005 is the compact/context upgrade. Every fragment below must appear in
+// the migration, and the CHECK expressions / trigger must be textually
+// identical to db/schema.sql (checked further down) so a 0001→0005 upgrade
+// ends up equivalent to a fresh install.
+const REQUIRED_0005_FRAGMENTS = [
+  "ALTER TABLE game_sessions",
+  "ADD COLUMN IF NOT EXISTS context_compact_text MEDIUMTEXT NULL",
+  "ADD COLUMN IF NOT EXISTS context_compact_payload JSON NULL",
+  "ADD COLUMN IF NOT EXISTS compacted_through_seq BIGINT UNSIGNED NULL",
+  "ADD COLUMN IF NOT EXISTS compacted_event_count INT UNSIGNED NULL",
+  "ADD COLUMN IF NOT EXISTS token_estimate INT UNSIGNED NULL",
+  "ADD COLUMN IF NOT EXISTS context_window INT UNSIGNED NULL",
+  "ADD COLUMN IF NOT EXISTS context_safety_ratio DECIMAL(5,4) NULL",
+  "ADD COLUMN IF NOT EXISTS reserved_completion_tokens INT UNSIGNED NULL",
+  "ADD COLUMN IF NOT EXISTS context_schema_version INT UNSIGNED NOT NULL DEFAULT 1",
+  "ADD COLUMN IF NOT EXISTS prompt_version INT UNSIGNED NOT NULL DEFAULT 1",
+  "ADD COLUMN IF NOT EXISTS last_compact_at DATETIME(6) NULL",
+  "ADD COLUMN IF NOT EXISTS last_compact_attempt_at DATETIME(6) NULL",
+  "ADD COLUMN IF NOT EXISTS last_compact_status ENUM('idle', 'compacted', 'skipped', 'failed') NOT NULL DEFAULT 'idle'",
+  "ADD COLUMN IF NOT EXISTS last_compact_error VARCHAR(500) NULL",
+  "ADD INDEX IF NOT EXISTS idx_game_sessions_compact_status",
+  "CREATE TABLE IF NOT EXISTS compact_compacted_events",
+  "CREATE TABLE IF NOT EXISTS model_context_windows",
+  "UNIQUE KEY uq_compact_compacted_events_attempt",
+  "UNIQUE KEY uq_model_context_windows_model",
+  "KEY idx_compact_compacted_events_session_status (session_id, status, created_at)",
+  "fk_compact_compacted_events_session",
+  "chk_compact_compacted_events_folded_seqs",
+  "INSERT IGNORE INTO model_context_windows",
+  "INSERT IGNORE INTO schema_migrations (migration_name, applied_by)",
+  "0005_compact_and_context",
+];
+
+// The exact CHECK expressions both schema.sql AND 0005 must carry, verbatim
+// (this is the drift the 0005 review caught: the migration previously skipped
+// these five CHECKs while schema.sql had them).
+const REQUIRED_GAME_SESSIONS_COMPACT_CHECK_EXPRESSIONS = [
+  "chk_game_sessions_token_estimate CHECK (token_estimate IS NULL OR token_estimate >= 0)",
+  "chk_game_sessions_context_window CHECK (context_window IS NULL OR context_window > 0)",
+  "chk_game_sessions_safety_ratio CHECK (context_safety_ratio IS NULL OR (context_safety_ratio >= 0 AND context_safety_ratio < 1))",
+  "chk_game_sessions_compact_seq CHECK (compacted_through_seq IS NULL OR compacted_through_seq > 0)",
+  "chk_game_sessions_compact_payload CHECK (context_compact_payload IS NULL OR JSON_VALID(context_compact_payload))",
+];
+
+const COMPACT_MONOTONIC_TRIGGER = "trg_game_sessions_compact_monotonic";
+const LEGACY_COMPACT_TRIGGER = "trg_game_sessions_no_compact_overwrite";
+
 const JSON_TABLES = [
   "stories",
   "story_versions",
@@ -293,6 +380,7 @@ const JSON_TABLES = [
   "pending_batches",
   "pending_batch_items",
   "session_checkpoints",
+  "compact_compacted_events",
 ];
 
 const POSTGRES_ONLY_PATTERNS = [
@@ -347,10 +435,22 @@ function triggerBlock(sql, triggerName) {
   return sql.slice(start, end === -1 ? undefined : end);
 }
 
+// Strip comments and collapse whitespace so two SQL blocks can be compared
+// semantically (the migration may carry inline comments schema.sql lacks).
+function normalizedSql(sql) {
+  return sql
+    .split("\n")
+    .map((line) => line.replace(/--.*$/, "").trim())
+    .filter((line) => line.length > 0)
+    .join("\n")
+    .replace(/\s+/g, " ");
+}
+
 let migration0001 = "";
 let migration0002 = "";
 let migration0003 = "";
 let migration0004 = "";
+let migration0005 = "";
 let schema = "";
 let docs = "";
 
@@ -359,6 +459,7 @@ try {
   migration0002 = await readFile(MIGRATION_0002_PATH, "utf8");
   migration0003 = await readFile(MIGRATION_0003_PATH, "utf8");
   migration0004 = await readFile(MIGRATION_0004_PATH, "utf8");
+  migration0005 = await readFile(MIGRATION_0005_PATH, "utf8");
   schema = await readFile(SCHEMA_PATH, "utf8");
   docs = await readFile(DOCS_PATH, "utf8");
 } catch (err) {
@@ -372,6 +473,7 @@ check("0001 migration file is non-empty", migration0001.trim().length > 0);
 check("0002 migration file is non-empty", migration0002.trim().length > 0);
 check("0003 migration file is non-empty", migration0003.trim().length > 0);
 check("0004 migration file is non-empty", migration0004.trim().length > 0);
+check("0005 migration file is non-empty", migration0005.trim().length > 0);
 check("schema file is non-empty", schema.trim().length > 0);
 check("data-model doc is non-empty", docs.trim().length > 0);
 
@@ -446,6 +548,93 @@ check(
   "docs/data-model.md documents the discarded CHECK contract",
   docs.includes("discarded") && docs.includes("promoted_event_id")
 );
+// 0004 must backfill terminal rows' completed_at BEFORE adding
+// chk_pending_batches_completed, or the CHECK would reject pre-existing
+// 0001-era rows and the migration would fail.
+{
+  const backfillAt = migration0004.indexOf("SET completed_at = COALESCE(updated_at");
+  check(
+    "0004 backfills terminal completed_at before chk_pending_batches_completed",
+    backfillAt !== -1 && backfillAt < migration0004.indexOf("ADD CONSTRAINT chk_pending_batches_completed")
+  );
+}
+// 0004's AFTER clauses must reproduce schema.sql's pending_batches column
+// order so a 0001→0004 upgrade lands physically identical to a fresh install.
+check(
+  "0004 pending_batches column order matches schema.sql (AFTER chain)",
+  [
+    "expected_revision BIGINT UNSIGNED NULL AFTER base_event_id",
+    "superseded_by CHAR(36) NULL AFTER promoted_event_id",
+    "source VARCHAR(64) NULL AFTER request_uuid",
+    "request_fingerprint CHAR(64) NULL AFTER request_payload",
+    "committed_count INT UNSIGNED NULL AFTER completed_at",
+    "item_count INT UNSIGNED NULL AFTER committed_count",
+  ].every((fragment) => migration0004.includes(fragment))
+);
+check(
+  "0004 pending_batch_items session scope column order matches schema.sql",
+  migration0004.includes("session_id BIGINT UNSIGNED NULL AFTER batch_id")
+);
+
+// 0005 is the compact/context upgrade; it must keep every game_sessions
+// column, CHECK, and the compact-monotonic trigger in lockstep with
+// schema.sql (this exact drift — a missing CHECK + a renamed trigger — is
+// what the review caught).
+check(
+  "0005 contains the compact/context fragments",
+  REQUIRED_0005_FRAGMENTS.every((fragment) => migration0005.includes(fragment))
+);
+check(
+  "0005 records its migration ledger entry",
+  migration0005.includes("INSERT IGNORE INTO schema_migrations (migration_name, applied_by)")
+);
+for (const expression of REQUIRED_GAME_SESSIONS_COMPACT_CHECK_EXPRESSIONS) {
+  check(`schema game_sessions constraint ${expression.split(" ")[0]}`, schema.includes(expression));
+  check(
+    `0005 adds the same CHECK as schema: ${expression.split(" ")[0]}`,
+    migration0005.includes(expression)
+  );
+}
+{
+  const schemaTrigger = triggerBlock(schema, COMPACT_MONOTONIC_TRIGGER);
+  const migrationTrigger = triggerBlock(migration0005, COMPACT_MONOTONIC_TRIGGER);
+  check("schema defines trg_game_sessions_compact_monotonic", schemaTrigger.length > 0);
+  check(
+    "0005 recreates the compact-monotonic trigger under the schema.sql name",
+    migrationTrigger.length > 0 &&
+      migrationTrigger.includes("BEFORE UPDATE ON game_sessions") &&
+      migrationTrigger.includes("compacted_through_seq is monotonically advancing")
+  );
+  check(
+    "0005 compact-monotonic trigger body matches schema.sql exactly",
+    migrationTrigger.length > 0 &&
+      normalizedSql(migrationTrigger) === normalizedSql(schemaTrigger)
+  );
+  // The pre-review trigger name must never be created again; 0005 keeps a
+  // DROP for databases that already ran the earlier revision.
+  check(
+    `schema does not carry the legacy trigger ${LEGACY_COMPACT_TRIGGER}`,
+    !schema.includes(`CREATE TRIGGER ${LEGACY_COMPACT_TRIGGER}`)
+  );
+  check(
+    `0005 drops (but never creates) the legacy trigger ${LEGACY_COMPACT_TRIGGER}`,
+    migration0005.includes(`DROP TRIGGER IF EXISTS ${LEGACY_COMPACT_TRIGGER}`) &&
+      !migration0005.includes(`CREATE TRIGGER ${LEGACY_COMPACT_TRIGGER}`)
+  );
+}
+// The two tables 0005 owns must be byte-identical (comments/whitespace
+// aside) to their schema.sql counterparts. When a future migration ALTERs
+// one of them, move this comparison to the latest defining migration.
+for (const table of ["compact_compacted_events", "model_context_windows"]) {
+  const schemaBlock = tableBlock(schema, table);
+  const migrationBlock = tableBlock(migration0005, table);
+  check(`0005 defines table ${table}`, migrationBlock.length > 0);
+  check(
+    `0005 ${table} matches schema.sql exactly (comments/whitespace aside)`,
+    migrationBlock.length > 0 && schemaBlock.length > 0 &&
+      normalizedSql(migrationBlock) === normalizedSql(schemaBlock)
+  );
+}
 
 // Engine and charset invariants.
 for (const [label, sql] of [
@@ -453,6 +642,7 @@ for (const [label, sql] of [
   ["0002", migration0002],
   ["0003", migration0003],
   ["0004", migration0004],
+  ["0005", migration0005],
   ["schema", schema],
 ]) {
   const tableCount = (sql.match(/CREATE TABLE IF NOT EXISTS\s+/g) || []).length;
@@ -473,9 +663,10 @@ for (const [label, sql] of [
     // 0004 only creates pending_batch_items; other tables are inherited
     // from 0001/0002/0003.
     check(`${label} JSON_VALID guard for pending_batch_items`, sql.includes("JSON_VALID(payload)"));
-  } else if (!["0002", "0003"].includes(label)) {
+  } else if (label === "0001" || label === "schema") {
     for (const table of JSON_TABLES) {
-      if (table === "pending_batch_items") continue; // added in 0004
+      // Tables created by later migrations are not part of 0001.
+      if (label === "0001" && (table === "pending_batch_items" || table === "compact_compacted_events")) continue;
       check(
         `${label} JSON_VALID guard for ${table}`,
         tableBlock(sql, table).includes("JSON_VALID")
@@ -510,16 +701,26 @@ for (const constraint of [
   "chk_game_sessions_generation_profile",
   "chk_game_sessions_opening_cursor",
   "chk_game_sessions_revision",
+  "chk_game_sessions_token_estimate",
+  "chk_game_sessions_context_window",
+  "chk_game_sessions_safety_ratio",
+  "chk_game_sessions_compact_seq",
+  "chk_game_sessions_compact_payload",
   "chk_session_events_source",
   "chk_session_events_source_sequence",
   "chk_pending_batches_source",
   "chk_pending_batches_counts",
+  "chk_pending_batches_completed",
   "chk_pending_batch_items_seq",
   "chk_pending_batch_items_payload",
   "chk_pending_batch_items_committed",
   "chk_pending_batch_items_discarded",
   "chk_pending_batch_items_pending",
   "chk_pending_batch_items_tool_commit",
+  "chk_compact_compacted_events_through_seq",
+  "chk_compact_compacted_events_folded_seqs",
+  "chk_model_context_windows_window",
+  "chk_model_context_windows_safety",
 ]) {
   check(`schema constraint ${constraint}`, schema.includes(constraint));
 }
@@ -560,6 +761,7 @@ for (const [label, sql] of [
   ["0002", migration0002],
   ["0003", migration0003],
   ["0004", migration0004],
+  ["0005", migration0005],
   ["schema", schema],
 ]) {
   for (const pattern of POSTGRES_ONLY_PATTERNS) {
@@ -573,6 +775,7 @@ for (const [label, sql] of [
   ["0002", migration0002],
   ["0003", migration0003],
   ["0004", migration0004],
+  ["0005", migration0005],
   ["schema", schema],
 ]) {
   for (const pattern of SECRET_PATTERNS) {
@@ -589,6 +792,7 @@ for (const fragment of [
   "db/migrations/0002_opening_cache_generation_profile.sql",
   "db/migrations/0003_session_playback.sql",
   "db/migrations/0004_pending_batch_lifecycle.sql",
+  "db/migrations/0005_compact_and_context.sql",
   "db/schema.sql",
   "node tests/schema-contract.test.mjs",
   "append-only",
@@ -602,6 +806,9 @@ for (const fragment of [
   "source_sequence",
   "narrative_beat",
   "request_fingerprint",
+  "compacted_through_seq",
+  "trg_game_sessions_compact_monotonic",
+  "model_context_windows",
 ]) {
   check(`docs covers ${fragment}`, docs.includes(fragment));
 }

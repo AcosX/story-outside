@@ -12,8 +12,9 @@
 --   1. session_events remains append-only (0001 triggers stay).
 --   2. pending_batches / pending_batch_items (owned by 07/08) are not
 --      touched here; compact never folds staged/pending items.
---   3. All changes use IF NOT EXISTS / INFORMATION_SCHEMA guards so the
---      migration is safe to run twice against the same database.
+--   3. All changes use IF NOT EXISTS / drop-by-name guards (columns,
+--      indexes, tables, named CHECKs and the trigger) so the migration is
+--      safe to run twice against the same database.
 --   4. compact_compacted_events is an audit/log of which event_seqs were
 --      folded into a given compact record. It is append-only at the
 --      application level; it does NOT modify session_events.
@@ -46,19 +47,41 @@ ALTER TABLE game_sessions
   ADD COLUMN IF NOT EXISTS last_compact_status ENUM('idle', 'compacted', 'skipped', 'failed') NOT NULL DEFAULT 'idle',
   ADD COLUMN IF NOT EXISTS last_compact_error VARCHAR(500) NULL;
 
--- Add CHECK constraints only when missing (MariaDB lacks ADD CONSTRAINT
--- IF NOT EXISTS, so we drop the named constraint first when present).
+-- game_sessions context CHECKs. These five named constraints mirror
+-- db/schema.sql exactly (chk_game_sessions_token_estimate /
+-- context_window / safety_ratio / compact_seq / compact_payload) so a
+-- 0001→0005 upgrade ends up equivalent to a fresh install. MariaDB lacks
+-- ADD CONSTRAINT IF NOT EXISTS, so the named constraints are dropped by
+-- name before being recreated (same re-runnable pattern as 0003/0004).
+ALTER TABLE game_sessions
+  DROP CONSTRAINT IF EXISTS chk_game_sessions_token_estimate,
+  DROP CONSTRAINT IF EXISTS chk_game_sessions_context_window,
+  DROP CONSTRAINT IF EXISTS chk_game_sessions_safety_ratio,
+  DROP CONSTRAINT IF EXISTS chk_game_sessions_compact_seq,
+  DROP CONSTRAINT IF EXISTS chk_game_sessions_compact_payload;
+
+ALTER TABLE game_sessions
+  ADD CONSTRAINT chk_game_sessions_token_estimate CHECK (token_estimate IS NULL OR token_estimate >= 0),
+  ADD CONSTRAINT chk_game_sessions_context_window CHECK (context_window IS NULL OR context_window > 0),
+  ADD CONSTRAINT chk_game_sessions_safety_ratio CHECK (context_safety_ratio IS NULL OR (context_safety_ratio >= 0 AND context_safety_ratio < 1)),
+  ADD CONSTRAINT chk_game_sessions_compact_seq CHECK (compacted_through_seq IS NULL OR compacted_through_seq > 0),
+  ADD CONSTRAINT chk_game_sessions_compact_payload CHECK (context_compact_payload IS NULL OR JSON_VALID(context_compact_payload));
+
+-- compact_through_seq on game_sessions is monotonically advancing: a
+-- later compact never undoes an earlier fold. The compact pipeline can
+-- advance it forward or leave it unchanged; it cannot go backwards. The
+-- trigger name matches db/schema.sql; the pre-review name
+-- trg_game_sessions_no_compact_overwrite is dropped first so databases
+-- that already ran an earlier revision of this migration upgrade cleanly
+-- and the migration stays re-runnable.
 DROP TRIGGER IF EXISTS trg_game_sessions_no_compact_overwrite;
+DROP TRIGGER IF EXISTS trg_game_sessions_compact_monotonic;
 
 DELIMITER $$
-CREATE TRIGGER trg_game_sessions_no_compact_overwrite
+CREATE TRIGGER trg_game_sessions_compact_monotonic
 BEFORE UPDATE ON game_sessions
 FOR EACH ROW
 BEGIN
-  -- When compact_summary rows already exist for a session, disallow
-  -- mutating compacted_through_seq downward (a later compact never
-  -- undoes an earlier fold). It is still legal to advance
-  -- compacted_through_seq forward or leave it unchanged.
   IF NEW.compacted_through_seq IS NOT NULL
      AND OLD.compacted_through_seq IS NOT NULL
      AND NEW.compacted_through_seq < OLD.compacted_through_seq THEN
@@ -66,14 +89,6 @@ BEGIN
   END IF;
 END$$
 DELIMITER ;
-
--- Add a CHECK that the schema/prompt versions are valid integers.
--- (We deliberately keep schema_version / prompt_version declared NOT NULL
--- with a default rather than NULL to make accidentally clearing them
--- impossible without an ALTER.)
--- Named CHECK constraints can be re-added safely by DROP IF EXISTS first
--- (MariaDB 10.6 supports this pattern).
--- No-op if already present; otherwise the default already covers it.
 
 -- Index for finding sessions that need compact (last_compact_status, model).
 ALTER TABLE game_sessions

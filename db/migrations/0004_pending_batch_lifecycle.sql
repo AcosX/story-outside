@@ -26,13 +26,24 @@ SET sql_mode = 'STRICT_TRANS_TABLES,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTIT
 
 -- pending_batches extensions. Existing 0001/0003 rows have NULL audit
 -- fields; backfill only NULLs so a rerun never overwrites an application's
--- value.
+-- value. The AFTER clauses reproduce the exact column order of
+-- db/schema.sql (cosmetic, but keeps a 0001→0004 upgrade physically
+-- identical to a fresh install).
 ALTER TABLE pending_batches
-  ADD COLUMN IF NOT EXISTS expected_revision BIGINT UNSIGNED NULL AFTER status,
-  ADD COLUMN IF NOT EXISTS request_fingerprint CHAR(64) NULL AFTER expected_revision,
-  ADD COLUMN IF NOT EXISTS committed_count INT UNSIGNED NULL AFTER request_fingerprint,
+  ADD COLUMN IF NOT EXISTS expected_revision BIGINT UNSIGNED NULL AFTER base_event_id,
+  ADD COLUMN IF NOT EXISTS request_fingerprint CHAR(64) NULL AFTER request_payload,
+  ADD COLUMN IF NOT EXISTS committed_count INT UNSIGNED NULL AFTER completed_at,
   ADD COLUMN IF NOT EXISTS item_count INT UNSIGNED NULL AFTER committed_count,
   ADD COLUMN IF NOT EXISTS superseded_by CHAR(36) NULL AFTER promoted_event_id;
+
+-- Source provenance is mandatory so a future audit can attribute the batch
+-- to the runtime that produced it. Existing rows default to 'legacy'.
+ALTER TABLE pending_batches
+  ADD COLUMN IF NOT EXISTS source VARCHAR(64) NULL AFTER request_uuid;
+UPDATE pending_batches
+   SET source = COALESCE(source, 'legacy');
+ALTER TABLE pending_batches
+  MODIFY source VARCHAR(64) NOT NULL DEFAULT 'runtime';
 
 UPDATE pending_batches
    SET expected_revision = COALESCE(expected_revision, 0),
@@ -49,15 +60,6 @@ ALTER TABLE pending_batches
 ALTER TABLE pending_batches
   ADD UNIQUE INDEX IF NOT EXISTS uq_pending_batches_fingerprint (request_fingerprint),
   ADD KEY IF NOT EXISTS idx_pending_batches_fingerprint (request_fingerprint);
-
--- Source provenance is mandatory so a future audit can attribute the batch
--- to the runtime that produced it. Existing rows default to 'legacy'.
-ALTER TABLE pending_batches
-  ADD COLUMN IF NOT EXISTS source VARCHAR(64) NULL AFTER request_uuid;
-UPDATE pending_batches
-   SET source = COALESCE(source, 'legacy');
-ALTER TABLE pending_batches
-  MODIFY source VARCHAR(64) NOT NULL DEFAULT 'runtime';
 
 -- ClickUp 08 P1.4: provenance + counts guards on pending_batches. These
 -- mirror db/schema.sql exactly so a 0001→0004 upgrade ends up equivalent to
@@ -199,7 +201,19 @@ ALTER TABLE pending_batch_items
 -- application_status mirrors the lifecycle for fast lookups; the existing
 -- status enum already covers queued/reserved/succeeded/failed/expired/
 -- superseded, so we do NOT change it. We only add a stricter check that
--- succeeded rows have completed_at.
+-- terminal rows have completed_at.
+--
+-- Defensive backfill FIRST: 0001-era rows may already carry a terminal
+-- status without completed_at (the timestamp was only enforced from 0004
+-- on). Adding chk_pending_batches_completed without this backfill would
+-- make the migration fail on such pre-existing rows. Fill ONLY NULLs —
+-- a rerun never overwrites an application value, keeping the migration
+-- re-runnable.
+UPDATE pending_batches
+   SET completed_at = COALESCE(updated_at, CURRENT_TIMESTAMP(6))
+ WHERE status IN ('succeeded', 'failed', 'expired', 'superseded')
+   AND completed_at IS NULL;
+
 ALTER TABLE pending_batches
   DROP CONSTRAINT IF EXISTS chk_pending_batches_completed;
 

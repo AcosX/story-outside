@@ -399,10 +399,6 @@ async function run() {
     const session_a = '00000000-0000-4000-8000-0000000e000c';
     const session_b = '00000000-0000-4000-8000-0000000e000d';
     const { repository, cache } = await pinnedRuntimeFixture({ session_uuid: session_a });
-    // Re-import for the second session: same seeded repository, so the
-    // second createSession is independent.
-    const sessionBContext = await pinnedRuntimeFixture({ session_uuid: session_b });
-    void sessionBContext;
     // Drain 1 opening event from session A.
     commitOpeningEvent({
       repository,
