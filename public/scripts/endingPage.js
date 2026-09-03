@@ -18,7 +18,9 @@
 //   * mount({ sessionUuid, sessionMeta }) — entry point. Always
 //     succeeds (the inline ending card is left in place on any failure
 //     so the user still sees *something*); switches the player screen
-//     from `player` to a dedicated `screen-ending` section.
+//     from `player` to a dedicated `screen-ending` section. A missing
+//     sessionUuid renders the "未提交" empty state (deep link with no
+//     stored session context) instead of throwing.
 //   * teardown() — restores the inline ending card and switches back
 //     to `screen-player`. The player hooks do not currently call this
 //     (the ending screen is terminal), but it is exported for tests.
@@ -68,27 +70,19 @@ async function fetchProjections(sessionUuid) {
 
 // ---------- DOM helpers ----------
 
-function escapeHtml(s) {
-  return String(s == null ? '' : s)
-    .replaceAll('&', '&amp;')
-    .replaceAll('<', '&lt;')
-    .replaceAll('>', '&gt;')
-    .replaceAll('"', '&quot;')
-    .replaceAll("'", '&#39;');
-}
-
 function clear(node) {
   while (node && node.firstChild) node.removeChild(node.firstChild);
 }
 
+// The props' `html` passthrough to innerHTML was removed on purpose:
+// every text goes through createTextNode so AI/provider payloads can
+// never inject markup into the ending page.
 function el(tag, props = {}, ...children) {
   const node = document.createElement(tag);
   for (const [key, value] of Object.entries(props)) {
     if (key === 'class') node.className = value;
     else if (key === 'dataset') {
       for (const [k, v] of Object.entries(value)) node.dataset[k] = v;
-    } else if (key === 'html') {
-      node.innerHTML = value;
     } else {
       node.setAttribute(key, value);
     }
@@ -349,10 +343,10 @@ function updateReplayView() {
 }
 
 async function mount({ sessionUuid, sessionMeta } = {}) {
-  if (!sessionUuid) {
-    throw new Error('endingPage.mount: sessionUuid required');
-  }
-  STATE.sessionUuid = sessionUuid;
+  // A missing session uuid is tolerated (deep link with no stored
+  // session context): the render falls through to the "未提交" empty
+  // state instead of throwing, so the user is never stranded.
+  STATE.sessionUuid = sessionUuid || null;
   // Locate the dedicated screen section. It must exist by the time the
   // player reaches `finished` (added to public/index.html).
   const screen = $('#screen-ending');
@@ -360,7 +354,9 @@ async function mount({ sessionUuid, sessionMeta } = {}) {
     throw new Error('endingPage.mount: #screen-ending not found in DOM');
   }
   // Fetch the three projections in parallel; render whatever we get.
-  const projections = await fetchProjections(sessionUuid);
+  const projections = sessionUuid
+    ? await fetchProjections(sessionUuid)
+    : { ending: { error: new Error('no session context') }, originalTimeline: null, replay: null };
   STATE.ending = projections.ending && !projections.ending.error ? projections.ending : null;
   STATE.originalTimeline = projections.originalTimeline && !projections.originalTimeline.error ? projections.originalTimeline : null;
   STATE.replay = projections.replay && !projections.replay.error ? projections.replay : null;
@@ -409,13 +405,6 @@ function teardown() {
   STATE.replay = null;
   STATE.replayIndex = 0;
   showScreen('player');
-}
-
-// Exposed for tests + future hot-reload. The module is loaded via
-// dynamic `import('/scripts/endingPage.js')` from player.js, so this
-// globalThis handle lets the harness replay a scenario deterministically.
-if (typeof globalThis !== 'undefined') {
-  globalThis.__ENDING_PAGE_STATE__ = STATE;
 }
 
 export { mount, teardown, STATE as __state__ };
