@@ -19,9 +19,14 @@
 //     stopped (without re-displaying already-committed lines);
 //   * /interrupt drops the pending tail and switches to realtime;
 //   * /finish (terminal tool call after final commit) stops the scheduler
-//     and renders the ending card; further commits are blocked;
+//     and renders the ending card; further commits are blocked; the
+//     terminal envelope is queued in state so a pause inside the
+//     deferred-render window cannot drop it — resume surfaces it first;
 //   * /recover on reload rebuilds the displayed lines from canonical
-//     history + active pending without re-running the provider;
+//     history + active pending without re-running the provider; when no
+//     pending remains and the committed ending projection answers 200,
+//     the session is already finished and the ending page mounts
+//     instead of continuing playback;
 //   * share is a Web Share API call with a Clipboard / URL fallback and a
 //     non-blocking toast on every path.
 
@@ -51,6 +56,11 @@ const state = {
   pendingIdx: 0,        // index of the NEXT pending event to display
   progressTotal: 0,     // largest known event total for progress bar
   finished: false,      // terminal tool_call has been rendered
+  // Tool call envelope whose deferred render has not happened yet. It
+  // lives in state (not only in the timer closure) so a pause inside
+  // the ~STEP_DELAY/2 window cannot swallow a choice/finish node.
+  queuedToolCall: null,
+  inputInFlight: false, // an interrupt request is in flight (double-submit guard)
   autoplayTimer: null,
   lastPlayerRequestId: 1,
 };
@@ -99,6 +109,8 @@ function setStatus(next) {
     if (state.toolCallTimer) clearTimeout(state.toolCallTimer);
     state.autoplayTimer = null;
     state.toolCallTimer = null;
+    // The terminal render is on screen; nothing may stay queued.
+    state.queuedToolCall = null;
   }
   if (next !== 'playing') {
     if (state.autoplayTimer) clearTimeout(state.autoplayTimer);
@@ -305,7 +317,7 @@ async function bootstrapSession({ story, role }) {
     state.generationProfile = generationProfile;
     setText('#story-name', story.title);
     setText('#role-name', role.label);
-    setText('#role-hook', '');
+    persistSessionContext();
     showScreen('player');
     await recoverAndStart();
   } catch (err) {
@@ -324,6 +336,33 @@ function newSessionUuid() {
   // Fallback: a non-cryptographic v4-shaped identifier.
   const rnd = (n) => Array.from({ length: n }, () => Math.floor(Math.random() * 16).toString(16)).join('');
   return `${rnd(8)}-${rnd(4)}-4${rnd(3)}-a${rnd(3)}-${rnd(12)}`;
+}
+
+// -------- Last-session context (for the ?s=ending deep link) --------
+
+const LAST_SESSION_KEY = 'story-outside:last-session';
+
+function persistSessionContext() {
+  // Remember the active session so a reload that lands on ?s=ending can
+  // re-mount the ending page for the SAME session instead of silently
+  // falling back to the picker. Best-effort: private browsing modes may
+  // block storage, in which case the deep link just shows the empty
+  // ending state.
+  try {
+    sessionStorage.setItem(LAST_SESSION_KEY, JSON.stringify({
+      sessionUuid: state.sessionUuid || null,
+      storyTitle: state.story ? state.story.title : '',
+      roleLabel: state.role ? state.role.label : '',
+    }));
+  } catch { /* storage unavailable — deep link degrades to empty state */ }
+}
+
+function readSessionContext() {
+  try {
+    const raw = sessionStorage.getItem(LAST_SESSION_KEY);
+    const ctx = raw ? JSON.parse(raw) : null;
+    return ctx && typeof ctx.sessionUuid === 'string' ? ctx : null;
+  } catch { return null; }
 }
 
 // -------- Recovery + autoplay driver --------
@@ -371,6 +410,23 @@ async function recoverAndStart() {
       scrollLogToEnd();
       setStatus('playing');
       scheduleNextStep();
+      return;
+    }
+    // No pending and no opening tail left. The session may already be
+    // finished (e.g. a reload after finish_story committed). Probe the
+    // read-only ending projection: 200 means the finish envelope is
+    // committed and playback must NOT continue — mount the ending page
+    // instead. 404 (error=ending_not_committed) or any transient failure
+    // keeps the original behavior: generate the next batch.
+    let endingCommitted = false;
+    try {
+      await api(`/api/dev/sessions/${state.sessionUuid}/ending`);
+      endingCommitted = true;
+    } catch { /* ending_not_committed (404) or transient failure */ }
+    if (endingCommitted) {
+      state.finished = true;
+      setStatus('finished');
+      await mountEndingPage();
       return;
     }
     await startNextBatch();
@@ -591,6 +647,16 @@ function scheduleNextStep() {
 async function runStep() {
   state.autoplayTimer = null;
   if (state.status !== 'playing' || state.finished) return;
+  // Guard: a tool call envelope whose deferred render was interrupted
+  // (pause inside the ~STEP_DELAY/2 window, explicit skip) must surface
+  // BEFORE any new batch is generated — the world line cannot skip its
+  // key nodes.
+  if (state.queuedToolCall) {
+    const queued = state.queuedToolCall;
+    state.queuedToolCall = null;
+    await surfaceToolCall(queued);
+    return;
+  }
   // Guard: while opening events are uncommitted, the narrative path
   // is blocked. Hand off to the opening scheduler instead of
   // generating a new narrative batch (which would discard the
@@ -679,10 +745,14 @@ async function commitNextPendingItem() {
       // queued, then defer the UI render so the player can read the
       // final line before the choice card or ending appears. The
       // deferred timer is short enough that surfaceToolCall wins the
-      // race against the next scheduleNextStep tick.
+      // race against the next scheduleNextStep tick. The envelope is
+      // ALSO stored in state.queuedToolCall so that a pause inside the
+      // deferred window (which clears the timer) cannot lose it —
+      // resume and the runStep/startNextBatch guards surface it first.
       if (state.autoplayTimer) clearTimeout(state.autoplayTimer);
       state.autoplayTimer = null;
       if (state.toolCallTimer) clearTimeout(state.toolCallTimer);
+      state.queuedToolCall = finalToolCall;
       state.toolCallTimer = setTimeout(() => {
         state.toolCallTimer = null;
         void surfaceToolCall(finalToolCall);
@@ -700,6 +770,14 @@ async function commitNextPendingItem() {
 
 async function startNextBatch() {
   if (state.finished) return;
+  // Same guard as runStep: never /generate over an undelivered tool
+  // call envelope.
+  if (state.queuedToolCall) {
+    const queued = state.queuedToolCall;
+    state.queuedToolCall = null;
+    await surfaceToolCall(queued);
+    return;
+  }
   // Guard: opening must be complete before a narrative batch can be
   // requested. The opening path runs through scheduleOpeningStep, which
   // calls /opening-events, never /generate.
@@ -763,6 +841,8 @@ async function startNextBatch() {
 
 async function surfaceToolCall(toolCall) {
   if (!toolCall) return;
+  // Whatever is being surfaced now is no longer queued.
+  state.queuedToolCall = null;
   if (toolCall.name === 'ask_player_choice') {
     setStatus('awaiting-choice');
     renderChoices(toolCall);
@@ -774,26 +854,7 @@ async function surfaceToolCall(toolCall) {
     renderEnding(toolCall);
     setText('#player-help', '');
     state.finished = true;
-    // ClickUp 11 hook: hand off to the dedicated ending page module,
-    // which fetches /ending + /original-timeline + /replay and renders
-    // the comparison + replay UI. We lazy-load so the player.js state
-    // machine does not depend on endingPage being available.
-    try {
-      const mod = await import('/scripts/endingPage.js');
-      if (mod && typeof mod.mount === 'function') {
-        await mod.mount({
-          sessionUuid: state.sessionUuid,
-          sessionMeta: {
-            storyTitle: state.story ? state.story.title : '',
-            roleLabel: state.role ? state.role.label : '',
-          },
-        });
-      }
-    } catch (err) {
-      // Non-fatal: keep the inline ending visible if the module is
-      // unreachable (e.g. dev environment without the new files).
-      showToast(`结局页加载失败：${err.message}`);
-    }
+    await mountEndingPage();
     return;
   }
   // Unknown tool: render the literal envelope so the player can see the
@@ -801,6 +862,31 @@ async function surfaceToolCall(toolCall) {
   showToast(`未识别的工具：${toolCall.name}`);
   setStatus('finished');
   state.finished = true;
+}
+
+async function mountEndingPage(sessionMetaOverride) {
+  // ClickUp 11 hook: hand off to the dedicated ending page module,
+  // which fetches /ending + /original-timeline + /replay and renders
+  // the comparison + replay UI. We lazy-load so the player.js state
+  // machine does not depend on endingPage being available.
+  try {
+    const mod = await import('/scripts/endingPage.js');
+    if (mod && typeof mod.mount === 'function') {
+      await mod.mount({
+        sessionUuid: state.sessionUuid,
+        sessionMeta: sessionMetaOverride || {
+          storyTitle: state.story ? state.story.title : '',
+          roleLabel: state.role ? state.role.label : '',
+        },
+      });
+      return true;
+    }
+  } catch (err) {
+    // Non-fatal: keep the inline ending visible if the module is
+    // unreachable (e.g. dev environment without the new files).
+    showToast(`结局页加载失败：${err.message}`);
+  }
+  return false;
 }
 
 
@@ -875,75 +961,40 @@ function renderEnding(toolCall) {
 
 // -------- Player interactions --------
 
-async function chooseOption(option) {
-  // Convert the option pick into a player_input → interrupt, then resume.
-  const text = `${option.id}: ${option.label || option.text || option.id}`;
-  // The sendPlayerInput call already handles the status transitions on
-  // success and failure. We only need to nudge the scheduler when the
-  // call actually landed in the canonical history.
-  const result = await sendPlayerInputChoice(text);
-  if (!result) return; // failure path: sendPlayerInput already restored status
-  // Use the choice id as a hint for the deterministic demo provider so
-  // the next batch reflects the player's decision (a/b → default
-  // 3-item batch, "finish" would be unusual here but allowed).
-  state.nextBatchInput = option.id === 'b' ? 'short' : 'hello';
-  setStatus('playing');
-  clearAutoplayTimer();
-  scheduleNext();
-}
-
-// Variant of sendPlayerInput used by the choice buttons: returns a
-// truthy value on success and a falsy value on failure (instead of
-// just throwing). Lets the caller stay in awaiting-choice on failure
-// without re-engaging the autoplay scheduler.
-async function sendPlayerInputChoice(text) {
-  if (!state.sessionUuid) return null;
-  const trimmed = (text || '').trim();
-  if (!trimmed) return null;
-  clearAutoplayTimer();
-  if (state.toolCallTimer) { clearTimeout(state.toolCallTimer); state.toolCallTimer = null; }
-  setStatus('loading');
-  try {
-    const result = await api(`/api/dev/sessions/${state.sessionUuid}/interrupt`, {
-      method: 'POST',
-      body: JSON.stringify({
-        text: trimmed,
-        client_request_id: `interrupt-${state.lastPlayerRequestId}`,
-        expected_revision: state.lastRevision || 0,
-      }),
-    });
-    state.lastPlayerRequestId += 1;
-    state.lastRevision = result.revision;
-    state.canonicalHistory = [...state.canonicalHistory, result.event];
-    appendLine({ type: 'player_input', text: trimmed }, { pending: false });
-    state.pending = null;
-    state.pendingIdx = 0;
-    clearAllPendingNodes();
-    const log = $('#story-log');
-    for (let i = log.children.length - 1; i >= 0; i -= 1) {
-      const child = log.children[i];
-      if (child.dataset && child.dataset.pending === 'true') child.remove();
-      else break;
-    }
-    state.nextBatchInput = trimmed;
-    return result;
-  } catch (err) {
-    showToast(`选择失败：${err.message}（可重试或输入自己的句子）`);
-    setStatus('awaiting-choice');
-    return null;
-  }
-}
-
-async function sendPlayerInput(text) {
-  if (!state.sessionUuid) return null;
-  const trimmed = (text || '').trim();
-  if (!trimmed) return null;
-  // Clear any in-flight schedulers so the failed send cannot race the
-  // user's retry; the form submit handler will restore the input on
-  // failure and re-enable the field.
-  clearAutoplayTimer();
-  if (state.toolCallTimer) { clearTimeout(state.toolCallTimer); state.toolCallTimer = null; }
+function setInputsDisabled(disabled) {
   const input = $('#player-input');
+  const btn = $('#player-input-btn');
+  if (input) input.disabled = disabled;
+  if (btn) btn.disabled = disabled;
+}
+
+// Single implementation behind sendPlayerInput (free-text submit) and
+// sendPlayerInputChoice (choice buttons): converts the player text into
+// a player_input → interrupt, drops the pending tail, and queues the
+// text as the next /generate input. `input` names the text field whose
+// value is cleared on success / restored on failure; `failLabel` only
+// shapes the error toast. Returns a truthy value on success and a falsy
+// value on failure so the choice-button caller can stay in
+// awaiting-choice without re-engaging the autoplay scheduler.
+async function interruptWithPlayerText(text, { input = null, failLabel = '打断' } = {}) {
+  if (!state.sessionUuid) return null;
+  const trimmed = (text || '').trim();
+  if (!trimmed) return null;
+  // Double-submit guard: a second submit while the interrupt request is
+  // in flight would replay the same client_request_id. Swallow it and
+  // disable the form so the UI matches.
+  if (state.inputInFlight) return null;
+  state.inputInFlight = true;
+  setInputsDisabled(true);
+  // Clear any in-flight schedulers so the failed send cannot race the
+  // user's retry; the caller restores the input on failure and the
+  // finally-block re-enables the field.
+  clearAutoplayTimer();
+  if (state.toolCallTimer) { clearTimeout(state.toolCallTimer); state.toolCallTimer = null; }
+  // An explicit player interrupt supersedes any tool call envelope
+  // whose deferred render has not happened yet.
+  state.queuedToolCall = null;
+  const inputEl = input ? $(input) : null;
   const previousStatus = state.status;
   setStatus('loading');
   try {
@@ -972,25 +1023,51 @@ async function sendPlayerInput(text) {
     // Save the typed text so the next /generate can use it as input
     // (drives the deterministic demo provider).
     state.nextBatchInput = trimmed;
-    if (input) input.value = '';
+    if (inputEl) inputEl.value = '';
     return result;
   } catch (err) {
     // Failure: the user must be able to retry. Restore the typed text
     // and the previous status (do NOT pretend we are still playing).
-    // If the input is still in the DOM (it should be), restore its
-    // value so the user can resubmit.
-    if (input) {
-      input.value = trimmed;
+    if (inputEl) {
+      inputEl.value = trimmed;
       // Best-effort re-focus so the next keystroke is captured.
-      try { input.focus({ preventScroll: true }); } catch { input.focus(); }
+      try { inputEl.focus({ preventScroll: true }); } catch { inputEl.focus(); }
     }
-    showToast(`打断失败：${err.message}（已保留输入，可重试）`);
+    showToast(`${failLabel}失败：${err.message}（已保留输入，可重试）`);
     // Drop back to the previous non-loading status so the player is
     // not stuck in a fake "playing" state. The submit handler will
     // resume the correct scheduler on retry.
     setStatus(previousStatus === 'loading' ? 'playing' : previousStatus);
     return null;
+  } finally {
+    state.inputInFlight = false;
+    setInputsDisabled(false);
   }
+}
+
+async function sendPlayerInput(text) {
+  return interruptWithPlayerText(text, { input: '#player-input', failLabel: '打断' });
+}
+
+async function sendPlayerInputChoice(text) {
+  return interruptWithPlayerText(text, { failLabel: '选择' });
+}
+
+async function chooseOption(option) {
+  // Convert the option pick into a player_input → interrupt, then resume.
+  const text = `${option.id}: ${option.label || option.text || option.id}`;
+  // The sendPlayerInput call already handles the status transitions on
+  // success and failure. We only need to nudge the scheduler when the
+  // call actually landed in the canonical history.
+  const result = await sendPlayerInputChoice(text);
+  if (!result) return; // failure path: sendPlayerInput already restored status
+  // Use the choice id as a hint for the deterministic demo provider so
+  // the next batch reflects the player's decision (a/b → default
+  // 3-item batch, "finish" would be unusual here but allowed).
+  state.nextBatchInput = option.id === 'b' ? 'short' : 'hello';
+  setStatus('playing');
+  clearAutoplayTimer();
+  scheduleNext();
 }
 
 // -------- Pause / resume / skip --------
@@ -1003,6 +1080,14 @@ function togglePause() {
   }
   if (state.status === 'paused') {
     setStatus('playing');
+    // A tool call envelope whose deferred render was interrupted by the
+    // pause must surface first; only then does the scheduler resume.
+    if (state.queuedToolCall) {
+      const queued = state.queuedToolCall;
+      state.queuedToolCall = null;
+      void surfaceToolCall(queued);
+      return;
+    }
     // Resume the right scheduler for the current phase so opening
     // playback keeps advancing through its remaining events instead
     // of jumping straight to a narrative /generate.
@@ -1103,6 +1188,7 @@ function backToPicker() {
   state.pending = null;
   state.pendingIdx = 0;
   state.finished = false;
+  state.queuedToolCall = null;
   setText('#story-log', '');
   setText('#player-choices', '');
   setText('#player-ending', '');
@@ -1124,7 +1210,12 @@ function escapeHtml(s) {
 
 // -------- Bootstrap --------
 
+let eventsBound = false;
 function bindEvents() {
+  // Guard against double bootstrap (e.g. harness re-runs): stacking a
+  // second submit/click handler would double-fire interrupts.
+  if (eventsBound) return;
+  eventsBound = true;
   $('#back-btn').addEventListener('click', backToPicker);
   $('#share-btn').addEventListener('click', () => { void share(); });
   $('#pause-btn').addEventListener('click', togglePause);
@@ -1164,23 +1255,54 @@ function bindEvents() {
 async function bootstrap() {
   bindEvents();
   setStatus('loading');
+  // Deep link: showScreen writes ?s=<screen> into the URL, and a reload
+  // on the ending screen must land back on the ending page instead of
+  // silently dropping the player into the picker. Attempt the mount
+  // first; when no committed ending exists for the remembered session
+  // (or no session is remembered at all), the ending page module renders
+  // its own empty state.
+  let deepLinkedToEnding = false;
+  try {
+    if (new URLSearchParams(window.location.search).get('s') === 'ending') {
+      const ctx = readSessionContext();
+      if (ctx) state.sessionUuid = ctx.sessionUuid;
+      deepLinkedToEnding = await mountEndingPage(ctx ? {
+        storyTitle: ctx.storyTitle || '',
+        roleLabel: ctx.roleLabel || '',
+      } : undefined);
+      if (deepLinkedToEnding) {
+        state.finished = true;
+        setStatus('finished');
+      }
+    }
+  } catch { /* fall through to the picker */ }
   await loadStories();
-  setStatus('picker');
-  showScreen('picker');
-  // Wire role chips once stories are loaded.
-  document.addEventListener('click', (e) => {
-    const t = e.target;
-    if (!(t instanceof HTMLElement)) return;
-    const roleChip = t.closest('#role-list .chip');
-    if (!roleChip) return;
-    const roleId = roleChip.dataset.roleId;
-    const role = (state.story && state.story.roles || []).find((r) => r.id === roleId);
-    if (!role) return;
-    $$('#role-list .chip').forEach((c) => c.setAttribute('aria-selected', String(c === roleChip)));
-    state.role = role;
-    setText('#role-name', role.label);
-    void bootstrapSession({ story: state.story, role });
-  });
+  if (deepLinkedToEnding) {
+    // Stay on the ending screen. Stories are loaded so the 返回 button
+    // still lands on a populated picker.
+  } else {
+    setStatus('picker');
+    showScreen('picker');
+  }
+  // Wire role chips once stories are loaded. Guarded so re-running
+  // bootstrap (e.g. harness re-entry) never stacks a second handler —
+  // duplicate handlers would race duplicate session creations.
+  if (!bootstrap.roleChipsWired) {
+    bootstrap.roleChipsWired = true;
+    document.addEventListener('click', (e) => {
+      const t = e.target;
+      if (!(t instanceof HTMLElement)) return;
+      const roleChip = t.closest('#role-list .chip');
+      if (!roleChip) return;
+      const roleId = roleChip.dataset.roleId;
+      const role = (state.story && state.story.roles || []).find((r) => r.id === roleId);
+      if (!role) return;
+      $$('#role-list .chip').forEach((c) => c.setAttribute('aria-selected', String(c === roleChip)));
+      state.role = role;
+      setText('#role-name', role.label);
+      void bootstrapSession({ story: state.story, role });
+    });
+  }
 }
 
 function renderRoles(roles) {
