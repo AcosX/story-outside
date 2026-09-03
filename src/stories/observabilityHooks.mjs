@@ -74,11 +74,15 @@ export function onSessionCreate(hookCtx) {
 }
 
 export function onOpeningCommit({ hookCtx, event = null, latency_ms = null } = {}) {
-  if (Number.isFinite(latency_ms)) {
-    recordCommit({ session_uuid: hookCtx.session_uuid, latency_ms });
-  } else {
-    recordCommit({ session_uuid: hookCtx.session_uuid, latency_ms: 0 });
-  }
+  // The session touch still happens (recordCommit is always called) but
+  // a missing/non-numeric latency must NOT be recorded as a 0ms sample:
+  // that would pollute the le_50 bucket and depress commitLatency.sum
+  // with fake "instant" commits. Only the latency sample is skipped
+  // when latency_ms is not finite; the event log below still goes out.
+  recordCommit({
+    session_uuid: hookCtx.session_uuid,
+    latency_ms: Number.isFinite(latency_ms) ? latency_ms : null,
+  });
   debug('session.opening.commit', {
     session_uuid: hookCtx.session_uuid,
     component: 'stories',

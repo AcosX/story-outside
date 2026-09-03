@@ -68,8 +68,11 @@ try {
     `status=${unobserved.response.status}`);
 
   const badUuid = await request('/api/admin/observability/sessions/not-a-uuid');
-  check('non-uuid session 400 or 404 (never 5xx)',
-    badUuid.response.status === 400 || badUuid.response.status === 404,
+  // The route captures any single path segment and lets isSessionUuid
+  // validate it, so malformed uuids get the endpoint's own 400
+  // validation_failed (never the static handler's 404).
+  check('non-uuid session 400 validation_failed',
+    badUuid.response.status === 400 && badUuid.data?.error === 'validation_failed',
     `status=${badUuid.response.status}`);
 
   // --- demo flow drives the counters off zero ---

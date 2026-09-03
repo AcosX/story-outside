@@ -20,6 +20,15 @@ import { recordOpeningCacheHit, recordOpeningCacheMiss } from './metrics.mjs';
 
 /** @type {Map<string, CacheAggregate>} */
 const cacheAggregates = new Map();
+
+// The cache_uuid key is externally controllable (the admin rebuild
+// endpoint mints one aggregate per generated cache), so the store must
+// stay bounded like metrics.sessionMetrics. When the cap is reached the
+// oldest-inserted aggregate is evicted; global hit/miss totals are NOT
+// rolled back, so the demo-path "hits > 0" acceptance proof survives
+// eviction of individual per-cache aggregates.
+export const MAX_CACHE_AGGREGATES = 500;
+
 const globalTotals = { hits: 0, misses: 0, lastHitAt: null, lastMissAt: null };
 
 function newAggregate(cache_uuid, story_uuid, story_version_uuid, generation_hash) {
@@ -62,6 +71,12 @@ export function recordHit(input) {
   if (!cache_uuid || !session_uuid) return;
   let aggregate = cacheAggregates.get(cache_uuid);
   if (!aggregate) {
+    if (cacheAggregates.size >= MAX_CACHE_AGGREGATES) {
+      // Insertion-order eviction: drop the oldest aggregate. Global
+      // totals are deliberately left untouched (no rollback).
+      const oldestKey = cacheAggregates.keys().next().value;
+      if (oldestKey !== undefined) cacheAggregates.delete(oldestKey);
+    }
     aggregate = newAggregate(
       cache_uuid,
       typeof input.story_uuid === 'string' ? input.story_uuid : null,

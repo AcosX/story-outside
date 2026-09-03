@@ -49,6 +49,7 @@ import {
 } from '../src/observability/timing.mjs';
 import {
   _resetCacheStatsForTests,
+  MAX_CACHE_AGGREGATES,
   recordHit,
   recordMiss,
   snapshotAll as cacheSnapshotAll,
@@ -304,6 +305,26 @@ await test('metrics: missing or bad input is silently ignored', () => {
   assert.deepEqual(snapshotAll().global, snapshotAll().global);
 });
 
+await test('metrics: session store eviction is LRU, not FIFO', () => {
+  _resetMetricsForTests();
+  // Fill the store to its cap with sessions s0..s{cap-1}.
+  const cap = 1000; // mirrors MAX_SESSION_METRICS in metrics.mjs
+  for (let i = 0; i < cap; i += 1) {
+    recordToolCall({ session_uuid: `s${i}` });
+  }
+  // Touch s0 so it becomes the most recently used session.
+  recordToolCall({ session_uuid: 's0' });
+  // One more session forces an eviction of the least recently used key.
+  recordToolCall({ session_uuid: 's-new' });
+  // With pure FIFO the eviction victim would have been s0; LRU keeps it.
+  assert.ok(snapshotSession('s0'), 'active session s0 must survive eviction (LRU)');
+  assert.ok(!snapshotSession('s1'), 'least recently used session s1 is evicted');
+  assert.ok(snapshotSession('s-new'), 'newly inserted session is present');
+  // Global counters are not rolled back on eviction: 1000 fills + 1
+  // refresh + 1 new session, every call counted.
+  assert.equal(snapshotAll().global.toolCalls, cap + 2);
+});
+
 // ---------------------------------------------------------------------------
 // timing.mjs
 // ---------------------------------------------------------------------------
@@ -322,6 +343,11 @@ await test('timing: timeAgentTurn and timeCommit are independent buckets', async
   assert.ok(s.agentLatency.count >= 1, 'agent latency not recorded');
   assert.ok(s.commitLatency.count >= 1, 'commit latency not recorded');
   assert.ok(s.agentLatency.sum >= 5, 'agent latency should be ≥ 5ms');
+  // Single-recorder contract: timeAgentTurn is a latency-only stopwatch.
+  // Turn counters belong to agent hooks onTurnSuccess; wiring both for
+  // the same turn would double-count. See docs/observability.md §3.
+  assert.equal(s.agentTurns, 0, 'timeAgentTurn must not record agentTurns');
+  assert.equal(snapshotAll().global.agentTurns, 0, 'timeAgentTurn must not bump global agentTurns');
 });
 
 await test('timing: timeProvider records failure on throw', async () => {
@@ -357,6 +383,9 @@ await test('timing: computeFrontendPlaybackMs returns diff or null', () => {
   const a = '2026-09-02T20:00:00.000Z';
   const b = '2026-09-02T20:00:00.500Z';
   assert.equal(computeFrontendPlaybackMs({ server_commit_at: a, client_playback_at: b }), 500);
+  // A negative diff (client clock behind the server) is clamped to 0 —
+  // deliberate trade-off documented in the source and docs/observability.md §3.
+  assert.equal(computeFrontendPlaybackMs({ server_commit_at: b, client_playback_at: a }), 0);
   assert.equal(computeFrontendPlaybackMs({ server_commit_at: a }), null);
   assert.equal(computeFrontendPlaybackMs({ client_playback_at: b }), null);
   assert.equal(computeFrontendPlaybackMs({}), null);
@@ -401,6 +430,24 @@ await test('cacheStats: opening cache hit metrics also increment', () => {
   const all = snapshotAll();
   assert.equal(all.sessions.s1.openingCacheHits, 2);
   assert.equal(all.global.openingCacheHits, 2);
+});
+
+await test('cacheStats: per-cache aggregates are bounded, global counters are not rolled back', () => {
+  _resetMetricsForTests();
+  _resetCacheStatsForTests();
+  const cap = MAX_CACHE_AGGREGATES;
+  // One hit per cache_uuid, in insertion order c0, c1, … c{cap+1}.
+  for (let i = 0; i < cap + 2; i += 1) {
+    recordHit({ session_uuid: 's1', cache_uuid: `c${i}` });
+  }
+  const snap = cacheSnapshotAll();
+  assert.equal(Object.keys(snap.caches).length, cap, 'store must stay at the cap');
+  assert.ok(!snap.caches.c0, 'oldest-inserted aggregate is evicted');
+  assert.ok(!snap.caches.c1, 'second-oldest aggregate is evicted');
+  assert.ok(snap.caches[`c${cap + 1}`], 'newest aggregate is present');
+  // Global counters keep every hit — eviction never rolls them back.
+  assert.equal(snap.global.hits, cap + 2);
+  assert.equal(snapshotAll().global.openingCacheHits, cap + 2);
 });
 
 // ---------------------------------------------------------------------------
@@ -575,6 +622,27 @@ await test('stories hooks: onOpeningCommit records commit latency', () => {
     onOpeningCommit({ hookCtx: ctx, event: { sequence: 0, type: 'narration' }, latency_ms: 7 });
     const s = snapshotSession('s1');
     assert.equal(s.commitLatency.count, 1);
+  } finally {
+    sink.restore();
+  }
+});
+
+await test('stories hooks: onOpeningCommit without latency records no fake 0ms sample', () => {
+  const sink = collectSink();
+  _resetMetricsForTests();
+  try {
+    const ctx = createStoriesHookContext({ session_uuid: 's1' });
+    onOpeningCommit({ hookCtx: ctx, event: { sequence: 0, type: 'narration' }, latency_ms: null });
+    const s = snapshotSession('s1');
+    // The commit is still attributed to the session record, but a
+    // missing latency must not land in the histogram as a 0ms sample
+    // (it would pollute le_50 and depress commitLatency.sum).
+    assert.ok(s, 'commit still touches the session record');
+    assert.equal(s.commitLatency.count, 0, 'no latency sample recorded');
+    assert.equal(s.commitLatency.le_50, 0, 'le_50 bucket stays clean');
+    // The event log is still emitted.
+    const parsed = JSON.parse(sink.lines.find((l) => l.includes('session.opening.commit')));
+    assert.equal(parsed.event, 'session.opening.commit');
   } finally {
     sink.restore();
   }

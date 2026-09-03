@@ -19,7 +19,7 @@
 //     errors so a misbehaving timer can never break a request.
 
 import {
-  recordAgentTurn,
+  recordAgentLatency,
   recordCommit,
   recordDbQuery,
   recordProviderRequest,
@@ -75,6 +75,15 @@ function nowNs() {
  * `.stop({ in_tokens, out_tokens, cache_read_tokens, truncated, retry })`
  * which records latency to metrics under the `agent` category.
  *
+ * SINGLE-RECORDER CONTRACT: this wrapper is a LATENCY-ONLY stopwatch.
+ * It feeds the agentLatency histogram via `recordAgentLatency` and does
+ * NOT bump agentTurns / token counters. Turn counters are recorded
+ * exactly once per turn by agent/observabilityHooks.onTurnSuccess (the
+ * single recorder, which owns the usage/truncated/retry context). Do
+ * not "fix" this by calling recordAgentTurn here — wiring both paths
+ * for the same turn would double-count every agent metric. See
+ * docs/observability.md §3.
+ *
  * The wrapper is intentionally non-throwing: an exception inside `fn`
  * still records the failure latency so observability stays accurate.
  *
@@ -88,7 +97,7 @@ export async function timeAgentTurn(ctx, fn) {
     return await fn();
   } finally {
     stopwatch.stop();
-    recordAgentTurn({
+    recordAgentLatency({
       session_uuid: ctx && ctx.session_uuid,
       latency_ms: stopwatch.elapsedMs(),
     });
@@ -180,6 +189,14 @@ export function computeFrontendPlaybackMs(input) {
   if (serverTs === null || clientTs === null) return null;
   const diff = clientTs - serverTs;
   if (!Number.isFinite(diff)) return null;
+  // Negative diffs (client clock behind the server clock) are clamped
+  // to 0. Trade-off, kept deliberately: clamping hides client clock
+  // skew instead of surfacing it, but it also guarantees a non-negative
+  // ms value so operators can sum/avg results without filtering
+  // negatives. Do NOT change the return type to carry a `clamped`
+  // marker — that would break every existing caller for a signal that
+  // today's demo (same-machine browser) never needs. If skew ever
+  // matters in production, add a separate sidecar field instead.
   return diff >= 0 ? Math.floor(diff) : 0;
 }
 
