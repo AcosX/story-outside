@@ -237,11 +237,15 @@ check('STORY_OUTSIDE_PROVIDER=mock selects Mock', () => {
   }
 });
 
-check('STORY_OUTSIDE_PROVIDER=real refuses loudly (no silent fallback)', () => {
+check('STORY_OUTSIDE_PROVIDER=real selects the Zhihu real provider', () => {
   __resetStoryProviderForTests();
   process.env.STORY_OUTSIDE_PROVIDER = 'real';
   try {
-    assert.throws(() => getStoryProvider(), /not implemented yet/i);
+    const p = getStoryProvider();
+    assert.equal(p.name, 'real');
+    assert.equal(typeof p.listStories, 'function');
+    assert.equal(typeof p.getStory, 'function');
+    assert.equal(typeof p.advanceStory, 'function');
   } finally {
     delete process.env.STORY_OUTSIDE_PROVIDER;
     __resetStoryProviderForTests();

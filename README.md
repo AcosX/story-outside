@@ -1,10 +1,10 @@
 # 故事之外 (Story Outside)
 
-知乎黑客松 MVP · Phase 4 · demo 模式（已抽出 Provider / Stories 接缝）
+知乎黑客松 MVP · Phase 4 · 默认 mock，可切 real（zhihu_hackathon_2026_p2 故事内容 API）
 
 > 如果当时，由你来选——进入故事，看看另一条世界线。
 
-这是一个**分支互动叙事**的小项目。Phase 2 抽出 `src/providers/` 接缝，Phase 4 抽出 `src/stories/` 应用层（canonical hash、版本化、作品级开场缓存、会话快照）。本仓库**不连接知乎官方 API**，所有数据来自 `src/providers/mockProvider.mjs` 里的示例 catalog，且**不写入 MariaDB**——仅作为应用层逻辑与未来 DAO 替换的接缝。
+这是一个**分支互动叙事**的小项目。Phase 2 抽出 `src/providers/` 接缝，Phase 4 抽出 `src/stories/` 应用层（canonical hash、版本化、作品级开场缓存、会话快照）。默认走 `src/providers/mockProvider.mjs` 的内存 catalog；设置 `STORY_OUTSIDE_PROVIDER=real` 后会改走 `src/providers/realProvider.mjs`，按官方契约对接 `api.zhihu.com/km-indep-home/hackathon/v2/story/*`——这些接口在 `zhihu_hackathon_2026_p2` 比赛期间不需要任何鉴权，也不发送 `Authorization` / `X-OAuth-Token`。所有写入仍然只走应用层内存仓库，**不写入 MariaDB**。
 
 ## 仓库布局
 
@@ -13,9 +13,10 @@
 ├── package.json              # 极简包描述 + 脚本
 ├── src/
 │   ├── server.mjs            # Node 原生 HTTP 服务（无框架）
-│   ├── providers/            # Provider 抽象 + Mock（官方 adapter 预留接缝）
+│   ├── providers/            # Provider 抽象 + Mock + Real
 │   │   ├── dto.mjs           #   与 transport 无关的数据形状 + 错误类型
 │   │   ├── mockProvider.mjs  #   内存版 Mock，提供 2 个示例故事
+│   │   ├── realProvider.mjs  #   对接 zhihu_hackathon_2026_p2 故事 API；无凭据；不重试
 │   │   └── index.mjs         #   Provider 选择器（默认 mock）
 │   └── stories/              # Phase 4 应用层（不写入 MariaDB）
 │       ├── canonicalHash.mjs #   canonical JSON + SHA-256，用于 story_versions.checksum
@@ -79,7 +80,8 @@ npm run check
 | --- | --- | --- |
 | `PORT` | `4173` | HTTP 端口 |
 | `HOST` | `127.0.0.1` | 监听地址（OAuth 不能用 `localhost` 回调） |
-| `STORY_OUTSIDE_PROVIDER` | `mock` | 数据 provider。`mock` = 内存版示例故事；`real` = 官方知乎 adapter（**未实现**，启动会报错，不静默回退到 mock）。 |
+| `STORY_OUTSIDE_PROVIDER` | `mock` | 数据 provider。`mock` = 内存版示例故事；`real` = 对接 `api.zhihu.com/km-indep-home/hackathon/v2/story/*`（`zhihu_hackathon_2026_p2` 期间不需要鉴权；不发送 `Authorization` / `X-OAuth-Token`；超时/429/5xx 走 typed ProviderError，不循环重试）。 |
+| `STORY_OUTSIDE_ZHIHU_TIMEOUT_MS` | `5000` | `real` provider 的 fetch 超时（毫秒）。 |
 
 ## Provider 接缝（mock ↔ 官方 adapter）
 
@@ -88,16 +90,15 @@ npm run check
 ```
 HTTP route (src/server.mjs)
     └─ StoryProvider interface (src/providers/index.mjs)
-         ├─ MockProvider (src/providers/mockProvider.mjs)   ← 当前唯一实现
-         └─ RealProvider (src/providers/realProvider.mjs)  ← TODO，不在本任务实现
+         ├─ MockProvider (src/providers/mockProvider.mjs)            ← 默认；内存示例 catalog
+         └─ RealZhihuStoryProvider (src/providers/realProvider.mjs)  ← 对接 zhihu_hackathon_2026_p2 故事 API
 ```
 
 - **DTO**：Provider 返回的形状见 `src/providers/dto.mjs`（`StorySummary`、`StoryDetail`、`AdvanceResult`、`Role`、`Beat`）。DTO 是与 transport 无关的纯数据对象；Provider 必须返回这些形状，路由才能继续复用 JSON 拼装逻辑。
-- **错误类型**：`StoryNotFoundError → 404`、`ValidationError → 400`、其他 `ProviderError → 502`。新增 provider 必须抛这些类（或同名子类），路由才不用变。
-- **选择 provider**：启动时读 `STORY_OUTSIDE_PROVIDER`，默认 `mock`。`real` 会**明确报错**而不是静默回退，避免生产上错配置后假装还能谈上知乎。
-- **未来接官方知乎**：把 `realProvider.mjs` 实现成 `StoryProvider`，里面负责凭据加载、token 兑换、用户接口调用（一切按 `docs/official-zhihu-skill.md`）；但该任务**不在本仓库本阶段**，也不会被 MockProvider 或 server.mjs 调用。
-
-严禁在代码或提交里出现真实 `app_id` / `app_key` / Access Secret / Token。Real provider 是接缝，不是实现。
+- **错误类型**：`StoryNotFoundError → 404`、`ValidationError → 400`、其他 `ProviderError → 502`。`realProvider` 还会抛出 `upstream_timeout / upstream_rate_limited / upstream_5xx / upstream_invalid_json / upstream_empty_body / upstream_shape_mismatch / unsupported_upstream_host`，路由层统一映射为 `502`。
+- **选择 provider**：启动时读 `STORY_OUTSIDE_PROVIDER`，默认 `mock`。
+- **真实故事 API 边界**：`realProvider` 发送的请求只到 `https://api.zhihu.com`；列表响应里 `work_id/title/artwork/tab_artwork/description/labels` 与详情响应里 `work_id/chapter_name/author_avatar/author_name/labels/introduction/content` 按官方契约映射；上游原文保留在 `source.raw`，作者 / 来源归属不透传到应用侧。`work_id` 拒绝 `/ ? # CR LF`，走 `encodeURIComponent`。
+- **严禁在代码或提交里出现真实 `app_id` / `app_key` / Access Secret / Token**。Real provider 当前按官方契约不需要凭据，未来若需要也只接收已加载的 credential，**绝不**读 `.env` / `process.env` 中任何看起来像凭据的键。
 
 ## API（demo）
 
@@ -130,7 +131,7 @@ HTTP route (src/server.mjs)
 
 - 把 demo 故事换成可配置 JSON / 文件 catalog（仍是 Mock provider 的内部实现变更，不改 DTO / 路由）
 - 增加 LLM-backed 群聊逐句播放（仍走前端 mock + 后端可替换 adapter）
-- 接入知乎 OAuth + 用户数据接口：实现 `src/providers/realProvider.mjs`，严格按 `docs/official-zhihu-skill.md` 的接缝，在生产域名上验收
+- 接入知乎 OAuth + 用户数据接口：与当前故事 API 不同，用户数据接口需 Access Secret + OAuth Token；另起任务，按 `docs/official-zhihu-skill.md` §3.1–3.5 安全边界
 - 引入 CI / Vercel / Cloudflare Pages 等部署目标
 - 把 `src/stories/repository.mjs` 替换为基于 MariaDB 的 DAO，逐方法保留当前应用层语义
 
@@ -141,4 +142,4 @@ HTTP route (src/server.mjs)
 - 不在 server 运行时依赖 `vendor/zhihu-hackathon/scripts/*.mjs`（它们是编排脚本，不属于运行依赖）
 - 不写入 MariaDB：`src/stories/repository.mjs` 是内存版 DAO；应用层只读快照、canonical hash 与作品级缓存均在内存中
 - 不在 `story_opening_caches` 上携带任何 `user_id` / `role_id` / `session_id`；该断言由 `src/stories/cacheKey.mjs` 在编译期强制（详见 `docs/data-model.md` §9）
-- 不 push，不创建远端仓库
+- 不在 `realProvider` 里循环重试上游 / 伪造原文 / 回显上游错误 body；所有失败必须出 typed `ProviderError`

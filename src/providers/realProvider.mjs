@@ -1,0 +1,496 @@
+// src/providers/realProvider.mjs — StoryProvider backed by the official
+// Zhihu Hackathon 2026 (Phase 2) story content API.
+//
+// Contract reference:
+//   /root/.openclaw/workspace/skills/zhihu/references/hackathon-content-api.md
+//
+// Hard rules taken from that contract (verbatim, do not relax):
+//   * No Access Secret. No OAuth App ID / App Key. No access_token.
+//   * No Authorization / X-OAuth-Token headers on the wire.
+//   * Endpoints are:
+//       GET https://api.zhihu.com/km-indep-home/hackathon/v2/story/list
+//       GET https://api.zhihu.com/km-indep-home/hackathon/v2/story/{work_id}
+//   * `work_id` must come from the list response (or otherwise be
+//     non-empty, contain no '/', '?', '#', CR or LF, and fit the
+//     work_id shape the upstream returns). Use a URL path-encoding
+//     function — never concatenate untrusted strings.
+//   * Failures (HTTP 4xx/5xx, 429, timeout, non-JSON body, missing
+//     fields, empty body) raise a typed ProviderError. We never loop
+//     retry, never fabricate content, never echo upstream error bodies
+//     to clients.
+//   * Unknown fields on a successful response are preserved on
+//     `source.raw` so attribution and forensic context survive. We do
+//     not pretend original content was authored by this app.
+//
+// Scope (ClickUp 13):
+//   * This provider is bound to zhihu_hackathon_2026_p2. The contract
+//     document explicitly warns the endpoints may change after the
+//     event. We surface that as a metadata flag on the provider so the
+//     /api/health banner can label itself correctly.
+//
+// What this provider deliberately does NOT do:
+//   * It never imports any file under vendor/zhihu-hackathon/**. Those
+//     scripts are orchestration tools, not runtime dependencies.
+//   * It never reads ZHIHU_OAUTH_APP_KEY / ZHIHU_ACCESS_SECRET /
+//     anything that looks like a credential. The story endpoints do not
+//     accept credentials and the spec forbids sending them.
+//   * It never touches the story application layer, the Agent runtime,
+//     the cache layer, or the MariaDB mapping. The seam stays a seam.
+
+import {
+  normaliseStorySummary,
+  normaliseStoryDetail,
+  ProviderError,
+  StoryNotFoundError,
+  ValidationError,
+} from './dto.mjs';
+
+const DEFAULT_BASE_URL = 'https://api.zhihu.com';
+const STORY_LIST_PATH = '/km-indep-home/hackathon/v2/story/list';
+const STORY_DETAIL_PATH = (workId) => `/km-indep-home/hackathon/v2/story/${encodeURIComponent(workId)}`;
+const DEFAULT_TIMEOUT_MS = 5000;
+
+// Per the official contract the upstream is an unauthenticated JSON API
+// for the duration of zhihu_hackathon_2026_p2. We do NOT set
+// Authorization / X-OAuth-Token; doing so would invite credential leaks
+// for no protocol benefit.
+const STATIC_HEADERS = Object.freeze({
+  accept: 'application/json',
+  // Node's built-in fetch requires a User-Agent to talk to some CDN
+  // edges. The string is a generic identifier — no credentials.
+  'user-agent': 'story-outside/0.1 (zhihu-hackathon-2026-p2; read-only)',
+});
+
+/**
+ * Hard guard against characters the upstream will reject and against
+ * characters we don't want to see in logs or URLs. Per the contract
+ * work_id values must NOT contain '/', '?', '#', CR or LF.
+ *
+ * The upstream list endpoint returns stringified numeric IDs
+ * (e.g. "1747681485547843585"), so we accept digits here as the common
+ * case while still permitting the broader slug-like alphabet the
+ * contract allows. Empty / whitespace-only / out-of-range IDs are
+ * rejected loudly at the seam.
+ *
+ * @param {unknown} raw
+ * @returns {string}
+ */
+function assertWorkId(raw) {
+  if (typeof raw !== 'string') {
+    throw new ValidationError('work_id must be a string', { receivedType: typeof raw });
+  }
+  const trimmed = raw.trim();
+  if (!trimmed) {
+    throw new ValidationError('work_id must be a non-empty string');
+  }
+  if (trimmed.length > 128) {
+    throw new ValidationError('work_id exceeds maximum length', { length: trimmed.length });
+  }
+  for (let i = 0; i < trimmed.length; i += 1) {
+    const code = trimmed.charCodeAt(i);
+    if (code === 0x2f /* / */ || code === 0x3f /* ? */ || code === 0x23 /* # */ ||
+        code === 0x0d /* CR */ || code === 0x0a /* LF */) {
+      throw new ValidationError('work_id contains a forbidden path character', { code });
+    }
+    if (code < 0x20 || code === 0x7f) {
+      throw new ValidationError('work_id contains a control character', { code });
+    }
+  }
+  return trimmed;
+}
+
+/**
+ * Read a positive integer env knob with a default. Throws nothing.
+ * @param {string|undefined} raw
+ * @param {number} fallback
+ * @returns {number}
+ */
+function readIntEnv(raw, fallback) {
+  if (typeof raw !== 'string' || !raw.trim()) return fallback;
+  const n = Number.parseInt(raw, 10);
+  return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+
+/**
+ * Decode a JSON response body. Distinguishes "empty body" from "parse
+ * error" so we can return a typed ProviderError rather than crash the
+ * route layer.
+ *
+ * @param {Response} res
+ * @returns {Promise<unknown>}
+ */
+async function decodeJson(res) {
+  const text = await res.text();
+  if (!text) {
+    throw new ProviderError('upstream_empty_body', 'Upstream returned an empty body.');
+  }
+  try {
+    return JSON.parse(text);
+  } catch (err) {
+    throw new ProviderError(
+      'upstream_invalid_json',
+      'Upstream did not return valid JSON.',
+      { contentLength: text.length },
+    );
+  }
+}
+
+/**
+ * Wrap a fetch with an AbortController timeout. We never retry on
+ * timeout — the contract forbids it.
+ *
+ * @param {string} url
+ * @param {{ timeoutMs: number, fetchImpl?: typeof fetch }} opts
+ * @returns {Promise<Response>}
+ */
+async function fetchWithTimeout(url, { timeoutMs, fetchImpl }) {
+  const fn = fetchImpl || globalThis.fetch;
+  if (typeof fn !== 'function') {
+    throw new ProviderError(
+      'fetch_unavailable',
+      'No fetch implementation is available in this runtime.',
+    );
+  }
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fn(url, {
+      method: 'GET',
+      headers: { ...STATIC_HEADERS },
+      signal: controller.signal,
+      redirect: 'follow',
+    });
+  } catch (err) {
+    if (err && (err.name === 'AbortError' || err.code === 'ABORT_ERR')) {
+      throw new ProviderError(
+        'upstream_timeout',
+        `Upstream did not respond within ${timeoutMs}ms.`,
+        { timeoutMs },
+      );
+    }
+    // Network-level failure (DNS, TLS, refused). Wrap so the route layer
+    // does not leak the underlying system error string.
+    throw new ProviderError(
+      'upstream_network_error',
+      'Could not reach the upstream API.',
+      { name: err && err.name ? err.name : 'network_error' },
+    );
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * @typedef {Object} ZhihuStoryListEntry
+ * @property {string} work_id
+ * @property {string} [title]
+ * @property {string} [artwork]
+ * @property {string} [tab_artwork]
+ * @property {string} [description]
+ * @property {string[]} [labels]
+ * @property {Record<string, unknown>} [source] Untrusted upstream fields.
+ */
+
+/**
+ * @typedef {Object} ZhihuStoryDetailEntry
+ * @property {string} work_id
+ * @property {string} [chapter_name]
+ * @property {string} [author_avatar]
+ * @property {string} [author_name]
+ * @property {string[]} [labels]
+ * @property {string} [introduction]
+ * @property {string} [content]
+ * @property {Record<string, unknown>} [source] Untrusted upstream fields.
+ */
+
+/**
+ * Translate an upstream list entry into the provider-agnostic
+ * `StorySummary` DTO.
+ *
+ *  work_id   → id
+ *  title     → title
+ *  description / introduction → hook
+ *  labels    → captured under source.labels (unknown to the DTO)
+ *  artwork / tab_artwork → captured under source.{artwork,tab_artwork}
+ *
+ * @param {unknown} raw
+ * @returns {ReturnType<typeof normaliseStorySummary>}
+ */
+function summaryFromListEntry(raw) {
+  if (!raw || typeof raw !== 'object') {
+    throw new ValidationError('story list entry must be an object');
+  }
+  const entry = /** @type {Record<string, unknown>} */ (raw);
+  if (typeof entry.work_id !== 'string' || !entry.work_id) {
+    throw new ValidationError('story list entry missing work_id');
+  }
+  const work_id = assertWorkId(entry.work_id);
+  if (typeof entry.title !== 'string' || !entry.title) {
+    throw new ValidationError(`story ${work_id} missing title`);
+  }
+  const description = typeof entry.description === 'string' ? entry.description : '';
+  // The DTO requires a non-empty hook. The contract explicitly allows
+  // description to be missing — fall back to a short, attributable
+  // placeholder so the route layer never sees an empty hook. We do
+  // NOT fabricate story content; the placeholder is metadata only.
+  const hook = description || `来自知乎黑客松参赛作品（${work_id}）`;
+  /** @type {{ id: string, label: string, mood: string }[]} */
+  const roles = [
+    {
+      id: 'author',
+      label: '原作',
+      mood: '',
+    },
+  ];
+  const summary = normaliseStorySummary({
+    id: work_id,
+    title: entry.title,
+    hook,
+    roles,
+  });
+  // Round-trip through the DTO normaliser; then attach the source
+  // metadata envelope for attribution.
+  /** @type {ZhihuStoryListEntry} */
+  const enriched = /** @type {any} */ ({
+    ...summary,
+    source: {
+      raw: entry,
+      labels: Array.isArray(entry.labels) ? entry.labels.slice() : [],
+      artwork: typeof entry.artwork === 'string' ? entry.artwork : null,
+      tab_artwork: typeof entry.tab_artwork === 'string' ? entry.tab_artwork : null,
+      attribution: 'zhihu_hackathon_2026_p2',
+    },
+  });
+  return enriched;
+}
+
+/**
+ * Translate an upstream detail entry into the provider-agnostic
+ * `StoryDetail` DTO, preserving attribution metadata.
+ *
+ *  work_id   → id
+ *  chapter_name / title → title
+ *  description / introduction → hook
+ *  author_avatar / author_name → captured under source.author*
+ *  labels    → captured under source.labels
+ *  content   → beats (single narration beat) — see comment below
+ *
+ * The official API returns a long `content` string with no structural
+ * role/choice markers. We refuse to invent `dialogue` / `ask_player_choice`
+ * beats because doing so would (a) misrepresent the upstream content
+ * and (b) break the opening-cache invariant that an `ask_player_choice`
+ * boundary is at a known beat index. The detail DTO instead carries
+ * the body as a single `narration` beat, plus a `source.content`
+ * field for downstream consumers that want the raw text.
+ *
+ * @param {unknown} raw
+ * @returns {ReturnType<typeof normaliseStoryDetail>}
+ */
+function detailFromDetailEntry(raw) {
+  if (!raw || typeof raw !== 'object') {
+    throw new ValidationError('story detail entry must be an object');
+  }
+  const entry = /** @type {Record<string, unknown>} */ (raw);
+  if (typeof entry.work_id !== 'string' || !entry.work_id) {
+    throw new ValidationError('story detail entry missing work_id');
+  }
+  const work_id = assertWorkId(entry.work_id);
+  const titleCandidate = [entry.chapter_name, entry.title].find(
+    (v) => typeof v === 'string' && /** @type {string} */ (v).length > 0,
+  );
+  if (!titleCandidate) {
+    throw new ValidationError(`story ${work_id} missing chapter_name/title`);
+  }
+  const introduction = typeof entry.introduction === 'string' ? entry.introduction : '';
+  const description = typeof entry.description === 'string' ? entry.description : '';
+  const hookSource = introduction || description || '';
+  const hook = hookSource || `来自知乎黑客松参赛作品（${work_id}）`;
+  const author_name = typeof entry.author_name === 'string' ? entry.author_name : '';
+  const author_avatar = typeof entry.author_avatar === 'string' ? entry.author_avatar : '';
+  const roles = [{
+    id: 'author',
+    // We surface the actual author name as the role label — that is
+    // the only author metadata the upstream gives us and the only way
+    // to preserve attribution in the DTO without a schema bump. We do
+    // NOT pretend this is a fictional in-app character.
+    label: author_name || '原作',
+    mood: '',
+  }];
+  const content = typeof entry.content === 'string' ? entry.content : '';
+  // Even an empty content field is acceptable to the contract ("the
+  // server may add or omit fields"); we surface it as an empty
+  // narration beat rather than fabricating text.
+  /** @type {{ text: string, index: number, type: 'narration' }[]} */
+  const beats = [{
+    text: content,
+    index: 0,
+    type: 'narration',
+  }];
+  const detail = normaliseStoryDetail({
+    id: work_id,
+    title: /** @type {string} */ (titleCandidate),
+    hook,
+    roles,
+    beats,
+  });
+  /** @type {Record<string, unknown>} */
+  const enriched = /** @type {any} */ ({
+    ...detail,
+    source: {
+      raw: entry,
+      author_name,
+      author_avatar,
+      labels: Array.isArray(entry.labels) ? entry.labels.slice() : [],
+      content,
+      attribution: 'zhihu_hackathon_2026_p2',
+    },
+  });
+  return enriched;
+}
+
+/**
+ * Build a fetch adapter so the provider can be unit-tested without the
+ * network. The factory is internal — production code calls
+ * `createRealZhihuStoryProvider()` and gets the real `globalThis.fetch`.
+ *
+ * @param {{ fetchImpl?: typeof fetch, baseUrl?: string, timeoutMs?: number }} [opts]
+ * @returns {{
+ *   listStories: () => Promise<ReturnType<typeof normaliseStorySummary>[]>,
+ *   getStory: (id: string) => Promise<ReturnType<typeof normaliseStoryDetail>>,
+ *   advanceStory: (input: { storyId: string, roleId?: string|null, index?: number }) => Promise<import('./dto.mjs').AdvanceResult>,
+ *   name: string,
+ *   meta: { upstream: string, contract: string, requiresAuth: false, contentType: 'story' },
+ * }}
+ */
+export function createRealZhihuStoryProvider(opts = {}) {
+  const fetchImpl = opts.fetchImpl || globalThis.fetch;
+  const baseUrl = (opts.baseUrl || DEFAULT_BASE_URL).replace(/\/+$/, '');
+  const timeoutMs = readIntEnv(
+    typeof process !== 'undefined' && process.env && process.env.STORY_OUTSIDE_ZHIHU_TIMEOUT_MS,
+    opts.timeoutMs || DEFAULT_TIMEOUT_MS,
+  );
+  if (!baseUrl.startsWith('https://api.zhihu.com')) {
+    // The contract fixes the host. Refuse to talk to anywhere else so a
+    // misconfigured env cannot silently redirect us to a malicious
+    // mirror. The list / detail URLs are also hard-coded against this
+    // host below.
+    throw new ProviderError(
+      'unsupported_upstream_host',
+      'Real provider is pinned to https://api.zhihu.com only.',
+      { baseUrl },
+    );
+  }
+
+  /** @type {Map<string, ReturnType<typeof normaliseStoryDetail>>} */
+  const detailCache = new Map();
+
+  /**
+   * @returns {Promise<unknown>}
+   */
+  async function fetchJson(path) {
+    const url = `${baseUrl}${path}`;
+    const res = await fetchWithTimeout(url, { timeoutMs, fetchImpl });
+    if (res.status === 404) {
+      throw new StoryNotFoundError(path);
+    }
+    if (res.status === 429) {
+      throw new ProviderError(
+        'upstream_rate_limited',
+        'Upstream rate-limited the request.',
+        { status: 429 },
+      );
+    }
+    if (res.status >= 500) {
+      throw new ProviderError(
+        'upstream_5xx',
+        `Upstream responded with ${res.status}.`,
+        { status: res.status },
+      );
+    }
+    if (res.status >= 400) {
+      // 4xx other than 404/429 — treat as upstream-rejected input.
+      throw new ProviderError(
+        'upstream_4xx',
+        `Upstream responded with ${res.status}.`,
+        { status: res.status },
+      );
+    }
+    if (res.status !== 200) {
+      throw new ProviderError(
+        'upstream_unexpected_status',
+        `Upstream responded with unexpected status ${res.status}.`,
+        { status: res.status },
+      );
+    }
+    return decodeJson(res);
+  }
+
+  return Object.freeze({
+    name: 'real',
+    meta: Object.freeze({
+      upstream: baseUrl,
+      contract: 'zhihu_hackathon_2026_p2',
+      requiresAuth: false,
+      contentType: 'story',
+      // Authoritative list of forbidden request headers — kept here so a
+      // future integration reviewer can verify the wire contract at a
+      // glance. The fetch above never sends any of these.
+      forbiddenRequestHeaders: Object.freeze([
+        'authorization',
+        'x-oauth-token',
+      ]),
+      hostAllowList: Object.freeze(['api.zhihu.com']),
+    }),
+    async listStories() {
+      const payload = await fetchJson(STORY_LIST_PATH);
+      if (!Array.isArray(payload)) {
+        throw new ProviderError(
+          'upstream_shape_mismatch',
+          'Story list payload was not an array.',
+        );
+      }
+      const out = [];
+      for (const entry of payload) {
+        out.push(summaryFromListEntry(entry));
+      }
+      return out;
+    },
+    async getStory(id) {
+      const work_id = assertWorkId(id);
+      if (detailCache.has(work_id)) {
+        // Defensive copy so callers cannot mutate the cached object.
+        const cached = detailCache.get(work_id);
+        return JSON.parse(JSON.stringify(cached));
+      }
+      const payload = await fetchJson(STORY_DETAIL_PATH(work_id));
+      const detail = detailFromDetailEntry(payload);
+      detailCache.set(work_id, detail);
+      return JSON.parse(JSON.stringify(detail));
+    },
+    async advanceStory(input) {
+      if (!input || typeof input !== 'object') {
+        throw new ValidationError('advance input must be an object');
+      }
+      const storyId = assertWorkId(input.storyId);
+      const detail = await this.getStory(storyId);
+      const idx = Number.isInteger(input.index) ? /** @type {number} */ (input.index) : 0;
+      if (idx < 0) {
+        throw new ValidationError('advance index must be >= 0', { index: idx });
+      }
+      // Real provider has no structured beats — `content` is a single
+      // narration beat. Walking past index 0 always means we have
+      // already shown the body, so advance is always finished.
+      const nextIndex = Math.min(idx + 1, detail.beats.length);
+      const finished = nextIndex >= detail.beats.length;
+      /** @type {import('./dto.mjs').AdvanceResult} */
+      const result = {
+        storyId: detail.id,
+        roleId: typeof input.roleId === 'string' ? input.roleId : null,
+        index: nextIndex,
+        finished,
+        beat: finished ? null : detail.beats[nextIndex].text,
+      };
+      return result;
+    },
+  });
+}

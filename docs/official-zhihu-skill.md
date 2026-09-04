@@ -6,33 +6,32 @@
 
 ## 1. 当前阶段定位
 
-- MVP 第一阶段**完全 demo 模式**：服务端 `src/server.mjs` 在内存里维护 2 个示例故事，所有 API 响应都带 `demo.official_zhihu_api: false` 字段。
-- 任何客户端都必须根据这个字段判断"是否真在和知乎对话"，否则一律视为 mock。
-- 我们**没有**调用官方 `zhihu-cli`、**没有**交换任何 OAuth Token、**没有**保存 App ID / App Key / Access Secret。
+- 默认模式仍是 mock：服务端 `src/server.mjs` 在内存里维护 2 个示例故事，所有响应都带 `demo.official_zhihu_api: false` 字段。
+- `STORY_OUTSIDE_PROVIDER=real` 接入官方 **zhihu_hackathon_2026_p2** 故事内容 API（端点见 §3）。响应里的 `demo` 段随之改为 `{ mode: 'live', provider: 'real', official_zhihu_api: true, contract: 'zhihu_hackathon_2026_p2', auth: 'none' }`。
+- 真实 API 仅在 `zhihu_hackathon_2026_p2` 比赛窗口内可用；活动结束后路径、响应或可用状态可能调整（见 `references/hackathon-content-api.md`）。比赛结束后请把 `STORY_OUTSIDE_PROVIDER` 切回 `mock`。
+- 我们**没有**调用官方 `zhihu-cli`、**没有**交换任何 OAuth Token、**没有**保存 App ID / App Key / Access Secret。真实故事 API 当前不需要鉴权（详见 §3.3）。
 
 ## 2. mock ↔ 官方 adapter 的接缝
 
-未来真的接入官方能力时，按下列接缝替换。Phase 2 已把接缝落地，便于后续并行开发：
-
 | 现在的 mock | 未来真实 adapter | 替换位置 |
 | --- | --- | --- |
-| `GET /api/stories` 返回 `STORIES` 数组 | 由后端 catalog 服务读取真实故事库（暂未确认是否走知乎创作内容接口） | `src/providers/mockProvider.mjs` 的 `listStories()` |
-| `GET /api/stories/:id` 返回单条 + beats | 同样由 catalog 服务提供；不直接调知乎 | `src/providers/mockProvider.mjs` 的 `getStory()` |
-| `POST /api/stories/advance` 仅递增 index | 接入 LLM 生成下一句；如要"展示用户关注/收藏"，从这里转调用户数据接口 | `src/providers/mockProvider.mjs` 的 `advanceStory()` |
-| `POST /api/chat` 原样回显 | 真正的群聊逐句播放；同样要避免无脑调用户数据接口 | 同上 handler（仍留在 `src/server.mjs`，不是 provider 接缝的一部分） |
-| `GET /api/health` 返回 demo 标志 | 在 OAuth 联调成功且 doctor 通过后切到 `mode: "live"` | `DEMO_FLAG` 常量 |
+| `GET /api/stories` 返回 `STORIES` 数组 | 由 `src/providers/realProvider.mjs` 调用 `https://api.zhihu.com/km-indep-home/hackathon/v2/story/list` 并按契约映射 | `src/providers/realProvider.mjs` 的 `listStories()` |
+| `GET /api/stories/:id` 返回单条 + beats | 同样由 `realProvider` 调 `…/story/{work_id}` 详情端点，按契约映射；`content` 作为单一 narration beat 保留原文，不切割为虚构的 dialogue/ask_player_choice | `src/providers/realProvider.mjs` 的 `getStory()` |
+| `POST /api/stories/advance` 仅递增 index | 真实 API 没有结构化 beats；advance 总是立即 finished（已展示完 `content`） | `src/providers/realProvider.mjs` 的 `advanceStory()` |
+| `POST /api/chat` 原样回显 | 真正的群聊逐句播放；与本次真实 API 接缝无关 | 同上 handler（仍留在 `src/server.mjs`，不是 provider 接缝的一部分） |
+| `GET /api/health` 返回 demo 标志 | `STORY_OUTSIDE_PROVIDER=real` 时切换为 live 模式并新增 `provider: 'real'` 字段 | `src/server.mjs` 的 `currentDemoFlag()` |
 
 Provider 接缝的关键文件：
 
 - `src/providers/dto.mjs` —— 与 transport 无关的 DTO（`StorySummary`、`StoryDetail`、`AdvanceResult` 等）和错误类型（`StoryNotFoundError`、`ValidationError`）。
 - `src/providers/mockProvider.mjs` —— 内存版 Mock；返回上面 DTO。
 - `src/providers/index.mjs` —— Provider 选择器；读 `STORY_OUTSIDE_PROVIDER`（默认 `mock`）。
-- `src/providers/realProvider.mjs` —— **尚未实现**；接入官方 API 时按接缝实现，从这里发起 token / 用户接口调用。
+- `src/providers/realProvider.mjs` —— 已实现；按官方契约对接故事 API；不发送 `Authorization`/`X-OAuth-Token`；不消费任何环境变量型 credential；超时 / 429 / 5xx / 非 JSON / 缺字段均抛出 typed `ProviderError`，不循环重试；上游响应原文保留在 `source.raw` 以便溯源。
 
 选择器规则：
 
 - `STORY_OUTSIDE_PROVIDER=mock`（默认） → MockProvider。
-- `STORY_OUTSIDE_PROVIDER=real` → **明确报错**而不是静默回退 mock，避免生产上错配置后假装还能谈上知乎。
+- `STORY_OUTSIDE_PROVIDER=real` → RealZhihuProvider；启动只需 Node ≥ 18 的内置 `fetch`，无需任何 secret。
 - `STORY_OUTSIDE_PROVIDER=<其他>` → 启动报 `Unknown STORY_OUTSIDE_PROVIDER`。
 
 后端**不**直接依赖 `vendor/zhihu-hackathon/scripts/*.mjs`。它们是编排型脚本，不属于运行依赖。后续若要"按官方指引执行 OAuth 流程"，应当是开发机本地跑这些脚本去申请/写入钥匙串，**而不是**服务器在每次启动时去跑。`src/providers/realProvider.mjs` 一律不许 `import` 任何 `vendor/zhihu-hackathon/**` 路径。
@@ -49,17 +48,24 @@ Provider 接缝的关键文件：
 
 **禁止把 App ID 写进 `ZHIHU_OAUTH_APP_KEY`，也禁止把 OAuth App Key 写进 `ZHIHU_ACCESS_SECRET`。**
 
-本仓库**任何位置都不保存这三个值**；Phase 1 完全没有 `.env` / `hackathon.config.json` 的 `oauth` 段。
+本仓库**任何位置都不保存这三个值**。当前真实故事 API（`zhihu_hackathon_2026_p2`）按 `references/hackathon-content-api.md` 不需要鉴权，因此 real provider 不读取上面任何凭证。未来若官方要求鉴权，必须先在本文档补一节"接入凭证前必要的安全检查"，再在 `realProvider` 里接收已加载的凭证值，**绝不**让它读 `.env` / `process.env` 中任何看起来像凭据的键。
 
-### 3.2 `/access_token` 表单（OAuth 兑换）
+### 3.2 故事内容端点（黑客松专用，无鉴权）
 
 ```
-app_id=<App ID>
-app_key=<OAuth App Key>
-grant_type=authorization_code            ← 固定枚举，不从回调读取
-redirect_uri=<公网 HTTPS callback>
-code=<回调里的 authorization_code>      ← 即便后端兼容字段名 code，也不叫 authorization_code
+GET https://api.zhihu.com/km-indep-home/hackathon/v2/story/list
+GET https://api.zhihu.com/km-indep-home/hackathon/v2/story/{work_id}
 ```
+
+请求头：仅 `Accept: application/json`（加上 `User-Agent` 仅为绕过部分 CDN 边缘限制；不含任何凭据）。
+
+列表响应字段：`work_id`、`title`、`artwork`、`tab_artwork`、`description`、`labels`（及其他服务端可新增字段，客户端须兼容缺失字段并保留未识别字段）。
+
+详情响应字段：`work_id`、`chapter_name`、`author_avatar`、`author_name`、`labels`、`introduction`、`content`（同上）。
+
+`work_id` 取自对应列表接口的返回；调用详情前必须校验非空、长度 ≤ 128，且不含 `/`、`?`、`#`、回车、换行或控制字符。provider 内部用 `encodeURIComponent` 走 URL path 编码，禁止拼接未校验输入。
+
+调用失败、超时、`429`/`5xx`、非 JSON 响应、缺字段、空 body 等情形须抛出 typed `ProviderError`，永不循环重试、永不伪造正文、永不回显上游错误 body。
 
 ### 3.3 用户数据接口的鉴权头
 
@@ -69,6 +75,8 @@ X-OAuth-Token: <OAuth access_token>
 ```
 
 `app_key` **不是** `X-OAuth-Token`。
+
+> **本次黑客松故事接口不需要以上鉴权头**。`realProvider` 显式禁用 `Authorization` 和 `X-OAuth-Token`，并在 `meta.forbiddenRequestHeaders` 中暴露该约束以供集成评审使用。
 
 ### 3.4 已知协议缺口（来自官方 `oauth-boundary.md`）
 
@@ -85,31 +93,50 @@ X-OAuth-Token: <OAuth access_token>
 - 本地 `http://127.0.0.1:4173/` 只能预览页面，不能完成知乎登录。
 - 真实 OAuth 必须部署到 Cloudflare / Sealos 等平台，使用公网 HTTPS 回调 `https://<public-domain>/auth/callback`，并和知乎开放平台登记值完全一致。
 - `PORT` / `HOST` 必须可配：默认 `127.0.0.1:4173`，未来部署时切换到平台要求的地址。
+- 黑客松故事 API 不需要公网回调；`STORY_OUTSIDE_PROVIDER=real` 在任何能联网到 `api.zhihu.com` 的环境下都能跑。
 
-## 4. Demo 模式如何被客户端识别
+## 4. Demo / Live 模式如何被客户端识别
 
 每个 JSON 响应都附 `demo` 段：
 
-```json
-{
-  "demo": {
-    "mode": "demo",
-    "official_zhihu_api": false,
-    "reason": "Phase 1 builds an interactive narrative demo without touching the real Zhihu Open Platform. See docs/official-zhihu-skill.md for the planned integration boundary."
+- mock 默认：
+  ```json
+  {
+    "demo": {
+      "mode": "demo",
+      "official_zhihu_api": false,
+      "reason": "Phase 2 builds an interactive narrative demo without touching the real Zhihu Open Platform. Data is served by src/providers/mockProvider.mjs (default STORY_OUTSIDE_PROVIDER=mock). See docs/official-zhihu-skill.md for the planned real-provider integration boundary."
+    }
   }
-}
-```
+  ```
+- real provider：
+  ```json
+  {
+    "demo": {
+      "mode": "live",
+      "provider": "real",
+      "official_zhihu_api": true,
+      "contract": "zhihu_hackathon_2026_p2",
+      "auth": "none",
+      "scope": "zhihu_hackathon_2026_p2",
+      "reason": "Live mode: data is served by src/providers/realProvider.mjs against api.zhihu.com/km-indep-home/hackathon/v2/story/*. ..."
+    }
+  }
+  ```
+
+`/api/health` 额外携带顶层 `provider: 'mock' | 'real'`，方便客户端不需要解 `demo` 段也能判断。
 
 前端在 `public/scripts/app.js` 的 `applyDemoBanner()` 里：
 
-- 把 `data-mode-tag` 的横幅标记成 `demo · 未连接知乎官方 API`；
+- 把 `data-mode-tag` 的横幅标记成 `demo · 未连接知乎官方 API` 或 `live · 已连接知乎黑客松 API`；
 - 把 `[data-demo-meta]` 元数据写入首屏；
 - 任何后续 adapter 接入后必须把这个标记置为 `live` 并清掉 demo 横幅。
 
 ## 5. 现在不做、以后要做
 
 - ❌ 现在：不引入官方 `zhihu-cli`、不写 OAuth handler、不写 Token 会话。
-- ✅ 以后：先在生产域名上把 OAuth 跑通 → 验收 5 项用户接口（创作 / 关注 / 收藏夹列表 / 收藏夹内容 / 近期收藏）→ 才把 `demo` 标记切到 `live`。
+- ✅ 现在：`STORY_OUTSIDE_PROVIDER=real` 可直接对接黑客松故事 API；无 Access Secret；超时 / 429 / 5xx / 缺字段统一返回 typed error；不循环重试。
+- ✅ 以后：先在生产域名上把 OAuth 跑通 → 验收 5 项用户接口（创作 / 关注 / 收藏夹列表 / 收藏夹内容 / 近期收藏）→ 才把用户数据接入游戏业务。
 - ✅ 以后：医生脚本（`vendor/zhihu-hackathon/scripts/doctor.mjs`）只在开发机运行；CI 不跑。
 
 ## 6. 校验快照

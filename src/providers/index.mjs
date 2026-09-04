@@ -2,29 +2,31 @@
 //
 // Any data source for /api/stories, /api/stories/:id, /api/stories/advance
 // (and future endpoints) goes through a StoryProvider. Routes never touch
-// the data layer directly. This is the seam where a future official Zhihu
-// adapter replaces the Mock without touching HTTP wiring.
+// the data layer directly. This is the seam where the official Zhihu
+// Hackathon story adapter replaces the Mock without touching HTTP wiring.
 //
-// Selector rules (current MVP):
+// Selector rules:
 //   * STORY_OUTSIDE_PROVIDER=mock       → mock (default; safe in dev & prod)
-//   * STORY_OUTSIDE_PROVIDER=real       → real adapter (NOT IMPLEMENTED YET)
-//                                          — see TODO below; we refuse loudly
-//                                            instead of silently falling back to
-//                                            mock, so a misconfigured prod does
-//                                            not pretend to talk to Zhihu.
+//   * STORY_OUTSIDE_PROVIDER=real       → real adapter (src/providers/realProvider.mjs)
+//                                          bound to the zhihu_hackathon_2026_p2
+//                                          story contract. Per that contract
+//                                          no Access Secret, OAuth token or
+//                                          other credential is required —
+//                                          these endpoints are unauthenticated
+//                                          during the hackathon window.
 //   * STORY_OUTSIDE_PROVIDER=<unknown>  → throws at startup
 //
-// Future Real provider MUST live in src/providers/realProvider.mjs and MUST
-// import nothing from vendor/zhihu-hackathon (those scripts are orchestration
-// tools, not runtime deps). It will be selected by setting
-// STORY_OUTSIDE_PROVIDER=real AND supplying the OAuth / Access Secret
-// credentials via env, per docs/official-zhihu-skill.md.
+// Real provider MUST live in src/providers/realProvider.mjs and MUST import
+// nothing from vendor/zhihu-hackathon (those scripts are orchestration tools,
+// not runtime deps).
 //
-// IMPORTANT: providers never log, store, or echo any credential value. They
-// receive already-loaded credentials from the bootstrap layer (out of scope
-// for Phase 1).
+// IMPORTANT: providers never log, store, or echo any credential value. The
+// real adapter does not consume credentials today; if a future story API
+// ever does require auth, the provider must receive already-loaded values
+// from the bootstrap layer (out of scope for this revision).
 
 import { createMockStoryProvider } from './mockProvider.mjs';
+import { createRealZhihuStoryProvider } from './realProvider.mjs';
 
 /**
  * @typedef {import('./dto.mjs').StorySummary} StorySummary
@@ -57,11 +59,7 @@ export function getStoryProvider() {
   if (requested === 'mock') {
     provider = createMockStoryProvider();
   } else if (requested === 'real') {
-    throw new Error(
-      'STORY_OUTSIDE_PROVIDER=real is not implemented yet. ' +
-        'See src/providers/index.mjs and docs/official-zhihu-skill.md before ' +
-        'wiring the official Zhihu adapter.',
-    );
+    provider = createRealZhihuStoryProvider();
   } else {
     throw new Error(
       `Unknown STORY_OUTSIDE_PROVIDER="${requested}". Expected "mock" or "real".`,
@@ -82,6 +80,7 @@ export function __resetStoryProviderForTests() {
 const _cache = new Map();
 
 export { createMockStoryProvider } from './mockProvider.mjs';
+export { createRealZhihuStoryProvider } from './realProvider.mjs';
 export {
   ProviderError,
   StoryNotFoundError,

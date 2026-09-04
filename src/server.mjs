@@ -178,6 +178,46 @@ const DEMO_FLAG = Object.freeze({
     'Phase 2 builds an interactive narrative demo without touching the real Zhihu Open Platform. Data is served by src/providers/mockProvider.mjs (default STORY_OUTSIDE_PROVIDER=mock). See docs/official-zhihu-skill.md for the planned real-provider integration boundary.',
 });
 
+// When STORY_OUTSIDE_PROVIDER=real is selected we MUST NOT advertise
+// `official_zhihu_api: false` — the upstream is now being called, with
+// the caveats spelled out below. The flag is computed lazily per
+// request so a process that switches provider via env after start
+// (tests do this) reports accurately. MockProvider keeps DEMO_FLAG
+// verbatim so existing tests that assert demo.official_zhihu_api ===
+// false continue to hold.
+function currentDemoFlag() {
+  let providerName = 'mock';
+  try {
+    providerName = getStoryProvider().name;
+  } catch {
+    providerName = (process.env.STORY_OUTSIDE_PROVIDER || 'mock').trim().toLowerCase();
+  }
+  if (providerName === 'real') {
+    return Object.freeze({
+      mode: 'live',
+      provider: 'real',
+      official_zhihu_api: true,
+      contract: 'zhihu_hackathon_2026_p2',
+      // Per the official contract these endpoints are unauthenticated
+      // during the hackathon. Surface that on the wire so a client can
+      // tell at a glance whether it is talking to a real adapter that
+      // happens not to need credentials, vs. a misconfigured deployment
+      // that quietly dropped a required Authorization header.
+      auth: 'none',
+      // The contract document explicitly warns the endpoints may change
+      // once the hackathon closes. We re-read that warning every response
+      // so a future operator does not have to chase it down in the docs.
+      scope: 'zhihu_hackathon_2026_p2',
+      reason:
+        'Live mode: data is served by src/providers/realProvider.mjs against ' +
+        'api.zhihu.com/km-indep-home/hackathon/v2/story/*. See ' +
+        'docs/official-zhihu-skill.md for the integration boundary and the ' +
+        'no-credential contract.',
+    });
+  }
+  return DEMO_FLAG;
+}
+
 // Phase 4: admin / dev tooling flag. Every /api/admin/* and /api/dev/* route
 // carries this banner so a future frontend / proxy can hide them in prod.
 // There is NO authentication here — these routes are demo/dev-only by design
@@ -428,7 +468,7 @@ function sessionError(err) {
 
 function sessionErrorResponse(res, err) {
   const { status, code, message, details } = sessionError(err);
-  const body = { error: code, message, demo: DEMO_FLAG, dev: DEV_FLAG };
+  const body = { error: code, message, demo: currentDemoFlag(), dev: DEV_FLAG };
   if (details) body.details = details;
   return jsonResponse(res, status, body);
 }
@@ -438,7 +478,7 @@ function rejectInvalidSessionUuid(res, session_uuid) {
   jsonResponse(res, 400, {
     error: 'validation_failed',
     message: 'session_uuid must be a UUID',
-    demo: DEMO_FLAG,
+    demo: currentDemoFlag(),
     dev: DEV_FLAG,
   });
   return true;
@@ -465,6 +505,15 @@ async function handleRequest(req, res) {
 
   // Health & meta
   if (method === 'GET' && pathname === '/api/health') {
+    let providerName = 'mock';
+    try {
+      providerName = getStoryProvider().name;
+    } catch {
+      // Provider unavailable — fall back to env var so /api/health
+      // still answers while the bootstrap layer figures out the
+      // misconfiguration. The route below will surface the real error
+      // on the first data request.
+    }
     return jsonResponse(res, 200, {
       ok: true,
       name: 'story-outside',
@@ -472,7 +521,8 @@ async function handleRequest(req, res) {
       phase: 4,
       uptimeSeconds: Math.round(process.uptime()),
       nodeVersion: process.version,
-      demo: DEMO_FLAG,
+      provider: providerName,
+      demo: currentDemoFlag(),
     });
   }
 
@@ -484,7 +534,7 @@ async function handleRequest(req, res) {
     return jsonResponse(res, 500, {
       error: 'provider_unavailable',
       message: String(err && err.message ? err.message : err),
-      demo: DEMO_FLAG,
+      demo: currentDemoFlag(),
     });
   }
 
@@ -492,10 +542,10 @@ async function handleRequest(req, res) {
   if (method === 'GET' && pathname === '/api/stories') {
     try {
       const stories = await provider.listStories();
-      return jsonResponse(res, 200, { demo: DEMO_FLAG, stories });
+      return jsonResponse(res, 200, { demo: currentDemoFlag(), stories });
     } catch (err) {
       const { status, code } = classifyProviderError(err);
-      return jsonResponse(res, status, { error: code, demo: DEMO_FLAG });
+      return jsonResponse(res, status, { error: code, demo: currentDemoFlag() });
     }
   }
 
@@ -504,10 +554,10 @@ async function handleRequest(req, res) {
   if (method === 'GET' && storyMatch) {
     try {
       const story = await provider.getStory(storyMatch[1]);
-      return jsonResponse(res, 200, { demo: DEMO_FLAG, story });
+      return jsonResponse(res, 200, { demo: currentDemoFlag(), story });
     } catch (err) {
       const { status, code } = classifyProviderError(err);
-      return jsonResponse(res, status, { error: code, demo: DEMO_FLAG });
+      return jsonResponse(res, status, { error: code, demo: currentDemoFlag() });
     }
   }
 
@@ -518,7 +568,7 @@ async function handleRequest(req, res) {
       body = await readJsonBody(req);
     } catch (err) {
       const { status, code } = classifyProviderError(err);
-      return jsonResponse(res, status, { error: code, demo: DEMO_FLAG });
+      return jsonResponse(res, status, { error: code, demo: currentDemoFlag() });
     }
     try {
       const result = await provider.advanceStory({
@@ -526,10 +576,10 @@ async function handleRequest(req, res) {
         roleId: body && body.roleId,
         index: body && body.index,
       });
-      return jsonResponse(res, 200, { demo: DEMO_FLAG, ...result });
+      return jsonResponse(res, 200, { demo: currentDemoFlag(), ...result });
     } catch (err) {
       const { status, code } = classifyProviderError(err);
-      return jsonResponse(res, status, { error: code, demo: DEMO_FLAG });
+      return jsonResponse(res, status, { error: code, demo: currentDemoFlag() });
     }
   }
 
@@ -540,14 +590,14 @@ async function handleRequest(req, res) {
       body = await readJsonBody(req);
     } catch (err) {
       const { status, code } = classifyProviderError(err);
-      return jsonResponse(res, status, { error: code, demo: DEMO_FLAG });
+      return jsonResponse(res, status, { error: code, demo: currentDemoFlag() });
     }
     const text = typeof body.text === 'string' ? body.text.trim() : '';
     if (!text) {
-      return jsonResponse(res, 400, { error: 'empty_text', demo: DEMO_FLAG });
+      return jsonResponse(res, 400, { error: 'empty_text', demo: currentDemoFlag() });
     }
     return jsonResponse(res, 200, {
-      demo: DEMO_FLAG,
+      demo: currentDemoFlag(),
       reply: `(mock)你说了：${text.slice(0, 280)}`,
       timestamp: new Date().toISOString(),
     });
@@ -579,7 +629,7 @@ async function handleRequest(req, res) {
         })),
       });
     }
-    return jsonResponse(res, 200, { demo: DEMO_FLAG, dev: DEV_FLAG, stories: out });
+    return jsonResponse(res, 200, { demo: currentDemoFlag(), dev: DEV_FLAG, stories: out });
   }
 
   // POST /api/admin/stories/import — run the canonical import pipeline for a
@@ -591,7 +641,7 @@ async function handleRequest(req, res) {
       body = await readJsonBody(req);
     } catch (err) {
       const { status, code } = classifyProviderError(err);
-      return jsonResponse(res, status, { error: code, demo: DEMO_FLAG, dev: DEV_FLAG });
+      return jsonResponse(res, status, { error: code, demo: currentDemoFlag(), dev: DEV_FLAG });
     }
     const story_uuid = typeof body.story_uuid === 'string' && body.story_uuid
       ? body.story_uuid
@@ -603,13 +653,13 @@ async function handleRequest(req, res) {
         slug: importMatch[1],
         story_uuid,
       });
-      return jsonResponse(res, 200, { demo: DEMO_FLAG, dev: DEV_FLAG, result });
+      return jsonResponse(res, 200, { demo: currentDemoFlag(), dev: DEV_FLAG, result });
     } catch (err) {
       const { status, code } = classifyProviderError(err);
       return jsonResponse(res, status, {
         error: code,
         message: String(err && err.message ? err.message : err),
-        demo: DEMO_FLAG,
+        demo: currentDemoFlag(),
         dev: DEV_FLAG,
       });
     }
@@ -626,12 +676,12 @@ async function handleRequest(req, res) {
       body = await readJsonBody(req);
     } catch (err) {
       const { status, code } = classifyProviderError(err);
-      return jsonResponse(res, status, { error: code, demo: DEMO_FLAG, dev: DEV_FLAG });
+      return jsonResponse(res, status, { error: code, demo: currentDemoFlag(), dev: DEV_FLAG });
     }
     if (!body.story_version_uuid || typeof body.story_version_uuid !== 'string') {
       return jsonResponse(res, 400, {
         error: 'missing_story_version_uuid',
-        demo: DEMO_FLAG,
+        demo: currentDemoFlag(),
         dev: DEV_FLAG,
       });
     }
@@ -649,13 +699,13 @@ async function handleRequest(req, res) {
         story_version_uuid: body.story_version_uuid,
         profile,
       });
-      return jsonResponse(res, 200, { demo: DEMO_FLAG, dev: DEV_FLAG, result });
+      return jsonResponse(res, 200, { demo: currentDemoFlag(), dev: DEV_FLAG, result });
     } catch (err) {
       const { status, code } = classifyProviderError(err);
       return jsonResponse(res, status, {
         error: code,
         message: String(err && err.message ? err.message : err),
-        demo: DEMO_FLAG,
+        demo: currentDemoFlag(),
         dev: DEV_FLAG,
       });
     }
@@ -687,28 +737,28 @@ async function handleRequest(req, res) {
       if (missing) {
         return jsonResponse(res, 400, {
           error: 'validation_failed', message: 'The session request is invalid.',
-          field: missing, demo: DEMO_FLAG, dev: DEV_FLAG,
+          field: missing, demo: currentDemoFlag(), dev: DEV_FLAG,
         });
       }
       for (const key of ['session_uuid', 'story_uuid', 'story_version_uuid']) {
         if (!isSessionUuid(body[key])) {
           return jsonResponse(res, 400, {
             error: 'validation_failed', message: 'The session request is invalid.',
-            field: key, demo: DEMO_FLAG, dev: DEV_FLAG,
+            field: key, demo: currentDemoFlag(), dev: DEV_FLAG,
           });
         }
       }
       if (!isSessionUuid(body.generation_profile.cache_uuid)) {
         return jsonResponse(res, 400, {
           error: 'invalid_cache', message: 'The opening cache is invalid for this session.',
-          demo: DEMO_FLAG, dev: DEV_FLAG,
+          demo: currentDemoFlag(), dev: DEV_FLAG,
         });
       }
       const pinnedCache = storyRepo.findOpeningCacheByUuid(body.generation_profile.cache_uuid);
       if (!pinnedCache || pinnedCache.status !== 'valid') {
         return jsonResponse(res, 400, {
           error: 'invalid_cache', message: 'The opening cache is invalid for this session.',
-          demo: DEMO_FLAG, dev: DEV_FLAG,
+          demo: currentDemoFlag(), dev: DEV_FLAG,
         });
       }
       // A cache-only profile is safe to accept here because every omitted
@@ -762,7 +812,7 @@ async function handleRequest(req, res) {
         onSessionCreate(sessionHookCtx);
         onOpeningCacheHit(sessionHookCtx);
         return jsonResponse(res, 200, {
-          demo: DEMO_FLAG, dev: DEV_FLAG, ...result, pinned,
+          demo: currentDemoFlag(), dev: DEV_FLAG, ...result, pinned,
           session: { ...result, pinned },
         });
       } catch (err) {
@@ -777,7 +827,7 @@ async function handleRequest(req, res) {
         return jsonResponse(res, 400, {
           error: 'missing_field',
           field: k,
-          demo: DEMO_FLAG,
+          demo: currentDemoFlag(),
           dev: DEV_FLAG,
         });
       }
@@ -791,13 +841,13 @@ async function handleRequest(req, res) {
         user_ref: body.user_ref,
         role_id: body.role_id,
       });
-      return jsonResponse(res, 200, { demo: DEMO_FLAG, dev: DEV_FLAG, snapshot });
+      return jsonResponse(res, 200, { demo: currentDemoFlag(), dev: DEV_FLAG, snapshot });
     } catch (err) {
       const { status, code } = classifyProviderError(err);
       return jsonResponse(res, status, {
         error: code,
         message: String(err && err.message ? err.message : err),
-        demo: DEMO_FLAG,
+        demo: currentDemoFlag(),
         dev: DEV_FLAG,
       });
     }
@@ -811,7 +861,7 @@ async function handleRequest(req, res) {
     try {
       const recovered = recoverSession({ repository: storyRepo, session_uuid: sessionMatch[1] });
       return jsonResponse(res, 200, {
-        demo: DEMO_FLAG,
+        demo: currentDemoFlag(),
         dev: DEV_FLAG,
         ...recovered,
         pinned: sessionPinnedMetadata.get(sessionMatch[1]) || null,
@@ -840,7 +890,7 @@ async function handleRequest(req, res) {
         !Number.isInteger(body.event.sequence) || typeof body.event.text !== 'string') {
       return jsonResponse(res, 400, {
         error: 'validation_failed', message: 'The opening event request is invalid.',
-        demo: DEMO_FLAG, dev: DEV_FLAG,
+        demo: currentDemoFlag(), dev: DEV_FLAG,
       });
     }
     try {
@@ -861,7 +911,7 @@ async function handleRequest(req, res) {
         event: body.event,
         latency_ms: Date.now() - openingCommitStartedAt,
       });
-      return jsonResponse(res, 200, { demo: DEMO_FLAG, dev: DEV_FLAG, ...result });
+      return jsonResponse(res, 200, { demo: currentDemoFlag(), dev: DEV_FLAG, ...result });
     } catch (err) {
       return sessionErrorResponse(res, err);
     }
@@ -894,7 +944,7 @@ async function handleRequest(req, res) {
     try {
       const recovered = recoverSession({ repository: storyRepo, session_uuid: recoverMatch[1] });
       return jsonResponse(res, 200, {
-        demo: DEMO_FLAG, dev: DEV_FLAG,
+        demo: currentDemoFlag(), dev: DEV_FLAG,
         ...recovered,
         pinned: sessionPinnedMetadata.get(recoverMatch[1]) || null,
       });
@@ -915,7 +965,7 @@ async function handleRequest(req, res) {
         session_uuid: discardMatch[1],
       });
       return jsonResponse(res, 200, {
-        demo: DEMO_FLAG, dev: DEV_FLAG,
+        demo: currentDemoFlag(), dev: DEV_FLAG,
         session_uuid: discardMatch[1],
         ...result,
       });
@@ -946,7 +996,7 @@ async function handleRequest(req, res) {
     try {
       const ending = buildEnding({ repository: storyRepo, session_uuid: endingMatch[1] });
       return jsonResponse(res, 200, {
-        demo: DEMO_FLAG, dev: DEV_FLAG,
+        demo: currentDemoFlag(), dev: DEV_FLAG,
         session_uuid: endingMatch[1],
         ...ending,
       });
@@ -956,7 +1006,7 @@ async function handleRequest(req, res) {
           error: 'ending_not_committed',
           message: 'finish_story has not yet committed for this session.',
           session_uuid: endingMatch[1],
-          demo: DEMO_FLAG, dev: DEV_FLAG,
+          demo: currentDemoFlag(), dev: DEV_FLAG,
         });
       }
       return sessionErrorResponse(res, err);
@@ -974,7 +1024,7 @@ async function handleRequest(req, res) {
     try {
       const timeline = buildOriginalTimeline({ repository: storyRepo, session_uuid: originalTimelineMatch[1] });
       return jsonResponse(res, 200, {
-        demo: DEMO_FLAG, dev: DEV_FLAG,
+        demo: currentDemoFlag(), dev: DEV_FLAG,
         session_uuid: originalTimelineMatch[1],
         ...timeline,
       });
@@ -993,7 +1043,7 @@ async function handleRequest(req, res) {
     try {
       const replay = buildReplay({ repository: storyRepo, session_uuid: replayMatch[1] });
       return jsonResponse(res, 200, {
-        demo: DEMO_FLAG, dev: DEV_FLAG,
+        demo: currentDemoFlag(), dev: DEV_FLAG,
         session_uuid: replayMatch[1],
         ...replay,
       });
@@ -1019,7 +1069,7 @@ async function handleRequest(req, res) {
         !Number.isInteger(body.expected_revision)) {
       return jsonResponse(res, 400, {
         error: 'validation_failed', message: 'The interrupt request is invalid.',
-        demo: DEMO_FLAG, dev: DEV_FLAG,
+        demo: currentDemoFlag(), dev: DEV_FLAG,
       });
     }
     try {
@@ -1045,7 +1095,7 @@ async function handleRequest(req, res) {
       // docs/observability.md sanity counter expects.
       onOpeningCacheMiss(interruptHookCtx, 'player_interrupt_realtime');
       return jsonResponse(res, 200, {
-        demo: DEMO_FLAG,
+        demo: currentDemoFlag(),
         dev: DEV_FLAG,
         ...result,
         player_event: result.event,
@@ -1093,7 +1143,7 @@ async function handleRequest(req, res) {
         (body.request_id !== undefined && (typeof body.request_id !== 'string' || !body.request_id.length))) {
       return jsonResponse(res, 400, {
         error: 'validation_failed', message: 'The generate request is invalid.',
-        demo: DEMO_FLAG, dev: DEV_FLAG,
+        demo: currentDemoFlag(), dev: DEV_FLAG,
       });
     }
     let runtime;
@@ -1116,7 +1166,7 @@ async function handleRequest(req, res) {
     } catch (err) {
       if (err instanceof AgentRuntimeError) {
         return jsonResponse(res, 400, {
-          error: err.code, message: err.message, demo: DEMO_FLAG, dev: DEV_FLAG,
+          error: err.code, message: err.message, demo: currentDemoFlag(), dev: DEV_FLAG,
         });
       }
       return sessionErrorResponse(res, err);
@@ -1128,7 +1178,7 @@ async function handleRequest(req, res) {
         expected_revision: body.expected_revision,
       });
       return jsonResponse(res, 200, {
-        demo: DEMO_FLAG, dev: DEV_FLAG,
+        demo: currentDemoFlag(), dev: DEV_FLAG,
         ...result,
         session_uuid: sessionUuid,
         pending_id: result.pending_id,
@@ -1142,7 +1192,7 @@ async function handleRequest(req, res) {
     } catch (err) {
       if (err instanceof AgentRuntimeError) {
         return jsonResponse(res, 400, {
-          error: err.code, message: err.message, demo: DEMO_FLAG, dev: DEV_FLAG,
+          error: err.code, message: err.message, demo: currentDemoFlag(), dev: DEV_FLAG,
         });
       }
       return sessionErrorResponse(res, err);
@@ -1170,7 +1220,7 @@ async function handleRequest(req, res) {
         (body.client_request_id !== undefined && (typeof body.client_request_id !== 'string' || !body.client_request_id.length))) {
       return jsonResponse(res, 400, {
         error: 'validation_failed', message: 'The narrative-event commit request is invalid.',
-        demo: DEMO_FLAG, dev: DEV_FLAG,
+        demo: currentDemoFlag(), dev: DEV_FLAG,
       });
     }
     try {
@@ -1182,7 +1232,7 @@ async function handleRequest(req, res) {
         expected_revision: body.expected_revision,
         ...(body.client_request_id ? { client_request_id: body.client_request_id } : {}),
       });
-      return jsonResponse(res, 200, { demo: DEMO_FLAG, dev: DEV_FLAG, ...result });
+      return jsonResponse(res, 200, { demo: currentDemoFlag(), dev: DEV_FLAG, ...result });
     } catch (err) {
       return sessionErrorResponse(res, err);
     }
@@ -1199,12 +1249,12 @@ async function handleRequest(req, res) {
       body = await readJsonBody(req);
     } catch (err) {
       const { status, code } = classifyProviderError(err);
-      return jsonResponse(res, status, { error: code, demo: DEMO_FLAG, dev: DEV_FLAG });
+      return jsonResponse(res, status, { error: code, demo: currentDemoFlag(), dev: DEV_FLAG });
     }
     if (!body.snapshot || typeof body.snapshot !== 'object') {
       return jsonResponse(res, 400, {
         error: 'missing_snapshot',
-        demo: DEMO_FLAG,
+        demo: currentDemoFlag(),
         dev: DEV_FLAG,
       });
     }
@@ -1213,7 +1263,7 @@ async function handleRequest(req, res) {
     if (typeof snapshotSessionUuid !== 'string' || snapshotSessionUuid !== urlSessionUuid) {
       return jsonResponse(res, 400, {
         error: 'session_uuid_mismatch',
-        demo: DEMO_FLAG,
+        demo: currentDemoFlag(),
         dev: DEV_FLAG,
       });
     }
@@ -1228,13 +1278,13 @@ async function handleRequest(req, res) {
         tool_name: 'ask_player_choice',
         latency_ms: Date.now() - firstChoiceStartedAt,
       });
-      return jsonResponse(res, 200, { demo: DEMO_FLAG, dev: DEV_FLAG, result });
+      return jsonResponse(res, 200, { demo: currentDemoFlag(), dev: DEV_FLAG, result });
     } catch (err) {
       const { status, code } = classifyProviderError(err);
       return jsonResponse(res, status, {
         error: code,
         message: String(err && err.message ? err.message : err),
-        demo: DEMO_FLAG,
+        demo: currentDemoFlag(),
         dev: DEV_FLAG,
       });
     }
@@ -1264,7 +1314,7 @@ async function handleRequest(req, res) {
       return jsonResponse(res, 400, {
         error: 'validation_failed',
         message: 'session_uuid must be a UUID',
-        demo: DEMO_FLAG,
+        demo: currentDemoFlag(),
         dev: DEV_FLAG,
       });
     }
@@ -1273,7 +1323,7 @@ async function handleRequest(req, res) {
       return jsonResponse(res, 404, {
         error: 'session_not_observed',
         message: 'No observability data recorded for this session yet.',
-        demo: DEMO_FLAG,
+        demo: currentDemoFlag(),
         dev: DEV_FLAG,
       });
     }
@@ -1293,7 +1343,7 @@ async function handleRequest(req, res) {
       pinnedSession = null;
     }
     return jsonResponse(res, 200, {
-      demo: DEMO_FLAG,
+      demo: currentDemoFlag(),
       dev: DEV_FLAG,
       session_uuid,
       pinned: pinnedSession ? {
@@ -1318,7 +1368,7 @@ async function handleRequest(req, res) {
     const metrics = snapshotMetricsAll();
     const cacheStats = snapshotCacheStatsAll();
     return jsonResponse(res, 200, {
-      demo: DEMO_FLAG,
+      demo: currentDemoFlag(),
       dev: DEV_FLAG,
       metrics,
       cache_stats: cacheStats,
