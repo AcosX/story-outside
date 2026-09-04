@@ -3,9 +3,11 @@
 //
 // Focus:
 //   * ensureOpeningCache awaits async generators / retry reuses failed row
+//   * ensureOpeningCache keeps the same cache_uuid after valid→invalidated→rebuild→fail
 //   * stageNarrativeBatch rejects tool-only batches
 //   * observeSession counts state transitions, not raw observations
 //   * sessionError does not hide unknown server errors as client 400s
+//   * sessionError preserves ValidationError codes (e.g. payload_too_large) as 400
 
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
@@ -131,4 +133,91 @@ test('sessionError maps unknown errors to 500, not validation_failed', () => {
   assert.equal(sessionError(new Error('totally unexpected inner failure')).status, 500);
   assert.equal(sessionError(new Error('sessionService: pending_id must be a UUID')).status, 400);
   assert.equal(sessionError(new Error('unknown session')).status, 404);
+});
+
+test('sessionError preserves ValidationError codes as 400, not 500', async () => {
+  const { ValidationError } = await import('../src/providers/dto.mjs');
+  // B1 regression: oversized body throws ValidationError('payload_too_large').
+  // sessionError must surface the precise code at 400 so clients see
+  // {"error":"invalid_input","message":"payload_too_large"} instead of
+  // a generic 500 internal_error.
+  const r1 = sessionError(new ValidationError('payload_too_large'));
+  assert.equal(r1.status, 400);
+  assert.equal(r1.code, 'invalid_input');
+  const r2 = sessionError(new ValidationError('bad_json'));
+  assert.equal(r2.status, 400);
+  assert.equal(r2.code, 'invalid_input');
+});
+
+test('sessionError does NOT over-match free-floating "invalid" as 400', () => {
+  // B2 regression: a service-layer message starting with "invalid" that
+  // lacks the sessionService:/endingService: prefix must not be silently
+  // re-classified as a client validation failure.
+  assert.equal(sessionError(new Error('invalid upstream response')).status, 500);
+  // But the explicit "sessionService: invalid X" form still maps to 400.
+  assert.equal(sessionError(new Error('sessionService: invalid tool call name')).status, 400);
+  // And the documented "tool-only batches are not allowed" still maps to 400.
+  assert.equal(
+    sessionError(new Error('stageNarrativeBatch: tool-only batches are not allowed')).status,
+    400,
+  );
+});
+
+test('ensureOpeningCache keeps the same cache_uuid after valid→invalidated→rebuild→fail', async () => {
+  // S4 regression: the original PR #5 promise is that retries reuse the
+  // same generation_hash (and therefore the same cache_uuid). After
+  // invalidation, however, the scope key is dropped, so the FIRST
+  // post-invalidation failure creates a fresh failed row. We assert the
+  // current contract: invalidation is a hard break; the prior failed
+  // row is not silently resurrected, but the new failed row is reusable
+  // by the next retry at the same generation_hash.
+  const { repository, fixtures } = createSeededRepository();
+  const f = fixtures[0];
+  const profile = defaultGenerationProfile();
+  let calls = 0;
+  const okGen = async ({ story, profile: p }) => generateOpeningCache({
+    story_uuid: f.story_uuid,
+    story_version_uuid: f.story_version_uuid,
+    opening_key: 'default',
+    profile: p,
+    story,
+  });
+  // 1) first build → valid
+  const first = await ensureOpeningCache({
+    repository,
+    story_version_uuid: f.story_version_uuid,
+    options: { profile, generator: okGen },
+  });
+  assert.equal(first.cache.status, 'valid');
+  // 2) invalidate that row
+  repository.recordCacheInvalidation(first.cache.cache_uuid, 'manual_invalidation');
+  // 3) rebuild with a generator that always fails → must surface as failed
+  const boomGen = async () => { calls += 1; throw new Error('post-invalidation boom'); };
+  await assert.rejects(
+    () => ensureOpeningCache({
+      repository,
+      story_version_uuid: f.story_version_uuid,
+      options: { profile, generator: boomGen },
+    }),
+    /generation failed/,
+  );
+  const key = deriveOpeningCacheKey({
+    story_uuid: f.story_uuid,
+    story_version_uuid: f.story_version_uuid,
+    opening_key: 'default',
+    profile,
+  });
+  const afterFail = repository.findOpeningCacheByScope(f.story_uuid, f.story_version_uuid, 'default', key);
+  assert.equal(afterFail.status, 'failed');
+  // 4) retry at the same generation_hash must reuse the post-invalidation
+  //    failed row instead of orphaning a third row.
+  const result = await ensureOpeningCache({
+    repository,
+    story_version_uuid: f.story_version_uuid,
+    options: { profile, generator: okGen },
+  });
+  assert.equal(result.cache.status, 'valid');
+  assert.equal(result.cache.cache_uuid, afterFail.cache_uuid);
+  // One invalidated row + one (now valid) replacement; no orphan.
+  assert.equal(repository.stats().cache_count, 2);
 });

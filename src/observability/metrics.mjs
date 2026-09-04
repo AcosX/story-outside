@@ -125,6 +125,10 @@ function touchSession(session_uuid, record) {
     globalMetrics.sessionsObserved += 1;
   }
   prev.lastSeenAt = record.lastSeenAt || new Date().toISOString();
+  // Initialise lastState on first sight so observeSession can rely on a
+  // defined previous-state value (== 'never observed') without re-deriving
+  // it inside the hot path.
+  if (prev.lastState === undefined) prev.lastState = null;
   return prev;
 }
 

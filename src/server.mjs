@@ -349,6 +349,14 @@ function isSessionUuid(value) {
 }
 
 function sessionError(err) {
+  // ValidationError carries a precise machine code (e.g. 'payload_too_large',
+  // 'bad_json', 'invalid_input') that the route layer should pass through
+  // verbatim. A 500 fallback would hide the real reason from clients and
+  // duplicate the mapping that classifyProviderError already does for the
+  // provider surface.
+  if (err instanceof ValidationError) {
+    return { status: 400, code: err.code || 'validation_failed', message: 'The session request is invalid.' };
+  }
   const text = String(err && err.message ? err.message : '');
   if (/unknown session/i.test(text)) {
     return { status: 404, code: 'session_not_found', message: 'Session was not found.' };
@@ -367,11 +375,19 @@ function sessionError(err) {
   if (/repository required|builder function required|index corruption|cannot read|undefined is not|sessionService: unknown error code/i.test(text)) {
     return { status: 500, code: 'internal_error', message: 'Internal server error.' };
   }
-  // Everything below is a defensive whitelist of the sessionService and
-  // endingService validation messages that the public route layers expose.
+  // Whitelist of sessionService / endingService / public service-function
+  // validation messages. The previous draft used a single broad regex with
+  // the literal "invalid" in it, which over-matched: any new service-layer
+  // message starting with "invalid" would be silently re-classified as
+  // 400. Keep this list narrow — extend it explicitly when a new
+  // client-facing validation is added.
   if (
-    /sessionService:|endingService:/i.test(text) ||
-    /must be a UUID|must be an integer|must be a non-negative integer|must be a positive integer|must be a non-empty string|must be an array|must be an object|must contain|must return|must equal|sequence must|out of range|not allowed|does not match|not present|not interruptible|not accepting|already has an unconsumed|at least one|required|invalid/i.test(text)
+    /^(session|ending|stage)Service:/i.test(text) ||
+    /^(commitOpeningEvent|stageNarrativeBatch|createSession|discardPendingTail|interruptWithPlayerInput|appendEvent|buildEnding|buildOriginalTimeline|buildReplay):/i.test(text) ||
+    /^(session|ending|stage)Service: invalid /i.test(text) ||
+    /not allowed in canonical history$/i.test(text) ||
+    /^payload_too_large$|^bad_json$|^tool-only batches are not allowed$/i.test(text) ||
+    /must be a UUID|must be an integer|must be a non-negative integer|must be a positive integer|must be a non-empty string|must be an array|must be an object|must contain|must return|must equal|sequence must|out of range|does not match|not present|not interruptible|not accepting|already has an unconsumed|at least one/i.test(text)
   ) {
     return { status: 400, code: 'validation_failed', message: 'The session request is invalid.' };
   }
@@ -773,8 +789,9 @@ async function handleRequest(req, res) {
   // POST /api/dev/sessions/:uuid/opening-events — append exactly one
   // explicitly supplied cache event. The service enforces contiguous order,
   // optimistic revision checks, and request-id idempotency.
-  const openingEventsMatch = pathname.match(/^\/api\/dev\/sessions\/([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\/opening-events$/);
+  const openingEventsMatch = pathname.match(/^\/api\/dev\/sessions\/([0-9a-fA-F-]+)\/opening-events$/);
   if (method === 'POST' && openingEventsMatch) {
+    if (rejectInvalidSessionUuid(res, openingEventsMatch[1])) return;
     let body = {};
     try {
       body = await readJsonBody(req);
@@ -953,8 +970,9 @@ async function handleRequest(req, res) {
   // POST /api/dev/sessions/:uuid/interrupt — explicitly switch to realtime
   // by appending player input. This route intentionally never invalidates a
   // shared opening cache.
-  const interruptMatch = pathname.match(/^\/api\/dev\/sessions\/([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\/interrupt$/);
+  const interruptMatch = pathname.match(/^\/api\/dev\/sessions\/([0-9a-fA-F-]+)\/interrupt$/);
   if (method === 'POST' && interruptMatch) {
+    if (rejectInvalidSessionUuid(res, interruptMatch[1])) return;
     let body = {};
     try {
       body = await readJsonBody(req);
