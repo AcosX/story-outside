@@ -355,14 +355,23 @@ async function followRedirect(fn, url, ctx) {
       { hostname: target.hostname },
     );
   }
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), ctx.timeoutMs);
+  // AbortSignal.timeout combines signal creation + timer scheduling
+  // into a single primitive (Node ≥ 17.3). We pass it directly into
+  // fetch so the request, the connect phase, and any pending read all
+  // share the same deadline. The fallback AbortController path
+  // remains for runtimes that lack AbortSignal.timeout.
+  const useStaticSignal = typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function';
+  const signal = useStaticSignal ? AbortSignal.timeout(ctx.timeoutMs) : (() => {
+    const c = new AbortController();
+    setTimeout(() => c.abort(), ctx.timeoutMs).unref();
+    return c.signal;
+  })();
   let res;
   try {
     res = await fn(target.toString(), {
       method: 'GET',
       headers: { ...STATIC_HEADERS },
-      signal: controller.signal,
+      signal,
       // Manual mode: the underlying fetch returns the 30x Response
       // without consuming body / following Location. We handle every
       // hop explicitly so the host allow-list is re-checked.
@@ -383,8 +392,6 @@ async function followRedirect(fn, url, ctx) {
       'Could not reach the upstream API.',
       { name: err && err.name ? err.name : 'network_error' },
     );
-  } finally {
-    clearTimeout(timer);
   }
   // 30x: hop to Location (re-validating host + size cap).
   if (res.status >= 300 && res.status < 400) {
