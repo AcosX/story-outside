@@ -44,6 +44,7 @@ import {
   StoryNotFoundError,
   ValidationError,
 } from './dto.mjs';
+import { BoundedMap } from '../util/boundedMap.mjs';
 
 const DEFAULT_BASE_URL = 'https://api.zhihu.com';
 const STORY_LIST_PATH = '/km-indep-home/hackathon/v2/story/list';
@@ -654,7 +655,7 @@ export function createRealZhihuStoryProvider(opts = {}) {
   }
 
   /** @type {Map<string, ReturnType<typeof normaliseStoryDetail>>} */
-  const detailCache = new Map();
+  const detailCache = new BoundedMap({ max: 256, name: 'realProvider.detailCache' });
 
   /**
    * @returns {Promise<unknown>}

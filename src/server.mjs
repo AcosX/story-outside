@@ -38,6 +38,7 @@ import {
   recoverSession,
   stageNarrativeBatch,
 } from './stories/sessionService.mjs';
+import { BoundedMap } from './util/boundedMap.mjs';
 import {
   AgentRuntimeError,
   createAgentRuntime,
@@ -152,12 +153,15 @@ const FINISH_AFTER = 5;     // emit a finish_story tool_call after N narrative b
  * is intentionally process-local: a fresh process starts a fresh demo
  * arc. The store mirrors the route layer pattern (sessionPinnedMetadata)
  * and is wiped when the server restarts.
+ *
+ * The store is bounded so a long-running server cannot grow without
+ * limit. Eviction follows the route layer pattern (sessionPinnedMetadata)
+ * and is LRU-based; an evicted session simply restarts the demo arc
+ * from turn 0 on the next /generate call. That is acceptable: the demo
+ * arc is non-authoritative — its only consumer is the player frontend's
+ * default input ('hello').
  */
-const demoTurnCounter = new Map();
-// The demo counter and pinned-metadata maps are keyed by externally
-// supplied session UUIDs, so both must stay bounded to avoid unbounded
-// memory growth from anonymous /api/dev traffic.
-const MAX_DEMO_SESSION_STATES = 2000;
+const demoTurnCounter = new BoundedMap({ max: 1024, name: 'demoTurnCounter' });
 function getDemoSessionState(sessionUuid) {
   let state = demoTurnCounter.get(sessionUuid);
   if (!state) {
@@ -411,15 +415,13 @@ const { repository: storyRepo, fixtures: storyFixtures } = createSeededRepositor
 // sessionService deliberately keeps its state private to the repository. The
 // route layer keeps only the request's non-secret pinned metadata so recovery
 // can return the same metadata without reaching into service internals.
-const sessionPinnedMetadata = new Map();
-const MAX_SESSION_PINNED_METADATA = 2000;
-function rememberSessionPinnedMetadata(session_uuid, pinned) {
-  if (!sessionPinnedMetadata.has(session_uuid) && sessionPinnedMetadata.size >= MAX_SESSION_PINNED_METADATA) {
-    const oldestKey = sessionPinnedMetadata.keys().next().value;
-    if (oldestKey !== undefined) sessionPinnedMetadata.delete(oldestKey);
-  }
-  sessionPinnedMetadata.set(session_uuid, pinned);
-}
+//
+// The store is bounded so a long-running server cannot accumulate state
+// for every UUID it has ever observed. Eviction is LRU-based; an evicted
+// session_uuid simply has no pinned metadata on the next /recover call
+// (pinned=null). The canonical session data lives in the repository, not
+// here — eviction here never loses durable information.
+const sessionPinnedMetadata = new BoundedMap({ max: 1024, name: 'sessionPinnedMetadata' });
 // Per-session turn-level request idempotency map. Keyed by session_uuid,
 // then by request_id. The map intentionally lives outside the repository
 // because the runtime does not own it (the repository is process-shared
