@@ -357,6 +357,15 @@ function sessionError(err) {
   if (err instanceof ValidationError) {
     return { status: 400, code: err.code || 'validation_failed', message: 'The session request is invalid.', details: err.details || null };
   }
+  // M3 follow-up: stable codes attached to errors raised inside the service.
+  // These short-circuit the message-regex classification below so the wire
+  // carries an explicit, non-ambiguous error code.
+  if (err && err.code === 'duplicate_client_request_id') {
+    return { status: 400, code: 'duplicate_client_request_id', message: err.message, details: err.details || null };
+  }
+  if (err && err.code === 'too_many_client_request_ids') {
+    return { status: 400, code: 'too_many_client_request_ids', message: err.message, details: err.details || null };
+  }
   const text = String(err && err.message ? err.message : '');
   if (/unknown session/i.test(text)) {
     return { status: 404, code: 'session_not_found', message: 'Session was not found.' };

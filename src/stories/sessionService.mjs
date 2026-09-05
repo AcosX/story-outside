@@ -123,9 +123,15 @@ const MAX_CANONICAL_SESSIONS = 2000;
 // client_request_id -> session_uuid for every id that produced a canonical
 // event. Unlike the per-session replay maps it is a uniqueness index, not
 // a cache — in the real DB its lifetime matches the table. In this
-// in-memory demo the map is still bounded so anonymous API traffic cannot
-// grow it without limit; evicting the oldest id shrinks the uniqueness
-// window (callers then re-validate against the normal request gauntlet).
+// in-memory demo the index is also bounded, BUT eviction is rejected at
+// the seam (it does NOT silently forget an old id and let a future
+// request reuse it under a different session — the SQL constraint would
+// refuse the row, so the demo must refuse it too). When the cap is
+// reached, a new cross-session id is refused with a stable
+// 'too_many_client_request_ids' code so operators can see the demo
+// ceiling; the per-session replay maps continue to evict their oldest
+// entries as before because their semantic is 'replay window', not
+// 'uniqueness index'.
 const MAX_TRACKED_CLIENT_REQUEST_IDS = 50000;
 function repositoryState(repository) {
   if (!repository || typeof repository !== 'object') {
@@ -255,13 +261,24 @@ function registerCanonicalRequestId(state, session, clientRequestId) {
   if (!state.clientRequestIndex) state.clientRequestIndex = new Map();
   const owner = state.clientRequestIndex.get(clientRequestId);
   if (owner && owner !== session.session_uuid) {
-    throw new Error(
+    const err = new Error(
       `sessionService: client_request_id '${clientRequestId}' was already committed by another session (${owner}) — uq_session_events_client_request is globally unique`,
     );
+    err.code = 'duplicate_client_request_id';
+    throw err;
   }
+  // M3 follow-up: do NOT silently evict the oldest id. If the demo
+  // in-memory uniqueness window is full, refuse the new id so the
+  // semantics stay consistent with the SQL UNIQUE constraint the
+  // production DAO will apply. The per-session replay maps continue to
+  // evict their own oldest entries because their semantic is different
+  // (replay window, not uniqueness).
   if (!state.clientRequestIndex.has(clientRequestId) && state.clientRequestIndex.size >= MAX_TRACKED_CLIENT_REQUEST_IDS) {
-    const oldestKey = state.clientRequestIndex.keys().next().value;
-    if (oldestKey !== undefined) state.clientRequestIndex.delete(oldestKey);
+    const err = new Error(
+      `sessionService: too many distinct client_request_id values have been committed across sessions (limit ${MAX_TRACKED_CLIENT_REQUEST_IDS})`,
+    );
+    err.code = 'too_many_client_request_ids';
+    throw err;
   }
   state.clientRequestIndex.set(clientRequestId, session.session_uuid);
 }
