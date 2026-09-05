@@ -25,14 +25,15 @@ Provider 接缝的关键文件：
 
 - `src/providers/dto.mjs` —— 与 transport 无关的 DTO（`StorySummary`、`StoryDetail`、`AdvanceResult` 等）和错误类型（`StoryNotFoundError`、`ValidationError`）。
 - `src/providers/mockProvider.mjs` —— 内存版 Mock；返回上面 DTO。
-- `src/providers/index.mjs` —— Provider 选择器；读 `STORY_OUTSIDE_PROVIDER`（默认 `mock`）。
+- `src/providers/index.mjs` —— Provider 选择器；读 `STORY_OUTSIDE_PROVIDER`（优先）或 `ZHIHU_PROVIDER`（向后兼容别名），默认 `mock`。
 - `src/providers/realProvider.mjs` —— 已实现；按官方契约对接故事 API；不发送 `Authorization`/`X-OAuth-Token`；不消费任何环境变量型 credential；超时 / 429 / 5xx / 非 JSON / 缺字段均抛出 typed `ProviderError`，不循环重试；上游响应原文保留在 `source.raw` 以便溯源。
 
 选择器规则：
 
 - `STORY_OUTSIDE_PROVIDER=mock`（默认） → MockProvider。
 - `STORY_OUTSIDE_PROVIDER=real` → RealZhihuProvider；启动只需 Node ≥ 18 的内置 `fetch`，无需任何 secret。
-- `STORY_OUTSIDE_PROVIDER=<其他>` → 启动报 `Unknown STORY_OUTSIDE_PROVIDER`。
+- `STORY_OUTSIDE_PROVIDER=<其他>` → 启动报 `Unknown provider value="..." (from env <key>)`。
+- 同时设置 `ZHIHU_PROVIDER` 时，`STORY_OUTSIDE_PROVIDER` 优先；只设 `ZHIHU_PROVIDER` 时作为 fallback。空值 / 纯空格的别名被跳过。
 
 后端**不**直接依赖 `vendor/zhihu-hackathon/scripts/*.mjs`。它们是编排型脚本，不属于运行依赖。后续若要"按官方指引执行 OAuth 流程"，应当是开发机本地跑这些脚本去申请/写入钥匙串，**而不是**服务器在每次启动时去跑。`src/providers/realProvider.mjs` 一律不许 `import` 任何 `vendor/zhihu-hackathon/**` 路径。
 

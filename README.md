@@ -80,7 +80,7 @@ npm run check
 | --- | --- | --- |
 | `PORT` | `4173` | HTTP 端口 |
 | `HOST` | `127.0.0.1` | 监听地址（OAuth 不能用 `localhost` 回调） |
-| `STORY_OUTSIDE_PROVIDER` | `mock` | 数据 provider。`mock` = 内存版示例故事；`real` = 对接 `api.zhihu.com/km-indep-home/hackathon/v2/story/*`（`zhihu_hackathon_2026_p2` 期间不需要鉴权；不发送 `Authorization` / `X-OAuth-Token`；超时/429/5xx 走 typed ProviderError，不循环重试）。 |
+| `STORY_OUTSIDE_PROVIDER` | `mock` | 数据 provider。`mock` = 内存版示例故事；`real` = 对接 `api.zhihu.com/km-indep-home/hackathon/v2/story/*`（`zhihu_hackathon_2026_p2` 期间不需要鉴权；不发送 `Authorization` / `X-OAuth-Token`；超时/429/5xx 走 typed ProviderError，不循环重试）。同时支持别名 `ZHIHU_PROVIDER`（向后兼容早期环境变量）；同时设置时 `STORY_OUTSIDE_PROVIDER` 优先。 |
 | `STORY_OUTSIDE_ZHIHU_TIMEOUT_MS` | `5000` | `real` provider 的 fetch 超时（毫秒）。 |
 
 ## Provider 接缝（mock ↔ 官方 adapter）
@@ -96,7 +96,7 @@ HTTP route (src/server.mjs)
 
 - **DTO**：Provider 返回的形状见 `src/providers/dto.mjs`（`StorySummary`、`StoryDetail`、`AdvanceResult`、`Role`、`Beat`）。DTO 是与 transport 无关的纯数据对象；Provider 必须返回这些形状，路由才能继续复用 JSON 拼装逻辑。
 - **错误类型**：`StoryNotFoundError → 404`、`ValidationError → 400`、其他 `ProviderError → 502`。`realProvider` 还会抛出 `upstream_timeout / upstream_rate_limited / upstream_5xx / upstream_invalid_json / upstream_empty_body / upstream_shape_mismatch / unsupported_upstream_host`，路由层统一映射为 `502`。
-- **选择 provider**：启动时读 `STORY_OUTSIDE_PROVIDER`，默认 `mock`。
+- **选择 provider**：启动时读 `STORY_OUTSIDE_PROVIDER`（优先）或 `ZHIHU_PROVIDER`（向后兼容的别名），默认 `mock`。
 - **真实故事 API 边界**：`realProvider` 发送的请求只到 `https://api.zhihu.com`；列表响应里 `work_id/title/artwork/tab_artwork/description/labels` 与详情响应里 `work_id/chapter_name/author_avatar/author_name/labels/introduction/content` 按官方契约映射；上游原文保留在 `source.raw`，作者 / 来源归属不透传到应用侧。`work_id` 拒绝 `/ ? # CR LF`，走 `encodeURIComponent`。
 - **严禁在代码或提交里出现真实 `app_id` / `app_key` / Access Secret / Token**。Real provider 当前按官方契约不需要凭据，未来若需要也只接收已加载的 credential，**绝不**读 `.env` / `process.env` 中任何看起来像凭据的键。
 

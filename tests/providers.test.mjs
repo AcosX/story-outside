@@ -10,6 +10,7 @@ import {
   createMockStoryProvider,
   getStoryProvider,
   ProviderError,
+  readProviderEnv,
   StoryNotFoundError,
   ValidationError,
   normaliseStoryDetail,
@@ -256,9 +257,89 @@ check('STORY_OUTSIDE_PROVIDER=unknown throws at startup', () => {
   __resetStoryProviderForTests();
   process.env.STORY_OUTSIDE_PROVIDER = 'whatever';
   try {
-    assert.throws(() => getStoryProvider(), /Unknown STORY_OUTSIDE_PROVIDER/);
+    assert.throws(() => getStoryProvider(), /Unknown provider value="whatever"/);
   } finally {
     delete process.env.STORY_OUTSIDE_PROVIDER;
+    __resetStoryProviderForTests();
+  }
+});
+
+check('ZHIHU_PROVIDER=real selects the Zhihu real provider', () => {
+  __resetStoryProviderForTests();
+  delete process.env.STORY_OUTSIDE_PROVIDER;
+  process.env.ZHIHU_PROVIDER = 'real';
+  try {
+    const p = getStoryProvider();
+    assert.equal(p.name, 'real');
+  } finally {
+    delete process.env.ZHIHU_PROVIDER;
+    __resetStoryProviderForTests();
+  }
+});
+
+check('ZHIHU_PROVIDER=mock selects the Mock', () => {
+  __resetStoryProviderForTests();
+  delete process.env.STORY_OUTSIDE_PROVIDER;
+  process.env.ZHIHU_PROVIDER = 'mock';
+  try {
+    const p = getStoryProvider();
+    assert.equal(p.name, 'mock');
+  } finally {
+    delete process.env.ZHIHU_PROVIDER;
+    __resetStoryProviderForTests();
+  }
+});
+
+check('STORY_OUTSIDE_PROVIDER wins over ZHIHU_PROVIDER', () => {
+  __resetStoryProviderForTests();
+  process.env.STORY_OUTSIDE_PROVIDER = 'mock';
+  process.env.ZHIHU_PROVIDER = 'real';
+  try {
+    const p = getStoryProvider();
+    assert.equal(p.name, 'mock');
+  } finally {
+    delete process.env.STORY_OUTSIDE_PROVIDER;
+    delete process.env.ZHIHU_PROVIDER;
+    __resetStoryProviderForTests();
+  }
+});
+
+check('empty ZHIHU_PROVIDER falls back to default mock', () => {
+  __resetStoryProviderForTests();
+  delete process.env.STORY_OUTSIDE_PROVIDER;
+  process.env.ZHIHU_PROVIDER = '   ';
+  try {
+    const p = getStoryProvider();
+    assert.equal(p.name, 'mock');
+  } finally {
+    delete process.env.ZHIHU_PROVIDER;
+    __resetStoryProviderForTests();
+  }
+});
+
+check('ZHIHU_PROVIDER=unknown throws with the resolved value', () => {
+  __resetStoryProviderForTests();
+  delete process.env.STORY_OUTSIDE_PROVIDER;
+  process.env.ZHIHU_PROVIDER = 'gibberish';
+  try {
+    assert.throws(() => getStoryProvider(), /Unknown provider value="gibberish"/);
+  } finally {
+    delete process.env.ZHIHU_PROVIDER;
+    __resetStoryProviderForTests();
+  }
+});
+
+check('readProviderEnv reports the winning env key', () => {
+  __resetStoryProviderForTests();
+  delete process.env.STORY_OUTSIDE_PROVIDER;
+  delete process.env.ZHIHU_PROVIDER;
+  process.env.ZHIHU_PROVIDER = 'real';
+  try {
+    const info = readProviderEnv();
+    assert.equal(info.key, 'ZHIHU_PROVIDER');
+    assert.equal(info.value, 'real');
+  } finally {
+    delete process.env.ZHIHU_PROVIDER;
     __resetStoryProviderForTests();
   }
 });

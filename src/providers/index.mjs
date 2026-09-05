@@ -16,6 +16,13 @@
 //                                          during the hackathon window.
 //   * STORY_OUTSIDE_PROVIDER=<unknown>  → throws at startup
 //
+// Both STORY_OUTSIDE_PROVIDER and the legacy alias ZHIHU_PROVIDER are
+// honoured. STORY_OUTSIDE_PROVIDER wins if both are set, so a deployment
+// that already standardises on the project-wide name does not need to be
+// touched. ZHIHU_PROVIDER remains a fallback for hackathon teams that
+// wired their early environment variable before the project-wide name
+// was settled.
+//
 // Real provider MUST live in src/providers/realProvider.mjs and MUST import
 // nothing from vendor/zhihu-hackathon (those scripts are orchestration tools,
 // not runtime deps).
@@ -44,16 +51,41 @@ import { createRealZhihuStoryProvider } from './realProvider.mjs';
  * @property {(input: {storyId: string, roleId?: string|null, index?: number}) => Promise<AdvanceResult>} advanceStory
  */
 
-const ENV_KEY = 'STORY_OUTSIDE_PROVIDER';
+const ENV_KEYS = Object.freeze(['STORY_OUTSIDE_PROVIDER', 'ZHIHU_PROVIDER']);
+const DEFAULT_VALUE = 'mock';
+
+/**
+ * Resolve the configured provider name from process.env. The first env
+ * var in ENV_KEYS wins; subsequent aliases are ignored. Empty / whitespace
+ * values are skipped so a deployment can set one variable to empty to
+ * fall through to the next.
+ *
+ * @returns {{ key: string, value: string }}
+ */
+export function readProviderEnv() {
+  for (const key of ENV_KEYS) {
+    const raw = process.env[key];
+    if (typeof raw !== 'string') continue;
+    const trimmed = raw.trim().toLowerCase();
+    if (!trimmed) continue;
+    return { key, value: trimmed };
+  }
+  return { key: 'default', value: DEFAULT_VALUE };
+}
 
 /**
  * Resolve and instantiate the active StoryProvider. Memoised.
  * @returns {StoryProvider}
  */
 export function getStoryProvider() {
-  const cached = _cache.get(ENV_KEY);
+  // Cache key encodes BOTH the resolved value and the env key that won,
+  // so that switching STORY_OUTSIDE_PROVIDER=mock back to default while
+  // leaving ZHIHU_PROVIDER=real does not silently keep the old provider.
+  const { key, value } = readProviderEnv();
+  const cacheKey = `${key}::${value}`;
+  const cached = _cache.get(cacheKey);
   if (cached) return cached;
-  const requested = (process.env[ENV_KEY] || 'mock').trim().toLowerCase();
+  const requested = value;
   /** @type {StoryProvider} */
   let provider;
   if (requested === 'mock') {
@@ -62,10 +94,10 @@ export function getStoryProvider() {
     provider = createRealZhihuStoryProvider();
   } else {
     throw new Error(
-      `Unknown STORY_OUTSIDE_PROVIDER="${requested}". Expected "mock" or "real".`,
+      `Unknown provider value="${requested}" (from env ${key}). Expected "mock" or "real".`,
     );
   }
-  _cache.set(ENV_KEY, provider);
+  _cache.set(cacheKey, provider);
   return provider;
 }
 
