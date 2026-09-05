@@ -1,7 +1,7 @@
 # 结局页 · ClickUp 11
 
-> 范围：结局页、原著对比与世界线回放。  
-> 状态：基于 `feat/story-outside-09@919d52d` 新增分支 `feat/story-outside-11`。  
+> 范围：结局页、原著对比与世界线回放。
+> 状态：基于 `feat/story-outside-09@919d52d` 新增分支 `feat/story-outside-11`。
 > 本文件只描述 ClickUp 11 的契约、字段定义、对比算法与回放口径；所有边界条件与 09 / 08 / 07 契约保持一致。
 
 ## 1. 设计原则
