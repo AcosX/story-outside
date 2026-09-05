@@ -221,6 +221,29 @@ try {
   }
 
   // ------------------------------------------------------------------
+  // /api/admin/stories/:slug/import — B4 regression: omitting story_uuid
+  // must still produce a valid v4 UUID and a non-null opening_cache_uuid.
+  // cafe-rain is pre-seeded, so the route should resolve the existing
+  // story_uuid (idempotent) and return the seeded row. The UUID must
+  // pass a strict v4 shape check (no stray hyphen in the tail segment,
+  // which was the original bug).
+  // ------------------------------------------------------------------
+  {
+    const res = await fetch(`${baseUrl}/api/admin/stories/cafe-rain/import`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({}),
+    });
+    const data = await res.json();
+    check('POST import (no story_uuid) 200', res.status === 200, `status=${res.status}`);
+    const story_uuid = data.result?.story_uuid;
+    check('import without story_uuid returns a v4-shaped UUID', !!story_uuid && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(story_uuid), `uuid=${story_uuid}`);
+    check('import without story_uuid resolves to the seeded story_uuid', story_uuid === cafeFixture.story_uuid, `got=${story_uuid} expected=${cafeFixture.story_uuid}`);
+    check('import without story_uuid produces a non-null opening_cache_uuid', !!data.result?.opening_cache_uuid);
+    check('import without story_uuid produces status=valid', data.result?.opening_cache_status === 'valid');
+  }
+
+  // ------------------------------------------------------------------
   // /api/admin/stories — must include stories that came in via the real
   // provider import above (not only seeded fixtures).
   // ------------------------------------------------------------------

@@ -695,14 +695,24 @@ async function handleRequest(req, res) {
       const { status, code } = classifyProviderError(err);
       return jsonResponse(res, status, { error: code, demo: currentDemoFlag(), dev: DEV_FLAG });
     }
-    // Body-supplied story_uuid wins; otherwise allocate a fresh UUID.
-    // NOTE: see B4 follow-up commit — this default currently uses a
-    // naive randomUUID().slice(0,12) synthesis that produces an invalid
-    // tail segment; the B2/B3 ensure-flow seams work even with that bug
-    // because callers always pass an explicit story_uuid.
-    const story_uuid = typeof body.story_uuid === 'string' && body.story_uuid
+    // Body-supplied story_uuid wins; otherwise look up an existing row for
+    // this slug (idempotent re-import), or allocate a fresh v4 UUID.
+    //
+    // B4 fix: the previous default used `randomUUID().slice(0,12)` which
+    // produced an invalid tail segment (the slice spans the second hyphen
+    // of a v4 UUID). Repository-level UUID_PATTERN validation rejected
+    // the resulting string. We now use crypto.randomUUID() directly —
+    // it is already a valid v4 UUID — and also fall back to any
+    // existing story_uuid for the same slug so that an "omit
+    // story_uuid" request against an already-imported story resolves
+    // idempotently rather than producing a second duplicate row.
+    let story_uuid = typeof body.story_uuid === 'string' && body.story_uuid
       ? body.story_uuid
-      : `00000000-0000-4000-8000-${randomUUID().slice(0, 12).padStart(12, '0')}`;
+      : null;
+    if (!story_uuid) {
+      const existing = storyRepo.findStoryBySlug(importMatch[1]);
+      story_uuid = existing ? existing.story_uuid : randomUUID();
+    }
     try {
       const result = await importStoryFromProvider({
         repository: storyRepo,
