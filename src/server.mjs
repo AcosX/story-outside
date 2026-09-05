@@ -357,9 +357,15 @@ function sessionError(err) {
   if (err instanceof ValidationError) {
     return { status: 400, code: err.code || 'validation_failed', message: 'The session request is invalid.', details: err.details || null };
   }
-  // M3 follow-up: stable codes attached to errors raised inside the service.
-  // These short-circuit the message-regex classification below so the wire
-  // carries an explicit, non-ambiguous error code.
+  // M4 typed-error short-circuits. Errors raised inside the service carry
+  // stable codes that map to specific HTTP statuses; the message-regex
+  // fallback below only runs for plain Error instances.
+  if (err && err.code === 'session_not_found') {
+    return { status: 404, code: 'session_not_found', message: 'Session was not found.', details: err.details || null };
+  }
+  if (err && err.code === 'repository_not_initialized') {
+    return { status: 500, code: 'internal_error', message: 'Internal server error.', details: err.details || null };
+  }
   if (err && err.code === 'duplicate_client_request_id') {
     return { status: 400, code: 'duplicate_client_request_id', message: err.message, details: err.details || null };
   }
@@ -367,7 +373,13 @@ function sessionError(err) {
     return { status: 400, code: 'too_many_client_request_ids', message: err.message, details: err.details || null };
   }
   const text = String(err && err.message ? err.message : '');
-  if (/unknown session/i.test(text)) {
+  // M4 follow-up: the legacy 'unknown session' string is no longer raised
+  // by the service (the service throws SessionNotFoundError with code
+  // 'session_not_found' instead). We keep a defensive substring check
+  // here ONLY for older snapshots that might still surface the old
+  // message — narrowing the match to the full 'unknown session' phrase
+  // so unrelated 'unknown X' messages cannot silently become 404s.
+  if (/^sessionService: unknown session\b/.test(text)) {
     return { status: 404, code: 'session_not_found', message: 'Session was not found.' };
   }
   if (/revision mismatch/i.test(text)) {
@@ -380,8 +392,12 @@ function sessionError(err) {
     return { status: 400, code: 'duplicate_session', message: 'The session already exists.' };
   }
   // Plain programming / infrastructure mistakes must surface as 500, not
-  // masquerade as client validation failures.
-  if (/repository required|builder function required|index corruption|cannot read|undefined is not|sessionService: unknown error code/i.test(text)) {
+  // masquerade as client validation failures. The 'repository has no
+  // sessionState' line was historically leaked from endingService and
+  // re-classified as 400 by the broad prefix regex below; that exact
+  // phrasing is now 500 because it is an internal-state mistake that
+  // should never reach the HTTP layer in the first place.
+  if (/repository required|builder function required|index corruption|cannot read|undefined is not|sessionService: unknown error code|has no sessionState/i.test(text)) {
     return { status: 500, code: 'internal_error', message: 'Internal server error.' };
   }
   // Whitelist of sessionService / endingService / public service-function
@@ -389,13 +405,16 @@ function sessionError(err) {
   // the literal "invalid" in it, which over-matched: any new service-layer
   // message starting with "invalid" would be silently re-classified as
   // 400. Keep this list narrow — extend it explicitly when a new
-  // client-facing validation is added.
+  // client-facing validation is added. Service-function prefixes now
+  // also match only when followed by a known service message pattern,
+  // so the broad '(session|ending|stage)Service:' stem cannot sweep in
+  // an internal-state line by accident.
   if (
-    /^(session|ending|stage)Service:/i.test(text) ||
     /^(commitOpeningEvent|stageNarrativeBatch|createSession|discardPendingTail|interruptWithPlayerInput|appendEvent|buildEnding|buildOriginalTimeline|buildReplay):/i.test(text) ||
+    /^(session|ending|stage)Service: (invalid |pinned cache|role_id|generation_profile|sequence|event|prompt|expected_revision|cache_uuid|pending_id|client_request_id|revision |request_id|must |session_uuid|cache|tool|not )/i.test(text) ||
     /^(session|ending|stage)Service: invalid /i.test(text) ||
     /not allowed in canonical history$/i.test(text) ||
-    /^payload_too_large$|^bad_json$|^tool-only batches are not allowed$/i.test(text) ||
+    /^tool-only batches are not allowed$/i.test(text) ||
     /must be a UUID|must be an integer|must be a non-negative integer|must be a positive integer|must be a non-empty string|must be an array|must be an object|must contain|must return|must equal|sequence must|out of range|does not match|not present|not interruptible|not accepting|already has an unconsumed|at least one/i.test(text)
   ) {
     return { status: 400, code: 'validation_failed', message: 'The session request is invalid.' };

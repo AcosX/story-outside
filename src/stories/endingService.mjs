@@ -28,6 +28,8 @@
 // Every projection can be rebuilt deterministically from
 // session_events + story_version + opening_cache.
 
+import { SessionNotFoundError, ValidationError } from '../providers/dto.mjs';
+
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 const CACHE_EVENT_TYPES = new Set(['narration', 'dialogue', 'action', 'beat']);
@@ -40,7 +42,7 @@ const REPLAY_EXCLUDED_TYPES = new Set([
 
 function assertUuid(label, value) {
   if (typeof value !== 'string' || !UUID_PATTERN.test(value)) {
-    throw new Error(`endingService: ${label} must be a UUID`);
+    throw new ValidationError(`endingService: ${label} must be a UUID`);
   }
 }
 
@@ -51,10 +53,15 @@ function clone(value) {
 function sessionFor(repository, session_uuid) {
   const state = repository.sessionState;
   if (!state || !state.sessions) {
-    throw new Error('endingService: repository has no sessionState');
+    // Repository not initialized yet — surface as a 500-level internal
+    // error so the route layer does not silently re-classify it as a
+    // 400 'validation_failed' via the broad message regex.
+    const err = new Error('endingService: repository has no sessionState');
+    err.code = 'repository_not_initialized';
+    throw err;
   }
   const session = state.sessions.get(session_uuid);
-  if (!session) throw new Error(`endingService: unknown session '${session_uuid}'`);
+  if (!session) throw new SessionNotFoundError(session_uuid);
   return session;
 }
 

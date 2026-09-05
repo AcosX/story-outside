@@ -86,6 +86,35 @@ export class StoryNotFoundError extends ProviderError {
   }
 }
 
+/**
+ * Session-scoped not-found error. Carries a stable `session_uuid` detail
+ * so the route layer can surface it (currently mapped to 404
+ * session_not_found; previously the ending/original-timeline/replay
+ * routes raised plain Errors whose message started with
+ * 'endingService:' and were silently re-classified as 400 by the broad
+ * sessionError message-regex). Throw this anywhere a session_uuid is
+ * required and not present in the canonical store.
+ */
+export class SessionNotFoundError extends ProviderError {
+  constructor(session_uuid) {
+    super('session_not_found', `Session not found: ${session_uuid}`, { session_uuid });
+    this.name = 'SessionNotFoundError';
+  }
+}
+
+/**
+ * Version conflict — expected resource state (revision, pending_id,
+ * opening_cursor) does not match the current session. The route layer
+ * maps this to 409 conflict; previously these ended up as 400
+ * 'validation_failed' via the message-regex classification.
+ */
+export class SessionConflictError extends ProviderError {
+  constructor(code, message, details) {
+    super(code, message, details);
+    this.name = 'SessionConflictError';
+  }
+}
+
 export class ValidationError extends ProviderError {
   /**
    * @param {string} message

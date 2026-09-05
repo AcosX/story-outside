@@ -129,10 +129,17 @@ test('observeSession counts state transitions, not raw observations', () => {
   assert.equal(snapshot.global.sessionsByState.opening, 1);
 });
 
-test('sessionError maps unknown errors to 500, not validation_failed', () => {
+test('sessionError maps unknown errors to 500, not validation_failed', async () => {
+  const { SessionNotFoundError } = await import('../src/providers/dto.mjs');
   assert.equal(sessionError(new Error('totally unexpected inner failure')).status, 500);
   assert.equal(sessionError(new Error('sessionService: pending_id must be a UUID')).status, 400);
-  assert.equal(sessionError(new Error('unknown session')).status, 404);
+  // M4 follow-up: the service throws SessionNotFoundError with a stable
+  // code 'session_not_found' instead of a free-floating 'unknown session'
+  // message; sessionError short-circuits on the code to 404. A bare
+  // 'unknown session' string no longer auto-maps to 404 so unrelated
+  // messages starting with 'unknown' cannot be silently re-classified.
+  assert.equal(sessionError(new SessionNotFoundError('00000000-0000-4000-8000-000000000000')).status, 404);
+  assert.equal(sessionError(new SessionNotFoundError('00000000-0000-4000-8000-000000000000')).code, 'session_not_found');
 });
 
 test('sessionError preserves ValidationError codes as 400, not 500', async () => {

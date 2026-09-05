@@ -261,7 +261,7 @@ try {
   } catch (err) {
     unknown = err;
   }
-  check('fresh in-memory repository reports unknown session', !!unknown && /unknown session/.test(unknown.message));
+  check('fresh in-memory repository reports unknown session', !!unknown && unknown.code === 'session_not_found');
 
   // ----- validation contract -----
   const badGenerate = await post(generatePath, { input: 'not-an-object', expected_revision: 6 });

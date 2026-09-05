@@ -80,6 +80,7 @@
 
 import { randomUUID } from 'node:crypto';
 import { canonicalJsonStringify, canonicalSha256 } from './canonicalHash.mjs';
+import { SessionNotFoundError, SessionConflictError } from '../providers/dto.mjs';
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const SESSION_STATE = 'sessionState';
@@ -168,7 +169,7 @@ function nowIso() {
 
 function sessionFor(repository, session_uuid) {
   const session = repositoryState(repository).sessions.get(session_uuid);
-  if (!session) throw new Error(`sessionService: unknown session '${session_uuid}'`);
+  if (!session) throw new SessionNotFoundError(session_uuid);
   return session;
 }
 
