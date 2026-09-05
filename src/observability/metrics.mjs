@@ -118,7 +118,20 @@ function touchSession(session_uuid, record) {
   } else {
     if (sessionMetrics.size >= MAX_SESSION_METRICS) {
       const oldestKey = sessionMetrics.keys().next().value;
-      if (oldestKey !== undefined) sessionMetrics.delete(oldestKey);
+      if (oldestKey !== undefined) {
+        const evicted = sessionMetrics.get(oldestKey);
+        // M5 follow-up: roll the gauge back when a session is evicted
+        // from the per-session map so sessionsByState stays consistent
+        // with the per-session map size. Without this the gauge could
+        // exceed the per-session map size (over-count) or, if a session
+        // re-touched after eviction, leave a stale bucket (under-count).
+        if (evicted && typeof evicted.lastState === 'string'
+            && Object.prototype.hasOwnProperty.call(globalMetrics.sessionsByState, evicted.lastState)
+            && globalMetrics.sessionsByState[evicted.lastState] > 0) {
+          globalMetrics.sessionsByState[evicted.lastState] -= 1;
+        }
+        sessionMetrics.delete(oldestKey);
+      }
     }
     prev = newSessionMetrics();
     sessionMetrics.set(session_uuid, prev);
@@ -293,11 +306,22 @@ export const observeSession = safe(({ session_uuid, state = null } = {}) => {
   // insertion here — only the state label below is conditional.
   const s = touchSession(session_uuid, {});
   if (typeof state === 'string' && Object.prototype.hasOwnProperty.call(globalMetrics.sessionsByState, state)) {
-    // Count STATE TRANSITIONS, not raw observations: the same session that
-    // spends many turns in `realtime` would otherwise be recounted on every
-    // hook call and `sessionsByState` would never equal "sessions currently
-    // in that state".
+    // M5 follow-up: sessionsByState is a CURRENT gauge, not a transition
+    // counter. The previous implementation incremented the new bucket
+    // whenever the state changed, but never decremented the old bucket,
+    // so a session that moved opening → realtime → opening produced
+    // {opening: 2, realtime: 1} even though only one session existed.
+    // The gauge contract: at any moment
+    // `sum(sessionsByState[*])` equals the number of distinct sessions
+    // that have called observeSession in a known state. On eviction of
+    // a session from sessionMetrics (MAX_SESSION_METRICS = 1000) the
+    // LRU sweep below rolls the bucket back so the global count stays
+    // consistent with the per-session map.
     if (s.lastState !== state) {
+      if (typeof s.lastState === 'string' && Object.prototype.hasOwnProperty.call(globalMetrics.sessionsByState, s.lastState)
+          && globalMetrics.sessionsByState[s.lastState] > 0) {
+        globalMetrics.sessionsByState[s.lastState] -= 1;
+      }
       globalMetrics.sessionsByState[state] += 1;
       s.lastState = state;
     }
