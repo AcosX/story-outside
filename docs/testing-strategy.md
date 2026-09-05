@@ -158,12 +158,12 @@ git diff --check
 
 * `repository` 的内存状态在进程退出时丢失 — 真实生产是 MariaDB。
 * `createMockAgentProvider` 的 canned responses — 真实生产是任意 LLM provider。
-* `STORY_OUTSIDE_PROVIDER=mock` 是默认 — `real` 仍未实现。
+* `STORY_OUTSIDE_PROVIDER=mock` 是默认；`ZHIHU_PROVIDER` 是向后兼容的别名（`STORY_OUTSIDE_PROVIDER` 优先）。`real` 已实现。
 
 ## 7. 添加新测试的规则
 
 * 不要 mutate `tests/fixtures/seed-stories/cafe-rain.mjs` — 用新 slug / 新 fixture 文件。
 * 不要让 suite 依赖网络 / 真实 LLM / MariaDB。
-* 不要在 suite 里 echo `process.env.STORY_OUTSIDE_PROVIDER` 之外的任何 env key。
+* 不要在 suite 里 echo `process.env.STORY_OUTSIDE_PROVIDER` 或 `process.env.ZHIHU_PROVIDER` 之外的任何 env key。
 * 新增套件时同步追加到 `package.json` 的 `test` 链尾（"合编时统一收编"已完成，链内现有 26 个套件）。
 * 4–8 个 commit 粒度，每个 commit 末尾加 `Co-authored-by: OpenClaw <claw@acosx.top>`。

@@ -23,7 +23,7 @@ import {
 import {
   createSeededRepository,
   defaultGenerationProfile,
-  importStory as importStoryFromProvider,
+  importStoryAndEnsureCache as importStoryFromProvider,
   markFirstChoiceConsumed,
   rebuildOpeningCache,
   startSessionSnapshot,
@@ -38,6 +38,7 @@ import {
   recoverSession,
   stageNarrativeBatch,
 } from './stories/sessionService.mjs';
+import { BoundedMap } from './util/boundedMap.mjs';
 import {
   AgentRuntimeError,
   createAgentRuntime,
@@ -152,19 +153,18 @@ const FINISH_AFTER = 5;     // emit a finish_story tool_call after N narrative b
  * is intentionally process-local: a fresh process starts a fresh demo
  * arc. The store mirrors the route layer pattern (sessionPinnedMetadata)
  * and is wiped when the server restarts.
+ *
+ * The store is bounded so a long-running server cannot grow without
+ * limit. Eviction follows the route layer pattern (sessionPinnedMetadata)
+ * and is LRU-based; an evicted session simply restarts the demo arc
+ * from turn 0 on the next /generate call. That is acceptable: the demo
+ * arc is non-authoritative — its only consumer is the player frontend's
+ * default input ('hello').
  */
-const demoTurnCounter = new Map();
-// The demo counter and pinned-metadata maps are keyed by externally
-// supplied session UUIDs, so both must stay bounded to avoid unbounded
-// memory growth from anonymous /api/dev traffic.
-const MAX_DEMO_SESSION_STATES = 2000;
+const demoTurnCounter = new BoundedMap({ max: 1024, name: 'demoTurnCounter' });
 function getDemoSessionState(sessionUuid) {
   let state = demoTurnCounter.get(sessionUuid);
   if (!state) {
-    if (demoTurnCounter.size >= MAX_DEMO_SESSION_STATES) {
-      const oldestKey = demoTurnCounter.keys().next().value;
-      if (oldestKey !== undefined) demoTurnCounter.delete(oldestKey);
-    }
     state = { turnCount: 0 };
     demoTurnCounter.set(sessionUuid, state);
   }
@@ -177,6 +177,89 @@ const DEMO_FLAG = Object.freeze({
   reason:
     'Phase 2 builds an interactive narrative demo without touching the real Zhihu Open Platform. Data is served by src/providers/mockProvider.mjs (default STORY_OUTSIDE_PROVIDER=mock). See docs/official-zhihu-skill.md for the planned real-provider integration boundary.',
 });
+
+// When STORY_OUTSIDE_PROVIDER=real is selected we MUST NOT advertise
+// `official_zhihu_api: false` — the upstream is now being called, with
+// the caveats spelled out below. The flag is computed lazily per
+// request so a process that switches provider via env after start
+// (tests do this) reports accurately. MockProvider keeps DEMO_FLAG
+// verbatim so existing tests that assert demo.official_zhihu_api ===
+// false continue to hold.
+//
+// The official Zhihu Hackathon story content API only exposes the
+// `/story/list` and `/story/{id}` endpoints. It deliberately does NOT
+// expose a chat / completion endpoint, and it does NOT model the
+// in-app Agent runtime (generate / narrative / tool routing). Those
+// surfaces therefore stay bound to the deterministic demo provider
+// regardless of STORY_OUTSIDE_PROVIDER — they have no upstream
+// counterpart. The allow-list below makes that contract loud on the
+// wire so a client can tell at a glance whether a response came from
+// the real adapter or from the deterministic in-process demo.
+const MOCK_ONLY_ROUTES = Object.freeze([
+  // Phase 4 admin tooling that operates on the seeded in-memory fixtures
+  // (not on the live upstream). With STORY_OUTSIDE_PROVIDER=real these
+  // endpoints become dev-only and refuse to write — they exist solely
+  // so an operator can inspect the local mock catalog.
+  '/api/admin/stories',
+  '/api/admin/stories/:slug/import',
+  '/api/admin/opening-cache/rebuild',
+  // Group-chat echo placeholder — this endpoint never pretended to call
+  // a real model; with the real story provider it still echoes input.
+  '/api/chat',
+  // Agent runtime + session-tool routes. The official story content
+  // API is read-only JSON; narrative generation is owned by an
+  // in-process deterministic demo. These routes stay demo-only.
+  '/api/dev/sessions',
+  '/api/dev/sessions/:uuid',
+  '/api/dev/sessions/:uuid/opening-events',
+  '/api/dev/sessions/:uuid/recover',
+  '/api/dev/sessions/:uuid/discard-pending',
+  '/api/dev/sessions/:uuid/ending',
+  '/api/dev/sessions/:uuid/original-timeline',
+  '/api/dev/sessions/:uuid/replay',
+  '/api/dev/sessions/:uuid/interrupt',
+  '/api/dev/sessions/:uuid/generate',
+  '/api/dev/sessions/:uuid/narrative-events',
+  '/api/dev/sessions/:uuid/first-choice',
+  '/api/admin/observability/sessions/:uuid',
+  '/api/admin/observability/metrics/summary',
+]);
+
+function currentDemoFlag() {
+  let providerName = 'mock';
+  try {
+    providerName = getStoryProvider().name;
+  } catch {
+    providerName = (process.env.STORY_OUTSIDE_PROVIDER || 'mock').trim().toLowerCase();
+  }
+  if (providerName === 'real') {
+    return Object.freeze({
+      mode: 'live',
+      provider: 'real',
+      official_zhihu_api: true,
+      contract: 'zhihu_hackathon_2026_p2',
+      // Per the official contract these endpoints are unauthenticated
+      // during the hackathon. Surface that on the wire so a client can
+      // tell at a glance whether it is talking to a real adapter that
+      // happens not to need credentials, vs. a misconfigured deployment
+      // that quietly dropped a required Authorization header.
+      auth: 'none',
+      // The contract document explicitly warns the endpoints may change
+      // once the hackathon closes. We re-read that warning every response
+      // so a future operator does not have to chase it down in the docs.
+      scope: 'zhihu_hackathon_2026_p2',
+      // Surfaces that stay bound to the deterministic demo even when
+      // the story content provider is real. See MOCK_ONLY_ROUTES.
+      mock_only_routes: MOCK_ONLY_ROUTES,
+      reason:
+        'Live mode: data is served by src/providers/realProvider.mjs against ' +
+        'api.zhihu.com/km-indep-home/hackathon/v2/story/*. See ' +
+        'docs/official-zhihu-skill.md for the integration boundary and the ' +
+        'no-credential contract.',
+    });
+  }
+  return DEMO_FLAG;
+}
 
 // Phase 4: admin / dev tooling flag. Every /api/admin/* and /api/dev/* route
 // carries this banner so a future frontend / proxy can hide them in prod.
@@ -328,15 +411,13 @@ const { repository: storyRepo, fixtures: storyFixtures } = createSeededRepositor
 // sessionService deliberately keeps its state private to the repository. The
 // route layer keeps only the request's non-secret pinned metadata so recovery
 // can return the same metadata without reaching into service internals.
-const sessionPinnedMetadata = new Map();
-const MAX_SESSION_PINNED_METADATA = 2000;
-function rememberSessionPinnedMetadata(session_uuid, pinned) {
-  if (!sessionPinnedMetadata.has(session_uuid) && sessionPinnedMetadata.size >= MAX_SESSION_PINNED_METADATA) {
-    const oldestKey = sessionPinnedMetadata.keys().next().value;
-    if (oldestKey !== undefined) sessionPinnedMetadata.delete(oldestKey);
-  }
-  sessionPinnedMetadata.set(session_uuid, pinned);
-}
+//
+// The store is bounded so a long-running server cannot accumulate state
+// for every UUID it has ever observed. Eviction is LRU-based; an evicted
+// session_uuid simply has no pinned metadata on the next /recover call
+// (pinned=null). The canonical session data lives in the repository, not
+// here — eviction here never loses durable information.
+const sessionPinnedMetadata = new BoundedMap({ max: 1024, name: 'sessionPinnedMetadata' });
 // Per-session turn-level request idempotency map. Keyed by session_uuid,
 // then by request_id. The map intentionally lives outside the repository
 // because the runtime does not own it (the repository is process-shared
@@ -428,7 +509,7 @@ function sessionError(err) {
 
 function sessionErrorResponse(res, err) {
   const { status, code, message, details } = sessionError(err);
-  const body = { error: code, message, demo: DEMO_FLAG, dev: DEV_FLAG };
+  const body = { error: code, message, demo: currentDemoFlag(), dev: DEV_FLAG };
   if (details) body.details = details;
   return jsonResponse(res, status, body);
 }
@@ -438,7 +519,7 @@ function rejectInvalidSessionUuid(res, session_uuid) {
   jsonResponse(res, 400, {
     error: 'validation_failed',
     message: 'session_uuid must be a UUID',
-    demo: DEMO_FLAG,
+    demo: currentDemoFlag(),
     dev: DEV_FLAG,
   });
   return true;
@@ -465,6 +546,15 @@ async function handleRequest(req, res) {
 
   // Health & meta
   if (method === 'GET' && pathname === '/api/health') {
+    let providerName = 'mock';
+    try {
+      providerName = getStoryProvider().name;
+    } catch {
+      // Provider unavailable — fall back to env var so /api/health
+      // still answers while the bootstrap layer figures out the
+      // misconfiguration. The route below will surface the real error
+      // on the first data request.
+    }
     return jsonResponse(res, 200, {
       ok: true,
       name: 'story-outside',
@@ -472,7 +562,8 @@ async function handleRequest(req, res) {
       phase: 4,
       uptimeSeconds: Math.round(process.uptime()),
       nodeVersion: process.version,
-      demo: DEMO_FLAG,
+      provider: providerName,
+      demo: currentDemoFlag(),
     });
   }
 
@@ -484,7 +575,7 @@ async function handleRequest(req, res) {
     return jsonResponse(res, 500, {
       error: 'provider_unavailable',
       message: String(err && err.message ? err.message : err),
-      demo: DEMO_FLAG,
+      demo: currentDemoFlag(),
     });
   }
 
@@ -492,10 +583,10 @@ async function handleRequest(req, res) {
   if (method === 'GET' && pathname === '/api/stories') {
     try {
       const stories = await provider.listStories();
-      return jsonResponse(res, 200, { demo: DEMO_FLAG, stories });
+      return jsonResponse(res, 200, { demo: currentDemoFlag(), stories });
     } catch (err) {
       const { status, code } = classifyProviderError(err);
-      return jsonResponse(res, status, { error: code, demo: DEMO_FLAG });
+      return jsonResponse(res, status, { error: code, demo: currentDemoFlag() });
     }
   }
 
@@ -504,10 +595,10 @@ async function handleRequest(req, res) {
   if (method === 'GET' && storyMatch) {
     try {
       const story = await provider.getStory(storyMatch[1]);
-      return jsonResponse(res, 200, { demo: DEMO_FLAG, story });
+      return jsonResponse(res, 200, { demo: currentDemoFlag(), story });
     } catch (err) {
       const { status, code } = classifyProviderError(err);
-      return jsonResponse(res, status, { error: code, demo: DEMO_FLAG });
+      return jsonResponse(res, status, { error: code, demo: currentDemoFlag() });
     }
   }
 
@@ -518,7 +609,7 @@ async function handleRequest(req, res) {
       body = await readJsonBody(req);
     } catch (err) {
       const { status, code } = classifyProviderError(err);
-      return jsonResponse(res, status, { error: code, demo: DEMO_FLAG });
+      return jsonResponse(res, status, { error: code, demo: currentDemoFlag() });
     }
     try {
       const result = await provider.advanceStory({
@@ -526,10 +617,10 @@ async function handleRequest(req, res) {
         roleId: body && body.roleId,
         index: body && body.index,
       });
-      return jsonResponse(res, 200, { demo: DEMO_FLAG, ...result });
+      return jsonResponse(res, 200, { demo: currentDemoFlag(), ...result });
     } catch (err) {
       const { status, code } = classifyProviderError(err);
-      return jsonResponse(res, status, { error: code, demo: DEMO_FLAG });
+      return jsonResponse(res, status, { error: code, demo: currentDemoFlag() });
     }
   }
 
@@ -540,14 +631,14 @@ async function handleRequest(req, res) {
       body = await readJsonBody(req);
     } catch (err) {
       const { status, code } = classifyProviderError(err);
-      return jsonResponse(res, status, { error: code, demo: DEMO_FLAG });
+      return jsonResponse(res, status, { error: code, demo: currentDemoFlag() });
     }
     const text = typeof body.text === 'string' ? body.text.trim() : '';
     if (!text) {
-      return jsonResponse(res, 400, { error: 'empty_text', demo: DEMO_FLAG });
+      return jsonResponse(res, 400, { error: 'empty_text', demo: currentDemoFlag() });
     }
     return jsonResponse(res, 200, {
-      demo: DEMO_FLAG,
+      demo: currentDemoFlag(),
       reply: `(mock)你说了：${text.slice(0, 280)}`,
       timestamp: new Date().toISOString(),
     });
@@ -562,15 +653,19 @@ async function handleRequest(req, res) {
   // do not write to MariaDB.
   // -----------------------------------------------------------------------
 
-  // GET /api/admin/stories — list the seeded fixture stories with their
-  // story_uuid / story_version_uuid so admins can copy identifiers.
+  // GET /api/admin/stories — list every story currently in the in-memory
+  // repository (seeded fixtures ∪ stories imported via the real provider
+  // since process start). Includes their story_uuid / story_version_uuid
+  // list so admins can copy identifiers and bootstrap a session against
+  // any imported story, not just the seeded mock catalogue.
   if (method === 'GET' && pathname === '/api/admin/stories') {
     const out = [];
-    for (const f of storyFixtures) {
-      const versions = storyRepo.listVersionsByStory(f.story_uuid);
+    for (const row of storyRepo.listStories()) {
+      const versions = storyRepo.listVersionsByStory(row.story_uuid);
       out.push({
-        slug: f.slug,
-        story_uuid: f.story_uuid,
+        slug: row.slug,
+        story_uuid: row.story_uuid,
+        title: row.title,
         versions: versions.map((v) => ({
           story_version_uuid: v.version_uuid,
           version_no: v.version_no,
@@ -579,11 +674,14 @@ async function handleRequest(req, res) {
         })),
       });
     }
-    return jsonResponse(res, 200, { demo: DEMO_FLAG, dev: DEV_FLAG, stories: out });
+    return jsonResponse(res, 200, { demo: currentDemoFlag(), dev: DEV_FLAG, stories: out });
   }
 
   // POST /api/admin/stories/import — run the canonical import pipeline for a
   // slug. Same content → no new version; different content → new version_no.
+  // The response now always carries a non-null opening_cache_uuid /
+  // opening_cache_status (see importStoryAndEnsureCache), so the frontend
+  // bootstrap can immediately create a session against the imported story.
   const importMatch = pathname.match(/^\/api\/admin\/stories\/([a-z0-9-]+)\/import$/);
   if (method === 'POST' && importMatch) {
     let body = {};
@@ -591,11 +689,26 @@ async function handleRequest(req, res) {
       body = await readJsonBody(req);
     } catch (err) {
       const { status, code } = classifyProviderError(err);
-      return jsonResponse(res, status, { error: code, demo: DEMO_FLAG, dev: DEV_FLAG });
+      return jsonResponse(res, status, { error: code, demo: currentDemoFlag(), dev: DEV_FLAG });
     }
-    const story_uuid = typeof body.story_uuid === 'string' && body.story_uuid
+    // Body-supplied story_uuid wins; otherwise look up an existing row for
+    // this slug (idempotent re-import), or allocate a fresh v4 UUID.
+    //
+    // B4 fix: the previous default used `randomUUID().slice(0,12)` which
+    // produced an invalid tail segment (the slice spans the second hyphen
+    // of a v4 UUID). Repository-level UUID_PATTERN validation rejected
+    // the resulting string. We now use crypto.randomUUID() directly —
+    // it is already a valid v4 UUID — and also fall back to any
+    // existing story_uuid for the same slug so that an "omit
+    // story_uuid" request against an already-imported story resolves
+    // idempotently rather than producing a second duplicate row.
+    let story_uuid = typeof body.story_uuid === 'string' && body.story_uuid
       ? body.story_uuid
-      : `00000000-0000-4000-8000-${randomUUID().slice(0, 12).padStart(12, '0')}`;
+      : null;
+    if (!story_uuid) {
+      const existing = storyRepo.findStoryBySlug(importMatch[1]);
+      story_uuid = existing ? existing.story_uuid : randomUUID();
+    }
     try {
       const result = await importStoryFromProvider({
         repository: storyRepo,
@@ -603,13 +716,62 @@ async function handleRequest(req, res) {
         slug: importMatch[1],
         story_uuid,
       });
-      return jsonResponse(res, 200, { demo: DEMO_FLAG, dev: DEV_FLAG, result });
+      return jsonResponse(res, 200, { demo: currentDemoFlag(), dev: DEV_FLAG, result });
     } catch (err) {
       const { status, code } = classifyProviderError(err);
       return jsonResponse(res, status, {
         error: code,
         message: String(err && err.message ? err.message : err),
-        demo: DEMO_FLAG,
+        demo: currentDemoFlag(),
+        dev: DEV_FLAG,
+      });
+    }
+  }
+
+  // POST /api/stories/:workId/ensure — idempotent "select real story →
+  // bootstrap session" seam. The frontend's real-mode bootstrap calls
+  // this after picking a story from /api/stories (which only returns
+  // DTOs, not UUIDs). The handler imports the story if it is not yet in
+  // the repository, ensures a public opening cache exists, and returns
+  // everything the client needs to start a session:
+  //   { story_uuid, story_version_uuid, opening_cache_uuid, opening_cache_status }
+  //
+  // Idempotent: a second call returns the same UUIDs and reports
+  // cache_reused=true so a frontend retry cannot create a second
+  // version row.
+  const ensureMatch = pathname.match(/^\/api\/stories\/([a-z0-9-]+)\/ensure$/);
+  if (method === 'POST' && ensureMatch) {
+    const workId = ensureMatch[1];
+    // Look up existing story first so the call is fully idempotent.
+    const existing = storyRepo.findStoryBySlug(workId);
+    const story_uuid = existing
+      ? existing.story_uuid
+      : randomUUID();
+    try {
+      const result = await importStoryFromProvider({
+        repository: storyRepo,
+        provider,
+        slug: workId,
+        story_uuid,
+      });
+      return jsonResponse(res, 200, {
+        demo: currentDemoFlag(),
+        dev: DEV_FLAG,
+        slug: workId,
+        story_uuid: result.story_uuid,
+        story_version_uuid: result.story_version_uuid,
+        version_no: result.version_no,
+        version_reused: result.version_reused,
+        cache_reused: result.cache_reused,
+        opening_cache_uuid: result.opening_cache_uuid,
+        opening_cache_status: result.opening_cache_status,
+      });
+    } catch (err) {
+      const { status, code } = classifyProviderError(err);
+      return jsonResponse(res, status, {
+        error: code,
+        message: String(err && err.message ? err.message : err),
+        demo: currentDemoFlag(),
         dev: DEV_FLAG,
       });
     }
@@ -626,12 +788,12 @@ async function handleRequest(req, res) {
       body = await readJsonBody(req);
     } catch (err) {
       const { status, code } = classifyProviderError(err);
-      return jsonResponse(res, status, { error: code, demo: DEMO_FLAG, dev: DEV_FLAG });
+      return jsonResponse(res, status, { error: code, demo: currentDemoFlag(), dev: DEV_FLAG });
     }
     if (!body.story_version_uuid || typeof body.story_version_uuid !== 'string') {
       return jsonResponse(res, 400, {
         error: 'missing_story_version_uuid',
-        demo: DEMO_FLAG,
+        demo: currentDemoFlag(),
         dev: DEV_FLAG,
       });
     }
@@ -649,13 +811,13 @@ async function handleRequest(req, res) {
         story_version_uuid: body.story_version_uuid,
         profile,
       });
-      return jsonResponse(res, 200, { demo: DEMO_FLAG, dev: DEV_FLAG, result });
+      return jsonResponse(res, 200, { demo: currentDemoFlag(), dev: DEV_FLAG, result });
     } catch (err) {
       const { status, code } = classifyProviderError(err);
       return jsonResponse(res, status, {
         error: code,
         message: String(err && err.message ? err.message : err),
-        demo: DEMO_FLAG,
+        demo: currentDemoFlag(),
         dev: DEV_FLAG,
       });
     }
@@ -687,28 +849,28 @@ async function handleRequest(req, res) {
       if (missing) {
         return jsonResponse(res, 400, {
           error: 'validation_failed', message: 'The session request is invalid.',
-          field: missing, demo: DEMO_FLAG, dev: DEV_FLAG,
+          field: missing, demo: currentDemoFlag(), dev: DEV_FLAG,
         });
       }
       for (const key of ['session_uuid', 'story_uuid', 'story_version_uuid']) {
         if (!isSessionUuid(body[key])) {
           return jsonResponse(res, 400, {
             error: 'validation_failed', message: 'The session request is invalid.',
-            field: key, demo: DEMO_FLAG, dev: DEV_FLAG,
+            field: key, demo: currentDemoFlag(), dev: DEV_FLAG,
           });
         }
       }
       if (!isSessionUuid(body.generation_profile.cache_uuid)) {
         return jsonResponse(res, 400, {
           error: 'invalid_cache', message: 'The opening cache is invalid for this session.',
-          demo: DEMO_FLAG, dev: DEV_FLAG,
+          demo: currentDemoFlag(), dev: DEV_FLAG,
         });
       }
       const pinnedCache = storyRepo.findOpeningCacheByUuid(body.generation_profile.cache_uuid);
       if (!pinnedCache || pinnedCache.status !== 'valid') {
         return jsonResponse(res, 400, {
           error: 'invalid_cache', message: 'The opening cache is invalid for this session.',
-          demo: DEMO_FLAG, dev: DEV_FLAG,
+          demo: currentDemoFlag(), dev: DEV_FLAG,
         });
       }
       // A cache-only profile is safe to accept here because every omitted
@@ -747,7 +909,7 @@ async function handleRequest(req, res) {
           prompt: body.prompt,
           generation_profile: profile,
         };
-        rememberSessionPinnedMetadata(body.session_uuid, pinned);
+        sessionPinnedMetadata.set(body.session_uuid, pinned);
         // ClickUp 14 observability hooks (route layer, per docs/observability.md §5).
         // A freshly created session pins a valid opening cache, so this counts
         // as a cache hit for the pinned cache_uuid.
@@ -762,7 +924,7 @@ async function handleRequest(req, res) {
         onSessionCreate(sessionHookCtx);
         onOpeningCacheHit(sessionHookCtx);
         return jsonResponse(res, 200, {
-          demo: DEMO_FLAG, dev: DEV_FLAG, ...result, pinned,
+          demo: currentDemoFlag(), dev: DEV_FLAG, ...result, pinned,
           session: { ...result, pinned },
         });
       } catch (err) {
@@ -777,7 +939,7 @@ async function handleRequest(req, res) {
         return jsonResponse(res, 400, {
           error: 'missing_field',
           field: k,
-          demo: DEMO_FLAG,
+          demo: currentDemoFlag(),
           dev: DEV_FLAG,
         });
       }
@@ -791,13 +953,13 @@ async function handleRequest(req, res) {
         user_ref: body.user_ref,
         role_id: body.role_id,
       });
-      return jsonResponse(res, 200, { demo: DEMO_FLAG, dev: DEV_FLAG, snapshot });
+      return jsonResponse(res, 200, { demo: currentDemoFlag(), dev: DEV_FLAG, snapshot });
     } catch (err) {
       const { status, code } = classifyProviderError(err);
       return jsonResponse(res, status, {
         error: code,
         message: String(err && err.message ? err.message : err),
-        demo: DEMO_FLAG,
+        demo: currentDemoFlag(),
         dev: DEV_FLAG,
       });
     }
@@ -811,7 +973,7 @@ async function handleRequest(req, res) {
     try {
       const recovered = recoverSession({ repository: storyRepo, session_uuid: sessionMatch[1] });
       return jsonResponse(res, 200, {
-        demo: DEMO_FLAG,
+        demo: currentDemoFlag(),
         dev: DEV_FLAG,
         ...recovered,
         pinned: sessionPinnedMetadata.get(sessionMatch[1]) || null,
@@ -840,7 +1002,7 @@ async function handleRequest(req, res) {
         !Number.isInteger(body.event.sequence) || typeof body.event.text !== 'string') {
       return jsonResponse(res, 400, {
         error: 'validation_failed', message: 'The opening event request is invalid.',
-        demo: DEMO_FLAG, dev: DEV_FLAG,
+        demo: currentDemoFlag(), dev: DEV_FLAG,
       });
     }
     try {
@@ -861,7 +1023,7 @@ async function handleRequest(req, res) {
         event: body.event,
         latency_ms: Date.now() - openingCommitStartedAt,
       });
-      return jsonResponse(res, 200, { demo: DEMO_FLAG, dev: DEV_FLAG, ...result });
+      return jsonResponse(res, 200, { demo: currentDemoFlag(), dev: DEV_FLAG, ...result });
     } catch (err) {
       return sessionErrorResponse(res, err);
     }
@@ -894,7 +1056,7 @@ async function handleRequest(req, res) {
     try {
       const recovered = recoverSession({ repository: storyRepo, session_uuid: recoverMatch[1] });
       return jsonResponse(res, 200, {
-        demo: DEMO_FLAG, dev: DEV_FLAG,
+        demo: currentDemoFlag(), dev: DEV_FLAG,
         ...recovered,
         pinned: sessionPinnedMetadata.get(recoverMatch[1]) || null,
       });
@@ -915,7 +1077,7 @@ async function handleRequest(req, res) {
         session_uuid: discardMatch[1],
       });
       return jsonResponse(res, 200, {
-        demo: DEMO_FLAG, dev: DEV_FLAG,
+        demo: currentDemoFlag(), dev: DEV_FLAG,
         session_uuid: discardMatch[1],
         ...result,
       });
@@ -946,7 +1108,7 @@ async function handleRequest(req, res) {
     try {
       const ending = buildEnding({ repository: storyRepo, session_uuid: endingMatch[1] });
       return jsonResponse(res, 200, {
-        demo: DEMO_FLAG, dev: DEV_FLAG,
+        demo: currentDemoFlag(), dev: DEV_FLAG,
         session_uuid: endingMatch[1],
         ...ending,
       });
@@ -956,7 +1118,7 @@ async function handleRequest(req, res) {
           error: 'ending_not_committed',
           message: 'finish_story has not yet committed for this session.',
           session_uuid: endingMatch[1],
-          demo: DEMO_FLAG, dev: DEV_FLAG,
+          demo: currentDemoFlag(), dev: DEV_FLAG,
         });
       }
       return sessionErrorResponse(res, err);
@@ -974,7 +1136,7 @@ async function handleRequest(req, res) {
     try {
       const timeline = buildOriginalTimeline({ repository: storyRepo, session_uuid: originalTimelineMatch[1] });
       return jsonResponse(res, 200, {
-        demo: DEMO_FLAG, dev: DEV_FLAG,
+        demo: currentDemoFlag(), dev: DEV_FLAG,
         session_uuid: originalTimelineMatch[1],
         ...timeline,
       });
@@ -993,7 +1155,7 @@ async function handleRequest(req, res) {
     try {
       const replay = buildReplay({ repository: storyRepo, session_uuid: replayMatch[1] });
       return jsonResponse(res, 200, {
-        demo: DEMO_FLAG, dev: DEV_FLAG,
+        demo: currentDemoFlag(), dev: DEV_FLAG,
         session_uuid: replayMatch[1],
         ...replay,
       });
@@ -1019,7 +1181,7 @@ async function handleRequest(req, res) {
         !Number.isInteger(body.expected_revision)) {
       return jsonResponse(res, 400, {
         error: 'validation_failed', message: 'The interrupt request is invalid.',
-        demo: DEMO_FLAG, dev: DEV_FLAG,
+        demo: currentDemoFlag(), dev: DEV_FLAG,
       });
     }
     try {
@@ -1045,7 +1207,7 @@ async function handleRequest(req, res) {
       // docs/observability.md sanity counter expects.
       onOpeningCacheMiss(interruptHookCtx, 'player_interrupt_realtime');
       return jsonResponse(res, 200, {
-        demo: DEMO_FLAG,
+        demo: currentDemoFlag(),
         dev: DEV_FLAG,
         ...result,
         player_event: result.event,
@@ -1093,7 +1255,7 @@ async function handleRequest(req, res) {
         (body.request_id !== undefined && (typeof body.request_id !== 'string' || !body.request_id.length))) {
       return jsonResponse(res, 400, {
         error: 'validation_failed', message: 'The generate request is invalid.',
-        demo: DEMO_FLAG, dev: DEV_FLAG,
+        demo: currentDemoFlag(), dev: DEV_FLAG,
       });
     }
     let runtime;
@@ -1116,7 +1278,7 @@ async function handleRequest(req, res) {
     } catch (err) {
       if (err instanceof AgentRuntimeError) {
         return jsonResponse(res, 400, {
-          error: err.code, message: err.message, demo: DEMO_FLAG, dev: DEV_FLAG,
+          error: err.code, message: err.message, demo: currentDemoFlag(), dev: DEV_FLAG,
         });
       }
       return sessionErrorResponse(res, err);
@@ -1128,7 +1290,7 @@ async function handleRequest(req, res) {
         expected_revision: body.expected_revision,
       });
       return jsonResponse(res, 200, {
-        demo: DEMO_FLAG, dev: DEV_FLAG,
+        demo: currentDemoFlag(), dev: DEV_FLAG,
         ...result,
         session_uuid: sessionUuid,
         pending_id: result.pending_id,
@@ -1142,7 +1304,7 @@ async function handleRequest(req, res) {
     } catch (err) {
       if (err instanceof AgentRuntimeError) {
         return jsonResponse(res, 400, {
-          error: err.code, message: err.message, demo: DEMO_FLAG, dev: DEV_FLAG,
+          error: err.code, message: err.message, demo: currentDemoFlag(), dev: DEV_FLAG,
         });
       }
       return sessionErrorResponse(res, err);
@@ -1170,7 +1332,7 @@ async function handleRequest(req, res) {
         (body.client_request_id !== undefined && (typeof body.client_request_id !== 'string' || !body.client_request_id.length))) {
       return jsonResponse(res, 400, {
         error: 'validation_failed', message: 'The narrative-event commit request is invalid.',
-        demo: DEMO_FLAG, dev: DEV_FLAG,
+        demo: currentDemoFlag(), dev: DEV_FLAG,
       });
     }
     try {
@@ -1182,7 +1344,7 @@ async function handleRequest(req, res) {
         expected_revision: body.expected_revision,
         ...(body.client_request_id ? { client_request_id: body.client_request_id } : {}),
       });
-      return jsonResponse(res, 200, { demo: DEMO_FLAG, dev: DEV_FLAG, ...result });
+      return jsonResponse(res, 200, { demo: currentDemoFlag(), dev: DEV_FLAG, ...result });
     } catch (err) {
       return sessionErrorResponse(res, err);
     }
@@ -1199,12 +1361,12 @@ async function handleRequest(req, res) {
       body = await readJsonBody(req);
     } catch (err) {
       const { status, code } = classifyProviderError(err);
-      return jsonResponse(res, status, { error: code, demo: DEMO_FLAG, dev: DEV_FLAG });
+      return jsonResponse(res, status, { error: code, demo: currentDemoFlag(), dev: DEV_FLAG });
     }
     if (!body.snapshot || typeof body.snapshot !== 'object') {
       return jsonResponse(res, 400, {
         error: 'missing_snapshot',
-        demo: DEMO_FLAG,
+        demo: currentDemoFlag(),
         dev: DEV_FLAG,
       });
     }
@@ -1213,7 +1375,7 @@ async function handleRequest(req, res) {
     if (typeof snapshotSessionUuid !== 'string' || snapshotSessionUuid !== urlSessionUuid) {
       return jsonResponse(res, 400, {
         error: 'session_uuid_mismatch',
-        demo: DEMO_FLAG,
+        demo: currentDemoFlag(),
         dev: DEV_FLAG,
       });
     }
@@ -1228,13 +1390,13 @@ async function handleRequest(req, res) {
         tool_name: 'ask_player_choice',
         latency_ms: Date.now() - firstChoiceStartedAt,
       });
-      return jsonResponse(res, 200, { demo: DEMO_FLAG, dev: DEV_FLAG, result });
+      return jsonResponse(res, 200, { demo: currentDemoFlag(), dev: DEV_FLAG, result });
     } catch (err) {
       const { status, code } = classifyProviderError(err);
       return jsonResponse(res, status, {
         error: code,
         message: String(err && err.message ? err.message : err),
-        demo: DEMO_FLAG,
+        demo: currentDemoFlag(),
         dev: DEV_FLAG,
       });
     }
@@ -1264,7 +1426,7 @@ async function handleRequest(req, res) {
       return jsonResponse(res, 400, {
         error: 'validation_failed',
         message: 'session_uuid must be a UUID',
-        demo: DEMO_FLAG,
+        demo: currentDemoFlag(),
         dev: DEV_FLAG,
       });
     }
@@ -1273,7 +1435,7 @@ async function handleRequest(req, res) {
       return jsonResponse(res, 404, {
         error: 'session_not_observed',
         message: 'No observability data recorded for this session yet.',
-        demo: DEMO_FLAG,
+        demo: currentDemoFlag(),
         dev: DEV_FLAG,
       });
     }
@@ -1293,7 +1455,7 @@ async function handleRequest(req, res) {
       pinnedSession = null;
     }
     return jsonResponse(res, 200, {
-      demo: DEMO_FLAG,
+      demo: currentDemoFlag(),
       dev: DEV_FLAG,
       session_uuid,
       pinned: pinnedSession ? {
@@ -1318,7 +1480,7 @@ async function handleRequest(req, res) {
     const metrics = snapshotMetricsAll();
     const cacheStats = snapshotCacheStatsAll();
     return jsonResponse(res, 200, {
-      demo: DEMO_FLAG,
+      demo: currentDemoFlag(),
       dev: DEV_FLAG,
       metrics,
       cache_stats: cacheStats,

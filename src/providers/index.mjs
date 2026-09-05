@@ -2,29 +2,38 @@
 //
 // Any data source for /api/stories, /api/stories/:id, /api/stories/advance
 // (and future endpoints) goes through a StoryProvider. Routes never touch
-// the data layer directly. This is the seam where a future official Zhihu
-// adapter replaces the Mock without touching HTTP wiring.
+// the data layer directly. This is the seam where the official Zhihu
+// Hackathon story adapter replaces the Mock without touching HTTP wiring.
 //
-// Selector rules (current MVP):
+// Selector rules:
 //   * STORY_OUTSIDE_PROVIDER=mock       → mock (default; safe in dev & prod)
-//   * STORY_OUTSIDE_PROVIDER=real       → real adapter (NOT IMPLEMENTED YET)
-//                                          — see TODO below; we refuse loudly
-//                                            instead of silently falling back to
-//                                            mock, so a misconfigured prod does
-//                                            not pretend to talk to Zhihu.
+//   * STORY_OUTSIDE_PROVIDER=real       → real adapter (src/providers/realProvider.mjs)
+//                                          bound to the zhihu_hackathon_2026_p2
+//                                          story contract. Per that contract
+//                                          no Access Secret, OAuth token or
+//                                          other credential is required —
+//                                          these endpoints are unauthenticated
+//                                          during the hackathon window.
 //   * STORY_OUTSIDE_PROVIDER=<unknown>  → throws at startup
 //
-// Future Real provider MUST live in src/providers/realProvider.mjs and MUST
-// import nothing from vendor/zhihu-hackathon (those scripts are orchestration
-// tools, not runtime deps). It will be selected by setting
-// STORY_OUTSIDE_PROVIDER=real AND supplying the OAuth / Access Secret
-// credentials via env, per docs/official-zhihu-skill.md.
+// Both STORY_OUTSIDE_PROVIDER and the legacy alias ZHIHU_PROVIDER are
+// honoured. STORY_OUTSIDE_PROVIDER wins if both are set, so a deployment
+// that already standardises on the project-wide name does not need to be
+// touched. ZHIHU_PROVIDER remains a fallback for hackathon teams that
+// wired their early environment variable before the project-wide name
+// was settled.
 //
-// IMPORTANT: providers never log, store, or echo any credential value. They
-// receive already-loaded credentials from the bootstrap layer (out of scope
-// for Phase 1).
+// Real provider MUST live in src/providers/realProvider.mjs and MUST import
+// nothing from vendor/zhihu-hackathon (those scripts are orchestration tools,
+// not runtime deps).
+//
+// IMPORTANT: providers never log, store, or echo any credential value. The
+// real adapter does not consume credentials today; if a future story API
+// ever does require auth, the provider must receive already-loaded values
+// from the bootstrap layer (out of scope for this revision).
 
 import { createMockStoryProvider } from './mockProvider.mjs';
+import { createRealZhihuStoryProvider } from './realProvider.mjs';
 
 /**
  * @typedef {import('./dto.mjs').StorySummary} StorySummary
@@ -42,32 +51,53 @@ import { createMockStoryProvider } from './mockProvider.mjs';
  * @property {(input: {storyId: string, roleId?: string|null, index?: number}) => Promise<AdvanceResult>} advanceStory
  */
 
-const ENV_KEY = 'STORY_OUTSIDE_PROVIDER';
+const ENV_KEYS = Object.freeze(['STORY_OUTSIDE_PROVIDER', 'ZHIHU_PROVIDER']);
+const DEFAULT_VALUE = 'mock';
+
+/**
+ * Resolve the configured provider name from process.env. The first env
+ * var in ENV_KEYS wins; subsequent aliases are ignored. Empty / whitespace
+ * values are skipped so a deployment can set one variable to empty to
+ * fall through to the next.
+ *
+ * @returns {{ key: string, value: string }}
+ */
+export function readProviderEnv() {
+  for (const key of ENV_KEYS) {
+    const raw = process.env[key];
+    if (typeof raw !== 'string') continue;
+    const trimmed = raw.trim().toLowerCase();
+    if (!trimmed) continue;
+    return { key, value: trimmed };
+  }
+  return { key: 'default', value: DEFAULT_VALUE };
+}
 
 /**
  * Resolve and instantiate the active StoryProvider. Memoised.
  * @returns {StoryProvider}
  */
 export function getStoryProvider() {
-  const cached = _cache.get(ENV_KEY);
+  // Cache key encodes BOTH the resolved value and the env key that won,
+  // so that switching STORY_OUTSIDE_PROVIDER=mock back to default while
+  // leaving ZHIHU_PROVIDER=real does not silently keep the old provider.
+  const { key, value } = readProviderEnv();
+  const cacheKey = `${key}::${value}`;
+  const cached = _cache.get(cacheKey);
   if (cached) return cached;
-  const requested = (process.env[ENV_KEY] || 'mock').trim().toLowerCase();
+  const requested = value;
   /** @type {StoryProvider} */
   let provider;
   if (requested === 'mock') {
     provider = createMockStoryProvider();
   } else if (requested === 'real') {
-    throw new Error(
-      'STORY_OUTSIDE_PROVIDER=real is not implemented yet. ' +
-        'See src/providers/index.mjs and docs/official-zhihu-skill.md before ' +
-        'wiring the official Zhihu adapter.',
-    );
+    provider = createRealZhihuStoryProvider();
   } else {
     throw new Error(
-      `Unknown STORY_OUTSIDE_PROVIDER="${requested}". Expected "mock" or "real".`,
+      `Unknown provider value="${requested}" (from env ${key}). Expected "mock" or "real".`,
     );
   }
-  _cache.set(ENV_KEY, provider);
+  _cache.set(cacheKey, provider);
   return provider;
 }
 
@@ -82,6 +112,7 @@ export function __resetStoryProviderForTests() {
 const _cache = new Map();
 
 export { createMockStoryProvider } from './mockProvider.mjs';
+export { createRealZhihuStoryProvider } from './realProvider.mjs';
 export {
   ProviderError,
   StoryNotFoundError,
