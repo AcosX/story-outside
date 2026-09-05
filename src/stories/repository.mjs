@@ -92,7 +92,7 @@ const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{
 // under a fresh generation_profile / scope produces a new cache row).
 //
 // Eviction policy (PR #7 follow-up, ChatGPT re-review fix 2026-09-05,
-// Blocker 1):
+// Blocker 1 + Blocker 2):
 //   1. Drop rows whose status is 'failed' or 'invalidated' first; those
 //      are useless for future lookups and the scope index is pruned so
 //      a rebuild can republish under the same scope key.
@@ -102,11 +102,13 @@ const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{
 //      NEVER dropped — the previous behaviour evicted valid rows
 //      blindly, which broke `commitOpeningEvent` on any active session
 //      whose pinned cache was the eviction target.
-//   3. If the bulk eviction finds no candidate at all (every row is
-//      currently pinned, or the only candidates left are all pinned),
-//      the loop returns 0 and leaves the store as-is. The caller is
-//      expected to refuse the next insert rather than evict a pinned
-//      cache (see B2 follow-up).
+//   3. If EVERY row is currently pinned (or the only candidates left
+//      are all pinned), upsertOpeningCache's reservation seam refuses
+//      the insert with a stable `too_many_pinned_caches` error instead
+//      of silently dropping a live session's cache. The MariaDB-backed
+//      DAO will replace this branch with TTL + per-scope GC; in the
+//      in-memory demo there is no TTL so we hard-fail instead of
+//      silently losing a live session's cache.
 // The scope index (openingCachesByScope) is pruned of the evicted rows
 // so future lookups still find a valid replacement if one exists.
 // Documented as a demo bound in docs/observability.md.
@@ -287,6 +289,85 @@ function evictOpeningCachesIfFull(state) {
     }
   }
   return evicted;
+}
+
+/**
+ * Reserve a slot in the cache store before inserting a new row. If the
+ * store is at the cap and we cannot evict a single row (every row is
+ * pinned), refuse with a stable `too_many_pinned_caches` error so the
+ * caller never sees a "ghost row" — an inserted row that the very next
+ * eviction pass removes (PR #7 ChatGPT 2026-09-05 re-review, Blocker 2).
+ *
+ * The reservation runs `evictOpeningCacheOnce` — a one-shot eviction
+ * that drops AT MOST ONE row even when the store is at exactly the
+ * cap (the existing `evictOpeningCachesIfFull` only loops when strictly
+ * above the cap, so it is a no-op when the store is exactly full). The
+ * pinned-aware filter from B1 makes the one-shot eviction skip any
+ * valid cache that an active session still needs.
+ *
+ * Concurrent batches in a single tick can therefore exceed the cap by
+ * at most N-1 before the next batch's first insert observes the cap
+ * and refuses; that is acceptable for an in-memory demo (the
+ * production DAO will replace this with a SQL UNIQUE + TTL story).
+ */
+function reserveOpeningCacheSlot(state) {
+  if (state.openingCaches.size < MAX_OPENING_CACHES) return;
+  // Drop ONE eviction candidate. If we cannot drop any (every row is
+  // pinned), refuse — the new row would otherwise be inserted and
+  // immediately evicted on the next insertion (the B2 ghost-row bug).
+  evictOpeningCacheOnce(state);
+  if (state.openingCaches.size >= MAX_OPENING_CACHES) {
+    const err = new Error(
+      `repository: cannot insert opening cache — store is at MAX_OPENING_CACHES=${MAX_OPENING_CACHES} and ` +
+      'every existing row is currently pinned by an active session; evict or finish a session first.',
+    );
+    err.code = 'too_many_pinned_caches';
+    throw err;
+  }
+}
+
+/**
+ * One-shot eviction: drop the BEST eviction candidate and return the
+ * uuid that was removed, or null when nothing is evictable (every row
+ * is pinned). Best candidate is the same one the bulk
+ * `evictOpeningCachesIfFull` loop would pick on its first iteration
+ * (failed > invalidated > unpinned-valid, oldest first within a tier).
+ */
+function evictOpeningCacheOnce(state) {
+  const pinned = state._pinnedCacheResolver();
+  let targetUuid = null;
+  let targetTier = Infinity;
+  let targetUpdatedAt = null;
+  for (const [uuid, row] of state.openingCaches.entries()) {
+    // Skip pinned valid rows — they are still in use by an active
+    // session. failed / invalidated rows are always eviction candidates
+    // regardless of pinning (they cannot be served any more).
+    if (row.status === 'valid' && pinned.has(uuid)) continue;
+    const tier = row.status === 'failed' ? 0
+      : row.status === 'invalidated' ? 1
+        : row.status === 'valid' ? 3 : 2;
+    const updatedAt = typeof row.updated_at === 'string' ? row.updated_at : null;
+    if (tier < targetTier || (tier === targetTier && (targetUpdatedAt === null || (updatedAt !== null && updatedAt < targetUpdatedAt)))) {
+      targetUuid = uuid;
+      targetTier = tier;
+      targetUpdatedAt = updatedAt;
+    }
+  }
+  if (targetUuid === null) return null;
+  const removed = state.openingCaches.get(targetUuid);
+  state.openingCaches.delete(targetUuid);
+  if (removed) {
+    const key = makeOpeningScopeKey(
+      removed.story_uuid,
+      removed.story_version_uuid,
+      removed.opening_key,
+      removed.generation_hash,
+    );
+    if (state.openingCachesByScope.get(key) === targetUuid) {
+      state.openingCachesByScope.delete(key);
+    }
+  }
+  return targetUuid;
 }
 
 /**
@@ -513,11 +594,22 @@ export function createInMemoryStoryRepository() {
         created_at: now,
         updated_at: now,
       };
-      // PR #7 ChatGPT follow-up (2026-09-05): the pinned-aware eviction
-      // (B1) protects the row of any active session. The cap-aware
-      // belt-and-braces eviction below keeps the store bounded when an
-      // out-of-band caller briefly exceeds MAX_OPENING_CACHES.
+      // PR #7 ChatGPT follow-up (2026-09-05, B2): reserve the slot BEFORE
+      // insertion so a freshly inserted row can never be evicted by the
+      // very same call. If the cap cannot be freed (every row is
+      // pinned), reserveOpeningCacheSlot throws a stable
+      // `too_many_pinned_caches` error and we never reach the `set`
+      // below — so the returned row is guaranteed to be findable by
+      // both cache_uuid AND by scope key. The pinned-aware filter in
+      // B1 makes the one-shot eviction here actually succeed when
+      // there is any failed / invalidated / unpinned valid row to drop.
+      reserveOpeningCacheSlot(state);
       state.openingCaches.set(cache_uuid, row);
+      // Belt-and-braces: drop any pre-existing overshoot (e.g. when the
+      // session layer recently evicted a session and unpinned a cache,
+      // leaving the store temporarily above the cap). This pass MUST NOT
+      // pick the row we just inserted (it has the newest updated_at and
+      // is at most the lone candidate in the worst case).
       evictOpeningCachesIfFull(state);
       // A failed attempt can be re-found by the SAME generation_hash so a
       // retry reuses/updates the row instead of leaving an orphan. A valid

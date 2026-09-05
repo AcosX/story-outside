@@ -372,6 +372,13 @@ function sessionError(err) {
   if (err && err.code === 'too_many_client_request_ids') {
     return { status: 400, code: 'too_many_client_request_ids', message: err.message, details: err.details || null };
   }
+  // PR #7 ChatGPT 2026-09-05 follow-up (Blocker 1+2): opening-cache
+  // store at the cap with every row pinned. Maps to 503 because the
+  // caller has to finish or evict a session to make room — the demo
+  // does not silently drop pinned caches.
+  if (err && err.code === 'too_many_pinned_caches') {
+    return { status: 503, code: 'too_many_pinned_caches', message: err.message, details: err.details || null };
+  }
   const text = String(err && err.message ? err.message : '');
   // M4 follow-up: the legacy 'unknown session' string is no longer raised
   // by the service (the service throws SessionNotFoundError with code
