@@ -144,7 +144,55 @@ function readIntEnv(raw, fallback) {
  * @returns {Promise<unknown>}
  */
 async function decodeJson(res) {
-  const text = await res.text();
+  // Pre-check Content-Length before allocating the body. fetch returns
+  // a Headers object; missing header → null. Trust the header only as
+  // an optimisation — if the upstream lies, the per-byte counter below
+  // is the authoritative cap.
+  const declared = Number.parseInt(res.headers.get('content-length') || '', 10);
+  if (Number.isFinite(declared) && declared > MAX_RESPONSE_BYTES) {
+    throw new ProviderError(
+      'upstream_body_too_large',
+      `Upstream declared response size ${declared} exceeds ${MAX_RESPONSE_BYTES}.`,
+      { declared, cap: MAX_RESPONSE_BYTES },
+    );
+  }
+  // Stream-accumulate the body with a hard byte cap so an upstream that
+  // lies about Content-Length (or omits it) cannot blow up the heap.
+  const reader = res.body && typeof res.body.getReader === 'function' ? res.body.getReader() : null;
+  const decoder = new TextDecoder('utf-8');
+  let text = '';
+  let total = 0;
+  if (reader) {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      if (!value) continue;
+      total += value.byteLength;
+      if (total > MAX_RESPONSE_BYTES) {
+        try { await reader.cancel(); } catch { /* ignore */ }
+        throw new ProviderError(
+          'upstream_body_too_large',
+          `Upstream body exceeded ${MAX_RESPONSE_BYTES} bytes while reading.`,
+          { cap: MAX_RESPONSE_BYTES },
+        );
+      }
+      text += decoder.decode(value, { stream: true });
+    }
+    text += decoder.decode();
+  } else {
+    // Defensive fallback for runtimes without ReadableStream bodies
+    // (the Node test harness occasionally hits this). .text() still
+    // runs under the AbortController timeout; the size cap is enforced
+    // post-hoc because the alternative is unbounded allocation.
+    text = await res.text();
+    if (text.length > MAX_RESPONSE_BYTES) {
+      throw new ProviderError(
+        'upstream_body_too_large',
+        `Upstream body exceeded ${MAX_RESPONSE_BYTES} bytes.`,
+        { cap: MAX_RESPONSE_BYTES, contentLength: text.length },
+      );
+    }
+  }
   if (!text) {
     throw new ProviderError('upstream_empty_body', 'Upstream returned an empty body.');
   }
@@ -160,8 +208,24 @@ async function decodeJson(res) {
 }
 
 /**
+ * Cap on upstream response body size in bytes. The official Zhihu
+ * Hackathon story endpoints return JSON for at most a few dozen
+ * entries (work_id list and per-work detail). Anything substantially
+ * larger than this is treated as an upstream misbehaviour / DoS, NOT
+ * legitimate content. We refuse to allocate it. The constant lives
+ * here (not in env) because it is part of the safety contract, not a
+ * tuning knob.
+ */
+const MAX_RESPONSE_BYTES = 1024 * 1024; // 1 MiB
+const MAX_REDIRECTS = 3;
+
+/**
  * Wrap a fetch with an AbortController timeout. We never retry on
- * timeout — the contract forbids it.
+ * timeout — the contract forbids it. Redirects are handled manually
+ * (see followRedirect) so we can keep host-pinning, size-pinning and
+ * idempotency on every hop. fetch's built-in `redirect: 'follow'`
+ * would silently follow redirects to a non-api.zhihu.com host, which
+ * is exactly what the host allow-list is meant to prevent.
  *
  * @param {string} url
  * @param {{ timeoutMs: number, fetchImpl?: typeof fetch }} opts
@@ -175,21 +239,67 @@ async function fetchWithTimeout(url, { timeoutMs, fetchImpl }) {
       'No fetch implementation is available in this runtime.',
     );
   }
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  return followRedirect(fn, url, { timeoutMs, hops: 0 });
+}
+
+/**
+ * Manually follow 30x responses, hopping at most MAX_REDIRECTS times,
+ * re-validating the host allow-list and re-applying the body size cap
+ * at every step.
+ *
+ * @param {typeof fetch} fn
+ * @param {string} url
+ * @param {{ timeoutMs: number, hops: number }} ctx
+ * @returns {Promise<Response>}
+ */
+async function followRedirect(fn, url, ctx) {
+  if (ctx.hops > MAX_REDIRECTS) {
+    throw new ProviderError(
+      'upstream_too_many_redirects',
+      `Upstream redirected more than ${MAX_REDIRECTS} times.`,
+      { hops: ctx.hops },
+    );
+  }
+  // Pre-flight: parse + host-pinning. We never want fetch to dispatch
+  // a request whose hostname we did not authorise. fetch with
+  // `redirect: 'manual'` still issues the request; we pre-check so we
+  // never even send bytes to a non-allow-listed host.
+  let target;
   try {
-    return await fn(url, {
+    target = new URL(url);
+  } catch (err) {
+    throw new ProviderError(
+      'upstream_invalid_url',
+      'Upstream URL could not be parsed.',
+      { name: err && err.name ? err.name : 'parse_error' },
+    );
+  }
+  if (!isAllowedUpstreamHost(target.hostname)) {
+    throw new ProviderError(
+      'unsupported_upstream_host',
+      `Refusing to call non-allow-listed upstream host "${target.hostname}".`,
+      { hostname: target.hostname },
+    );
+  }
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), ctx.timeoutMs);
+  let res;
+  try {
+    res = await fn(target.toString(), {
       method: 'GET',
       headers: { ...STATIC_HEADERS },
       signal: controller.signal,
-      redirect: 'follow',
+      // Manual mode: the underlying fetch returns the 30x Response
+      // without consuming body / following Location. We handle every
+      // hop explicitly so the host allow-list is re-checked.
+      redirect: 'manual',
     });
   } catch (err) {
     if (err && (err.name === 'AbortError' || err.code === 'ABORT_ERR')) {
       throw new ProviderError(
         'upstream_timeout',
-        `Upstream did not respond within ${timeoutMs}ms.`,
-        { timeoutMs },
+        `Upstream did not respond within ${ctx.timeoutMs}ms.`,
+        { timeoutMs: ctx.timeoutMs },
       );
     }
     // Network-level failure (DNS, TLS, refused). Wrap so the route layer
@@ -202,6 +312,43 @@ async function fetchWithTimeout(url, { timeoutMs, fetchImpl }) {
   } finally {
     clearTimeout(timer);
   }
+  // 30x: hop to Location (re-validating host + size cap).
+  if (res.status >= 300 && res.status < 400) {
+    const location = res.headers.get('location');
+    if (!location) {
+      throw new ProviderError(
+        'upstream_redirect_missing_location',
+        'Upstream returned a redirect with no Location header.',
+        { status: res.status },
+      );
+    }
+    let nextUrl;
+    try {
+      nextUrl = new URL(location, target).toString();
+    } catch (err) {
+      throw new ProviderError(
+        'upstream_invalid_redirect',
+        'Upstream returned a malformed redirect target.',
+        { status: res.status },
+      );
+    }
+    return followRedirect(fn, nextUrl, { timeoutMs: ctx.timeoutMs, hops: ctx.hops + 1 });
+  }
+  return res;
+}
+
+/**
+ * Check whether a hostname (no scheme, no path) is allow-listed.
+ * Exact-match against api.zhihu.com. Defeats host-prefix bypass
+ * (`api.zhihu.com.attacker.example`) and IDN homograph
+ * (`api.zhihu.cn`).
+ *
+ * @param {string} hostname
+ * @returns {boolean}
+ */
+function isAllowedUpstreamHost(hostname) {
+  if (typeof hostname !== 'string' || !hostname) return false;
+  return hostname.toLowerCase() === 'api.zhihu.com';
 }
 
 /**
