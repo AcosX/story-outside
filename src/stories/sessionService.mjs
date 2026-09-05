@@ -119,20 +119,32 @@ const MAX_TRACKED_REQUESTS_PER_SESSION = 1000;
 // further; documented as a demo bound in docs/observability.md.
 const MAX_CANONICAL_SESSIONS = 2000;
 
-// Mirror of uq_session_events_client_request (db/schema.sql): the column
-// is GLOBALLY unique across sessions, not per session. This registry maps
-// client_request_id -> session_uuid for every id that produced a canonical
-// event. Unlike the per-session replay maps it is a uniqueness index, not
-// a cache — in the real DB its lifetime matches the table. In this
-// in-memory demo the index is also bounded, BUT eviction is rejected at
-// the seam (it does NOT silently forget an old id and let a future
-// request reuse it under a different session — the SQL constraint would
-// refuse the row, so the demo must refuse it too). When the cap is
-// reached, a new cross-session id is refused with a stable
-// 'too_many_client_request_ids' code so operators can see the demo
-// ceiling; the per-session replay maps continue to evict their oldest
-// entries as before because their semantic is 'replay window', not
-// 'uniqueness index'.
+// Bounded sliding window per process (PR #7 follow-up, ChatGPT 2026-09-05
+// re-review, Blocker 3). The MariaDB schema keeps a GLOBALLY UNIQUE
+// constraint on `client_request_id` (uq_session_events_client_request),
+// which would survive across all processes and across process lifetime.
+// The in-memory demo cannot keep an equivalent index forever — it is
+// bounded by MAX_TRACKED_CLIENT_REQUEST_IDS so the demo memory budget
+// stays predictable. The trade-off, made explicit here so a future
+// operator cannot silently rely on the wrong guarantee:
+//
+//   * SAME-session replay with the same id and the same payload
+//     continues to return the prior result (per-session idempotency,
+//     still enforced by `session.requestIds`).
+//   * SAME-session replay with the same id and a DIFFERENT payload
+//     still fails closed (per-session fingerprint check).
+//   * CROSS-session reuse of an id that is still in the window is now
+//     ACCEPTED — the demo treats `clientRequestIndex` as a bounded
+//     sliding window, NOT as a mirror of the SQL UNIQUE index. A future
+//     session may legally re-commit under an id that an evicted session
+//     previously held. The production DAO replaces this index with the
+//     SQL UNIQUE constraint, which DOES reject cross-session reuse.
+//
+// When the cap is reached a NEW (previously unseen) id is refused with
+// a stable 'too_many_client_request_ids' code so operators can see the
+// demo ceiling; the per-session replay maps continue to evict their
+// oldest entries as before because their semantic is 'replay window',
+// not 'uniqueness index'.
 const MAX_TRACKED_CLIENT_REQUEST_IDS = 50000;
 function repositoryState(repository) {
   if (!repository || typeof repository !== 'object') {
@@ -288,30 +300,33 @@ function rememberRequest(session, id, entry) {
 }
 
 /**
- * Enforce the cross-session uniqueness of client_request_id on canonical
- * events (mirror of uq_session_events_client_request). Called from append()
- * — the only writer of canonical events — so a duplicate id used by a
- * DIFFERENT session fails closed exactly like the SQL unique key would.
- * Same-session replays never reach this path (they return earlier through
- * the idempotency lookup and do not append a second event).
+ * Enforce the bounded cross-session uniqueness window on canonical
+ * events. Called from append() — the only writer of canonical events.
+ *
+ * Contract (PR #7 follow-up, ChatGPT 2026-09-05 re-review, Blocker 3):
+ *   * A cross-session reuse of an id that is ALREADY in the window IS
+ *     ALLOWED. The index is a bounded sliding window per process, not a
+ *     mirror of the SQL UNIQUE constraint — once an owning session is
+ *     evicted (or its id otherwise drops out of the window), any
+ *     session may reuse the id. Same-session idempotency is enforced
+ *     earlier by `session.requestIds` (with a different fingerprint
+ *     failure mode); this function only deals with the cross-session
+ *     case.
+ *   * A previously unseen id is refused with a stable
+ *     'too_many_client_request_ids' code when the window is full so
+ *     operators see the demo ceiling instead of silent eviction.
+ *
+ * @returns {void}
  */
 function registerCanonicalRequestId(state, session, clientRequestId) {
   if (!clientRequestId) return;
   if (!state.clientRequestIndex) state.clientRequestIndex = new Map();
-  const owner = state.clientRequestIndex.get(clientRequestId);
-  if (owner && owner !== session.session_uuid) {
-    const err = new Error(
-      `sessionService: client_request_id '${clientRequestId}' was already committed by another session (${owner}) — uq_session_events_client_request is globally unique`,
-    );
-    err.code = 'duplicate_client_request_id';
-    throw err;
-  }
-  // M3 follow-up: do NOT silently evict the oldest id. If the demo
-  // in-memory uniqueness window is full, refuse the new id so the
-  // semantics stay consistent with the SQL UNIQUE constraint the
-  // production DAO will apply. The per-session replay maps continue to
-  // evict their own oldest entries because their semantic is different
-  // (replay window, not uniqueness).
+  // B3 follow-up: cross-session reuse is now accepted. The previous
+  // behaviour tried to mirror SQL UNIQUE by refusing the new owner with
+  // `duplicate_client_request_id`; that contract was inconsistent with
+  // `evictSession` clearing the index on eviction. We keep the same
+  // SET semantics for the index, drop the per-id owner check, and
+  // refuse only when the window is full for an UNSEEN id.
   if (!state.clientRequestIndex.has(clientRequestId) && state.clientRequestIndex.size >= MAX_TRACKED_CLIENT_REQUEST_IDS) {
     const err = new Error(
       `sessionService: too many distinct client_request_id values have been committed across sessions (limit ${MAX_TRACKED_CLIENT_REQUEST_IDS})`,
@@ -616,8 +631,16 @@ export function createSession({ repository, session_uuid, story_uuid, story_vers
  * Drop the least-recently-touched session from the canonical store.
  * Eviction is a hard cut: history / pending / per-session request maps
  * are gone, and every entry the session contributed to the cross-session
- * clientRequestIndex is removed so a future replay of a freed id will
- * pass the uniqueness check (rather than being permanently blocked).
+ * clientRequestIndex is removed.
+ *
+ * B3 follow-up (ChatGPT 2026-09-05 re-review): the previous contract
+ * claimed that cross-session id uniqueness survived eviction. In
+ * practice `evictSession` already cleared the per-owner entries, so the
+ * claim was internally inconsistent. The new contract explicitly
+ * downgrades the in-memory index to a bounded sliding window — after
+ * eviction a freed id MAY be reused by a fresh session, and the SQL
+ * UNIQUE constraint is no longer claimed here. See the comment on
+ * `MAX_TRACKED_CLIENT_REQUEST_IDS` and `registerCanonicalRequestId`.
  */
 function evictOldestSession(state) {
   let oldestUuid = null;
@@ -638,6 +661,12 @@ function evictOldestSession(state) {
 
 function evictSession(state, session_uuid) {
   state.sessions.delete(session_uuid);
+  // B3 follow-up: clean up the per-session slots in the cross-session
+  // window so future inserts under those ids do not appear to still be
+  // owned by the now-evicted session. Note: cross-session reuse is now
+  // accepted by `registerCanonicalRequestId` once the index no longer
+  // remembers the evicted session — the new contract documents this as
+  // a bounded sliding window, not a mirror of SQL UNIQUE.
   if (state.clientRequestIndex && state.clientRequestIndex.size > 0) {
     for (const [id, owner] of state.clientRequestIndex.entries()) {
       if (owner === session_uuid) state.clientRequestIndex.delete(id);

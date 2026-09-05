@@ -366,9 +366,6 @@ function sessionError(err) {
   if (err && err.code === 'repository_not_initialized') {
     return { status: 500, code: 'internal_error', message: 'Internal server error.', details: err.details || null };
   }
-  if (err && err.code === 'duplicate_client_request_id') {
-    return { status: 400, code: 'duplicate_client_request_id', message: err.message, details: err.details || null };
-  }
   if (err && err.code === 'too_many_client_request_ids') {
     return { status: 400, code: 'too_many_client_request_ids', message: err.message, details: err.details || null };
   }

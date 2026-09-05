@@ -339,11 +339,19 @@ async function run() {
     assert.equal(repository.findOpeningCacheByUuid(cache.cache_uuid).status, 'valid');
   });
 
-  await test('6. client_request_id is globally unique across sessions (uq_session_events_client_request mirror)', async () => {
-    // The SQL unique key on session_events.client_request_id is GLOBAL —
-    // not scoped per session. The in-memory mirror must fail closed the
-    // same way when a second session reuses an id that already produced a
-    // canonical event.
+  await test('6. client_request_id uniqueness is a bounded per-process window (B3 downgrade)', async () => {
+    // B3 follow-up (PR #7 ChatGPT 2026-09-05 re-review): the in-memory
+    // demo no longer mirrors the SQL GLOBAL UNIQUE constraint on
+    // session_events.client_request_id. Once the previous owning
+    // session is evicted, a fresh session MAY reuse the id. Within the
+    // window, the same-session replay rules still apply:
+    //   * same id + same payload → idempotent replay;
+    //   * same id + different payload → fail closed.
+    // The cross-session case is now ACCEPTED so this test pins the new
+    // contract; the SQL UNIQUE constraint is owned by the production DAO,
+    // not by the in-memory demo. See the comment on
+    // `MAX_TRACKED_CLIENT_REQUEST_IDS` in sessionService.mjs and the
+    // dedicated `chatgptReviewFixes.test.mjs` regression tests.
     const sessionA = '00000000-0000-4000-8000-0000000a0006';
     const sessionB = '00000000-0000-4000-8000-0000000a0007';
     const { repository, cache, profile } = await sessionFixture({ session_uuid: sessionA });
@@ -379,24 +387,28 @@ async function run() {
       expected_revision: 0,
     });
     assert.deepEqual(replay, first);
-    // A DIFFERENT session reusing the id fails closed — even with an
-    // identical payload — mirroring the global unique key.
-    assert.throws(
-      () =>
-        commitOpeningEvent({
-          repository,
-          session_uuid: sessionB,
-          cache_uuid: cache.cache_uuid,
-          event: shown(events[0]),
-          client_request_id: 'tx-shared-open-1',
-          expected_revision: 0,
-        }),
-      /another session/,
-    );
-    // The failed cross-session commit appended nothing anywhere.
+    // A DIFFERENT session reusing the id while sessionA is still in the
+    // window is now ACCEPTED under the B3 downgrade — the in-memory
+    // demo treats `clientRequestIndex` as a bounded sliding window, not
+    // a mirror of the SQL UNIQUE constraint. Session A still owns one
+    // canonical event; session B commits a fresh event under the same
+    // id.
+    const reused = commitOpeningEvent({
+      repository,
+      session_uuid: sessionB,
+      cache_uuid: cache.cache_uuid,
+      event: shown(events[0]),
+      client_request_id: 'tx-shared-open-1',
+      expected_revision: 0,
+    });
+    assert.equal(reused.session_uuid, sessionB);
+    assert.equal(reused.event.client_request_id, 'tx-shared-open-1');
+    // Each session has its own event_seq counter, so both will be 1 —
+    // the differentiator is event_id (server-generated UUID per event).
+    assert.notEqual(reused.event.event_id, first.event.event_id);
+    // Both sessions still have their own event chains.
     assert.equal(listSessionEvents({ repository, session_uuid: sessionA }).length, 1);
-    assert.equal(listSessionEvents({ repository, session_uuid: sessionB }).length, 0);
-    assert.equal(getSession({ repository, session_uuid: sessionB }).revision, 0);
+    assert.equal(listSessionEvents({ repository, session_uuid: sessionB }).length, 1);
   });
 
   await test('7. final-commit retry with the same client_request_id replays the prior result (response-lost regression)', async () => {
