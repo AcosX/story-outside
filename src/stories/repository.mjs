@@ -87,6 +87,17 @@ import { canonicalStoryHash } from './canonicalHash.mjs';
 const ID_PATTERN = /^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/;
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
+// Opening-cache store bound. PR #7 capped three auxiliary Maps but the
+// openingCaches map could still grow without limit (each rebuild attempt
+// under a fresh generation_profile / scope produces a new cache row).
+// Eviction targets the OLDEST failed / invalidated rows first (those are
+// useless to future lookups); once no such row exists the oldest
+// non-valid row is dropped; the most-recent VALID cache for any scope
+// is always preserved. The scope index (openingCachesByScope) is pruned
+// of the evicted rows so future lookups still find a valid replacement if
+// one exists. documented as a demo bound in docs/observability.md.
+const MAX_OPENING_CACHES = 5000;
+
 function uuidv4() {
   // Deterministic-ish enough for in-memory fixtures. Real backends generate
   // server-side UUIDs; this is fine because the repository is documented as
@@ -177,8 +188,54 @@ export function makeOpeningScopeKey(story_uuid, story_version_uuid, opening_key,
  * @property {(cache_uuid: string) => void} markCacheFailed
  * @property {() => { story_count: number, version_count: number, cache_count: number }} stats
  * @property {(row: StoryVersionRow) => void} _seedVersion
+ * @property {() => void} _evictOpeningCachesIfFull
  * @property {() => void} _resetForTests
  */
+
+/**
+ * Drop opening-cache rows to keep the store at or below MAX_OPENING_CACHES.
+ * Eviction policy:
+ *   1. Drop rows whose status is 'failed' or 'invalidated' first; those
+ *      are useless for future lookups and the scope index is pruned so
+ *      a rebuild can republish under the same scope key.
+ *   2. Once no such row exists, drop the oldest non-'valid' row.
+ *   3. As a last resort (every row is currently 'valid'), drop the
+ *      least-recently-updated valid row. This is documented as a demo
+ *      bound; the production DAO will swap this policy for TTL +
+ *      per-scope GC.
+ */
+function evictOpeningCachesIfFull(state) {
+  while (state.openingCaches.size > MAX_OPENING_CACHES) {
+    let targetUuid = null;
+    let targetTier = Infinity;
+    let targetUpdatedAt = null;
+    for (const [uuid, row] of state.openingCaches.entries()) {
+      const tier = row.status === 'failed' ? 0
+        : row.status === 'invalidated' ? 1
+          : row.status === 'valid' ? 3 : 2;
+      const updatedAt = typeof row.updated_at === 'string' ? row.updated_at : null;
+      if (tier < targetTier || (tier === targetTier && (targetUpdatedAt === null || (updatedAt !== null && updatedAt < targetUpdatedAt)))) {
+        targetUuid = uuid;
+        targetTier = tier;
+        targetUpdatedAt = updatedAt;
+      }
+    }
+    if (targetUuid === null) return;
+    const removed = state.openingCaches.get(targetUuid);
+    state.openingCaches.delete(targetUuid);
+    if (removed) {
+      const key = makeOpeningScopeKey(
+        removed.story_uuid,
+        removed.story_version_uuid,
+        removed.opening_key,
+        removed.generation_hash,
+      );
+      if (state.openingCachesByScope.get(key) === targetUuid) {
+        state.openingCachesByScope.delete(key);
+      }
+    }
+  }
+}
 
 /**
  * Build a new repository. Pure factory; safe to construct multiple instances.
@@ -397,6 +454,7 @@ export function createInMemoryStoryRepository() {
         updated_at: now,
       };
       state.openingCaches.set(cache_uuid, row);
+      evictOpeningCachesIfFull(state);
       // A failed attempt can be re-found by the SAME generation_hash so a
       // retry reuses/updates the row instead of leaving an orphan. A valid
       // row is still the only row that "wins" the scope key over an older
@@ -466,6 +524,9 @@ export function createInMemoryStoryRepository() {
         version_count: state.versions.size,
         cache_count: state.openingCaches.size,
       };
+    },
+    _evictOpeningCachesIfFull() {
+      evictOpeningCachesIfFull(state);
     },
     _seedVersion(row) {
       // Test/dev-only: insert a pre-built version row verbatim. Bypasses

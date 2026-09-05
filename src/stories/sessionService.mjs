@@ -103,6 +103,21 @@ const MAX_NARRATIVE_ITEMS = 4;
 // of a stale cached result.
 const MAX_TRACKED_REQUESTS_PER_SESSION = 1000;
 
+// Canonical session store bound. PR #7 only capped three auxiliary Maps
+// (sessionPinnedMetadata, turnRequests-by-session, sessionMetrics); the
+// canonical session store itself could still grow without limit. This
+// demo-grade bound evicts the LEAST RECENTLY TOUCHED session when the
+// store is full. Touch points (commitOpeningEvent, stageNarrativeBatch,
+// commitNarrativeEvent, interruptWithPlayerInput, recoverSession,
+// recordCompact) call `touchSession(...)` to refresh the LRU position;
+// `createSession` also touches after insertion. The eviction drops
+// history / pending / requestIds / turnRequests for the evicted session
+// AND drops its entries from the cross-session uniqueness index so
+// future replays are not silently prevented. Anonymous /api/dev traffic
+// can therefore grow the canonical store up to this bound and no
+// further; documented as a demo bound in docs/observability.md.
+const MAX_CANONICAL_SESSIONS = 2000;
+
 // Mirror of uq_session_events_client_request (db/schema.sql): the column
 // is GLOBALLY unique across sessions, not per session. This registry maps
 // client_request_id -> session_uuid for every id that produced a canonical
@@ -148,6 +163,21 @@ function nowIso() {
 function sessionFor(repository, session_uuid) {
   const session = repositoryState(repository).sessions.get(session_uuid);
   if (!session) throw new Error(`sessionService: unknown session '${session_uuid}'`);
+  return session;
+}
+
+/**
+ * Resolve a session AND refresh its LRU position. Use this on every
+ * mutating and read-only access that means "the session is still
+ * active" (route handlers, recovers, commits, interrupts, compact
+ * touch). Throws the same `unknown session` error as sessionFor when
+ * the session was evicted. Pairing every entry point with a touch
+ * keeps eviction targeting the genuinely quiet sessions rather than a
+ * session that just happens to have been inserted a long time ago.
+ */
+function sessionForActive(repository, session_uuid) {
+  const session = sessionFor(repository, session_uuid);
+  touchSessionRecord(session);
   return session;
 }
 
@@ -511,15 +541,68 @@ export function createSession({ repository, session_uuid, story_uuid, story_vers
     last_compact_error: null,
     compact_history: [], // append-only list of compact_attempt records (audit)
   };
+  // Evict the least-recently-touched session if the canonical store is
+  // full. Eviction drops ALL per-session state including history and
+  // pending batch, AND the session's entries in the cross-session
+  // uniqueness index (see registerCanonicalRequestId / the eviction
+  // helper below). createSession is the only insertion point for the
+  // canonical store, so bounding here keeps the entire demo memory
+  // budget predictable (this is the H1 follow-up to PR #7).
+  if (state.sessions.size >= MAX_CANONICAL_SESSIONS) {
+    evictOldestSession(state);
+  }
   state.sessions.set(session_uuid, session);
+  session.lastTouchedAt = nowIso();
   return publicSession(session);
+}
+
+/**
+ * Drop the least-recently-touched session from the canonical store.
+ * Eviction is a hard cut: history / pending / per-session request maps
+ * are gone, and every entry the session contributed to the cross-session
+ * clientRequestIndex is removed so a future replay of a freed id will
+ * pass the uniqueness check (rather than being permanently blocked).
+ */
+function evictOldestSession(state) {
+  let oldestUuid = null;
+  let oldestAt = null;
+  for (const [uuid, session] of state.sessions.entries()) {
+    const touched = typeof session.lastTouchedAt === 'string' ? session.lastTouchedAt : null;
+    // Sessions inserted without lastTouchedAt (legacy code path or
+    // rehydrated state) sort first by insertion order, so they are the
+    // natural eviction target.
+    if (oldestUuid === null || (touched === null) || (oldestAt !== null && touched < oldestAt)) {
+      oldestUuid = uuid;
+      oldestAt = touched;
+    }
+  }
+  if (oldestUuid === null) return;
+  evictSession(state, oldestUuid);
+}
+
+function evictSession(state, session_uuid) {
+  state.sessions.delete(session_uuid);
+  if (state.clientRequestIndex && state.clientRequestIndex.size > 0) {
+    for (const [id, owner] of state.clientRequestIndex.entries()) {
+      if (owner === session_uuid) state.clientRequestIndex.delete(id);
+    }
+  }
+}
+
+/**
+ * Refresh the session's LRU position so eviction targets the least
+ * recently ACTIVE session, not just the oldest inserted one. A long-lived
+ * busy session must not be evicted by a burst of new sessions.
+ */
+function touchSessionRecord(session) {
+  session.lastTouchedAt = nowIso();
 }
 
 export function commitOpeningEvent({ repository, session_uuid, cache_uuid, event, client_request_id, expected_revision }) {
   if (!repository) throw new Error('commitOpeningEvent: repository required');
   assertUuid('session_uuid', session_uuid);
   assertUuid('cache_uuid', cache_uuid);
-  const session = sessionFor(repository, session_uuid);
+  const session = sessionForActive(repository, session_uuid);
   if (session.cache_uuid !== cache_uuid) throw new Error('commitOpeningEvent: cache_uuid does not match session cache');
   const id = requestId(client_request_id);
   const prior = idempotentResult(session, id, 'opening', { event });
@@ -603,7 +686,7 @@ export function stageNarrativeBatch({ repository, session_uuid, items, tool_call
       ...(event.speaker !== undefined ? { speaker: event.speaker } : {}),
     };
   });
-  const session = sessionFor(repository, session_uuid);
+  const session = sessionForActive(repository, session_uuid);
   const id = requestId(client_request_id);
   const stageFingerprintInput = { payload: { items: normalized, tool_call: tool_call || null, source: normalizedSource } };
   if (id) {
@@ -724,7 +807,7 @@ export function commitNarrativeEvent({ repository, session_uuid, pending_id, seq
   if (!Number.isInteger(expected_revision)) {
     throw new Error('commitNarrativeEvent: expected_revision must be an integer');
   }
-  const session = sessionFor(repository, session_uuid);
+  const session = sessionForActive(repository, session_uuid);
   const id = requestId(client_request_id);
   // Idempotency lookup comes FIRST: after the final commit clears
   // session.pending, a replay of that same commit must still return the
@@ -818,7 +901,7 @@ export function commitNarrativeEvent({ repository, session_uuid, pending_id, seq
 export function interruptWithPlayerInput({ repository, session_uuid, text, client_request_id, expected_revision }) {
   if (!repository) throw new Error('interruptWithPlayerInput: repository required');
   assertUuid('session_uuid', session_uuid);
-  const session = sessionFor(repository, session_uuid);
+  const session = sessionForActive(repository, session_uuid);
   const id = requestId(client_request_id);
   const prior = idempotentResult(session, id, 'interrupt', { text });
   if (prior) return prior;
@@ -876,7 +959,7 @@ export function lookupTurnRequest({ repository, session_uuid, request_id }) {
   if (typeof request_id !== 'string' || request_id.length === 0) {
     throw new Error('lookupTurnRequest: request_id must be a non-empty string');
   }
-  const prior = sessionFor(repository, session_uuid).turnRequests.get(request_id);
+  const prior = sessionForActive(repository, session_uuid).turnRequests.get(request_id);
   return prior ? { fingerprint: prior.fingerprint, result: clone(prior.result) } : null;
 }
 
@@ -896,7 +979,7 @@ export function registerTurnRequest({ repository, session_uuid, request_id, fing
   if (typeof request_id !== 'string' || request_id.length === 0) {
     throw new Error('registerTurnRequest: request_id must be a non-empty string');
   }
-  const session = sessionFor(repository, session_uuid);
+  const session = sessionForActive(repository, session_uuid);
   const prior = session.turnRequests.get(request_id);
   if (prior) {
     if (prior.fingerprint !== fingerprint) {
@@ -917,7 +1000,7 @@ export function registerTurnRequest({ repository, session_uuid, request_id, fing
  */
 export function discardPendingTail({ repository, session_uuid }) {
   if (!repository) throw new Error('discardPendingTail: repository required');
-  const session = sessionFor(repository, session_uuid);
+  const session = sessionForActive(repository, session_uuid);
   const dropped = session.pending;
   session.pending = null;
   return {
@@ -930,13 +1013,13 @@ export function discardPendingTail({ repository, session_uuid }) {
 export function getSession({ repository, session_uuid }) {
   if (!repository) throw new Error('getSession: repository required');
   assertUuid('session_uuid', session_uuid);
-  return publicSession(sessionFor(repository, session_uuid));
+  return publicSession(sessionForActive(repository, session_uuid));
 }
 
 export function listSessionEvents({ repository, session_uuid }) {
   if (!repository) throw new Error('listSessionEvents: repository required');
   assertUuid('session_uuid', session_uuid);
-  return clone(sessionFor(repository, session_uuid).history);
+  return clone(sessionForActive(repository, session_uuid).history);
 }
 
 /**
@@ -957,7 +1040,7 @@ export function listSessionEvents({ repository, session_uuid }) {
 export function recoverSession({ repository, session_uuid }) {
   if (!repository) throw new Error('recoverSession: repository required');
   assertUuid('session_uuid', session_uuid);
-  const session = sessionFor(repository, session_uuid);
+  const session = sessionForActive(repository, session_uuid);
   return {
     ...publicSession(session, true),
     pending: publicPending(ensurePendingShape(session.pending)),
@@ -1054,7 +1137,7 @@ export function recordCompact(args) {
   assertUuid('session_uuid', args.session_uuid);
   const status = args.status === 'skipped' || args.status === 'failed' ? args.status : 'compacted';
   assertCompactInput(args, status);
-  const session = sessionFor(args.repository, args.session_uuid);
+  const session = sessionForActive(args.repository, args.session_uuid);
   if (Number.isInteger(session.compacted_through_seq)) {
     const strictlyGreaterRequired = status !== 'skipped';
     if (args.through_seq < session.compacted_through_seq
@@ -1116,7 +1199,7 @@ export function recordCompactFailure(args) {
   if (!args || typeof args !== 'object') throw new Error('recordCompactFailure: args required');
   if (!args.repository) throw new Error('recordCompactFailure: repository required');
   assertUuid('session_uuid', args.session_uuid);
-  const session = sessionFor(args.repository, args.session_uuid);
+  const session = sessionForActive(args.repository, args.session_uuid);
   const occurredAt = typeof args.occurred_at === 'string' ? args.occurred_at : nowIso();
   const errorCode = typeof args.error_code === 'string' ? args.error_code : 'unknown';
   const errorMessage = typeof args.error_message === 'string' ? args.error_message : errorCode;
@@ -1152,7 +1235,7 @@ export function recordCompactFailure(args) {
 export function getSessionCompact({ repository, session_uuid }) {
   if (!repository) throw new Error('getSessionCompact: repository required');
   assertUuid('session_uuid', session_uuid);
-  return publicCompact(sessionFor(repository, session_uuid));
+  return publicCompact(sessionForActive(repository, session_uuid));
 }
 
 /**
@@ -1185,7 +1268,7 @@ export function rebuildCompactFromHistory(args) {
   if (typeof args.builder !== 'function') {
     throw new Error('rebuildCompactFromHistory: builder function required');
   }
-  const session = sessionFor(args.repository, args.session_uuid);
+  const session = sessionForActive(args.repository, args.session_uuid);
   const history = session.history;
   const keptRecent = Number.isInteger(args.kept_recent) && args.kept_recent >= 0 ? args.kept_recent : 8;
   const tailStart = history.length > keptRecent ? history.length - keptRecent : history.length;
