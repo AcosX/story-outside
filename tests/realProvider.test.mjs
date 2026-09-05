@@ -425,6 +425,264 @@ async function run() {
     assert.notEqual(b.source.author_name, 'mutated');
     assert.notEqual(b.beats[0].text, 'mutated');
   });
+
+  // ----- 16. host-guard defensive cases (P1-1) ------------------------
+  await test('16. host guard refuses prefix-bypass, IDN, http, and path-suffix variants', () => {
+    const hostile = [
+      // Prefix bypass — `api.zhihu.com.attacker.example` shares the
+      // exact prefix with the allow-listed host. A naive startsWith()
+      // check would happily accept this URL.
+      'https://api.zhihu.com.attacker.example',
+      'https://api.zhihu.com.evil.tld',
+      // IDN / lookalike host.
+      'https://api.zhihu.cn',
+      'https://api.zhihu.co',
+      // Wrong scheme.
+      'http://api.zhihu.com',
+      // Path bypass — the host part is `attacker.com`, not
+      // `api.zhihu.com`. A naive check on the URL.toString() value
+      // would still find the allow-listed substring inside the path.
+      'https://attacker.com/api.zhihu.com',
+    ];
+    for (const baseUrl of hostile) {
+      assert.throws(
+        () => createRealZhihuStoryProvider({ baseUrl }),
+        (err) => err instanceof ProviderError && err.code === 'unsupported_upstream_host',
+        `expected ${baseUrl} to be rejected`,
+      );
+    }
+    // Sanity: the canonical host (with /v1 suffix or no suffix) is
+    // accepted — the test above would falsely pass if every URL were
+    // denied, so we must keep the allow-list meaningful.
+    for (const baseUrl of ['https://api.zhihu.com', 'https://api.zhihu.com/']) {
+      assert.doesNotThrow(() => createRealZhihuStoryProvider({
+        baseUrl,
+        fetchImpl: makeFakeFetch({}),
+      }));
+    }
+  });
+
+  // ----- 17. redirect handling (P1-2) ---------------------------------
+  await test('17. 30x responses are followed manually and host-pinned per hop', async () => {
+    let hops = 0;
+    const fakeFetch = async (url, init) => {
+      hops += 1;
+      const u = new URL(url);
+      assert.equal(init.redirect, 'manual', 'fetch must use redirect:manual');
+      if (hops === 1) {
+        assert.equal(u.hostname, 'api.zhihu.com');
+        return new Response('', {
+          status: 302,
+          headers: {
+            location: 'https://api.zhihu.com/km-indep-home/hackathon/v2/story/list',
+          },
+        });
+      }
+      // Second hop — list endpoint with valid payload.
+      return new Response(JSON.stringify(LIST_PAYLOAD), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    };
+    const provider = createRealZhihuStoryProvider({ fetchImpl: fakeFetch });
+    const list = await provider.listStories();
+    assert.equal(list.length, 2);
+    assert.equal(hops, 2);
+  });
+
+  await test('17.1 30x to a non-allow-listed host is refused', async () => {
+    const fakeFetch = async (url) => {
+      const u = new URL(url);
+      return new Response('', {
+        status: 302,
+        headers: { location: 'https://attacker.example/api.zhihu.com/steal' },
+      });
+    };
+    const provider = createRealZhihuStoryProvider({ fetchImpl: fakeFetch });
+    await assert.rejects(
+      () => provider.listStories(),
+      (err) => err instanceof ProviderError
+        && (err.code === 'unsupported_upstream_host' || err.code === 'upstream_too_many_redirects'),
+    );
+  });
+
+  await test('17.2 more than MAX_REDIRECTS hops raises upstream_too_many_redirects', async () => {
+    let hops = 0;
+    const fakeFetch = async (url) => {
+      hops += 1;
+      const u = new URL(url);
+      return new Response('', {
+        status: 302,
+        headers: { location: `${u.toString()}?loop=${hops}` },
+      });
+    };
+    const provider = createRealZhihuStoryProvider({ fetchImpl: fakeFetch });
+    await assert.rejects(
+      () => provider.listStories(),
+      (err) => err instanceof ProviderError && err.code === 'upstream_too_many_redirects',
+    );
+  });
+
+  // ----- 18. source.raw does not triple-allocate (P1-3) ---------------
+  await test('18. source.raw drops body-sized fields and source.content is capped', async () => {
+    const longContent = 'B'.repeat(80 * 1024); // 80 KiB > MAX_SOURCE_TEXT_BYTES
+    const payload = {
+      work_id: '1747681485547843585',
+      chapter_name: 'X',
+      author_avatar: 'https://pic.example/a.png',
+      author_name: '沈南因',
+      labels: ['惊悚'],
+      introduction: 'I'.repeat(80 * 1024),
+      content: longContent,
+      custom_field: 'kept in source.raw',
+    };
+    const fakeFetch = makeFakeFetch({
+      '/km-indep-home/hackathon/v2/story/1747681485547843585': { status: 200, body: payload },
+    });
+    const provider = createRealZhihuStoryProvider({ fetchImpl: fakeFetch });
+    const detail = await provider.getStory('1747681485547843585');
+    // Body-sized fields are NOT inside source.raw — they live on the
+    // explicit DTO / source.content fields.
+    assert.equal(detail.source.raw.content, undefined);
+    assert.equal(detail.source.raw.introduction, undefined);
+    assert.equal(detail.source.raw.labels, undefined);
+    // Surviving fields (non-content) stay in source.raw.
+    assert.equal(detail.source.raw.custom_field, 'kept in source.raw');
+    // source.content is capped at MAX_SOURCE_TEXT_BYTES; the truncated
+    // flag is set so downstream consumers know the value was clipped.
+    assert.equal(detail.source.content.length, 64 * 1024);
+    assert.equal(detail.source.content_truncated, true);
+    assert.equal(detail.source.introduction.length, 64 * 1024);
+    // The detail.beats[0].text still carries the FULL original body —
+    // the cap applies only to source.content / source.introduction so
+    // the in-app reader still sees the full story.
+    assert.equal(detail.beats[0].text.length, 80 * 1024);
+  });
+
+  // ----- 19. detailCache is bounded (P1-5) ----------------------------
+  await test('19. realProvider.detailCache evicts LRU entries beyond the cap', async () => {
+    const tracker = [];
+    const fetchSpy = async (url) => {
+      tracker.push(new URL(url).pathname);
+      return new Response(JSON.stringify({ ...DETAIL_PAYLOAD, work_id: 'id-0' }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    };
+    const provider = createRealZhihuStoryProvider({ fetchImpl: fetchSpy });
+    // Pre-warm id-0, id-1, ..., id-255 (256 entries — at the cap).
+    for (let i = 0; i < 256; i += 1) {
+      await provider.getStory(`id-${i}`);
+    }
+    // The 257th unique id evicts id-0 from the LRU.
+    await provider.getStory('id-257');
+    // Re-fetch id-0 — must hit the wire again. We count distinct call
+    // timestamps (the URL pathname is the same in the spy above, but
+    // the calls themselves are observable).
+    const callsBefore = tracker.length;
+    await provider.getStory('id-0');
+    assert.ok(
+      tracker.length > callsBefore,
+      `id-0 must be re-fetched after LRU eviction (tracker went from ${callsBefore} to ${tracker.length})`,
+    );
+  });
+
+  // ----- 20. body size cap (P1-6 / P1-2) ------------------------------
+  await test('20. upstream response body > MAX_RESPONSE_BYTES is rejected as upstream_body_too_large', async () => {
+    // Fake fetch returns a body that declares Content-Length above the
+    // cap. The provider must refuse without buffering the entire body.
+    const oversized = 'x'.repeat(2 * 1024 * 1024); // 2 MiB
+    const fakeFetch = async () => {
+      const body = new ReadableStream({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode(oversized));
+          controller.close();
+        },
+      });
+      return new Response(body, {
+        status: 200,
+        headers: {
+          'content-type': 'application/json',
+          'content-length': String(oversized.length),
+        },
+      });
+    };
+    const provider = createRealZhihuStoryProvider({ fetchImpl: fakeFetch });
+    await assert.rejects(
+      () => provider.listStories(),
+      (err) => err instanceof ProviderError && err.code === 'upstream_body_too_large',
+    );
+  });
+
+  // ----- 21. real mode flags admin/chat/generate as mock_only (P1-4) -
+  await test('21. /api/health under STORY_OUTSIDE_PROVIDER=real surfaces mock_only_routes', async () => {
+    __resetStoryProviderForTests();
+    process.env.STORY_OUTSIDE_PROVIDER = 'real';
+    try {
+      const { server: appServer } = await import('../src/server.mjs');
+      const appPort = await new Promise((resolve, reject) => {
+        appServer.listen(0, '127.0.0.1', () => {
+          const a = /** @type {import('node:net').AddressInfo} */ (appServer.address());
+          resolve(a.port);
+        });
+        appServer.on('error', reject);
+      });
+      try {
+        const health = await fetch(`http://127.0.0.1:${appPort}/api/health`).then((r) => r.json());
+        assert.equal(health.provider, 'real');
+        assert.equal(health.demo.official_zhihu_api, true);
+        assert.ok(Array.isArray(health.demo.mock_only_routes), 'mock_only_routes must be an array');
+        // /api/chat must be in the whitelist (it never bound to a real
+        // provider in the first place — the contract has no chat
+        // endpoint).
+        assert.ok(
+          health.demo.mock_only_routes.includes('/api/chat'),
+          '/api/chat must be on the mock_only_routes whitelist',
+        );
+        // /api/dev/sessions/:uuid/generate must be in the whitelist
+        // (the agent runtime stays deterministic in real mode).
+        assert.ok(
+          health.demo.mock_only_routes.some((p) => p.endsWith('/generate')),
+          '/api/dev/sessions/:uuid/generate must be on the mock_only_routes whitelist',
+        );
+        // /api/admin/stories/import must be in the whitelist.
+        assert.ok(
+          health.demo.mock_only_routes.some((p) => p.endsWith('/import')),
+          'import route must be on the mock_only_routes whitelist',
+        );
+      } finally {
+        await new Promise((resolve) => appServer.close(resolve));
+      }
+    } finally {
+      delete process.env.STORY_OUTSIDE_PROVIDER;
+      __resetStoryProviderForTests();
+    }
+  });
+
+  // ----- 22. work_id mismatch between list entry and detail param ----
+  await test('22. detail request for a work_id the upstream does not know returns StoryNotFoundError, never silent fallback', async () => {
+    const fakeFetch = makeFakeFetch({
+      '/km-indep-home/hackathon/v2/story/nonexistent': { status: 404 },
+    });
+    const provider = createRealZhihuStoryProvider({ fetchImpl: fakeFetch });
+    await assert.rejects(
+      () => provider.getStory('nonexistent'),
+      (err) => err instanceof StoryNotFoundError && err.code === 'story_not_found',
+    );
+    // The provider must NOT serve a cached fallback for a 404 — we
+    // confirm the cache stays empty by re-issuing the request after
+    // a successful sibling detail, then re-issuing 'nonexistent'.
+    const fakeFetch2 = makeFakeFetch({
+      '/km-indep-home/hackathon/v2/story/1747681485547843585': { status: 200, body: DETAIL_PAYLOAD },
+      '/km-indep-home/hackathon/v2/story/nonexistent': { status: 404 },
+    });
+    const provider2 = createRealZhihuStoryProvider({ fetchImpl: fakeFetch2 });
+    await provider2.getStory('1747681485547843585');
+    await assert.rejects(
+      () => provider2.getStory('nonexistent'),
+      (err) => err instanceof StoryNotFoundError,
+    );
+  });
 }
 
 run()
