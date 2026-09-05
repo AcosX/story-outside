@@ -355,6 +355,22 @@ async function followRedirect(fn, url, ctx) {
       { hostname: target.hostname },
     );
   }
+  // B1 (PR #8 ChatGPT follow-up): the host allow-list is necessary but
+  // NOT sufficient. A redirect to `http://api.zhihu.com/...` (downgrade
+  // to cleartext) or to `https://api.zhihu.com:8080/...` (port the
+  // contract does not specify) must be refused even though the host
+  // matches. The official contract pins the endpoint to HTTPS on the
+  // default port (443); any other scheme/port is, by definition, not
+  // the upstream we agreed to talk to. We re-check this on every hop
+  // because a redirect can rewrite the scheme/port even when the
+  // hostname stays constant.
+  if (target.protocol !== 'https:' || (target.port && target.port !== '443')) {
+    throw new ProviderError(
+      'unsupported_upstream_origin',
+      `Refusing to call upstream origin "${target.protocol}//${target.host}${target.port ? ':' + target.port : ''}" — only https://api.zhihu.com (default port) is allowed.`,
+      { protocol: target.protocol, port: target.port, hostname: target.hostname },
+    );
+  }
   // AbortSignal.timeout combines signal creation + timer scheduling
   // into a single primitive (Node ≥ 17.3). We pass it directly into
   // fetch so the request, the connect phase, and any pending read all
