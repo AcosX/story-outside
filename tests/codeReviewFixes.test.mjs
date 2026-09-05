@@ -114,16 +114,29 @@ test('stageNarrativeBatch rejects tool-only batches', async () => {
   }), /tool-only batches are not allowed/);
 });
 
-test('observeSession counts state transitions, not raw observations', () => {
+test('observeSession tracks the CURRENT state as a gauge, not a transition counter', () => {
   _resetMetricsForTests();
   const session_uuid = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+  // Same session observed multiple times in the same state must NOT
+  // double-count — gauge semantics: one session in `realtime`.
   observeSession({ session_uuid, state: 'realtime' });
   observeSession({ session_uuid, state: 'realtime' });
   observeSession({ session_uuid, state: 'realtime' });
   let snapshot = snapshotMetricsAll();
   assert.equal(snapshot.global.sessionsByState.realtime, 1);
+  assert.equal(snapshot.global.sessionsByState.opening, 0);
+  // Same session moved to `opening` must decrement realtime AND increment
+  // opening — the previous broken implementation left realtime at 1 and
+  // bumped opening to 1, so a single session counted as 2.
   observeSession({ session_uuid, state: 'opening' });
   observeSession({ session_uuid, state: 'opening' });
+  snapshot = snapshotMetricsAll();
+  assert.equal(snapshot.global.sessionsByState.realtime, 0);
+  assert.equal(snapshot.global.sessionsByState.opening, 1);
+  // A second session arriving in `realtime` must bump only the realtime
+  // bucket; opening stays at 1 because session #1 is still there.
+  const session_uuid2 = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc';
+  observeSession({ session_uuid: session_uuid2, state: 'realtime' });
   snapshot = snapshotMetricsAll();
   assert.equal(snapshot.global.sessionsByState.realtime, 1);
   assert.equal(snapshot.global.sessionsByState.opening, 1);
