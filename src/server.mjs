@@ -185,6 +185,46 @@ const DEMO_FLAG = Object.freeze({
 // (tests do this) reports accurately. MockProvider keeps DEMO_FLAG
 // verbatim so existing tests that assert demo.official_zhihu_api ===
 // false continue to hold.
+//
+// The official Zhihu Hackathon story content API only exposes the
+// `/story/list` and `/story/{id}` endpoints. It deliberately does NOT
+// expose a chat / completion endpoint, and it does NOT model the
+// in-app Agent runtime (generate / narrative / tool routing). Those
+// surfaces therefore stay bound to the deterministic demo provider
+// regardless of STORY_OUTSIDE_PROVIDER — they have no upstream
+// counterpart. The allow-list below makes that contract loud on the
+// wire so a client can tell at a glance whether a response came from
+// the real adapter or from the deterministic in-process demo.
+const MOCK_ONLY_ROUTES = Object.freeze([
+  // Phase 4 admin tooling that operates on the seeded in-memory fixtures
+  // (not on the live upstream). With STORY_OUTSIDE_PROVIDER=real these
+  // endpoints become dev-only and refuse to write — they exist solely
+  // so an operator can inspect the local mock catalog.
+  '/api/admin/stories',
+  '/api/admin/stories/:slug/import',
+  '/api/admin/opening-cache/rebuild',
+  // Group-chat echo placeholder — this endpoint never pretended to call
+  // a real model; with the real story provider it still echoes input.
+  '/api/chat',
+  // Agent runtime + session-tool routes. The official story content
+  // API is read-only JSON; narrative generation is owned by an
+  // in-process deterministic demo. These routes stay demo-only.
+  '/api/dev/sessions',
+  '/api/dev/sessions/:uuid',
+  '/api/dev/sessions/:uuid/opening-events',
+  '/api/dev/sessions/:uuid/recover',
+  '/api/dev/sessions/:uuid/discard-pending',
+  '/api/dev/sessions/:uuid/ending',
+  '/api/dev/sessions/:uuid/original-timeline',
+  '/api/dev/sessions/:uuid/replay',
+  '/api/dev/sessions/:uuid/interrupt',
+  '/api/dev/sessions/:uuid/generate',
+  '/api/dev/sessions/:uuid/narrative-events',
+  '/api/dev/sessions/:uuid/first-choice',
+  '/api/admin/observability/sessions/:uuid',
+  '/api/admin/observability/metrics/summary',
+]);
+
 function currentDemoFlag() {
   let providerName = 'mock';
   try {
@@ -208,6 +248,9 @@ function currentDemoFlag() {
       // once the hackathon closes. We re-read that warning every response
       // so a future operator does not have to chase it down in the docs.
       scope: 'zhihu_hackathon_2026_p2',
+      // Surfaces that stay bound to the deterministic demo even when
+      // the story content provider is real. See MOCK_ONLY_ROUTES.
+      mock_only_routes: MOCK_ONLY_ROUTES,
       reason:
         'Live mode: data is served by src/providers/realProvider.mjs against ' +
         'api.zhihu.com/km-indep-home/hackathon/v2/story/*. See ' +
