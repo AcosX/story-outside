@@ -152,6 +152,74 @@ export async function importStory({ repository, provider, slug, story_uuid, prof
 }
 
 /**
+ * @typedef {Object} ImportStoryWithCacheResult
+ * @property {string} story_uuid
+ * @property {string} story_version_uuid
+ * @property {number} version_no
+ * @property {string} checksum
+ * @property {boolean} version_reused
+ * @property {string} opening_cache_uuid
+ * @property {string} opening_cache_status
+ * @property {boolean} cache_reused       true if the cache already existed (reused) vs newly generated.
+ */
+
+/**
+ * Application-layer flow that closes the "import → bootstrap session" loop.
+ *
+ * 1. Runs the same canonical import pipeline as importStory().
+ * 2. Then runs ensureOpeningCache() so the returned result always carries
+ *    a non-null opening_cache_uuid / status.
+ *
+ * Without this closure the import route returned cache_reused=true but a
+ * null opening_cache_uuid, and the frontend bootstrap (which needs the
+ * cache_uuid to start a session) failed with `invalid_cache`.
+ *
+ * @param {object} input
+ * @param {StoryRepository} input.repository
+ * @param {object} input.provider          Object exposing `getStory` (StoryProvider).
+ * @param {string} input.slug
+ * @param {string} input.story_uuid
+ * @param {GenerationProfile} [input.profile]
+ * @returns {Promise<ImportStoryWithCacheResult>}
+ */
+export async function importStoryAndEnsureCache({ repository, provider, slug, story_uuid, profile }) {
+  if (!repository) throw new Error('importStoryAndEnsureCache: repository required');
+  if (!provider || typeof provider.getStory !== 'function') {
+    throw new Error('importStoryAndEnsureCache: provider with getStory required');
+  }
+  if (typeof slug !== 'string' || !slug) {
+    throw new Error('importStoryAndEnsureCache: slug required');
+  }
+  if (typeof story_uuid !== 'string' || !story_uuid) {
+    throw new Error('importStoryAndEnsureCache: story_uuid required');
+  }
+  const imported = await importStory({
+    repository,
+    provider,
+    slug,
+    story_uuid,
+    profile,
+  });
+  const ensured = await ensureOpeningCache({
+    repository,
+    story_version_uuid: imported.story_version_uuid,
+    options: { profile: profile || defaultGenerationProfile() },
+  });
+  /** @type {ImportStoryWithCacheResult} */
+  const result = {
+    story_uuid: imported.story_uuid,
+    story_version_uuid: imported.story_version_uuid,
+    version_no: imported.version_no,
+    checksum: imported.checksum,
+    version_reused: imported.version_reused,
+    opening_cache_uuid: ensured.cache.cache_uuid,
+    opening_cache_status: ensured.cache.status,
+    cache_reused: ensured.reused,
+  };
+  return result;
+}
+
+/**
  * @typedef {Object} EnsureOpeningOptions
  * @property {GenerationProfile} [profile]
  * @property {string} [opening_key]

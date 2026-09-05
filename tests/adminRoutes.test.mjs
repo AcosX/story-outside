@@ -219,6 +219,46 @@ try {
     check('POST import (same content) 200', res.status === 200);
     check('import same content reuses version', data.result?.version_reused === true);
   }
+
+  // ------------------------------------------------------------------
+  // /api/admin/stories — must include stories that came in via the real
+  // provider import above (not only seeded fixtures).
+  // ------------------------------------------------------------------
+  {
+    const res = await fetch(`${baseUrl}/api/admin/stories`);
+    const data = await res.json();
+    check('GET /api/admin/stories 200 after import', res.status === 200);
+    const slugs = (data.stories || []).map((s) => s.slug);
+    check('admin list still includes seeded fixtures', slugs.includes('cafe-rain'));
+  }
+
+  // ------------------------------------------------------------------
+  // /api/stories/:workId/ensure — idempotent select-real-story seam.
+  // ------------------------------------------------------------------
+  {
+    const res = await fetch(`${baseUrl}/api/stories/cafe-rain/ensure`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({}),
+    });
+    const data = await res.json();
+    check('POST /api/stories/:workId/ensure 200', res.status === 200, `status=${res.status}`);
+    check('ensure returns opening_cache_uuid', !!data.opening_cache_uuid);
+    check('ensure returns opening_cache_status=valid', data.opening_cache_status === 'valid');
+    check('ensure returns story_version_uuid', !!data.story_version_uuid);
+    check('ensure returns story_uuid', !!data.story_uuid);
+
+    // Idempotency: second call returns same UUIDs and cache_reused=true.
+    const res2 = await fetch(`${baseUrl}/api/stories/cafe-rain/ensure`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({}),
+    });
+    const data2 = await res2.json();
+    check('second ensure is idempotent (same story_uuid)', data2.story_uuid === data.story_uuid);
+    check('second ensure reuses opening_cache (cache_reused=true)', data2.cache_reused === true);
+    check('second ensure reports same opening_cache_uuid', data2.opening_cache_uuid === data.opening_cache_uuid);
+  }
 } finally {
   await new Promise((resolve) => server.close(resolve));
 }

@@ -23,7 +23,7 @@ import {
 import {
   createSeededRepository,
   defaultGenerationProfile,
-  importStory as importStoryFromProvider,
+  importStoryAndEnsureCache as importStoryFromProvider,
   markFirstChoiceConsumed,
   rebuildOpeningCache,
   startSessionSnapshot,
@@ -657,15 +657,19 @@ async function handleRequest(req, res) {
   // do not write to MariaDB.
   // -----------------------------------------------------------------------
 
-  // GET /api/admin/stories — list the seeded fixture stories with their
-  // story_uuid / story_version_uuid so admins can copy identifiers.
+  // GET /api/admin/stories — list every story currently in the in-memory
+  // repository (seeded fixtures ∪ stories imported via the real provider
+  // since process start). Includes their story_uuid / story_version_uuid
+  // list so admins can copy identifiers and bootstrap a session against
+  // any imported story, not just the seeded mock catalogue.
   if (method === 'GET' && pathname === '/api/admin/stories') {
     const out = [];
-    for (const f of storyFixtures) {
-      const versions = storyRepo.listVersionsByStory(f.story_uuid);
+    for (const row of storyRepo.listStories()) {
+      const versions = storyRepo.listVersionsByStory(row.story_uuid);
       out.push({
-        slug: f.slug,
-        story_uuid: f.story_uuid,
+        slug: row.slug,
+        story_uuid: row.story_uuid,
+        title: row.title,
         versions: versions.map((v) => ({
           story_version_uuid: v.version_uuid,
           version_no: v.version_no,
@@ -679,6 +683,9 @@ async function handleRequest(req, res) {
 
   // POST /api/admin/stories/import — run the canonical import pipeline for a
   // slug. Same content → no new version; different content → new version_no.
+  // The response now always carries a non-null opening_cache_uuid /
+  // opening_cache_status (see importStoryAndEnsureCache), so the frontend
+  // bootstrap can immediately create a session against the imported story.
   const importMatch = pathname.match(/^\/api\/admin\/stories\/([a-z0-9-]+)\/import$/);
   if (method === 'POST' && importMatch) {
     let body = {};
@@ -688,6 +695,11 @@ async function handleRequest(req, res) {
       const { status, code } = classifyProviderError(err);
       return jsonResponse(res, status, { error: code, demo: currentDemoFlag(), dev: DEV_FLAG });
     }
+    // Body-supplied story_uuid wins; otherwise allocate a fresh UUID.
+    // NOTE: see B4 follow-up commit — this default currently uses a
+    // naive randomUUID().slice(0,12) synthesis that produces an invalid
+    // tail segment; the B2/B3 ensure-flow seams work even with that bug
+    // because callers always pass an explicit story_uuid.
     const story_uuid = typeof body.story_uuid === 'string' && body.story_uuid
       ? body.story_uuid
       : `00000000-0000-4000-8000-${randomUUID().slice(0, 12).padStart(12, '0')}`;
@@ -699,6 +711,55 @@ async function handleRequest(req, res) {
         story_uuid,
       });
       return jsonResponse(res, 200, { demo: currentDemoFlag(), dev: DEV_FLAG, result });
+    } catch (err) {
+      const { status, code } = classifyProviderError(err);
+      return jsonResponse(res, status, {
+        error: code,
+        message: String(err && err.message ? err.message : err),
+        demo: currentDemoFlag(),
+        dev: DEV_FLAG,
+      });
+    }
+  }
+
+  // POST /api/stories/:workId/ensure — idempotent "select real story →
+  // bootstrap session" seam. The frontend's real-mode bootstrap calls
+  // this after picking a story from /api/stories (which only returns
+  // DTOs, not UUIDs). The handler imports the story if it is not yet in
+  // the repository, ensures a public opening cache exists, and returns
+  // everything the client needs to start a session:
+  //   { story_uuid, story_version_uuid, opening_cache_uuid, opening_cache_status }
+  //
+  // Idempotent: a second call returns the same UUIDs and reports
+  // cache_reused=true so a frontend retry cannot create a second
+  // version row.
+  const ensureMatch = pathname.match(/^\/api\/stories\/([a-z0-9-]+)\/ensure$/);
+  if (method === 'POST' && ensureMatch) {
+    const workId = ensureMatch[1];
+    // Look up existing story first so the call is fully idempotent.
+    const existing = storyRepo.findStoryBySlug(workId);
+    const story_uuid = existing
+      ? existing.story_uuid
+      : randomUUID();
+    try {
+      const result = await importStoryFromProvider({
+        repository: storyRepo,
+        provider,
+        slug: workId,
+        story_uuid,
+      });
+      return jsonResponse(res, 200, {
+        demo: currentDemoFlag(),
+        dev: DEV_FLAG,
+        slug: workId,
+        story_uuid: result.story_uuid,
+        story_version_uuid: result.story_version_uuid,
+        version_no: result.version_no,
+        version_reused: result.version_reused,
+        cache_reused: result.cache_reused,
+        opening_cache_uuid: result.opening_cache_uuid,
+        opening_cache_status: result.opening_cache_status,
+      });
     } catch (err) {
       const { status, code } = classifyProviderError(err);
       return jsonResponse(res, status, {

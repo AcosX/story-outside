@@ -192,6 +192,7 @@ export function makeOpeningScopeKey(story_uuid, story_version_uuid, opening_key,
  * @property {(input: { story_uuid: string, slug: string, title: string, hook: string, locale?: string }) => StoryRow} upsertStory
  * @property {(checksum: string) => StoryVersionRow | null} findVersionByChecksum
  * @property {(story_uuid: string) => StoryVersionRow[]} listVersionsByStory
+ * @property {() => StoryRow[]} listStories
  * @property {(input: {
  *    story_uuid: string,
  *    story_detail: object,
@@ -464,6 +465,23 @@ export function createInMemoryStoryRepository() {
         if (v) out.push(v);
       }
       out.sort((a, b) => a.version_no - b.version_no);
+      return out;
+    },
+    listStories() {
+      // Returns every story row currently in the repository, ordered by
+      // created_at (oldest first) so callers can render the catalogue
+      // deterministically. Includes stories inserted via upsertStory AND
+      // any stories previously seeded through _seedVersion. The result is
+      // a shallow copy: callers must not mutate the row objects.
+      const out = [];
+      for (const row of state.stories.values()) {
+        out.push(row);
+      }
+      out.sort((a, b) => {
+        if (a.created_at < b.created_at) return -1;
+        if (a.created_at > b.created_at) return 1;
+        return 0;
+      });
       return out;
     },
     importVersion(input) {

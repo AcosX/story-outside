@@ -23,6 +23,7 @@ import {
   defaultGenerationProfile,
   ensureOpeningCache,
   importStory,
+  importStoryAndEnsureCache,
   markFirstChoiceConsumed,
   rebuildOpeningCache,
   startSessionSnapshot,
@@ -552,6 +553,116 @@ async function runChecks() {
         }),
       /provider returned story id/,
     );
+  });
+
+  console.log('\nimportStoryAndEnsureCache closes the bootstrap loop');
+
+  await check('returns non-null opening_cache_uuid and status on first import', async () => {
+    const repository = createInMemoryStoryRepository();
+    const provider = createMockStoryProvider();
+    const story_uuid = '00000000-0000-4000-8000-aaaaaaaaaaaa';
+    const result = await importStoryAndEnsureCache({
+      repository,
+      provider,
+      slug: 'cafe-rain',
+      story_uuid,
+    });
+    assert.equal(result.story_uuid, story_uuid);
+    assert.equal(typeof result.story_version_uuid, 'string');
+    assert.ok(/^[0-9a-f-]{36}$/i.test(result.story_version_uuid));
+    assert.ok(typeof result.opening_cache_uuid === 'string' && result.opening_cache_uuid.length > 0);
+    assert.equal(result.opening_cache_status, 'valid');
+    assert.equal(result.cache_reused, false);
+    assert.equal(result.version_reused, false);
+  });
+
+  await check('second call with same story_uuid reuses both version and cache', async () => {
+    const repository = createInMemoryStoryRepository();
+    const provider = createMockStoryProvider();
+    const story_uuid = '00000000-0000-4000-8000-aaaaaaaaaaab';
+    const first = await importStoryAndEnsureCache({
+      repository, provider, slug: 'cafe-rain', story_uuid,
+    });
+    const second = await importStoryAndEnsureCache({
+      repository, provider, slug: 'cafe-rain', story_uuid,
+    });
+    assert.equal(second.story_version_uuid, first.story_version_uuid);
+    assert.equal(second.opening_cache_uuid, first.opening_cache_uuid);
+    assert.equal(second.version_reused, true);
+    assert.equal(second.cache_reused, true);
+  });
+
+  await check('importStoryAndEnsureCache rejects missing provider', async () => {
+    const repository = createInMemoryStoryRepository();
+    await assert.rejects(
+      () => importStoryAndEnsureCache({
+        repository, provider: null, slug: 'cafe-rain',
+        story_uuid: '00000000-0000-4000-8000-aaaaaaaaaaac',
+      }),
+      /provider with getStory required/,
+    );
+  });
+
+  await check('importStoryAndEnsureCache rejects empty slug', async () => {
+    const repository = createInMemoryStoryRepository();
+    const provider = createMockStoryProvider();
+    await assert.rejects(
+      () => importStoryAndEnsureCache({
+        repository, provider, slug: '', story_uuid: '00000000-0000-4000-8000-aaaaaaaaaaad',
+      }),
+      /slug required/,
+    );
+  });
+
+  await check('importStoryAndEnsureCache rejects empty story_uuid', async () => {
+    const repository = createInMemoryStoryRepository();
+    const provider = createMockStoryProvider();
+    await assert.rejects(
+      () => importStoryAndEnsureCache({
+        repository, provider, slug: 'cafe-rain', story_uuid: '',
+      }),
+      /story_uuid required/,
+    );
+  });
+
+  console.log('\nRepository listStories returns rows ordered by created_at');
+
+  await check('empty repository yields empty list', () => {
+    const repository = createInMemoryStoryRepository();
+    assert.deepEqual(repository.listStories(), []);
+  });
+
+  await check('seeded stories are returned by listStories', () => {
+    const { repository } = createSeededRepository();
+    const stories = repository.listStories();
+    assert.ok(Array.isArray(stories) && stories.length >= 2);
+    const slugs = stories.map((s) => s.slug);
+    assert.ok(slugs.includes('cafe-rain'));
+    for (const s of stories) {
+      assert.equal(typeof s.story_uuid, 'string');
+      assert.equal(typeof s.slug, 'string');
+      assert.equal(typeof s.title, 'string');
+    }
+  });
+
+  await check('listStories is ordered by created_at ascending', async () => {
+    const repository = createInMemoryStoryRepository();
+    repository.upsertStory({
+      story_uuid: '00000000-0000-4000-8000-000000000001',
+      slug: 'alpha-1',
+      title: 'A1', hook: 'h',
+    });
+    // Wait long enough that created_at differs at millisecond resolution.
+    await new Promise((r) => setTimeout(r, 5));
+    repository.upsertStory({
+      story_uuid: '00000000-0000-4000-8000-000000000002',
+      slug: 'beta-2',
+      title: 'B2', hook: 'h',
+    });
+    const stories = repository.listStories();
+    assert.equal(stories.length, 2);
+    assert.equal(stories[0].slug, 'alpha-1');
+    assert.equal(stories[1].slug, 'beta-2');
   });
 }
 

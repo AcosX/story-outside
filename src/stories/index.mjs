@@ -31,6 +31,7 @@ export {
   defaultGenerationProfile,
   ensureOpeningCache,
   importStory,
+  importStoryAndEnsureCache,
   markFirstChoiceConsumed,
   rebuildOpeningCache,
   startSessionSnapshot,
