@@ -773,8 +773,9 @@ async function handleRequest(req, res) {
 
   // GET /api/dev/sessions/:uuid — recover only canonical session state. This
   // endpoint never generates from, or appends to, the opening cache.
-  const sessionMatch = pathname.match(/^\/api\/dev\/sessions\/([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$/);
+  const sessionMatch = pathname.match(/^\/api\/dev\/sessions\/([^/]+)$/);
   if (method === 'GET' && sessionMatch) {
+    if (rejectInvalidSessionUuid(res, sessionMatch[1])) return;
     try {
       const recovered = recoverSession({ repository: storyRepo, session_uuid: sessionMatch[1] });
       return jsonResponse(res, 200, {
@@ -791,7 +792,7 @@ async function handleRequest(req, res) {
   // POST /api/dev/sessions/:uuid/opening-events — append exactly one
   // explicitly supplied cache event. The service enforces contiguous order,
   // optimistic revision checks, and request-id idempotency.
-  const openingEventsMatch = pathname.match(/^\/api\/dev\/sessions\/([0-9a-fA-F-]+)\/opening-events$/);
+  const openingEventsMatch = pathname.match(/^\/api\/dev\/sessions\/([^/]+)\/opening-events$/);
   if (method === 'POST' && openingEventsMatch) {
     if (rejectInvalidSessionUuid(res, openingEventsMatch[1])) return;
     let body = {};
@@ -855,7 +856,7 @@ async function handleRequest(req, res) {
   // active pending snapshot. Never calls the provider, never replays,
   // never mutates state. Same-process only: the repository is
   // in-memory, so a fresh process does not know this session.
-  const recoverMatch = pathname.match(/^\/api\/dev\/sessions\/([0-9a-fA-F-]+)\/recover$/);
+  const recoverMatch = pathname.match(/^\/api\/dev\/sessions\/([^/]+)\/recover$/);
   if (method === 'GET' && recoverMatch) {
     if (rejectInvalidSessionUuid(res, recoverMatch[1])) return;
     try {
@@ -873,7 +874,7 @@ async function handleRequest(req, res) {
   // POST /api/dev/sessions/:uuid/discard-pending — drop the active
   // pending batch without committing. Used when the player wants to
   // clear a stale batch (e.g. recovery picked up a half-committed one).
-  const discardMatch = pathname.match(/^\/api\/dev\/sessions\/([0-9a-fA-F-]+)\/discard-pending$/);
+  const discardMatch = pathname.match(/^\/api\/dev\/sessions\/([^/]+)\/discard-pending$/);
   if (method === 'POST' && discardMatch) {
     if (rejectInvalidSessionUuid(res, discardMatch[1])) return;
     try {
@@ -907,7 +908,7 @@ async function handleRequest(req, res) {
   // envelope plus derived fields (first_deviation, total_analysis,
   // category). Returns 404 ending_not_committed when finish_story has
   // not yet committed for this session.
-  const endingMatch = pathname.match(/^\/api\/dev\/sessions\/([0-9a-fA-F-]+)\/ending$/);
+  const endingMatch = pathname.match(/^\/api\/dev\/sessions\/([^/]+)\/ending$/);
   if (method === 'GET' && endingMatch) {
     if (rejectInvalidSessionUuid(res, endingMatch[1])) return;
     try {
@@ -935,7 +936,7 @@ async function handleRequest(req, res) {
   // / choice boundary). NEVER sourced from the AI-parallel timeline.
   // Includes a `source_attribution` label so the UI can mark these
   // entries as "来自原作 …".
-  const originalTimelineMatch = pathname.match(/^\/api\/dev\/sessions\/([0-9a-fA-F-]+)\/original-timeline$/);
+  const originalTimelineMatch = pathname.match(/^\/api\/dev\/sessions\/([^/]+)\/original-timeline$/);
   if (method === 'GET' && originalTimelineMatch) {
     if (rejectInvalidSessionUuid(res, originalTimelineMatch[1])) return;
     try {
@@ -954,7 +955,7 @@ async function handleRequest(req, res) {
   // session_events in event_seq order. Excludes tool_call /
   // pending_tool_call / pending / discarded rows (08 contract). Does
   // NOT include pending_batch items with status='staged'.
-  const replayMatch = pathname.match(/^\/api\/dev\/sessions\/([0-9a-fA-F-]+)\/replay$/);
+  const replayMatch = pathname.match(/^\/api\/dev\/sessions\/([^/]+)\/replay$/);
   if (method === 'GET' && replayMatch) {
     if (rejectInvalidSessionUuid(res, replayMatch[1])) return;
     try {
@@ -972,7 +973,7 @@ async function handleRequest(req, res) {
   // POST /api/dev/sessions/:uuid/interrupt — explicitly switch to realtime
   // by appending player input. This route intentionally never invalidates a
   // shared opening cache.
-  const interruptMatch = pathname.match(/^\/api\/dev\/sessions\/([0-9a-fA-F-]+)\/interrupt$/);
+  const interruptMatch = pathname.match(/^\/api\/dev\/sessions\/([^/]+)\/interrupt$/);
   if (method === 'POST' && interruptMatch) {
     if (rejectInvalidSessionUuid(res, interruptMatch[1])) return;
     let body = {};
@@ -1045,7 +1046,7 @@ async function handleRequest(req, res) {
   // result (same turn_id / pending_id / tool envelope) without calling
   // the provider again; the same request_id with a different input or
   // revision fails closed with duplicate_request.
-  const generateMatch = pathname.match(/^\/api\/dev\/sessions\/([0-9a-fA-F-]+)\/generate$/);
+  const generateMatch = pathname.match(/^\/api\/dev\/sessions\/([^/]+)\/generate$/);
   if (method === 'POST' && generateMatch) {
     const sessionUuid = generateMatch[1];
     if (rejectInvalidSessionUuid(res, sessionUuid)) return;
@@ -1121,7 +1122,7 @@ async function handleRequest(req, res) {
   // is appended to canonical history; revision advances by 1. The optional
   // final tool_call (if present) is exposed on the last commit result but
   // never becomes a canonical event.
-  const narrativeMatch = pathname.match(/^\/api\/dev\/sessions\/([0-9a-fA-F-]+)\/narrative-events$/);
+  const narrativeMatch = pathname.match(/^\/api\/dev\/sessions\/([^/]+)\/narrative-events$/);
   if (method === 'POST' && narrativeMatch) {
     const sessionUuid = narrativeMatch[1];
     if (rejectInvalidSessionUuid(res, sessionUuid)) return;
@@ -1158,7 +1159,7 @@ async function handleRequest(req, res) {
   // POST /api/dev/sessions/:uuid/first-choice — record the first
   // ask_player_choice on THAT session and return a session-local consumed
   // marker. The shared opening cache is NOT invalidated for other sessions.
-  const firstChoiceMatch = pathname.match(/^\/api\/dev\/sessions\/([0-9a-fA-F-]+)\/first-choice$/);
+  const firstChoiceMatch = pathname.match(/^\/api\/dev\/sessions\/([^/]+)\/first-choice$/);
   if (method === 'POST' && firstChoiceMatch) {
     if (rejectInvalidSessionUuid(res, firstChoiceMatch[1])) return;
     let body = {};
