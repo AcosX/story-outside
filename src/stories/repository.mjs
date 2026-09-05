@@ -90,12 +90,26 @@ const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{
 // Opening-cache store bound. PR #7 capped three auxiliary Maps but the
 // openingCaches map could still grow without limit (each rebuild attempt
 // under a fresh generation_profile / scope produces a new cache row).
-// Eviction targets the OLDEST failed / invalidated rows first (those are
-// useless to future lookups); once no such row exists the oldest
-// non-valid row is dropped; the most-recent VALID cache for any scope
-// is always preserved. The scope index (openingCachesByScope) is pruned
-// of the evicted rows so future lookups still find a valid replacement if
-// one exists. documented as a demo bound in docs/observability.md.
+//
+// Eviction policy (PR #7 follow-up, ChatGPT re-review fix 2026-09-05,
+// Blocker 1):
+//   1. Drop rows whose status is 'failed' or 'invalidated' first; those
+//      are useless for future lookups and the scope index is pruned so
+//      a rebuild can republish under the same scope key.
+//   2. If no such row exists, drop the OLDEST UNPINNED valid row.
+//      "Pinned" means: at least one active canonical session has this
+//      cache_uuid in `session.cache_uuid`. A pinned valid row is
+//      NEVER dropped — the previous behaviour evicted valid rows
+//      blindly, which broke `commitOpeningEvent` on any active session
+//      whose pinned cache was the eviction target.
+//   3. If the bulk eviction finds no candidate at all (every row is
+//      currently pinned, or the only candidates left are all pinned),
+//      the loop returns 0 and leaves the store as-is. The caller is
+//      expected to refuse the next insert rather than evict a pinned
+//      cache (see B2 follow-up).
+// The scope index (openingCachesByScope) is pruned of the evicted rows
+// so future lookups still find a valid replacement if one exists.
+// Documented as a demo bound in docs/observability.md.
 const MAX_OPENING_CACHES = 5000;
 
 function uuidv4() {
@@ -136,6 +150,7 @@ function assertSlug(label, value) {
  *   openingCaches: Map<string, OpeningCacheRow>,   // keyed by cache_uuid
  *   openingCachesByScope: Map<string, string>,     // scope key → cache_uuid (valid only)
  *   sessionFirstChoices: Map<string, SessionFirstChoiceMarker>,  // session_uuid → marker
+ *   _pinnedCacheResolver: () => Set<string>,
  * }}
  */
 function createEmptyState() {
@@ -148,6 +163,9 @@ function createEmptyState() {
     openingCaches: new Map(),
     openingCachesByScope: new Map(),
     sessionFirstChoices: new Map(),
+    // Wired by createInMemoryStoryRepository so the eviction loop can see
+    // which cache_uuids are still pinned by an active canonical session.
+    _pinnedCacheResolver: defaultPinnedCacheResolver,
   };
 }
 
@@ -190,26 +208,58 @@ export function makeOpeningScopeKey(story_uuid, story_version_uuid, opening_key,
  * @property {(row: StoryVersionRow) => void} _seedVersion
  * @property {() => void} _evictOpeningCachesIfFull
  * @property {() => void} _resetForTests
+ * @property {(resolver: () => Set<string>) => void} _setPinnedCacheResolver
  */
 
 /**
+ * Hook to let the repository know which cache_uuids are currently pinned
+ * by at least one active canonical session. The session layer registers a
+ * resolver that returns a Set<cache_uuid>; the resolver is queried during
+ * eviction so pinned valid rows are NEVER dropped. Without this hook the
+ * eviction loop would happily drop the very cache a live session needs
+ * for `commitOpeningEvent`, surfacing as `pinned cache is no longer
+ * valid` mid-stream (the ChatGPT 2026-09-05 re-review flagged this).
+ */
+function defaultPinnedCacheResolver() {
+  // Resolver set per-repository inside createInMemoryStoryRepository; the
+  // module-level fallback returns an empty set so the file can be loaded
+  // and unit-tested without booting the session layer.
+  return new Set();
+}
+
+/**
  * Drop opening-cache rows to keep the store at or below MAX_OPENING_CACHES.
- * Eviction policy:
+ * Returns the count of rows actually evicted; returns 0 when the only
+ * remaining candidates are pinned and the caller cannot make progress
+ * (so the caller can refuse the insert with a stable error code).
+ *
+ * Eviction policy (PR #7 follow-up, ChatGPT 2026-09-05):
  *   1. Drop rows whose status is 'failed' or 'invalidated' first; those
  *      are useless for future lookups and the scope index is pruned so
  *      a rebuild can republish under the same scope key.
- *   2. Once no such row exists, drop the oldest non-'valid' row.
- *   3. As a last resort (every row is currently 'valid'), drop the
- *      least-recently-updated valid row. This is documented as a demo
- *      bound; the production DAO will swap this policy for TTL +
- *      per-scope GC.
+ *   2. Once no such row exists, drop the OLDEST UNPINNED valid row. A
+ *      pinned valid row (referenced by an active canonical session via
+ *      `session.cache_uuid`) is SKIPPED — evicting it would break
+ *      `commitOpeningEvent` for that session. The least-recently-updated
+ *      valid row is dropped when multiple unpinned candidates exist.
+ *   3. As a last resort (every row is currently pinned), the function
+ *      returns 0 and the caller is expected to refuse the insert with a
+ *      stable `too_many_pinned_caches` error.
+ *
+ * @returns {number} rows actually evicted in this pass
  */
 function evictOpeningCachesIfFull(state) {
+  let evicted = 0;
   while (state.openingCaches.size > MAX_OPENING_CACHES) {
+    const pinned = state._pinnedCacheResolver();
     let targetUuid = null;
     let targetTier = Infinity;
     let targetUpdatedAt = null;
     for (const [uuid, row] of state.openingCaches.entries()) {
+      // Skip pinned valid rows — they are still in use by an active
+      // session. failed / invalidated rows are always eviction candidates
+      // regardless of pinning (they cannot be served any more).
+      if (row.status === 'valid' && pinned.has(uuid)) continue;
       const tier = row.status === 'failed' ? 0
         : row.status === 'invalidated' ? 1
           : row.status === 'valid' ? 3 : 2;
@@ -220,9 +270,10 @@ function evictOpeningCachesIfFull(state) {
         targetUpdatedAt = updatedAt;
       }
     }
-    if (targetUuid === null) return;
+    if (targetUuid === null) return evicted;
     const removed = state.openingCaches.get(targetUuid);
     state.openingCaches.delete(targetUuid);
+    evicted += 1;
     if (removed) {
       const key = makeOpeningScopeKey(
         removed.story_uuid,
@@ -235,6 +286,7 @@ function evictOpeningCachesIfFull(state) {
       }
     }
   }
+  return evicted;
 }
 
 /**
@@ -243,6 +295,14 @@ function evictOpeningCachesIfFull(state) {
  */
 export function createInMemoryStoryRepository() {
   const state = createEmptyState();
+  // The session layer owns the canonical session map; it knows which
+  // cache_uuids are currently pinned via `session.cache_uuid`. The
+  // repository needs to consult that set during eviction so a live
+  // session's cache is never dropped. The session layer wires this hook
+  // through sessionService.bindPinnedCacheResolver; the fallback returns
+  // an empty set so the repository can be exercised in unit tests
+  // without booting the session layer.
+  state._pinnedCacheResolver = () => new Set();
 
   /** @type {StoryRepository} */
   const repo = {
@@ -453,6 +513,10 @@ export function createInMemoryStoryRepository() {
         created_at: now,
         updated_at: now,
       };
+      // PR #7 ChatGPT follow-up (2026-09-05): the pinned-aware eviction
+      // (B1) protects the row of any active session. The cap-aware
+      // belt-and-braces eviction below keeps the store bounded when an
+      // out-of-band caller briefly exceeds MAX_OPENING_CACHES.
       state.openingCaches.set(cache_uuid, row);
       evictOpeningCachesIfFull(state);
       // A failed attempt can be re-found by the SAME generation_hash so a
@@ -528,6 +592,12 @@ export function createInMemoryStoryRepository() {
     _evictOpeningCachesIfFull() {
       evictOpeningCachesIfFull(state);
     },
+    _setPinnedCacheResolver(resolver) {
+      if (typeof resolver !== 'function') {
+        throw new Error('repository: _setPinnedCacheResolver requires a function');
+      }
+      state._pinnedCacheResolver = resolver;
+    },
     _seedVersion(row) {
       // Test/dev-only: insert a pre-built version row verbatim. Bypasses
       // importVersion's random UUID so fixtures can keep stable UUIDs.
@@ -558,6 +628,7 @@ export function createInMemoryStoryRepository() {
       state.openingCaches = fresh.openingCaches;
       state.openingCachesByScope = fresh.openingCachesByScope;
       state.sessionFirstChoices = fresh.sessionFirstChoices;
+      state._pinnedCacheResolver = fresh._pinnedCacheResolver;
     },
   };
 

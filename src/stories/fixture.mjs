@@ -12,6 +12,7 @@
 
 import { canonicalStoryHash } from './canonicalHash.mjs';
 import { createInMemoryStoryRepository } from './repository.mjs';
+import { bindPinnedCacheResolver } from './sessionService.mjs';
 
 /**
  * Stable UUIDs for the bundled mock catalog. Real deployments generate
@@ -75,6 +76,10 @@ const MOCK_DETAILS = {
  */
 export function createSeededRepository() {
   const repository = createInMemoryStoryRepository();
+  // Wire the opening-cache eviction hook to the canonical session map so
+  // the eviction loop never drops a cache that is still pinned by an
+  // active session (PR #7 ChatGPT 2026-09-05 follow-up, Blocker 1).
+  bindPinnedCacheResolver(repository);
   /** @type {Array<{ story_uuid: string, story_version_uuid: string, slug: string }>} */
   const fixtures = [];
   for (const [slug, ids] of Object.entries(FIXTURE_UUIDS)) {

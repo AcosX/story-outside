@@ -153,6 +153,44 @@ function repositoryState(repository) {
 // mutate the returned object.
 export { repositoryState };
 
+/**
+ * Wire the repository's pinned-cache resolver to the canonical session
+ * store so the opening-cache eviction loop (PR #7 ChatGPT 2026-09-05
+ * follow-up) knows which cache_uuids are still pinned by an active
+ * session. Without this hook the eviction loop happily drops the very
+ * cache `commitOpeningEvent` needs, surfacing as
+ * `commitOpeningEvent: pinned cache is no longer valid` mid-stream.
+ *
+ * The resolver returns a FRESH Set on every call because the eviction
+ * loop runs on the hot path and we do not want to expose the live
+ * internal Map (callers must not mutate it). The set is built from
+ * `state.sessions`, so it automatically shrinks when sessions are
+ * evicted — no separate bookkeeping is required.
+ *
+ * @param {object} repository
+ */
+export function bindPinnedCacheResolver(repository) {
+  if (!repository || typeof repository !== 'object') {
+    throw new Error('bindPinnedCacheResolver: repository required');
+  }
+  const state = repositoryState(repository);
+  if (typeof repository._setPinnedCacheResolver !== 'function') {
+    // The repository layer is expected to expose the hook; if it does
+    // not, fail loud at boot rather than silently dropping the safety
+    // net.
+    throw new Error('bindPinnedCacheResolver: repository does not expose _setPinnedCacheResolver');
+  }
+  repository._setPinnedCacheResolver(() => {
+    const pinned = new Set();
+    for (const session of state.sessions.values()) {
+      if (session && typeof session.cache_uuid === 'string' && session.cache_uuid) {
+        pinned.add(session.cache_uuid);
+      }
+    }
+    return pinned;
+  });
+}
+
 function assertUuid(label, value) {
   if (typeof value !== 'string' || !UUID_PATTERN.test(value)) {
     throw new Error(`sessionService: ${label} must be a UUID`);
