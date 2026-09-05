@@ -62,6 +62,30 @@ const STATIC_HEADERS = Object.freeze({
 });
 
 /**
+ * Exact-match allow-list for the upstream base URL. Defends against:
+ *   - host-prefix bypass: `https://api.zhihu.com.attacker.example`
+ *   - trailing path suffix: `https://api.zhihu.com.evil/foo`
+ *   - IDN homograph:  `https://api.zhihu.cn` (xn-- variant accepted by
+ *     URL but never `api.zhihu.com`)
+ *
+ * The check normalises both sides to lowercase and requires the URL
+ * to start with the exact allow-listed prefix AND have no further host
+ * label beyond the allow-listed host. The character before the first
+ * slash must be the end of the host. We deliberately do NOT trust
+ * `URL.hostname` to be canonical — it can be percent-decoded or
+ * include a port we did not ask for.
+ *
+ * @param {string} baseUrl
+ * @returns {boolean}
+ */
+function isAllowedUpstreamBaseUrl(baseUrl) {
+  if (typeof baseUrl !== 'string' || !baseUrl) return false;
+  const allow = 'https://api.zhihu.com';
+  if (baseUrl.length !== allow.length && baseUrl.charAt(allow.length) !== '/') return false;
+  return baseUrl.toLowerCase() === allow || baseUrl.toLowerCase().startsWith(`${allow}/`);
+}
+
+/**
  * Hard guard against characters the upstream will reject and against
  * characters we don't want to see in logs or URLs. Per the contract
  * work_id values must NOT contain '/', '?', '#', CR or LF.
@@ -369,11 +393,15 @@ export function createRealZhihuStoryProvider(opts = {}) {
     typeof process !== 'undefined' && process.env && process.env.STORY_OUTSIDE_ZHIHU_TIMEOUT_MS,
     opts.timeoutMs || DEFAULT_TIMEOUT_MS,
   );
-  if (!baseUrl.startsWith('https://api.zhihu.com')) {
+  if (!isAllowedUpstreamBaseUrl(baseUrl)) {
     // The contract fixes the host. Refuse to talk to anywhere else so a
     // misconfigured env cannot silently redirect us to a malicious
     // mirror. The list / detail URLs are also hard-coded against this
-    // host below.
+    // host below. Exact-match is required (not startsWith) so that
+    // look-alike hosts such as `https://api.zhihu.com.attacker.example`
+    // cannot piggy-back on a permissive prefix check. The allow-list
+    // also rejects IDN homograph variants (`api.zhihu.cn`,
+    // `xn--...`) at the canonical-form layer.
     throw new ProviderError(
       'unsupported_upstream_host',
       'Real provider is pinned to https://api.zhihu.com only.',
