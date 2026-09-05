@@ -220,6 +220,79 @@ const MAX_RESPONSE_BYTES = 1024 * 1024; // 1 MiB
 const MAX_REDIRECTS = 3;
 
 /**
+ * Cap on the per-entry source.content / source.introduction text size.
+ * The contract returns short fields; anything in the multi-MB range is
+ * misbehaviour. We keep the explicit content under source.content for
+ * downstream consumers that want it, but we do NOT carry the full body
+ * into source.raw — that would triple the in-memory cost (raw + DTO
+ * + cache defensive copy).
+ */
+const MAX_SOURCE_TEXT_BYTES = 64 * 1024; // 64 KiB
+
+/**
+ * Build a defensive shallow copy of a DTO so callers cannot mutate the
+ * cached object. We avoid JSON.parse(JSON.stringify(...)) because the
+ * detail DTO carries long content strings and the JSON round-trip
+ * triples peak allocation (raw → string → parse → object). A shallow
+ * copy plus per-array/per-object cloning of the source envelope is
+ * sufficient: callers never reach into nested beats[] or source.* from
+ * outside the provider boundary.
+ *
+ * @template T
+ * @param {T} value
+ * @returns {T}
+ */
+function shallowDefensiveCopy(value) {
+  if (value === null || typeof value !== 'object') return value;
+  if (Array.isArray(value)) {
+    /** @type {any[]} */
+    const out = new Array(value.length);
+    for (let i = 0; i < value.length; i += 1) out[i] = shallowDefensiveCopy(value[i]);
+    return /** @type {T} */ (/** @type {unknown} */ (out));
+  }
+  /** @type {Record<string, unknown>} */
+  const out = {};
+  for (const k of Object.keys(/** @type {Record<string, unknown>} */ (value))) {
+    out[k] = shallowDefensiveCopy(/** @type {any} */ (value)[k]);
+  }
+  return /** @type {T} */ (/** @type {unknown} */ (out));
+}
+
+/**
+ * Strip the body-sized fields from a source.raw envelope and cap
+ * surviving text fields. The explicit DTO fields already carry the
+ * attributable metadata (title, author, labels, etc.); raw only needs
+ * to keep the provenance fields an operator would inspect.
+ *
+ * @param {Record<string, unknown>} raw
+ * @param {string[]} dropKeys   Keys to remove from raw (body-sized content).
+ * @returns {Record<string, unknown>}
+ */
+function trimSourceRaw(raw, dropKeys) {
+  /** @type {Record<string, unknown>} */
+  const out = {};
+  for (const k of Object.keys(raw)) {
+    if (dropKeys.includes(k)) continue;
+    out[k] = raw[k];
+  }
+  return out;
+}
+
+/**
+ * Cap a text field at MAX_SOURCE_TEXT_BYTES. Returns the trimmed text
+ * plus a `truncated: true` marker so downstream consumers know the
+ * value was clipped.
+ *
+ * @param {string} text
+ * @returns {{ text: string, truncated: boolean }}
+ */
+function capSourceText(text) {
+  if (typeof text !== 'string') return { text: '', truncated: false };
+  if (text.length <= MAX_SOURCE_TEXT_BYTES) return { text, truncated: false };
+  return { text: text.slice(0, MAX_SOURCE_TEXT_BYTES), truncated: true };
+}
+
+/**
  * Wrap a fetch with an AbortController timeout. We never retry on
  * timeout — the contract forbids it. Redirects are handled manually
  * (see followRedirect) so we can keep host-pinning, size-pinning and
@@ -420,12 +493,15 @@ function summaryFromListEntry(raw) {
     roles,
   });
   // Round-trip through the DTO normaliser; then attach the source
-  // metadata envelope for attribution.
+  // metadata envelope for attribution. We strip body-sized fields from
+  // source.raw (description / labels already live on the explicit DTO
+  // envelope above), so a list with thousands of entries cannot blow
+  // up memory through the raw sub-object.
   /** @type {ZhihuStoryListEntry} */
   const enriched = /** @type {any} */ ({
     ...summary,
     source: {
-      raw: entry,
+      raw: trimSourceRaw(entry, ['description', 'labels', 'artwork', 'tab_artwork']),
       labels: Array.isArray(entry.labels) ? entry.labels.slice() : [],
       artwork: typeof entry.artwork === 'string' ? entry.artwork : null,
       tab_artwork: typeof entry.tab_artwork === 'string' ? entry.tab_artwork : null,
@@ -504,15 +580,36 @@ function detailFromDetailEntry(raw) {
     roles,
     beats,
   });
+  // Cap source.content + source.introduction at MAX_SOURCE_TEXT_BYTES
+  // so a misbehaving upstream returning a multi-MB body cannot blow
+  // up the in-memory cache. We deliberately do NOT include the long
+  // `content` body in source.raw — the explicit `source.content` field
+  // already carries the attributable text, and raw is reserved for
+  // small provenance metadata.
+  const cappedContent = capSourceText(content);
+  const cappedIntroduction = capSourceText(introduction);
+  const cappedHook = capSourceText(hookSource);
   /** @type {Record<string, unknown>} */
   const enriched = /** @type {any} */ ({
     ...detail,
     source: {
-      raw: entry,
+      raw: trimSourceRaw(entry, [
+        'content',
+        'introduction',
+        'description',
+        'labels',
+        'author_name',
+        'author_avatar',
+        'chapter_name',
+        'title',
+      ]),
       author_name,
       author_avatar,
       labels: Array.isArray(entry.labels) ? entry.labels.slice() : [],
-      content,
+      content: cappedContent.text,
+      content_truncated: cappedContent.truncated,
+      introduction: cappedIntroduction.text,
+      hook: cappedHook.text,
       attribution: 'zhihu_hackathon_2026_p2',
     },
   });
@@ -634,13 +731,16 @@ export function createRealZhihuStoryProvider(opts = {}) {
       const work_id = assertWorkId(id);
       if (detailCache.has(work_id)) {
         // Defensive copy so callers cannot mutate the cached object.
+        // We use shallowDefensiveCopy rather than a JSON round-trip so
+        // a multi-KiB content string is not cloned three times (raw →
+        // string → parse → object) on every hit.
         const cached = detailCache.get(work_id);
-        return JSON.parse(JSON.stringify(cached));
+        return shallowDefensiveCopy(cached);
       }
       const payload = await fetchJson(STORY_DETAIL_PATH(work_id));
       const detail = detailFromDetailEntry(payload);
       detailCache.set(work_id, detail);
-      return JSON.parse(JSON.stringify(detail));
+      return shallowDefensiveCopy(detail);
     },
     async advanceStory(input) {
       if (!input || typeof input !== 'object') {
