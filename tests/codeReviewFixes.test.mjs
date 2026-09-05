@@ -7,7 +7,7 @@
 //   * stageNarrativeBatch rejects tool-only batches
 //   * observeSession counts state transitions, not raw observations
 //   * sessionError does not hide unknown server errors as client 400s
-//   * sessionError preserves ValidationError codes (e.g. payload_too_large) as 400
+//   * sessionError preserves ValidationError codes (e.g. payload_too_large, bad_json) as 400
 
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
@@ -137,16 +137,22 @@ test('sessionError maps unknown errors to 500, not validation_failed', () => {
 
 test('sessionError preserves ValidationError codes as 400, not 500', async () => {
   const { ValidationError } = await import('../src/providers/dto.mjs');
-  // B1 regression: oversized body throws ValidationError('payload_too_large').
+  // B1 regression: oversized body throws ValidationError('payload_too_large', { code: 'payload_too_large' }).
   // sessionError must surface the precise code at 400 so clients see
-  // {"error":"invalid_input","message":"payload_too_large"} instead of
-  // a generic 500 internal_error.
-  const r1 = sessionError(new ValidationError('payload_too_large'));
+  // {"error":"payload_too_large", "details":{"limit_bytes":65536}} instead of
+  // a generic {"error":"invalid_input"}. The default-code path stays 400 too,
+  // so the B1 'not 500' invariant continues to hold for callers that did
+  // not pin one.
+  const r1 = sessionError(new ValidationError('payload_too_large', { code: 'payload_too_large' }));
   assert.equal(r1.status, 400);
-  assert.equal(r1.code, 'invalid_input');
-  const r2 = sessionError(new ValidationError('bad_json'));
+  assert.equal(r1.code, 'payload_too_large');
+  const r2 = sessionError(new ValidationError('bad_json', { code: 'bad_json' }));
   assert.equal(r2.status, 400);
-  assert.equal(r2.code, 'invalid_input');
+  assert.equal(r2.code, 'bad_json');
+  // Generic ValidationError without a pinned code still maps to 400 invalid_input.
+  const r3 = sessionError(new ValidationError('story summary missing id'));
+  assert.equal(r3.status, 400);
+  assert.equal(r3.code, 'invalid_input');
 });
 
 test('sessionError does NOT over-match free-floating "invalid" as 400', () => {

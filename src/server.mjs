@@ -286,7 +286,7 @@ async function readJsonBody(req) {
         // does not stall the keep-alive connection, and drop any further
         // data events.
         req.resume();
-        reject(new ValidationError('payload_too_large'));
+        reject(new ValidationError('payload_too_large', { code: 'payload_too_large', details: { limit_bytes: 64 * 1024 } }));
         return;
       }
       chunks.push(chunk);
@@ -298,7 +298,7 @@ async function readJsonBody(req) {
       try {
         resolveBody(JSON.parse(raw));
       } catch (err) {
-        reject(new ValidationError('bad_json'));
+        reject(new ValidationError('bad_json', { code: 'bad_json' }));
       }
     });
     req.on('error', reject);
@@ -313,9 +313,9 @@ async function readJsonBody(req) {
  * @returns {{ status: number, code: string }}
  */
 function classifyProviderError(err) {
-  if (err instanceof StoryNotFoundError) return { status: 404, code: err.code };
-  if (err instanceof ValidationError) return { status: 400, code: err.code };
-  if (err instanceof ProviderError) return { status: 502, code: err.code };
+  if (err instanceof StoryNotFoundError) return { status: 404, code: err.code, details: err.details || null };
+  if (err instanceof ValidationError) return { status: 400, code: err.code, details: err.details || null };
+  if (err instanceof ProviderError) return { status: 502, code: err.code, details: err.details || null };
   return { status: 500, code: 'provider_error' };
 }
 
@@ -355,7 +355,7 @@ function sessionError(err) {
   // duplicate the mapping that classifyProviderError already does for the
   // provider surface.
   if (err instanceof ValidationError) {
-    return { status: 400, code: err.code || 'validation_failed', message: 'The session request is invalid.' };
+    return { status: 400, code: err.code || 'validation_failed', message: 'The session request is invalid.', details: err.details || null };
   }
   const text = String(err && err.message ? err.message : '');
   if (/unknown session/i.test(text)) {
@@ -395,8 +395,10 @@ function sessionError(err) {
 }
 
 function sessionErrorResponse(res, err) {
-  const { status, code, message } = sessionError(err);
-  return jsonResponse(res, status, { error: code, message, demo: DEMO_FLAG, dev: DEV_FLAG });
+  const { status, code, message, details } = sessionError(err);
+  const body = { error: code, message, demo: DEMO_FLAG, dev: DEV_FLAG };
+  if (details) body.details = details;
+  return jsonResponse(res, status, body);
 }
 
 function rejectInvalidSessionUuid(res, session_uuid) {

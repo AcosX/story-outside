@@ -80,7 +80,7 @@ export function createMockStoryProvider() {
       if (!story) throw new StoryNotFoundError(input.storyId);
       const idx = Number.isInteger(input.index) ? input.index : 0;
       if (idx < 0) {
-        throw new ValidationError('advance index must be >= 0', { index: idx });
+        throw new ValidationError('advance index must be >= 0', { details: { index: idx } });
       }
       const roleId = typeof input.roleId === 'string' ? input.roleId : null;
       const nextIndex = Math.min(idx + 1, story.beats.length);
@@ -109,6 +109,6 @@ function assertStoryId(id) {
     throw new ValidationError('story id must be a non-empty string');
   }
   if (!ID_PATTERN.test(id)) {
-    throw new ValidationError('story id has invalid shape', { id });
+    throw new ValidationError('story id has invalid shape', { details: { id } });
   }
 }

@@ -87,8 +87,21 @@ export class StoryNotFoundError extends ProviderError {
 }
 
 export class ValidationError extends ProviderError {
-  constructor(message, details) {
-    super('invalid_input', message, details);
+  /**
+   * @param {string} message
+   * @param {object} [options]
+   * @param {string} [options.code] Machine-readable code surfaced on the
+   *   wire. Defaults to 'invalid_input'; route callers may pin a more
+   *   specific code (e.g. 'payload_too_large', 'bad_json') so clients
+   *   can disambiguate body-parser failures from generic input
+   *   validation. The wire code is what appears in the response
+   *   `error` field; the human message stays the original argument.
+   * @param {object} [options.details]
+   */
+  constructor(message, options = undefined) {
+    const code = (options && typeof options.code === 'string' && options.code) || 'invalid_input';
+    const details = options && options.details;
+    super(code, message, details);
     this.name = 'ValidationError';
   }
 }
