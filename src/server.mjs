@@ -165,10 +165,6 @@ const demoTurnCounter = new BoundedMap({ max: 1024, name: 'demoTurnCounter' });
 function getDemoSessionState(sessionUuid) {
   let state = demoTurnCounter.get(sessionUuid);
   if (!state) {
-    if (demoTurnCounter.size >= MAX_DEMO_SESSION_STATES) {
-      const oldestKey = demoTurnCounter.keys().next().value;
-      if (oldestKey !== undefined) demoTurnCounter.delete(oldestKey);
-    }
     state = { turnCount: 0 };
     demoTurnCounter.set(sessionUuid, state);
   }
@@ -913,7 +909,7 @@ async function handleRequest(req, res) {
           prompt: body.prompt,
           generation_profile: profile,
         };
-        rememberSessionPinnedMetadata(body.session_uuid, pinned);
+        sessionPinnedMetadata.set(body.session_uuid, pinned);
         // ClickUp 14 observability hooks (route layer, per docs/observability.md §5).
         // A freshly created session pins a valid opening cache, so this counts
         // as a cache hit for the pinned cache_uuid.
