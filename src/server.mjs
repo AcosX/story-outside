@@ -33,6 +33,12 @@ import {
   seedCommunityProfiles,
 } from './community/index.mjs';
 import {
+  FollowingError,
+  createFollowingService,
+  createInMemoryFollowingRepository,
+  getMockFollowingIdentity,
+} from './ecosystem/following/index.mjs';
+import {
   bootstrapSessionFromWork,
   commitNarrativeEvent,
   commitOpeningEvent,
@@ -429,6 +435,18 @@ const { repository: storyRepo, fixtures: storyFixtures } = createSeededRepositor
 // story_version the seed loop did not cover.
 const communityProfileRepo = createInMemoryCommunityProfileRepository();
 seedCommunityProfiles(storyRepo, communityProfileRepo);
+
+// ClickUp 16.3 — public ecosystem / follow / share surface.
+//
+// The repository is process-local (in-memory, bounded by per-follower
+// cache size). The service applies the business rules: follow does NOT
+// imply share, share / unshare require the request to come from the
+// session's owner (verified via the `X-Mock-User-uuid` header — see
+// the auth seam below), and the friend-timelines cache is keyed by
+// follower_uuid so two distinct followers do not see each other's
+// cached snapshot.
+const followingRepo = createInMemoryFollowingRepository();
+const followingService = createFollowingService(followingRepo);
 
 // sessionService deliberately keeps its state private to the repository. The
 // route layer keeps only the request's non-secret pinned metadata so recovery
@@ -2048,6 +2066,297 @@ async function handleRequest(req, res) {
       });
     } catch (err) {
       return sessionErrorResponse(res, err);
+    }
+  }
+
+  // ---------------------------------------------------------------------
+  // ClickUp 16.3 — public /v1/ecosystem/* HTTP façade.
+  //
+  // The surface intentionally does NOT live under /api/admin/* or
+  // /api/dev/*; those prefixes are reserved for demo-only tooling
+  // (DEV_FLAG banner) and the follow / share surface is public. The
+  // routes below DO NOT advertise DEV_FLAG in their responses so a
+  // player never sees a "demo-only" banner on a feed item.
+  //
+  // Owner check (ChatGPT 2026-09-06 P1 fix):
+  //   `share` and `unshare` MUST come from the session owner. The
+  //   authoritative owner is resolved from the `X-Mock-User-uuid`
+  //   header (mock auth seam — see `resolveAuthPrincipal`). The
+  //   request body is NEVER consulted for the caller's identity —
+  //   keys like `user_ref`, `user_uuid`, `identity` are rejected
+  //   with `validation_failed` before any business logic runs. The
+  //   service layer enforces the owner invariant; the route layer
+  //   rejects forged identities up front.
+  // ---------------------------------------------------------------------
+
+  // ClickUp 16.3 mock auth seam. The header name is `X-Mock-User-uuid`
+  // and the value is looked up in the mock-identity fixture. A missing
+  // header returns `null` (the caller is unauthenticated) so the route
+  // can answer 401 cleanly. This is a temporary mock — a real
+  // deployment would replace this with a JWT / session-cookie / OIDC
+  // verification path. The seam is kept inside `handleRequest` so a
+  // future production auth provider can swap in without rewriting the
+  // routes. The body NEVER carries an identity (see the
+  // IDENTITY_BODY_KEYS whitelist rejection in each route).
+  function resolveAuthPrincipal(req) {
+    const headerValue = req.headers['x-mock-user-uuid'];
+    const value = Array.isArray(headerValue) ? headerValue[0] : headerValue;
+    if (typeof value !== 'string' || !value) return null;
+    return getMockFollowingIdentity(value);
+  }
+
+  // ClickUp 16.3 strict body whitelist for every /v1/ecosystem route.
+  // The request body MAY NOT carry any identity-shaped field. The list
+  // is intentionally narrow: only fields the route actually needs are
+  // allowed. Any unknown top-level key (including `user_ref`,
+  // `user_uuid`, `identity`, `user_id`, `actor`, `subject`, etc.) makes
+  // the route answer 400 `validation_failed` BEFORE the body is parsed
+  // by the service layer, so a forged identity can never reach the
+  // service.
+  const ECOSYSTEM_FOLLOW_BODY_KEYS = ['target_user_uuid'];
+  const ECOSYSTEM_SHARE_BODY_KEYS = ['title', 'story_uuid', 'story_version_uuid'];
+  const UUID_KEYS_TO_REJECT = new Set([
+    'user_ref', 'user_uuid', 'user_id', 'identity',
+    'user', 'subject', 'actor', 'owner',
+  ]);
+
+  function rejectIdentityInBody(body, allowed) {
+    if (!validObject(body)) return null;
+    const keys = Object.keys(body);
+    for (const k of keys) {
+      if (UUID_KEYS_TO_REJECT.has(k)) {
+        jsonResponse(res, 400, {
+          error: 'validation_failed',
+          message: 'Identity-shaped fields are not allowed in the request body.',
+          field: k,
+          ...PUBLIC_DECORATE(),
+        });
+        return true;
+      }
+    }
+    const unknown = keys.filter((k) => !allowed.includes(k));
+    if (unknown.length > 0) {
+      jsonResponse(res, 400, {
+        error: 'validation_failed',
+        message: 'The ecosystem request body contains unknown fields.',
+        ...PUBLIC_DECORATE(),
+      });
+      return true;
+    }
+    return null;
+  }
+
+  function requireAuth() {
+    const principal = resolveAuthPrincipal(req);
+    if (!principal) {
+      jsonResponse(res, 401, {
+        error: 'unauthenticated',
+        message: 'X-Mock-User-uuid header is required.',
+        ...PUBLIC_DECORATE(),
+      });
+      return null;
+    }
+    return principal;
+  }
+
+  function mapFollowingError(err) {
+    if (err instanceof FollowingError) {
+      let status = 400;
+      switch (err.code) {
+        case 'not_session_owner':
+          status = 403;
+          break;
+        case 'cannot_follow_self':
+        case 'cannot_block_self':
+        case 'invalid_input':
+          status = 400;
+          break;
+        default:
+          status = 400;
+      }
+      return { status, code: err.code, message: err.message, details: err.details || null };
+    }
+    return { status: 500, code: 'internal_error', message: 'Internal server error.', details: null };
+  }
+
+  function followingErrorResponse(err) {
+    const mapped = mapFollowingError(err);
+    const body = {
+      error: mapped.code,
+      message: mapped.message,
+      ...PUBLIC_DECORATE(),
+    };
+    if (mapped.details) body.details = mapped.details;
+    return jsonResponse(res, mapped.status, body);
+  }
+
+  // POST /v1/ecosystem/follow — add a follow.
+  //   body: { target_user_uuid }
+  //   auth: X-Mock-User-uuid header.
+  if (method === 'POST' && pathname === '/v1/ecosystem/follow') {
+    let body = {};
+    try {
+      body = await readJsonBody(req);
+    } catch (err) {
+      return sessionErrorResponse(res, err);
+    }
+    const rejected = rejectIdentityInBody(body, ECOSYSTEM_FOLLOW_BODY_KEYS);
+    if (rejected) return rejected;
+    const auth = requireAuth();
+    if (!auth) return;
+    if (typeof body.target_user_uuid !== 'string' || !body.target_user_uuid) {
+      return jsonResponse(res, 400, {
+        error: 'validation_failed',
+        message: 'target_user_uuid is required.',
+        field: 'target_user_uuid',
+        ...PUBLIC_DECORATE(),
+      });
+    }
+    if (!isSessionUuid(body.target_user_uuid)) {
+      return jsonResponse(res, 400, {
+        error: 'validation_failed',
+        message: 'target_user_uuid must be a UUID.',
+        field: 'target_user_uuid',
+        ...PUBLIC_DECORATE(),
+      });
+    }
+    try {
+      const row = followingService.follow({
+        followerUuid: auth.user_uuid,
+        targetUserUuid: body.target_user_uuid,
+      });
+      return jsonResponse(res, 200, {
+        ...PUBLIC_DECORATE(),
+        follow: row,
+      });
+    } catch (err) {
+      return followingErrorResponse(err);
+    }
+  }
+
+  // DELETE /v1/ecosystem/follow/:target_user_uuid — remove a follow.
+  if (method === 'DELETE' && pathname.startsWith('/v1/ecosystem/follow/')) {
+    const target = pathname.slice('/v1/ecosystem/follow/'.length);
+    if (!isSessionUuid(target)) {
+      return jsonResponse(res, 400, {
+        error: 'validation_failed',
+        message: 'target_user_uuid must be a UUID.',
+        ...PUBLIC_DECORATE(),
+      });
+    }
+    const auth = requireAuth();
+    if (!auth) return;
+    try {
+      const removed = followingService.unfollow({
+        followerUuid: auth.user_uuid,
+        targetUserUuid: target,
+      });
+      return jsonResponse(res, 200, {
+        ...PUBLIC_DECORATE(),
+        removed,
+        target_user_uuid: target,
+      });
+    } catch (err) {
+      return followingErrorResponse(err);
+    }
+  }
+
+  // GET /v1/ecosystem/friend-timelines?since=...&limit=...
+  if (method === 'GET' && pathname === '/v1/ecosystem/friend-timelines') {
+    const auth = requireAuth();
+    if (!auth) return;
+    const sinceRaw = url.searchParams.get('since');
+    const limitRaw = url.searchParams.get('limit');
+    const limit = limitRaw !== null ? Number(limitRaw) : 50;
+    let payload;
+    try {
+      payload = followingService.friendTimelinesSafe({
+        followerUuid: auth.user_uuid,
+        since: sinceRaw,
+        limit: Number.isInteger(limit) && limit > 0 ? limit : 50,
+      });
+    } catch (err) {
+      return followingErrorResponse(err);
+    }
+    return jsonResponse(res, 200, {
+      ...PUBLIC_DECORATE(),
+      ...payload,
+    });
+  }
+
+  // POST /v1/ecosystem/sessions/:session_uuid/share — owner-only share.
+  if (method === 'POST' && pathname.startsWith('/v1/ecosystem/sessions/') && pathname.endsWith('/share')) {
+    const tail = pathname.slice('/v1/ecosystem/sessions/'.length, -'/share'.length);
+    if (!isSessionUuid(tail)) {
+      return jsonResponse(res, 400, {
+        error: 'validation_failed',
+        message: 'session_uuid must be a UUID.',
+        ...PUBLIC_DECORATE(),
+      });
+    }
+    let body = {};
+    try {
+      body = await readJsonBody(req);
+    } catch (err) {
+      return sessionErrorResponse(res, err);
+    }
+    if (body && Object.keys(body).length > 0) {
+      const rejected = rejectIdentityInBody(body, ECOSYSTEM_SHARE_BODY_KEYS);
+      if (rejected) return rejected;
+    }
+    const auth = requireAuth();
+    if (!auth) return;
+    try {
+      const row = followingService.shareSession({
+        sessionUuid: tail,
+        ownerUuid: auth.user_uuid,
+        title: typeof body.title === 'string' ? body.title : undefined,
+        story_uuid: typeof body.story_uuid === 'string' ? body.story_uuid : undefined,
+        story_version_uuid: typeof body.story_version_uuid === 'string' ? body.story_version_uuid : undefined,
+      });
+      return jsonResponse(res, 200, {
+        ...PUBLIC_DECORATE(),
+        share: row,
+      });
+    } catch (err) {
+      return followingErrorResponse(err);
+    }
+  }
+
+  // POST /v1/ecosystem/sessions/:session_uuid/unshare — owner-only unshare.
+  if (method === 'POST' && pathname.startsWith('/v1/ecosystem/sessions/') && pathname.endsWith('/unshare')) {
+    const tail = pathname.slice('/v1/ecosystem/sessions/'.length, -'/unshare'.length);
+    if (!isSessionUuid(tail)) {
+      return jsonResponse(res, 400, {
+        error: 'validation_failed',
+        message: 'session_uuid must be a UUID.',
+        ...PUBLIC_DECORATE(),
+      });
+    }
+    let body = {};
+    try {
+      body = await readJsonBody(req);
+    } catch (err) {
+      return sessionErrorResponse(res, err);
+    }
+    if (body && Object.keys(body).length > 0) {
+      const rejected = rejectIdentityInBody(body, []);
+      if (rejected) return rejected;
+    }
+    const auth = requireAuth();
+    if (!auth) return;
+    try {
+      const row = followingService.unshareSession({
+        sessionUuid: tail,
+        ownerUuid: auth.user_uuid,
+      });
+      return jsonResponse(res, 200, {
+        ...PUBLIC_DECORATE(),
+        unshared: !!row,
+        session_uuid: tail,
+      });
+    } catch (err) {
+      return followingErrorResponse(err);
     }
   }
 

@@ -1229,6 +1229,16 @@ function bindEvents() {
 
 async function bootstrap() {
   bindEvents();
+  // ClickUp 16.3 — lazily load the public social panel so the home
+  // page DOM stays untouched. The panel mounts a single floating host
+  // element at document.body and is non-intrusive to the existing
+  // picker / story / ending-card surfaces.
+  try {
+    const socialMod = await import('/scripts/socialPanel.js');
+    if (socialMod && typeof socialMod.mount === 'function') socialMod.mount();
+  } catch (err) {
+    /* panel is best-effort — the core game flow must still run */
+  }
   setStatus('loading');
   // Deep link: showScreen writes ?s=<screen> into the URL, and a reload
   // on the ending screen must land back on the ending page instead of

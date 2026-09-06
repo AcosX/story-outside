@@ -35,6 +35,13 @@ async function readEndingPageSource() {
 const PLAYER_ENDING_IMPORT = "import('/scripts/endingPage.js')";
 const PLAYER_ENDING_HOOK = 'globalThis.__HARNESS_IMPORT_ENDING_PAGE__()';
 
+// ClickUp 16.3 — the social panel is a separate module that the player
+// lazy-imports from bootstrap(). The harness rewrites the import URL
+// to a no-op hook so player.js's source remains import-clean for the
+// real browser while still evaluating inside `new Function()`.
+const PLAYER_SOCIAL_IMPORT = "import('/scripts/socialPanel.js')";
+const PLAYER_SOCIAL_HOOK = 'globalThis.__HARNESS_IMPORT_SOCIAL_PANEL__()';
+
 async function importEndingPageForHarness() {
   const source = await readEndingPageSource();
   const stripped = source.replace(/export\s*\{[^}]*\}\s*;?\s*$/m, '');
@@ -49,7 +56,25 @@ function applyHarnessPatches(source) {
       + 'in player.js source — update PLAYER_ENDING_IMPORT in tests/_player-dom.mjs'
     );
   }
-  return source.replaceAll(PLAYER_ENDING_IMPORT, PLAYER_ENDING_HOOK);
+  let patched = source.replaceAll(PLAYER_ENDING_IMPORT, PLAYER_ENDING_HOOK);
+  if (patched.includes(PLAYER_SOCIAL_IMPORT)) {
+    patched = patched.replaceAll(PLAYER_SOCIAL_IMPORT, PLAYER_SOCIAL_HOOK);
+  }
+  return patched;
+}
+
+// ClickUp 16.3 — the social panel module is intentionally NOT loaded
+// by the harness; the player.js source expects it via dynamic import,
+// but the harness substitutes a no-op namespace. Tests of the social
+// surface live in tests/ecosystemFollowingRebuilt.test.mjs and hit the
+// HTTP layer directly.
+async function importSocialPanelForHarness() {
+  return {
+    start: () => {},
+    mount: () => {},
+    refreshFeed: () => {},
+    refreshShareButton: () => {},
+  };
 }
 
 // --- Minimal DOM polyfill ---
@@ -585,6 +610,7 @@ export function createPlayerDom({ baseUrl, viewport = null, stepDelayMs = null, 
     globalThis.fetch = fetchStub;
     // Lazy ending-page import hook (see importEndingPageForHarness).
     globalThis.__HARNESS_IMPORT_ENDING_PAGE__ = importEndingPageForHarness;
+    globalThis.__HARNESS_IMPORT_SOCIAL_PANEL__ = importSocialPanelForHarness;
     if (!globalThis.crypto) globalThis.crypto = {};
     if (typeof globalThis.crypto.randomUUID !== 'function') {
       globalThis.crypto.randomUUID = () => '00000000-0000-4000-8000-000000000099';
