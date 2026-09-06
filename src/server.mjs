@@ -55,6 +55,10 @@ import {
 import { snapshotAll as snapshotMetricsAll, snapshotSession as snapshotMetricsSession } from './observability/metrics.mjs';
 import { snapshotAll as snapshotCacheStatsAll } from './observability/cacheStats.mjs';
 import {
+  attachRelevance,
+  createEcosystemHotOrchestrator,
+} from './providers/ecosystem/hot.mjs';
+import {
   createStoriesHookContext,
   onSessionCreate,
   onOpeningCommit,
@@ -429,6 +433,13 @@ const { repository: storyRepo, fixtures: storyFixtures } = createSeededRepositor
 // story_version the seed loop did not cover.
 const communityProfileRepo = createInMemoryCommunityProfileRepository();
 seedCommunityProfiles(storyRepo, communityProfileRepo);
+
+// ClickUp 16.4 P1 fix (2026-09-07): home-page 知乎热榜 orchestrator.
+// Owns its own pair-key cache so two callers with different identity
+// triples share the upstream data but see distinct relevance
+// projections. The orchestrator is created once per process so its
+// cache survives across requests; tests can build a fresh one.
+const ecosystemHotOrchestrator = createEcosystemHotOrchestrator();
 
 // sessionService deliberately keeps its state private to the repository. The
 // route layer keeps only the request's non-secret pinned metadata so recovery
@@ -2048,6 +2059,82 @@ async function handleRequest(req, res) {
       });
     } catch (err) {
       return sessionErrorResponse(res, err);
+    }
+  }
+
+  // GET /v1/ecosystem/hot — home-page 知乎热榜 façade (ClickUp 16.4).
+  //
+  // Public surface (no DEV_FLAG banner). Identity triple is optional:
+  // when story_uuid / story_version_uuid / community_profile_version
+  // are all supplied, the response carries `relevant_to_story` and
+  // every hot entry carries `relevant: { score, matched_terms }`.
+  // The matcher uses `StoryCommunityProfile.hot_keywords` as the
+  // `hot_match_terms` projection and `topics[].label` as the
+  // `themes` projection. When the identity triple is missing, the
+  // response degrades to a plain hot list (no relevance field).
+  if (method === 'GET' && pathname === '/v1/ecosystem/hot') {
+    const queryCategory = url.searchParams.get('category');
+    const queryStoryUuid = url.searchParams.get('story_uuid');
+    const queryStoryVersionUuid = url.searchParams.get('story_version_uuid');
+    const queryCommunityProfileVersion = url.searchParams.get('community_profile_version');
+    try {
+      const baseResponse = await ecosystemHotOrchestrator.fetchHot({
+        category: typeof queryCategory === 'string' && queryCategory ? queryCategory : undefined,
+      });
+      const identity = {
+        story_uuid: typeof queryStoryUuid === 'string' ? queryStoryUuid : '',
+        story_version_uuid: typeof queryStoryVersionUuid === 'string' ? queryStoryVersionUuid : '',
+        community_profile_version: typeof queryCommunityProfileVersion === 'string'
+          ? queryCommunityProfileVersion
+          : '',
+      };
+      const allIdentityFieldsSupplied = Boolean(identity.story_uuid)
+        && Boolean(identity.story_version_uuid)
+        && Boolean(identity.community_profile_version);
+      if (!allIdentityFieldsSupplied) {
+        // Plain list path. Strip any spurious `relevant` projection
+        // (defence in depth: the orchestrator does not attach one in
+        // this path, but a future refactor must keep the wire shape
+        // clean when identity is partial).
+        if (Array.isArray(baseResponse.hot)) {
+          for (const e of baseResponse.hot) {
+            if (e && 'relevant' in e) delete e.relevant;
+          }
+        }
+        return jsonResponse(res, 200, { ...PUBLIC_DECORATE(), ...baseResponse });
+      }
+      // Full identity path: attach relevance. Validation errors here
+      // (bad UUID, etc.) become a 400 with the public decoration so
+      // the home-page module can surface a placeholder.
+      try {
+        const responseWithRelevance = attachRelevance(baseResponse, identity, {
+          profileRepository: communityProfileRepo,
+        });
+        // ClickUp 16.4 P1 fix (2026-09-07): when the response carries
+        // `relevant_to_story`, surface that exact field name on the
+        // wire so the home-page module can read it via
+        // `response.relevant_to_story`. The orchestrator already set
+        // it on the response object; we just forward via the spread.
+        const wireResponse = responseWithRelevance && responseWithRelevance.relevant_to_story
+          ? responseWithRelevance
+          : baseResponse;
+        return jsonResponse(res, 200, { ...PUBLIC_DECORATE(), ...wireResponse });
+      } catch (relErr) {
+        const message = String(relErr && relErr.message ? relErr.message : relErr);
+        return jsonResponse(res, 400, {
+          error: 'invalid_identity',
+          message: 'story_uuid, story_version_uuid, and community_profile_version must all be valid UUIDs when supplied.',
+          ...PUBLIC_DECORATE(),
+          ...(message ? { detail: message } : {}),
+        });
+      }
+    } catch (err) {
+      const message = String(err && err.message ? err.message : err);
+      return jsonResponse(res, 502, {
+        error: 'ecosystem_hot_failed',
+        message,
+        ...PUBLIC_DECORATE(),
+      });
     }
   }
 

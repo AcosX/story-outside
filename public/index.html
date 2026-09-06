@@ -70,6 +70,27 @@
 
           <section
             class="picker-block"
+            id="ecosystem-hot-module"
+            aria-labelledby="ecosystem-hot-label"
+            data-screen="ecosystem-hot"
+            data-state="loading"
+          >
+            <h2 id="ecosystem-hot-label" class="picker-label">知乎此刻热议</h2>
+            <p
+              class="ecosystem-hot-status"
+              id="ecosystem-hot-status"
+              role="status"
+              aria-live="polite"
+            >载入中…</p>
+            <ol
+              class="ecosystem-hot-list"
+              id="ecosystem-hot-list"
+              aria-label="知乎热榜"
+            ></ol>
+          </section>
+
+          <section
+            class="picker-block"
             id="role-block"
             aria-labelledby="picker-roles-label"
             hidden
@@ -194,5 +215,6 @@
     </footer>
 
     <script type="module" src="/scripts/player.js"></script>
+    <script type="module" src="/scripts/homeHotModule.js"></script>
   </body>
 </html>
