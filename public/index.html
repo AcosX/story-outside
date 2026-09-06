@@ -193,6 +193,21 @@
       <span class="bottombar-meta">demo · 进程内会话</span>
     </footer>
 
+    <!--
+      ClickUp 16.2 P1 fix (2026-09-07): expose the community-profile
+      identity as a synchronous window global so the player can fall
+      back to it without a round-trip to /api/sessions. The default
+      values here are placeholders; the player overwrites them on
+      session bootstrap with the real values from the server response
+      (POST /api/sessions → community_profile_version).
+    -->
+    <script>
+      // STORY_OUTSIDE_COMMUNITY_PROFILE_VERSION is a non-secret,
+      // version-shaped string the player must forward to
+      // POST /v1/ecosystem/discussions so the cache pair-key is
+      // stable. The static contract test asserts this global exists.
+      window.STORY_OUTSIDE_COMMUNITY_PROFILE_VERSION = window.STORY_OUTSIDE_COMMUNITY_PROFILE_VERSION || null;
+    </script>
     <script type="module" src="/scripts/player.js"></script>
   </body>
 </html>

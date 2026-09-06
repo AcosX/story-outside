@@ -69,6 +69,22 @@ import {
   buildReplay,
 } from './stories/endingService.mjs';
 
+// ClickUp 16.2 P1 fix (2026-09-07): ecosystem search route uses the
+// search_queries[] contract (no more AI-derived query fields). The
+// adapter is selected by env STORY_OUTSIDE_ECOSYSTEM_SEARCH.
+import {
+  createInMemoryEcosystemSearchCacheRepository,
+  createMockZhihuSearchSource,
+  createRealZhihuSearchSource,
+  hasRealSearchCredentials,
+  normaliseDiscussionsRequest,
+  searchEcosystemDiscussions,
+} from './providers/ecosystem/index.mjs';
+
+import {
+  getCommunityProfile,
+} from './community/service.mjs';
+
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 const ROOT = resolve(__dirname, '..');
 const PUBLIC_DIR = resolve(ROOT, 'public');
@@ -444,6 +460,56 @@ const sessionPinnedMetadata = new BoundedMap({ max: 1024, name: 'sessionPinnedMe
 // then by request_id. The map intentionally lives outside the repository
 // because the runtime does not own it (the repository is process-shared
 // with other tests/routes); the route layer is the only producer.
+
+// ---------------------------------------------------------------------
+// ClickUp 16.2 P1 fix (2026-09-07): ecosystem search cache + adapter.
+// The cache is keyed per (story_version_uuid, community_profile_version,
+// query_id, query_hash) so different profiles / different queries never
+// share a row. The adapter is selected by STORY_OUTSIDE_ECOSYSTEM_SEARCH
+// (`mock` default; `real` requires hasRealSearchCredentials).
+// ---------------------------------------------------------------------
+const ecosystemSearchCacheRepo = createInMemoryEcosystemSearchCacheRepository();
+const ecosystemSearchAdapter = (process.env.STORY_OUTSIDE_ECOSYSTEM_SEARCH === 'real' && hasRealSearchCredentials())
+  ? createRealZhihuSearchSource()
+  : createMockZhihuSearchSource();
+
+/**
+ * Resolve the stable `community_profile_version` + canonical
+ * `community_profile_queries[]` for a given story_version_uuid.
+ *
+ * ClickUp 16.2 P1 fix (2026-09-07): the player must pass these to
+ * POST /v1/ecosystem/discussions; the response is best-effort and
+ * never throws (a missing profile just returns nulls). The version
+ * string is `generator_version@content_hash_prefix` — a new value
+ * iff the profile is regenerated.
+ *
+ * @param {string} story_version_uuid
+ * @returns {{ community_profile_version: string|null, community_profile_queries: object[]|null }}
+ */
+function resolveCommunityProfileVersion(story_version_uuid) {
+  if (typeof story_version_uuid !== 'string' || !story_version_uuid) {
+    return { community_profile_version: null, community_profile_queries: null };
+  }
+  try {
+    const profile = getCommunityProfile({
+      profileRepository: communityProfileRepo,
+      story_version_uuid,
+    });
+    if (!profile) {
+      return { community_profile_version: null, community_profile_queries: null };
+    }
+    const version = (profile.generator_version && profile.hash && profile.hash.content_hash)
+      ? `${profile.generator_version}@${profile.hash.content_hash.slice(0, 16)}`
+      : null;
+    const queries = Array.isArray(profile.queries) ? profile.queries.slice() : null;
+    return {
+      community_profile_version: version,
+      community_profile_queries: queries,
+    };
+  } catch {
+    return { community_profile_version: null, community_profile_queries: null };
+  }
+}
 
 const SESSION_UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -1649,6 +1715,10 @@ async function handleRequest(req, res) {
       });
       onSessionCreate(hookCtx);
       onOpeningCacheHit(hookCtx);
+      // ClickUp 16.2 P1 fix (2026-09-07): the player needs a stable
+      // community_profile_version + canonical queries to send with
+      // /v1/ecosystem/discussions.
+      const cv = resolveCommunityProfileVersion(result.story_version_uuid);
       return jsonResponse(res, 200, {
         ...PUBLIC_DECORATE(),
         session_uuid: sessionUuid,
@@ -1662,6 +1732,10 @@ async function handleRequest(req, res) {
         opening_cursor: result.session.opening_cursor,
         cache_reused: result.cache_reused,
         version_reused: result.version_reused,
+        // ClickUp 16.2 P1 fix: stable version + canonical queries
+        // the player should submit to /v1/ecosystem/discussions.
+        community_profile_version: cv.community_profile_version,
+        community_profile_queries: cv.community_profile_queries,
         pinned,
       });
     } catch (err) {
@@ -1675,9 +1749,17 @@ async function handleRequest(req, res) {
     if (rejectInvalidSessionUuid(res, publicSessionRoot[1])) return;
     try {
       const recovered = recoverSession({ repository: storyRepo, session_uuid: publicSessionRoot[1] });
+      // ClickUp 16.2 P1 fix: also expose community_profile_version +
+      // canonical queries so the player can submit them to
+      // /v1/ecosystem/discussions after a page reload.
+      const cv = recovered && recovered.story_version_uuid
+        ? resolveCommunityProfileVersion(recovered.story_version_uuid)
+        : { community_profile_version: null, community_profile_queries: null };
       return jsonResponse(res, 200, {
         ...PUBLIC_DECORATE(),
         ...recovered,
+        community_profile_version: cv.community_profile_version,
+        community_profile_queries: cv.community_profile_queries,
         pinned: sessionPinnedMetadata.get(publicSessionRoot[1]) || null,
       });
     } catch (err) {
@@ -1691,9 +1773,14 @@ async function handleRequest(req, res) {
     if (rejectInvalidSessionUuid(res, publicRecover[1])) return;
     try {
       const recovered = recoverSession({ repository: storyRepo, session_uuid: publicRecover[1] });
+      const cv = recovered && recovered.story_version_uuid
+        ? resolveCommunityProfileVersion(recovered.story_version_uuid)
+        : { community_profile_version: null, community_profile_queries: null };
       return jsonResponse(res, 200, {
         ...PUBLIC_DECORATE(),
         ...recovered,
+        community_profile_version: cv.community_profile_version,
+        community_profile_queries: cv.community_profile_queries,
         pinned: sessionPinnedMetadata.get(publicRecover[1]) || null,
       });
     } catch (err) {
@@ -2049,6 +2136,62 @@ async function handleRequest(req, res) {
     } catch (err) {
       return sessionErrorResponse(res, err);
     }
+  }
+
+  // ---------------------------------------------------------------------
+  // ClickUp 16.2 P1 fix (2026-09-07): POST /v1/ecosystem/discussions
+  // public surface.
+  //
+  // Hard contract:
+  //   * body MUST carry `search_queries: [{id, query, kind}][]`
+  //     AND identity (`story_uuid`, `story_version_uuid`,
+  //     `community_profile_version`). Missing identity is 400, NOT a
+  //     sentinel pair-key fallback.
+  //   * AI-derived fields (`query`, `ending_title`, `key_choices`,
+  //     `outcome`, `character_outcomes`, ...) are FORBIDDEN at the
+  //     seam — 400 'forbidden_field' so a future regression cannot
+  //     smuggle session-derived query text back in.
+  //   * Response carries NO demo / DEV_FLAG; the route lives on the
+  //     public surface.
+  //   * GET / PUT / DELETE → 405 with Allow: POST.
+  // ---------------------------------------------------------------------
+  if (pathname === '/v1/ecosystem/discussions') {
+    if (method !== 'POST') {
+      res.setHeader('allow', 'POST');
+      return jsonResponse(res, 405, {
+        error: 'method_not_allowed',
+        message: `Method ${method} is not allowed for ${pathname}.`,
+      });
+    }
+    let body = {};
+    try {
+      body = await readJsonBody(req);
+    } catch (err) {
+      return jsonResponse(res, 400, {
+        error: 'invalid_json',
+        message: 'invalid JSON body',
+      });
+    }
+    const normalised = normaliseDiscussionsRequest(body);
+    if (!normalised.ok) {
+      return jsonResponse(res, 400, {
+        error: normalised.code,
+        message: normalised.message,
+        field: normalised.field,
+      });
+    }
+    const outcome = await searchEcosystemDiscussions({
+      cache: ecosystemSearchCacheRepo,
+      adapter: ecosystemSearchAdapter,
+      search_queries: normalised.value.search_queries,
+      story_uuid: normalised.value.story_uuid,
+      story_version_uuid: normalised.value.story_version_uuid,
+      community_profile_version: normalised.value.community_profile_version,
+      limit: normalised.value.limit,
+    });
+    // Outcome already strips DEV_FLAG / demo. The route lives on the
+    // public surface; it never decorates with admin/dev fields.
+    return jsonResponse(res, 200, outcome);
   }
 
   // Root → static
