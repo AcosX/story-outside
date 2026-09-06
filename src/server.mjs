@@ -441,8 +441,22 @@ seedCommunityProfiles(storyRepo, communityProfileRepo);
 // StoryCommunityProfile on the server side. We DO NOT pre-seed any
 // topic-style surface — the topic source is always the canonical
 // knowledge_queries[] emitted by the profile generator at story_version
-// import time, looked up via `communityProfileService.findCanonicalByIdentity`.
-const knowledgeProvider = createEcosystemKnowledgeProvider();
+// import time.
+//
+// P1.v1-4 fix (2026-09-07 owner review): the route handler
+// resolves the canonical profile via
+// `communityProfileRepo.findByExternalVersion` — a pure exact-match
+// lookup that walks every preserved row and matches by the external
+// version string. NO active-row concept is consulted, so an old
+// session that pinned the prior external version keeps resolving
+// the prior row even after a newer content_hash has overtaken the
+// active slot for the same (story_version_uuid, generator_version)
+// scope. This is the seam that fixed the `communityProfile.test`
+// 8th-run flake: a row whose active index has been overwritten still
+// resolves via its external version.
+const knowledgeProvider = createEcosystemKnowledgeProvider({
+  communityProfileRepo,
+});
 
 // Thin in-process service namespace. The route layer never imports
 // src/community/service.mjs directly so we keep the canonical
@@ -2200,21 +2214,26 @@ async function handleRequest(req, res) {
       ? Math.min(body.limit, 32)
       : 4;
 
-    // P1.v2 — server-side canonical lookup. The handler MUST NOT trust
-    // caller-supplied knowledge_queries. It resolves the canonical
-    // row from the in-memory repo using only the identity tuple.
-    // Both the service helper and the repo method exist; the route
-    // layer talks to the service helper which delegates to the repo.
+    // P1.v1-4 fix (2026-09-07 owner review) — server-side canonical
+    // lookup now goes through `communityProfileRepo.findByExternalVersion`
+    // directly. This is a PURE exact-match by the EXTERNAL
+    // community_profile_version string (`<generator_version>@<16-hex-prefix>`);
+    // it walks every preserved row and returns the single row whose
+    // external version equals the supplied string. There is NO
+    // active-row concept here, so an old session that pinned the prior
+    // external version keeps resolving the prior row even after a
+    // newer content_hash has overtaken the active slot. There is NO
+    // silent fallback to "the latest row" — an unknown external
+    // version is a hard 400 `community_profile_not_found`. The
+    // previous `findCanonicalByIdentity` service helper is retained
+    // for tests but the route layer no longer goes through it.
     let canonicalProfile;
     try {
-      canonicalProfile = communityProfileService.findCanonicalByIdentity({
-        profileRepository: communityProfileRepo,
-        story_uuid: body.story_uuid,
-        story_version_uuid: body.story_version_uuid,
-        community_profile_version: body.community_profile_version,
-      });
+      canonicalProfile = communityProfileRepo.findByExternalVersion(
+        body.community_profile_version,
+      );
     } catch (err) {
-      // findCanonicalByIdentity throws on bad UUID shape; surface that
+      // findByExternalVersion throws on bad input shape; surface that
       // as a clean validation_failed rather than 500.
       return jsonResponse(res, 400, {
         error: 'validation_failed',
@@ -2223,15 +2242,12 @@ async function handleRequest(req, res) {
     }
     if (!canonicalProfile) {
       // Distinguish the failure shape so the operator can debug.
-      // P1.v1-3 — the supplied `community_profile_version` is the
-      // EXTERNAL derived form `<generator_version>-<content_hash_short>`,
-      // NOT the raw rule version. The lookup walks every preserved
-      // row and matches the derived external form, so an exact
-      // non-match means `community_profile_not_found` /
-      // `community_profile_version_mismatch` per the failure shape.
-      // There is no silent fallback to "the latest row" — old
-      // sessions pin the prior external version and must continue to
-      // resolve it.
+      // The supplied `community_profile_version` is the EXTERNAL
+      // derived form `<generator_version>@<content_hash_prefix>`,
+      // NOT the raw rule version. An exact non-match means either:
+      //   - no row exists at all for this story_version, or
+      //   - rows exist but the supplied external version (and/or
+      //     story_uuid) didn't match any preserved row.
       const allRows = communityProfileRepo.listByStoryVersion({
         story_version_uuid: body.story_version_uuid,
       });
@@ -2267,6 +2283,26 @@ async function handleRequest(req, res) {
         field: 'story_uuid',
       });
     }
+    // P1.v1-4 — `findByExternalVersion` resolves the row by external
+    // version string ONLY (it does not consult story_uuid because the
+    // external version is the canonical identity the browser carries).
+    // The story_uuid / story_version_uuid integrity check lives in
+    // the route handler so the repo method stays a pure external-
+    // version lookup. A mismatch is still surfaced as a 400.
+    if (canonicalProfile.story_uuid !== body.story_uuid) {
+      return jsonResponse(res, 400, {
+        error: 'story_version_mismatch',
+        message: 'Supplied story_uuid does not match the resolved row\'s story_uuid.',
+        field: 'story_uuid',
+      });
+    }
+    if (canonicalProfile.story_version_uuid !== body.story_version_uuid) {
+      return jsonResponse(res, 400, {
+        error: 'community_profile_not_found',
+        message: 'Supplied story_version_uuid does not match the resolved row\'s story_version_uuid.',
+        field: 'story_version_uuid',
+      });
+    }
 
     const canonicalQueries = Array.isArray(canonicalProfile.knowledge_queries)
       ? canonicalProfile.knowledge_queries.filter(
@@ -2280,6 +2316,15 @@ async function handleRequest(req, res) {
     // is called with the verbatim query string. Two different query
     // strings → two different cache rows → two different result
     // bundles.
+    //
+    // P1.v1-4: the resolved profile is pinned on every
+    // `match(input)` call as `input.profile` so the orchestrator
+    // can validate that the supplied `community_profile_version`
+    // matches the canonical derivation of the resolved row. The
+    // orchestrator itself does NOT call `findByExternalVersion`;
+    // the seam lives in the route handler so a single HTTP request
+    // resolves the profile ONCE and reuses the row across every
+    // canonical knowledge_query.
     const results = [];
     for (const q of canonicalQueries) {
       const matchResult = await knowledgeProvider.match({
@@ -2291,6 +2336,7 @@ async function handleRequest(req, res) {
           kind: typeof q.kind === 'string' ? q.kind : 'mixed',
         },
         limit: limitPerQuery,
+        profile: canonicalProfile,
       });
       results.push({
         id: typeof q.id === 'string' && q.id ? q.id : null,

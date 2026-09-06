@@ -1,6 +1,6 @@
 // tests/clickup16-5-p1-v1-3.test.mjs
 //
-// ClickUp 16.5 P1 v1-3 regression — canonical external
+// ClickUp 16.5 P1 v1-3 + v1-4 regression — canonical external
 // community_profile_version + historical exact lookup + two-generation
 // knowledge old-session regression.
 //
@@ -14,21 +14,38 @@
 // fixture + two-generation knowledge old-session regression this file
 // covers.
 //
-// This test rebuilds the regression on the SAME worktree (#25 + this
-// commit) and asserts the v1-3 contract:
+// P1.v1-4 (2026-09-07 owner review, this commit's scope):
+//   * The external format is widened to
+//     `<generator_version>@<content_hash_prefix>` where the prefix
+//     is the first 16 hex chars of `profile.hash.content_hash` (was
+//     `<gv>-<8-hex>` under v1-3). The `@` is the hard delimiter and
+//     the 16-hex prefix provides enough entropy for old-session
+//     exact lookup to disambiguate preserved rows.
+//   * The repository gains `findByExternalVersion(externalVersion)` —
+//     a pure exact-match by the external version string. The route
+//     handler calls it DIRECTLY (no detour through
+//     `findCanonicalByIdentity`'s active-row index). This is the
+//     seam that fixed the `communityProfile.test` 8th-run flake.
+//   * knowledge.mjs imports the community-layer helper so a future
+//     format bump cannot drift between the two layers.
 //
-//   P1.v1-3-1 — canonical external version
+// This test rebuilds the regression on the SAME worktree (#25 + this
+// commit) and asserts the v1-3 + v1-4 contract:
+//
+//   P1.v1-3-1 / P1.v1-4-1 — canonical external version
 //     * `deriveExternalCommunityProfileVersion(profile)` returns
-//       `<generator_version>-<content_hash_short>` where
-//       `content_hash_short` is the first 8 hex chars of
+//       `<generator_version>@<content_hash_prefix>` where
+//       `content_hash_prefix` is the first 16 hex chars of
 //       `profile.hash.content_hash`.
+//     * `parseExternalCommunityProfileVersion(versionString)` is the
+//       symmetric inverse and rejects malformed strings.
 //     * Two profiles with the same `generator_version` but a
 //       different content hash yield two DIFFERENT external versions.
 //
-//   P1.v1-3-2 — historical exact lookup
-//     * `repository.findCanonicalByIdentity(...)` resolves the row
-//       whose external version EXACTLY matches the supplied external
-//       version, even when a newer row has taken the active slot for
+//   P1.v1-3-2 / P1.v1-4-2 — historical exact lookup
+//     * `repository.findByExternalVersion(externalVersion)` resolves
+//       the row whose external version EXACTLY matches the supplied
+//       string, even when a newer row has taken the active slot for
 //       the same (story_version_uuid, generator_version) scope.
 //     * No exact match → returns `null` (no silent fallback).
 //     * The HTTP handler maps `null` to 400
@@ -37,7 +54,7 @@
 //       for the same story_version with non-matching external
 //       versions).
 //
-//   P1.v1-3-3 — two-generation knowledge old-session regression
+//   P1.v1-3-3 / P1.v1-4-3 — two-generation knowledge old-session regression
 //     * Fixture: same `story_version_uuid` + same `generator_version`
 //       + different `content_hash` (because the curated profile
 //       content was edited) + different `knowledge_queries[]`.
@@ -203,18 +220,34 @@ function post(url, body) {
 
 // ----- 1. deriveExternalCommunityProfileVersion ------------------------
 
-test('deriveExternalCommunityProfileVersion: <generator_version>-<content_hash_short>', () => {
+test('deriveExternalCommunityProfileVersion: <generator_version>@<content_hash_prefix> (16 hex)', () => {
   const { profileA, profileB } = installTwoGenerations(createInMemoryCommunityProfileRepository());
   const externalA = deriveExternalCommunityProfileVersion(profileA);
   const externalB = deriveExternalCommunityProfileVersion(profileB);
   assert.equal(
     externalA,
-    `${profileA.generator_version}-${profileA.hash.content_hash.slice(0, 8)}`,
+    `${profileA.generator_version}@${profileA.hash.content_hash.slice(0, 16)}`,
   );
   assert.equal(
     externalB,
-    `${profileB.generator_version}-${profileB.hash.content_hash.slice(0, 8)}`,
+    `${profileB.generator_version}@${profileB.hash.content_hash.slice(0, 16)}`,
   );
+  // P1.v1-4 — the format MUST be `<generator_version>@<16-hex-prefix>`
+  // (the hard `@` delimiter and 16 hex chars). The previous v1-3
+  // format `<generator_version>-<content_hash_short>` (8 hex chars)
+  // is retired; this assertion catches a regression to either shape.
+  // NOTE: the generator_version string itself can contain `@`
+  // (e.g. `community-profile@community-profile-rules/1`), so we
+  // anchor on the LAST `@` followed by exactly 16 hex chars.
+  assert.match(externalA, /@[0-9a-f]{16}$/i);
+  assert.match(externalB, /@[0-9a-f]{16}$/i);
+  const externalAHash = externalA.slice(externalA.lastIndexOf('@') + 1);
+  const externalBHash = externalB.slice(externalB.lastIndexOf('@') + 1);
+  assert.equal(externalAHash.length, 16);
+  assert.equal(externalBHash.length, 16);
+  assert.match(externalAHash, /^[0-9a-f]{16}$/i);
+  assert.match(externalBHash, /^[0-9a-f]{16}$/i);
+  assert.equal(externalA, `${profileA.generator_version}@${profileA.hash.content_hash.slice(0, 16)}`);
   // Same generator_version, different content_hash → distinct
   // external versions.
   assert.notEqual(externalA, externalB);
@@ -274,7 +307,7 @@ test('repository.findCanonicalByIdentity: unknown external version → null (no 
   const resolved = repo.findCanonicalByIdentity({
     story_uuid: version.story_uuid,
     story_version_uuid: version.version_uuid,
-    community_profile_version: `${profileA.generator_version}-deadbeef`,
+    community_profile_version: `${profileA.generator_version}@deadbeefcafebabe`,
   });
   assert.equal(resolved, null);
 });
@@ -347,7 +380,7 @@ test('HTTP /v1/ecosystem/knowledge: bogus third external version → 400 communi
     const res = await post(`${ctx.baseUrl}/v1/ecosystem/knowledge`, {
       story_uuid: version.story_uuid,
       story_version_uuid: version.version_uuid,
-      community_profile_version: `${profileA.generator_version}-deadbeef`,
+      community_profile_version: `${profileA.generator_version}@deadbeefcafebabe`,
     });
     assert.equal(res.status, 400);
     const body = await res.json();
@@ -369,7 +402,7 @@ test('HTTP /v1/ecosystem/knowledge: unknown story_version → 400 community_prof
     const res = await post(`${ctx.baseUrl}/v1/ecosystem/knowledge`, {
       story_uuid: '00000000-0000-4000-8000-000000000099',
       story_version_uuid: '00000000-0000-4000-8000-000000000199',
-      community_profile_version: 'community-profile@community-profile-rules/1-deadbeef',
+      community_profile_version: 'community-profile@community-profile-rules/1@deadbeefcafebabe',
     });
     assert.equal(res.status, 400);
     const body = await res.json();

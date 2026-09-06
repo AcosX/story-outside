@@ -20,6 +20,7 @@ export {
   COMMUNITY_PROFILE_GENERATOR_VERSION,
   deriveExternalCommunityProfileVersion,
   findCommunityProfileBoundsViolations,
+  parseExternalCommunityProfileVersion,
 } from './profile.mjs';
 
 export {

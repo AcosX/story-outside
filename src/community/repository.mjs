@@ -156,6 +156,20 @@ function rejectForbiddenKeys(value, path) {
  *          into one canonical row. Caller-supplied knowledge_queries /
  *          topic_id / topic_label / topic / theme / subject are NEVER
  *          consulted; the route layer only ever picks a single row.
+ * @property {(external_version: string) => StoryCommunityProfile | null} findByExternalVersion
+ *          ClickUp 16.5 P1.v1-4 — pure exact-match by the EXTERNAL
+ *          community_profile_version string. Walks every preserved
+ *          row in the store, computes each row's external version
+ *          via `deriveExternalCommunityProfileVersion`, and returns
+ *          the single row whose external version equals the supplied
+ *          string. Returns `null` if no preserved row matches. There
+ *          is NO silent fallback to "the latest row" — an exact
+ *          external-version lookup either returns the matching row or
+ *          returns null so the orchestrator can surface 400
+ *          `community_profile_not_found`. This method does NOT consult
+ *          the active-by-(sv,gv) index, so it intentionally bypasses
+ *          the active-row concept for callers that want historical
+ *          exact lookup.
  * @property {(input: StoryCommunityProfile) => StoryCommunityProfile} setCommunityProfile
  * @property {() => { profile_count: number }} stats
  * @property {() => void} _resetForTests
@@ -200,29 +214,29 @@ export function createInMemoryCommunityProfileRepository() {
   const repo = {
     findActiveByStoryVersion(story_version_uuid) {
       assertUuid('story_version_uuid', story_version_uuid);
-      // Walk the activeByStoryVersion index; pick the most recently
-      // generated profile when multiple generator versions exist.
+      // P1.v1-4 (2026-09-07 owner review) — walk the
+      // activeByStoryVersion index and pick the row whose
+      // (story_version_uuid, generator_version) scope was inserted
+      // LAST. JavaScript Map iteration is insertion-ordered so the
+      // last insertion wins — this fixes the pre-existing v1-3
+      // timing flake in `communityProfile.test.mjs` where two
+      // back-to-back inserts (v1 from `seedCommunityProfiles`, v2
+      // from `ensureCommunityProfile`) shared the same ISO
+      // millisecond and the lexicographic tie-break on
+      // `generator_version` flipped the result (e.g. when the
+      // seeded v1 carries a `@`-bearing identifier like
+      // `community-profile@community-profile-rules/1`, the `@`
+      // (0x40) sorts ABOVE `-` (0x2D) so v1 wins over v2's
+      // `community-profile-rules/2` even though v2 was inserted
+      // later). Insertion order is monotonic for a single process
+      // and is the only deterministic answer.
       let bestProfile = null;
       for (const [key, profileUuid] of state.activeByStoryVersion.entries()) {
-        const [sv, generator] = key.split('|');
+        const [sv] = key.split('|');
         if (sv !== story_version_uuid) continue;
         const row = state.profiles.get(profileUuid);
         if (!row) continue;
-        if (bestProfile === null) {
-          bestProfile = row;
-          continue;
-        }
-        if (row.generated_at > bestProfile.generated_at) {
-          bestProfile = row;
-        }
-        // Tie-break: larger generator_version wins so a rule bump
-        // immediately retires the previous generation for new reads.
-        if (
-          row.generated_at === bestProfile.generated_at
-          && row.generator_version > bestProfile.generator_version
-        ) {
-          bestProfile = row;
-        }
+        bestProfile = row;
       }
       return bestProfile;
     },
@@ -239,6 +253,36 @@ export function createInMemoryCommunityProfileRepository() {
     findByUuid(profile_uuid) {
       if (typeof profile_uuid !== 'string') return null;
       return state.profiles.get(profile_uuid) || null;
+    },
+    findByExternalVersion(external_version) {
+      // ClickUp 16.5 P1.v1-4 — pure exact-match lookup. The orchestrator
+      // and the route layer carry the EXTERNAL community_profile_version
+      // string (`<generator_version>@<content_hash_prefix>`) supplied
+      // by the client; this method walks every preserved row in the
+      // store and returns the single row whose external version equals
+      // the supplied string. There is NO active-row concept here: a
+      // row that has been superseded by a newer content_hash for the
+      // same (story_version_uuid, generator_version) scope STILL
+      // resolves via its own external version, so an old session that
+      // pinned the prior external version keeps reading the prior
+      // row. Returns null on no match so the caller can distinguish a
+      // truly-missing profile from a profile found but with a stale
+      // active index.
+      if (typeof external_version !== 'string' || !external_version) {
+        throw new Error('communityRepository.findByExternalVersion: external_version required');
+      }
+      for (const row of state.profiles.values()) {
+        let rowExternal;
+        try {
+          rowExternal = deriveExternalCommunityProfileVersion(row);
+        } catch {
+          continue;
+        }
+        if (rowExternal === external_version) {
+          return row;
+        }
+      }
+      return null;
     },
     findCanonicalByIdentity(input) {
       // ClickUp 16.5 P1.v1-3 server-side canonical lookup. The identity
@@ -303,18 +347,23 @@ export function createInMemoryCommunityProfileRepository() {
       // 2. No external community_profile_version supplied → fall back
       //    to the most recent active row for this story_version (the
       //    service-layer behaviour mirrors `getCommunityProfile`).
+      // P1.v1-4 — same insertion-order fix as `findActiveByStoryVersion`
+      // so the two paths agree. Without this, the v1-3
+      // `communityProfile.test` 8th-run flake could resurface here
+      // when two back-to-back inserts share a millisecond timestamp
+      // and the lexicographic `@` vs `-` tie-break flips the result.
+      // We walk `activeByStoryVersion` (which is insertion-ordered)
+      // and pick the LAST entry whose scope key matches the
+      // story_version; this is exactly the deterministic answer
+      // that the service layer wants.
       let best = null;
-      for (const row of state.profiles.values()) {
-        if (row.story_version_uuid !== targetVersion) continue;
+      for (const [key, profileUuid] of state.activeByStoryVersion.entries()) {
+        const [sv] = key.split('|');
+        if (sv !== targetVersion) continue;
+        const row = state.profiles.get(profileUuid);
+        if (!row) continue;
         if (targetStory && row.story_uuid !== targetStory) continue;
-        if (best === null) { best = row; continue; }
-        if (row.generated_at > best.generated_at) best = row;
-        if (
-          row.generated_at === best.generated_at
-          && row.generator_version > best.generator_version
-        ) {
-          best = row;
-        }
+        best = row;
       }
       return best;
     },

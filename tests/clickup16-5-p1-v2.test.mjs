@@ -344,18 +344,53 @@ function makeCapturingRealProvider() {
   return { provider, calls };
 }
 
+// P1.v1-4 — orchestrator unit tests below exercise the cache /
+// upstream path in isolation (without the HTTP route layer). The
+// route handler is responsible for calling
+// `communityProfileRepo.findByExternalVersion` and pinning the
+// resolved row on every `match(input)` call. To keep the unit tests
+// focused on the cache + upstream contract, we pin a synthetic
+// profile whose `deriveExternalCommunityProfileVersion` derivation
+// is unparseable as the canonical `<gv>@<16-hex>` form. The
+// orchestrator's integrity check is therefore skipped (because the
+// supplied `community_profile_version` does not parse as canonical),
+// and the cache / upstream path runs unchanged. The tests verify
+// that the route-layer seam is OPTIONAL — the orchestrator still
+// works when invoked directly with a pinned profile.
+function dummyProfileFor(storyVersionUuid, communityProfileVersion) {
+  return {
+    story_uuid: '00000000-0000-4000-8000-000000000000',
+    story_version_uuid: storyVersionUuid,
+    // Use a malformed external-version string so the orchestrator's
+    // `parseExternalCommunityProfileVersion` rejects it and the
+    // integrity check is skipped (the unit tests are NOT exercising
+    // the canonical-format contract; that's covered by the v1-3
+    // test file's first case).
+    generator_version: '__unit__',
+    hash: { content_hash: 'not-a-hex-string-just-a-placeholder-for-unit-tests' },
+    knowledge_queries: [],
+    // Echo the supplied community_profile_version back through the
+    // derivation so the cache key derivation is consistent with what
+    // the route layer would pass.
+    _external: communityProfileVersion,
+  };
+}
+
 test('match() invokes real provider with verbatim query.query (NOT query.id)', async () => {
   const { provider: realProvider, calls } = makeCapturingRealProvider();
   const knowledge = createEcosystemKnowledgeProvider({ realProvider });
+  const profile = dummyProfileFor('sv-1', 'cp-1');
   const r1 = await knowledge.match({
     story_version_uuid: 'sv-1',
     community_profile_version: 'cp-1',
     query: { id: 'qid-A', query: '咖啡因对人的影响', kind: 'knowledge' },
+    profile,
   });
   const r2 = await knowledge.match({
     story_version_uuid: 'sv-1',
     community_profile_version: 'cp-1',
     query: { id: 'qid-B', query: '小红书的咖啡店', kind: 'knowledge' },
+    profile,
   });
   // Two real-provider calls. Each one MUST carry the verbatim query
   // string (NOT the id).
@@ -371,16 +406,19 @@ test('match() invokes real provider with verbatim query.query (NOT query.id)', a
 test('match() second call with same query string hits cache; distinct query misses', async () => {
   const { provider: realProvider, calls } = makeCapturingRealProvider();
   const knowledge = createEcosystemKnowledgeProvider({ realProvider });
+  const profile = dummyProfileFor('sv-1', 'cp-1');
   // First pass — populate cache.
   const r1 = await knowledge.match({
     story_version_uuid: 'sv-1',
     community_profile_version: 'cp-1',
     query: { id: 'qid-A', query: '咖啡因对人的影响', kind: 'knowledge' },
+    profile,
   });
   const r2 = await knowledge.match({
     story_version_uuid: 'sv-1',
     community_profile_version: 'cp-1',
     query: { id: 'qid-B', query: '小红书的咖啡店', kind: 'knowledge' },
+    profile,
   });
   assert.equal(calls.length, 2);
   // Second pass — must hit cache (no new real calls).
@@ -388,11 +426,13 @@ test('match() second call with same query string hits cache; distinct query miss
     story_version_uuid: 'sv-1',
     community_profile_version: 'cp-1',
     query: { id: 'qid-A', query: '咖啡因对人的影响', kind: 'knowledge' },
+    profile,
   });
   const r2b = await knowledge.match({
     story_version_uuid: 'sv-1',
     community_profile_version: 'cp-1',
     query: { id: 'qid-B', query: '小红书的咖啡店', kind: 'knowledge' },
+    profile,
   });
   assert.equal(calls.length, 2, 'real provider should NOT be re-invoked on cache hit');
   assert.equal(r1b.cached, true);
@@ -404,17 +444,20 @@ test('match() second call with same query string hits cache; distinct query miss
 
 test('match() cache key contains query_hash; identical query_id with different query diverges', async () => {
   const knowledge = createEcosystemKnowledgeProvider();
+  const profile = dummyProfileFor('sv-1', 'cp-1');
   // First query with qid-shared + query 'a'.
   await knowledge.match({
     story_version_uuid: 'sv-1',
     community_profile_version: 'cp-1',
     query: { id: 'qid-shared', query: 'a', kind: 'knowledge' },
+    profile,
   });
   // Second query with the SAME id but a different query string.
   await knowledge.match({
     story_version_uuid: 'sv-1',
     community_profile_version: 'cp-1',
     query: { id: 'qid-shared', query: 'b', kind: 'knowledge' },
+    profile,
   });
   // Cache MUST contain two rows (the cache key includes query_hash).
   assert.equal(knowledge._keys().length, 2);

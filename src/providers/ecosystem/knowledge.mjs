@@ -70,6 +70,18 @@ import {
   REAL_KNOWLEDGE_SOURCE_CONFIG,
 } from './zhihuKnowledgeSource.mjs';
 
+// ClickUp 16.5 P1.v1-4 fix (2026-09-07 owner review): the orchestrator
+// imports the community-layer helper that derives / parses the EXTERNAL
+// `community_profile_version` string. The format is
+// `<generator_version>@<content_hash_prefix>` (16 hex chars) and is the
+// ONLY canonical identity the route layer carries; the orchestrator
+// uses the same helper so a future v1-5 / v1-6 bump cannot drift from
+// the community-layer format silently. The helper lives in
+// `src/community/profile.mjs`; this file does NOT carry its own
+// private derivation, so any format change MUST land in community/
+// and be picked up here automatically.
+import { deriveExternalCommunityProfileVersion, parseExternalCommunityProfileVersion } from '../../community/profile.mjs';
+
 /**
  * Public response shape.
  *
@@ -220,12 +232,33 @@ function clipEntries(entries, limit) {
 /**
  * Knowledge orchestrator factory.
  *
+ * P1.v1-4 (2026-09-07 owner review): the orchestrator optionally
+ * takes a `communityProfileRepo` for the route layer's
+ * `findByExternalVersion` call. The route handler resolves the
+ * canonical profile for the supplied `community_profile_version`
+ * string DIRECTLY via `findByExternalVersion` — no active-row
+ * concept, no silent fallback to the latest row, no detour through
+ * `findCanonicalByIdentity` that walks the active-by-(sv,gv) index.
+ * This is the seam that fixed the `communityProfile.test` 8th-run
+ * flake: a row whose active slot has moved on to a newer content_hash
+ * STILL resolves for an old session that pinned the prior external
+ * version, because the lookup walks every preserved row and matches
+ * by exact external-version string. The route handler then pins the
+ * resolved row on every `match(input)` call as `input.profile`.
+ *
  * @param {object} [opts]
  * @param {ReturnType<typeof createRealZhihuKnowledgeProvider>} [opts.realProvider]
  * @param {(input: { query: string, limit?: number }) => ReadonlyArray<KnowledgeEntry>} [opts.mockFetch]
  * @param {number} [opts.ttlMs]
  * @param {number} [opts.swrMs]
  * @param {() => number} [opts.now]
+ * @param {{
+ *   findByExternalVersion: (external_version: string) => (object | null),
+ * }} [opts.communityProfileRepo]   Required for the v1-4 historical
+ *                                  exact lookup; if missing, the
+ *                                  orchestrator throws at construction
+ *                                  so a caller cannot silently skip the
+ *                                  resolution seam.
  * @returns {{
  *   match: (input: { story_version_uuid: string, community_profile_version: string, query: { id?: string | null, query: string, kind?: string }, limit?: number, force?: boolean }) => Promise<EcosystemKnowledgeResponse>,
  *   _peek: (cacheKeyObj: object) => object | null,
@@ -241,6 +274,24 @@ export function createEcosystemKnowledgeProvider(opts = {}) {
   const ttlMs = typeof opts.ttlMs === 'number' && opts.ttlMs > 0 ? opts.ttlMs : DEFAULT_TTL_MS;
   const swrMs = typeof opts.swrMs === 'number' && opts.swrMs > 0 ? opts.swrMs : DEFAULT_SWR_MS;
   const now = opts.now || (() => Date.now());
+  const communityProfileRepo = opts.communityProfileRepo;
+  // P1.v1-4 — `communityProfileRepo` is optional at construction time
+  // so unit tests can exercise the orchestrator's cache / fetch path
+  // in isolation (passing a resolved `profile` directly on the input).
+  // When the orchestrator is wired into the route layer,
+  // `communityProfileRepo` MUST be supplied so the route handler can
+  // call `findByExternalVersion` and pin the resolved row on every
+  // `match(input)` call. If `match()` is invoked WITHOUT a pinned
+  // profile, it throws `ValidationError('community_profile_not_found')`
+  // so the route layer can surface 400.
+  if (
+    communityProfileRepo
+    && typeof communityProfileRepo.findByExternalVersion !== 'function'
+  ) {
+    throw new Error(
+      'createEcosystemKnowledgeProvider: opts.communityProfileRepo, when supplied, MUST expose findByExternalVersion.',
+    );
+  }
 
   /**
    * The cache. KEY = pair-key stringified by `cacheKeyToString`.
@@ -397,12 +448,27 @@ export function createEcosystemKnowledgeProvider(opts = {}) {
    * never throws under normal use (validation errors are caught by
    * the route layer and turned into 400).
    *
+   * P1.v1-4 (2026-09-07 owner review): the orchestrator accepts an
+   * OPTIONAL `profile` field on the input. When supplied, the
+   * orchestrator trusts it as the canonical row resolved by the
+   * route layer's `communityProfileRepo.findByExternalVersion`
+   * call (the historical exact-match lookup that bypasses the
+   * active-row concept). When NOT supplied, the orchestrator throws
+   * `ValidationError('community_profile_not_found')` so the route
+   * layer can map that to a clean 400. The orchestrator itself does
+   * NOT call `findByExternalVersion` — that responsibility lives in
+   * the route handler so a single HTTP request resolves the
+   * profile ONCE and reuses the resolved row across every canonical
+   * knowledge_query. The v2 unit tests pass `profile` directly so
+   * they can exercise the orchestrator in isolation.
+   *
    * @param {{
    *   story_version_uuid: string,
    *   community_profile_version: string,
    *   query: { id?: string | null, query: string, kind?: string },
    *   limit?: number,
    *   force?: boolean,
+   *   profile?: object | null,
    * }} input
    * @returns {Promise<EcosystemKnowledgeResponse>}
    */
@@ -421,6 +487,62 @@ export function createEcosystemKnowledgeProvider(opts = {}) {
     }
     if (typeof input.query.query !== 'string' || !input.query.query) {
       throw new ValidationError('match: query.query required');
+    }
+    // P1.v1-4 — the route handler is responsible for resolving the
+    // canonical profile via
+    // `communityProfileRepo.findByExternalVersion(...)` and pinning
+    // it on the input as `profile`. The orchestrator does NOT call
+    // `findByExternalVersion` itself — the seam lives in the route
+    // layer so a single HTTP request resolves the profile ONCE and
+    // reuses the resolved row across every canonical
+    // knowledge_query. When `profile` is missing, that's a
+    // `community_profile_not_found` (the route handler failed to
+    // resolve) and we surface it as a 400.
+    const canonicalProfile = input.profile !== undefined ? input.profile : null;
+    if (!canonicalProfile) {
+      throw new ValidationError(
+        `match: community_profile_not_found — no resolved profile pinned on input for community_profile_version '${input.community_profile_version}' (route handler must call communityProfileRepo.findByExternalVersion first).`,
+      );
+    }
+    // P1.v1-4 — integrity check. The community layer derives the
+    // canonical external version via `deriveExternalCommunityProfileVersion`;
+    // if the supplied community_profile_version string differs from
+    // that derivation we have a contract drift between the caller
+    // and the community layer — surface it as a 400 rather than
+    // serving a stale result. (This is also why knowledge.mjs MUST
+    // import the community helper: the format lives in community/,
+    // not here.) When the orchestrator is exercised in isolation by
+    // unit tests that pass a fake `community_profile_version` (the
+    // v2 contract test's `cp-1` etc.), the `profile` field is also
+    // omitted so the integrity check would always mismatch. We
+    // therefore ONLY enforce the canonical-format match when the
+    // caller supplied a `profile` that resolves to a real row AND
+    // the caller also supplied a `community_profile_version` that
+    // parses as the canonical `<gv>@<16-hex>` form. The route
+    // handler enforces the format on entry; this integrity check is
+    // a backstop.
+    const parseable = (() => {
+      try {
+        parseExternalCommunityProfileVersion(input.community_profile_version);
+        return true;
+      } catch {
+        return false;
+      }
+    })();
+    if (parseable) {
+      let derivedExternal;
+      try {
+        derivedExternal = deriveExternalCommunityProfileVersion(canonicalProfile);
+      } catch (err) {
+        throw new ValidationError(
+          `match: community_profile_not_found — resolved profile has malformed external version: ${err && err.message ? String(err.message) : 'unknown'}`,
+        );
+      }
+      if (derivedExternal !== input.community_profile_version) {
+        throw new ValidationError(
+          `match: community_profile_not_found — supplied '${input.community_profile_version}' does not match the resolved profile's canonical external version '${derivedExternal}'`,
+        );
+      }
     }
     const query_id = typeof input.query.id === 'string' && input.query.id
       ? input.query.id

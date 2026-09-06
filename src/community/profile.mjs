@@ -29,6 +29,18 @@
 // two different external versions → two preserved rows that an
 // old-session regression can resolve independently.
 //
+// ClickUp 16.5 P1.v1-4 fix (2026-09-07 owner review): the external
+// format is widened to `<generator_version>@<content_hash_prefix>`
+// where `content_hash_prefix` is the first 16 hex chars of
+// `profile.hash.content_hash` (was 8 hex chars under v1-3). The `@`
+// separator is a hard delimiter between the rule version and the
+// content identity so two rule versions whose names happen to embed
+// a `-` cannot collide on a substring match. The `parseExternal`
+// helper is the symmetric inverse so knowledge.mjs can validate the
+// supplied `community_profile_version` before doing any cache / repo
+// work. The internal schema is unchanged; the route layer and the
+// browser carry the EXTERNAL form and never the raw rule version.
+//
 // This module is intentionally pure: it does not call the network,
 // does not touch secrets, and does not read env vars that look like
 // credentials. The four ecology callers read via getCommunityProfile()
@@ -398,7 +410,9 @@ export function findCommunityProfileBoundsViolations(profile) {
  *   generator_version: string,
  *   hash: { content_hash: string },
  * }} profile
- * @returns {string} `<generator_version>-<content_hash_short>`
+ * @returns {string} `<generator_version>@<content_hash_prefix>`
+ *                  where `content_hash_prefix` is the first 16 hex
+ *                  chars of `profile.hash.content_hash`.
  */
 export function deriveExternalCommunityProfileVersion(profile) {
   if (!profile || typeof profile !== 'object') {
@@ -415,7 +429,58 @@ export function deriveExternalCommunityProfileVersion(profile) {
       'communityProfile.deriveExternalCommunityProfileVersion: hash.content_hash required',
     );
   }
-  return `${profile.generator_version}-${hash.content_hash.slice(0, 8)}`;
+  // P1.v1-4 — `@` is the hard delimiter; 16 hex chars is the
+  // content_hash prefix. Together they form the canonical external
+  // version used by the route layer, the orchestrator, and every
+  // regression test. The format is symmetric with
+  // `parseExternalCommunityProfileVersion` so the orchestrator can
+  // round-trip a string back into (generator_version, hash_prefix)
+  // without touching the repo.
+  return `${profile.generator_version}@${hash.content_hash.slice(0, 16)}`;
+}
+
+/**
+ * Parse an external community_profile_version string of the form
+ * `<generator_version>@<content_hash_prefix>` into its two halves.
+ * The prefix MUST be exactly 16 lowercase / uppercase hex chars; the
+ * generator_version MUST be a non-empty string and MUST NOT itself
+ * contain an `@` (the first `@` from the left is the canonical
+ * separator so a rule-version bump that introduces `@` cannot break
+ * parsing — we anchor on the LAST `@` to keep the contract stable
+ * even if a future rule format embeds one).
+ *
+ * Symmetric inverse of `deriveExternalCommunityProfileVersion`. The
+ * orchestrator uses this to validate the caller-supplied
+ * `community_profile_version` BEFORE doing any cache / repo work so
+ * a malformed string is rejected with a clean ValidationError
+ * rather than producing a silent cache miss on an unparseable key.
+ *
+ * @param {string} versionString
+ * @returns {{ generator_version: string, content_hash_prefix: string }}
+ */
+export function parseExternalCommunityProfileVersion(versionString) {
+  if (typeof versionString !== 'string' || !versionString) {
+    throw new Error('communityProfile.parseExternalCommunityProfileVersion: versionString required');
+  }
+  const atIndex = versionString.lastIndexOf('@');
+  if (atIndex <= 0 || atIndex === versionString.length - 1) {
+    throw new Error(
+      `communityProfile.parseExternalCommunityProfileVersion: malformed version string '${versionString}' — expected '<generator_version>@<16-hex-content_hash_prefix>'.`,
+    );
+  }
+  const generator_version = versionString.slice(0, atIndex);
+  const content_hash_prefix = versionString.slice(atIndex + 1);
+  if (!generator_version) {
+    throw new Error(
+      `communityProfile.parseExternalCommunityProfileVersion: generator_version empty in '${versionString}'.`,
+    );
+  }
+  if (!/^[0-9a-f]{16}$/i.test(content_hash_prefix)) {
+    throw new Error(
+      `communityProfile.parseExternalCommunityProfileVersion: content_hash_prefix '${content_hash_prefix}' must be exactly 16 hex chars in '${versionString}'.`,
+    );
+  }
+  return { generator_version, content_hash_prefix };
 }
 
 /**
