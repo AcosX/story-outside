@@ -211,6 +211,75 @@ export function setCommunityProfile({ profileRepository, profile }) {
   return profileRepository.setCommunityProfile(profile);
 }
 
+/**
+ * ClickUp 16.5 P1.v2 server-authoritative canonical lookup. The route
+ * layer must resolve a single profile row from the
+ * (story_uuid, story_version_uuid, community_profile_version) tuple
+ * and use that profile's `knowledge_queries` to drive the matcher.
+ * The caller is NEVER allowed to supply `knowledge_queries` /
+ * `topic_id` / `topic_label` / `topic` / `theme` / `subject` — those
+ * fields are caller-coerced and would let the AI pick its own
+ * subject matter, defeating the whole "community profile owns the
+ * subject list" contract.
+ *
+ * Returns the canonical row or `null` when the identity is invalid.
+ * The route layer maps `null` to a typed 400 (`community_profile_not_found`
+ * / `community_profile_version_mismatch` / `story_version_mismatch`)
+ * based on the failure shape — see src/server.mjs POST
+ * /v1/ecosystem/knowledge.
+ *
+ * @param {object} input
+ * @param {CommunityProfileRepository} input.profileRepository
+ * @param {string} input.story_uuid                          UUID, optional but recommended.
+ * @param {string} input.story_version_uuid                  UUID, required.
+ * @param {string} [input.community_profile_version]         Optional. When supplied,
+ *                                                            narrows to the row whose
+ *                                                            `generator_version` equals
+ *                                                            this string. The mismatch
+ *                                                            path returns `null`.
+ * @returns {StoryCommunityProfile | null}
+ */
+export function findCanonicalByIdentity({
+  profileRepository,
+  story_uuid,
+  story_version_uuid,
+  community_profile_version,
+}) {
+  if (!profileRepository) {
+    throw new Error('findCanonicalByIdentity: profileRepository required');
+  }
+  if (typeof story_version_uuid !== 'string' || !story_version_uuid) {
+    throw new Error('findCanonicalByIdentity: story_version_uuid required');
+  }
+  if (typeof story_uuid === 'string' && story_uuid) {
+    if (typeof community_profile_version === 'string' && community_profile_version) {
+      return profileRepository.findCanonicalByIdentity({
+        story_uuid,
+        story_version_uuid,
+        community_profile_version,
+      });
+    }
+    // story_uuid supplied but no community_profile_version — fall back
+    // to the most recent active row for that story_version, but still
+    // gate it on the supplied story_uuid so a wrong pair is rejected.
+    return profileRepository.findCanonicalByIdentity({
+      story_uuid,
+      story_version_uuid,
+      community_profile_version: null,
+    });
+  }
+  if (typeof community_profile_version === 'string' && community_profile_version) {
+    return profileRepository.findCanonicalByIdentity({
+      story_version_uuid,
+      community_profile_version,
+    });
+  }
+  return profileRepository.findCanonicalByIdentity({
+    story_version_uuid,
+    community_profile_version: null,
+  });
+}
+
 export {
   buildCommunityProfileFromSeed,
   buildStubCommunityProfile,

@@ -36,6 +36,7 @@ export {
 
 export {
   ensureCommunityProfile,
+  findCanonicalByIdentity,
   getCommunityProfile,
   setCommunityProfile,
 } from './service.mjs';

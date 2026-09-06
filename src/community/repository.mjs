@@ -137,6 +137,12 @@ function rejectForbiddenKeys(value, path) {
  * @property {(story_version_uuid: string, generator_version: string) => StoryCommunityProfile | null} findActiveByStoryVersionAndGenerator
  * @property {(profile_uuid: string) => StoryCommunityProfile | null} findByUuid
  * @property {(input: { story_version_uuid: string }) => StoryCommunityProfile[]} listByStoryVersion
+ * @property {(input: { story_uuid?: string, story_version_uuid: string, community_profile_version?: string | null }) => StoryCommunityProfile | null} findCanonicalByIdentity
+ *          ClickUp 16.5 P1.v2 — server-authoritative lookup that joins
+ *          (story_uuid, story_version_uuid, community_profile_version)
+ *          into one canonical row. Caller-supplied knowledge_queries /
+ *          topic_id / topic_label / topic / theme / subject are NEVER
+ *          consulted; the route layer only ever picks a single row.
  * @property {(input: StoryCommunityProfile) => StoryCommunityProfile} setCommunityProfile
  * @property {() => { profile_count: number }} stats
  * @property {() => void} _resetForTests
@@ -220,6 +226,64 @@ export function createInMemoryCommunityProfileRepository() {
     findByUuid(profile_uuid) {
       if (typeof profile_uuid !== 'string') return null;
       return state.profiles.get(profile_uuid) || null;
+    },
+    findCanonicalByIdentity(input) {
+      // ClickUp 16.5 P1.v2 server-side canonical lookup. The identity
+      // tuple is (story_uuid, story_version_uuid, community_profile_version).
+      // The route layer is NEVER allowed to feed `knowledge_queries` /
+      // `topic_id` / `topic_label` / `theme` / `subject` — those fields
+      // are caller-coerced and we MUST reject them at the seam so the
+      // AI cannot pick its own subject matter.
+      if (!input || typeof input !== 'object') {
+        throw new Error('communityRepository.findCanonicalByIdentity: input required');
+      }
+      assertUuid('story_version_uuid', input.story_version_uuid);
+      if (typeof input.story_uuid === 'string' && input.story_uuid) {
+        assertUuid('story_uuid', input.story_uuid);
+      }
+      // If the caller supplied a story_uuid, it MUST match the row's
+      // story_uuid — defence in depth so a confused client cannot mix
+      // versions across stories.
+      const targetVersion = input.story_version_uuid;
+      const targetStory = typeof input.story_uuid === 'string' && input.story_uuid
+        ? input.story_uuid
+        : null;
+      const requestedProfileVersion = typeof input.community_profile_version === 'string'
+        && input.community_profile_version
+        ? input.community_profile_version
+        : null;
+      // 1. Try the narrow (story_version_uuid, generator_version) row.
+      //    When a community_profile_version is supplied we MUST hit this
+      //    row or the identity is wrong (mismatch → null → 400
+      //    community_profile_version_mismatch).
+      if (requestedProfileVersion !== null) {
+        const exact = state.profiles;
+        for (const row of exact.values()) {
+          if (row.story_version_uuid !== targetVersion) continue;
+          if (row.generator_version !== requestedProfileVersion) continue;
+          if (targetStory && row.story_uuid !== targetStory) return null;
+          return row;
+        }
+        // No exact row — caller is lying about community_profile_version.
+        return null;
+      }
+      // 2. No community_profile_version supplied → fall back to the
+      //    most recent active row for this story_version (the
+      //    service-layer behaviour mirrors `getCommunityProfile`).
+      let best = null;
+      for (const row of state.profiles.values()) {
+        if (row.story_version_uuid !== targetVersion) continue;
+        if (targetStory && row.story_uuid !== targetStory) continue;
+        if (best === null) { best = row; continue; }
+        if (row.generated_at > best.generated_at) best = row;
+        if (
+          row.generated_at === best.generated_at
+          && row.generator_version > best.generator_version
+        ) {
+          best = row;
+        }
+      }
+      return best;
     },
     listByStoryVersion(input) {
       if (!input || typeof input !== 'object') {
