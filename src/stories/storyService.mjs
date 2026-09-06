@@ -272,9 +272,16 @@ export async function importStoryAndEnsureCache({
     opening_cache_status: ensured.cache.status,
     cache_reused: ensured.reused,
   };
-  // ClickUp 16.5 P1.1 (2026-09-07, PR #25): surface the canonical
-  // community_profile_version (= generator_version) so the public
+  // ClickUp 16.5 P1.1 + P1.v1-3 (2026-09-07, PR #25): surface the
+  // canonical external `community_profile_version` so the public
   // /api/sessions bootstrap response can echo it to the browser.
+  // The external form is `<generator_version>-<content_hash_short>`
+  // (see deriveExternalCommunityProfileVersion in
+  // src/community/profile.mjs) so two preserved rows with the same
+  // raw rule version but different content hashes yield two
+  // different external versions — that is what lets the route layer
+  // resolve old-session regressions that pinned a prior external
+  // version even after the active row has moved on.
   // The browser hands the value straight into the knowledge
   // orchestrator's cache_key so the player-side identity stays
   // canonical end-to-end (no missing_identifiers → no degraded
@@ -282,13 +289,18 @@ export async function importStoryAndEnsureCache({
   if (profileRepository) {
     try {
       const { getCommunityProfile: _getProfile } = await import('../community/service.mjs');
+      const { deriveExternalCommunityProfileVersion: _deriveExternal } = await import('../community/profile.mjs');
       const profile = _getProfile({
         profileRepository,
         story_version_uuid: imported.story_version_uuid,
       });
-      if (profile && profile.generator_version) {
-        result.community_profile_version = profile.generator_version;
+      if (profile && profile.generator_version && profile.hash && profile.hash.content_hash) {
+        result.community_profile_version = _deriveExternal(profile);
         result.community_profile_uuid = profile.profile_uuid;
+        // P1.v1-3 — surface the raw rule version too so an operator
+        // can still diagnose "is the row on rules/1 or rules/2?"
+        // without joining the schema field back from content_hash.
+        result.community_profile_generator_version = profile.generator_version;
       }
     } catch { /* swallow — caller already has the cache row */ }
   }

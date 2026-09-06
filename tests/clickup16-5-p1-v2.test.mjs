@@ -64,6 +64,7 @@ import {
 
 import {
   createInMemoryCommunityProfileRepository,
+  deriveExternalCommunityProfileVersion,
   seedCommunityProfiles,
 } from '../src/community/index.mjs';
 
@@ -73,7 +74,44 @@ import { createSeededRepository } from '../src/stories/fixture.mjs';
 
 const CAFE_RAIN_STORY_UUID = '11111111-1111-4111-8111-111111111111';
 const CAFE_RAIN_VERSION_UUID = '21111111-1111-4111-8111-111111111111';
-const CAFE_RAIN_PROFILE_VERSION = 'community-profile@community-profile-rules/1';
+// P1.v1-3 — the handler identity uses the EXTERNAL derived form
+// `<generator_version>-<content_hash_short>`, NOT the raw rule version.
+// The seed in fixtures.mjs is built deterministically from the cafe-rain
+// story_version_checksum, so we resolve the external version via
+// `cafeRainExternalVersion()` and reuse it across all body / lookup
+// calls so the test mirrors the browser ↔ server contract end-to-end.
+const CAFE_RAIN_GENERATOR_VERSION = 'community-profile@community-profile-rules/1';
+
+/** @type {{ externalVersion: string, profile: object } | null} */
+let CAFE_RAIN_SEED_CACHE = null;
+
+/**
+ * Resolve (and cache) the seeded cafe-rain profile + its external
+ * community_profile_version. The cafe-rain seed is fully deterministic
+ * so caching once is safe and mirrors how a real session pins the
+ * identity string at bootstrap.
+ */
+function cafeRainSeed() {
+  if (CAFE_RAIN_SEED_CACHE) return CAFE_RAIN_SEED_CACHE;
+  const { repository } = createSeededRepository();
+  const profileRepo = createInMemoryCommunityProfileRepository();
+  seedCommunityProfiles(repository, profileRepo);
+  const profile = profileRepo.findActiveByStoryVersion(CAFE_RAIN_VERSION_UUID);
+  if (!profile) throw new Error('seed cafe-rain profile missing');
+  CAFE_RAIN_SEED_CACHE = {
+    repository,
+    profileRepo,
+    profile,
+    externalVersion: deriveExternalCommunityProfileVersion(profile),
+    generatorVersion: profile.generator_version,
+  };
+  return CAFE_RAIN_SEED_CACHE;
+}
+
+/** External community_profile_version the browser / handler carry for cafe-rain. */
+function cafeRainExternalVersion() {
+  return cafeRainSeed().externalVersion;
+}
 
 const FORBIDDEN_FIELDS = [
   'knowledge_queries',
@@ -127,7 +165,7 @@ test('forbidden_field: knowledge_queries supplied → 400', async () => {
     const res = await post(`${ctx.baseUrl}/v1/ecosystem/knowledge`, {
       story_uuid: CAFE_RAIN_STORY_UUID,
       story_version_uuid: CAFE_RAIN_VERSION_UUID,
-      community_profile_version: CAFE_RAIN_PROFILE_VERSION,
+      community_profile_version: cafeRainExternalVersion(),
       knowledge_queries: [{ id: 'fake', query: 'anything', kind: 'fake' }],
     });
     assert.equal(res.status, 400);
@@ -146,7 +184,7 @@ test('forbidden_field: each banned free-form field is rejected', async () => {
       const payload = {
         story_uuid: CAFE_RAIN_STORY_UUID,
         story_version_uuid: CAFE_RAIN_VERSION_UUID,
-        community_profile_version: CAFE_RAIN_PROFILE_VERSION,
+        community_profile_version: cafeRainExternalVersion(),
         [field]: field === 'knowledge_queries' ? [{ id: 'x', query: 'x', kind: 'web' }] : 'x',
       };
       const res = await post(`${ctx.baseUrl}/v1/ecosystem/knowledge`, payload);
@@ -204,7 +242,7 @@ test('story_version_mismatch → 400 (right version, wrong story)', async () => 
     const res = await post(`${ctx.baseUrl}/v1/ecosystem/knowledge`, {
       story_uuid: '00000000-0000-4000-8000-deadbeefdead',
       story_version_uuid: CAFE_RAIN_VERSION_UUID,
-      community_profile_version: CAFE_RAIN_PROFILE_VERSION,
+      community_profile_version: cafeRainExternalVersion(),
     });
     assert.equal(res.status, 400);
     const body = await res.json();
@@ -222,7 +260,7 @@ test('clean body + canonical identity → 200 with canonical queries', async () 
     const res = await post(`${ctx.baseUrl}/v1/ecosystem/knowledge`, {
       story_uuid: CAFE_RAIN_STORY_UUID,
       story_version_uuid: CAFE_RAIN_VERSION_UUID,
-      community_profile_version: CAFE_RAIN_PROFILE_VERSION,
+      community_profile_version: cafeRainExternalVersion(),
     });
     assert.equal(res.status, 200);
     const body = await res.json();
@@ -391,7 +429,7 @@ test('real regression: cafe-rain canonical identity → 2 distinct bundles', asy
     const res = await post(`${ctx.baseUrl}/v1/ecosystem/knowledge`, {
       story_uuid: CAFE_RAIN_STORY_UUID,
       story_version_uuid: CAFE_RAIN_VERSION_UUID,
-      community_profile_version: CAFE_RAIN_PROFILE_VERSION,
+      community_profile_version: cafeRainExternalVersion(),
     });
     assert.equal(res.status, 200);
     const body = await res.json();
@@ -420,7 +458,7 @@ test('real regression: cafe-rain canonical identity → 2 distinct bundles', asy
     const res2 = await post(`${ctx.baseUrl}/v1/ecosystem/knowledge`, {
       story_uuid: CAFE_RAIN_STORY_UUID,
       story_version_uuid: CAFE_RAIN_VERSION_UUID,
-      community_profile_version: CAFE_RAIN_PROFILE_VERSION,
+      community_profile_version: cafeRainExternalVersion(),
     });
     assert.equal(res2.status, 200);
     const body2 = await res2.json();
@@ -443,12 +481,12 @@ test('communityProfileService.findCanonicalByIdentity resolves the seeded profil
   const row = profileRepo.findCanonicalByIdentity({
     story_uuid: CAFE_RAIN_STORY_UUID,
     story_version_uuid: CAFE_RAIN_VERSION_UUID,
-    community_profile_version: CAFE_RAIN_PROFILE_VERSION,
+    community_profile_version: cafeRainExternalVersion(),
   });
   assert.ok(row);
   assert.equal(row.story_uuid, CAFE_RAIN_STORY_UUID);
   assert.equal(row.story_version_uuid, CAFE_RAIN_VERSION_UUID);
-  assert.equal(row.generator_version, CAFE_RAIN_PROFILE_VERSION);
+  assert.equal(row.generator_version, CAFE_RAIN_GENERATOR_VERSION);
   // Knowledge queries carry the canonical query string — the
   // orchestrator consumes them as-is.
   assert.equal(row.knowledge_queries[0].query, '雨夜咖啡馆 设定 百科');

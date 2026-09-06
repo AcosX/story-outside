@@ -23,11 +23,24 @@
 //     with two checksums (rare, but possible when content_payload is
 //     corrected) keeps separate profiles.
 //
+// ClickUp 16.5 P1.v1-3 fix (2026-09-07 owner review): the handler
+// identity is the DERIVED external
+// `community_profile_version = <generator_version>-<content_hash_short>`,
+// NOT the raw `generator_version`. `findCanonicalByIdentity` walks
+// every preserved row for the supplied story_version, computes each
+// row's external version, and matches the requested external version
+// against those — so a row superseded by a newer content_hash stays
+// resolvable for old sessions that still pin the prior external
+// version. There is NO silent fallback to "the latest row": an exact
+// external-version lookup either returns the matching row or returns
+// `null` so the route layer can report `community_profile_not_found`.
+//
 // The module does not read env vars that look like credentials and
 // does not call any external API.
 
 import {
   assertCommunityProfileShape,
+  deriveExternalCommunityProfileVersion,
   findCommunityProfileBoundsViolations,
 } from './profile.mjs';
 
@@ -228,12 +241,14 @@ export function createInMemoryCommunityProfileRepository() {
       return state.profiles.get(profile_uuid) || null;
     },
     findCanonicalByIdentity(input) {
-      // ClickUp 16.5 P1.v2 server-side canonical lookup. The identity
+      // ClickUp 16.5 P1.v1-3 server-side canonical lookup. The identity
       // tuple is (story_uuid, story_version_uuid, community_profile_version).
-      // The route layer is NEVER allowed to feed `knowledge_queries` /
-      // `topic_id` / `topic_label` / `theme` / `subject` — those fields
-      // are caller-coerced and we MUST reject them at the seam so the
-      // AI cannot pick its own subject matter.
+      // `community_profile_version` here is the EXTERNAL DERIVED form
+      // `<generator_version>-<content_hash_short>`, NOT the raw rule
+      // version. The route layer is NEVER allowed to feed
+      // `knowledge_queries` / `topic_id` / `topic_label` / `theme` /
+      // `subject` — those fields are caller-coerced and we MUST reject
+      // them at the seam so the AI cannot pick its own subject matter.
       if (!input || typeof input !== 'object') {
         throw new Error('communityRepository.findCanonicalByIdentity: input required');
       }
@@ -248,27 +263,45 @@ export function createInMemoryCommunityProfileRepository() {
       const targetStory = typeof input.story_uuid === 'string' && input.story_uuid
         ? input.story_uuid
         : null;
-      const requestedProfileVersion = typeof input.community_profile_version === 'string'
+      const requestedExternalVersion = typeof input.community_profile_version === 'string'
         && input.community_profile_version
         ? input.community_profile_version
         : null;
-      // 1. Try the narrow (story_version_uuid, generator_version) row.
-      //    When a community_profile_version is supplied we MUST hit this
-      //    row or the identity is wrong (mismatch → null → 400
-      //    community_profile_version_mismatch).
-      if (requestedProfileVersion !== null) {
-        const exact = state.profiles;
-        for (const row of exact.values()) {
+      // 1. Exact external-version match across every preserved row for
+      //    the story_version. Two preserved rows with the same
+      //    generator_version but a different content_hash (curated
+      //    fixture edit, retry-with-different-seed, etc.) carry
+      //    different external versions, so a session that pinned the
+      //    OLD external version keeps resolving the OLD row even after
+      //    the active row has moved on to a newer one. There is NO
+      //    silent fallback to "the latest row" — if the external
+      //    version string does not match, return `null` so the route
+      //    layer surfaces 400 `community_profile_not_found` /
+      //    `community_profile_version_mismatch`.
+      if (requestedExternalVersion !== null) {
+        let exactMatch = null;
+        for (const row of state.profiles.values()) {
           if (row.story_version_uuid !== targetVersion) continue;
-          if (row.generator_version !== requestedProfileVersion) continue;
-          if (targetStory && row.story_uuid !== targetStory) return null;
-          return row;
+          if (targetStory && row.story_uuid !== targetStory) {
+            // story_uuid supplied but the row's story_uuid differs —
+            // do NOT return a hit; keep scanning for an exact
+            // external-version match, and if none found return null.
+            continue;
+          }
+          let rowExternal;
+          try {
+            rowExternal = deriveExternalCommunityProfileVersion(row);
+          } catch {
+            continue;
+          }
+          if (rowExternal !== requestedExternalVersion) continue;
+          exactMatch = row;
+          break;
         }
-        // No exact row — caller is lying about community_profile_version.
-        return null;
+        return exactMatch;
       }
-      // 2. No community_profile_version supplied → fall back to the
-      //    most recent active row for this story_version (the
+      // 2. No external community_profile_version supplied → fall back
+      //    to the most recent active row for this story_version (the
       //    service-layer behaviour mirrors `getCommunityProfile`).
       let best = null;
       for (const row of state.profiles.values()) {

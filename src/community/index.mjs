@@ -18,6 +18,7 @@ export {
   buildStubCommunityProfile,
   COMMUNITY_PROFILE_BOUNDS,
   COMMUNITY_PROFILE_GENERATOR_VERSION,
+  deriveExternalCommunityProfileVersion,
   findCommunityProfileBoundsViolations,
 } from './profile.mjs';
 

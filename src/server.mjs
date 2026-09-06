@@ -30,6 +30,7 @@ import {
 } from './stories/index.mjs';
 import {
   createInMemoryCommunityProfileRepository,
+  deriveExternalCommunityProfileVersion,
   findCanonicalByIdentity,
   seedCommunityProfiles,
 } from './community/index.mjs';
@@ -2076,6 +2077,19 @@ async function handleRequest(req, res) {
   // -----------------------------------------------------------------
   // ClickUp 16.5 — public /v1/ecosystem/knowledge façade (player-facing).
   //
+  // P1.v1-3 fix (2026-09-07 owner review): the
+  // `community_profile_version` carried in the body is the EXTERNAL
+  // DERIVED form `<generator_version>-<content_hash_short>` (see
+  // `deriveExternalCommunityProfileVersion` in
+  // src/community/profile.mjs). The internal schema keeps
+  // `generator_version` as the raw rule version; the external
+  // derivation lives next to it and is the ONLY identity string the
+  // route layer / browser treats as canonical. Two preserved rows
+  // with the same `generator_version` but a different `content_hash`
+  // carry different external versions, so an old-session regression
+  // pinning the prior external version keeps resolving the prior row
+  // even after the active row has moved on.
+  //
   // P1.v2 fix (2026-09-07 ChatGPT review): the surface is
   // SERVER-AUTHORITATIVE. The handler accepts ONLY the three identity
   // fields (story_uuid, story_version_uuid, community_profile_version)
@@ -2209,12 +2223,15 @@ async function handleRequest(req, res) {
     }
     if (!canonicalProfile) {
       // Distinguish the failure shape so the operator can debug.
-      // 1) community_profile_version supplied but no row matches →
-      //    `community_profile_version_mismatch`.
-      // 2) story_uuid supplied but no row matches → `story_version_mismatch`
-      //    (the only stable id the client has is story_version_uuid, so
-      //    a mismatch with story_uuid is reported as a story_version-level
-      //    failure with a precise reason).
+      // P1.v1-3 — the supplied `community_profile_version` is the
+      // EXTERNAL derived form `<generator_version>-<content_hash_short>`,
+      // NOT the raw rule version. The lookup walks every preserved
+      // row and matches the derived external form, so an exact
+      // non-match means `community_profile_not_found` /
+      // `community_profile_version_mismatch` per the failure shape.
+      // There is no silent fallback to "the latest row" — old
+      // sessions pin the prior external version and must continue to
+      // resolve it.
       const allRows = communityProfileRepo.listByStoryVersion({
         story_version_uuid: body.story_version_uuid,
       });
@@ -2226,20 +2243,24 @@ async function handleRequest(req, res) {
           field: 'story_version_uuid',
         });
       }
-      // Version has rows but the supplied community_profile_version
+      // Version has rows but the supplied external community_profile_version
       // (and/or story_uuid) didn't match.
-      const hasVersionMatch = allRows.some(
-        (row) => row.generator_version === body.community_profile_version,
-      );
-      if (!hasVersionMatch) {
+      const hasExternalVersionMatch = allRows.some((row) => {
+        try {
+          return deriveExternalCommunityProfileVersion(row) === body.community_profile_version;
+        } catch {
+          return false;
+        }
+      });
+      if (!hasExternalVersionMatch) {
         return jsonResponse(res, 400, {
           error: 'community_profile_version_mismatch',
-          message: 'Supplied community_profile_version does not match any row for this story_version.',
+          message: 'Supplied community_profile_version does not match any preserved row for this story_version.',
           field: 'community_profile_version',
         });
       }
-      // Rows exist and the profile version matches — but the story_uuid
-      // differs.
+      // Rows exist and an external-version match was found — but the
+      // story_uuid differs from the matching row's story_uuid.
       return jsonResponse(res, 400, {
         error: 'story_version_mismatch',
         message: 'Supplied story_uuid does not match the row\'s story_uuid.',
@@ -2389,4 +2410,4 @@ if (isMainModule) {
   });
 }
 
-export { server, DEMO_FLAG, DEV_FLAG, classifyProviderError, sessionError, storyRepo, storyFixtures, listFixtureStorySlugs };
+export { server, DEMO_FLAG, DEV_FLAG, classifyProviderError, sessionError, storyRepo, communityProfileRepo, storyFixtures, listFixtureStorySlugs };
