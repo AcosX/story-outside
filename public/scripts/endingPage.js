@@ -39,8 +39,20 @@ const STATE = {
 
 // ---------- API helper ----------
 
+// ClickUp 16.3 P1 v2 (ChatGPT 2026-09-07 02:23 review of PR #22):
+//   The HMAC-signed `story_outside_session` cookie is the ONLY
+//   authoritative caller identity. The cookie is httpOnly so this
+//   script cannot read it; we explicitly opt in to same-origin
+//   credentials so the browser attaches it automatically on
+//   /v1/ecosystem/* and other auth-required endpoints. We NEVER
+//   read `document.cookie`, never assemble a `user_uuid`, and never
+//   resolve the owner client-side — every owner decision is made by
+//   a server-side endpoint that verifies the HMAC cookie.
 async function api(path) {
-  const res = await fetch(path, { headers: { accept: 'application/json' } });
+  const res = await fetch(path, {
+    headers: { accept: 'application/json' },
+    credentials: 'same-origin',
+  });
   let data = null;
   try { data = await res.json(); } catch { data = null; }
   if (!res.ok) {
