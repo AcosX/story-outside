@@ -70,6 +70,27 @@
 
           <section
             class="picker-block"
+            id="ecosystem-hot-module"
+            aria-labelledby="ecosystem-hot-label"
+            data-screen="ecosystem-hot"
+            data-state="loading"
+          >
+            <h2 id="ecosystem-hot-label" class="picker-label">知乎此刻热议</h2>
+            <p
+              class="ecosystem-hot-status"
+              id="ecosystem-hot-status"
+              role="status"
+              aria-live="polite"
+            >载入中…</p>
+            <ol
+              class="ecosystem-hot-list"
+              id="ecosystem-hot-list"
+              aria-label="知乎热榜"
+            ></ol>
+          </section>
+
+          <section
+            class="picker-block"
             id="role-block"
             aria-labelledby="picker-roles-label"
             hidden
@@ -193,6 +214,15 @@
       <span class="bottombar-meta">demo · 进程内会话</span>
     </footer>
 
+    <!-- ClickUp 16.4 P1.v2 fix (2026-09-07): load order is significant.
+         identity.js MUST run before player.js / homeHotModule.js so
+         the STORY_OUTSIDE_IDENTITY global is populated from
+         sessionStorage on first paint. homeHotModule.js depends on
+         identity.js for the global + event; player.js sets the
+         identity on pickStory / startStory / endingPage.
+         homeHotModule.js is independent (no import on player.js). -->
+    <script src="/scripts/identity.js"></script>
     <script type="module" src="/scripts/player.js"></script>
+    <script type="module" src="/scripts/homeHotModule.js"></script>
   </body>
 </html>

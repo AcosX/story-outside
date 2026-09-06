@@ -12,7 +12,7 @@
 //   * The forbidden-key surface (session_uuid, user_ref, …) is rejected
 //     by the repository so a buggy caller cannot smuggle session
 //     data into a supposedly public profile.
-//   * A story_version_checksum change OR a generator_version change
+//   * A story_version_checksum change OR a community_profile_version change
 //     creates a NEW profile row without overwriting the old one.
 //   * Stub profiles (for stories without a curated seed) are
 //     deterministic given the same story detail.
@@ -185,7 +185,7 @@ async function runChecks() {
 
   // ----- versioning ----------------------------------------------------
 
-  await check('generator_version change creates a NEW profile row, keeps the old one', () => {
+  await check('community_profile_version change creates a NEW profile row, keeps the old one', () => {
     const { repository } = createSeededRepository();
     const profileRepo = createInMemoryCommunityProfileRepository();
     seedCommunityProfiles(repository, profileRepo);
@@ -193,7 +193,7 @@ async function runChecks() {
     const v1 = getCommunityProfile({
       profileRepository: profileRepo,
       story_version_uuid: sv,
-      generator_version: 'community-profile@community-profile-rules/1',
+      community_profile_version: '1.0.0',
     });
     const v2 = ensureCommunityProfile({
       repository,
@@ -201,17 +201,17 @@ async function runChecks() {
       story_version_uuid: sv,
       story: MOCK_DETAILS_FOR_COMMUNITY['cafe-rain'],
       options: {
-        generator_version: 'community-profile-rules/2',
+        community_profile_version: '2.0.0',
         source: 'mock-generated',
       },
     });
     assert.ok(v1 && v2);
     assert.notEqual(v1.profile_uuid, v2.profile_uuid);
-    assert.notEqual(v1.generator_version, v2.generator_version);
+    assert.notEqual(v1.community_profile_version, v2.community_profile_version);
     // listByStoryVersion returns both rows for this story_version.
     const all = profileRepo.listByStoryVersion({ story_version_uuid: sv });
     assert.equal(all.length, 2);
-    // v2 wins as the latest active when no generator_version filter is given.
+    // v2 wins as the latest active when no community_profile_version filter is given.
     const latest = getCommunityProfile({ profileRepository: profileRepo, story_version_uuid: sv });
     assert.equal(latest.profile_uuid, v2.profile_uuid);
   });
@@ -269,7 +269,7 @@ async function runChecks() {
     // Top-level keys.
     const allowed = new Set([
       'profile_uuid', 'story_uuid', 'story_version_uuid',
-      'story_version_checksum', 'generator_version', 'generated_at',
+      'story_version_checksum', 'community_profile_version', 'generated_at',
       'source', 'locale', 'topics', 'queries', 'knowledge_queries',
       'hot_keywords', 'hash',
     ]);

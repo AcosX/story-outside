@@ -14,10 +14,13 @@
 
 export {
   assertCommunityProfileShape,
+  assertCommunityProfileVersionSemver,
   buildCommunityProfileFromSeed,
   buildStubCommunityProfile,
   COMMUNITY_PROFILE_BOUNDS,
   COMMUNITY_PROFILE_GENERATOR_VERSION,
+  COMMUNITY_PROFILE_VERSION_FORMAT_DESCRIPTION,
+  COMMUNITY_PROFILE_VERSION_PATTERN,
   findCommunityProfileBoundsViolations,
 } from './profile.mjs';
 

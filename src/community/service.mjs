@@ -5,7 +5,7 @@
 //     story_version, options })` is the single import-time entry point.
 //     When called for a story_version that already has an active
 //     profile, it returns the existing profile (idempotent). When the
-//     story_version is new OR the generator_version changed, a new
+//     story_version is new OR the community_profile_version changed, a new
 //     profile row is generated and stored. The previous row is kept.
 //   * `getCommunityProfile({ profileRepository, story_version_uuid })`
 //     is the read-side seam used by the four ecology capabilities
@@ -36,7 +36,7 @@ import {
 /**
  * @typedef {Object} CommunityProfileServiceOptions
  * @property {string} [locale]                      Default 'zh-CN'.
- * @property {string} [generator_version]           Override the rule version.
+ * @property {string} [community_profile_version]           Override the rule version.
  * @property {object} [seed]                        Hand-curated seed. When
  *                                                 supplied, the seed is used
  *                                                 verbatim (mock-fixture
@@ -53,21 +53,21 @@ import {
  * @param {object} input
  * @param {CommunityProfileRepository} input.profileRepository
  * @param {string} input.story_version_uuid
- * @param {string} [input.generator_version]   When supplied, narrows to a
+ * @param {string} [input.community_profile_version]   When supplied, narrows to a
  *                                             specific rule version. When
  *                                             omitted, returns the most
  *                                             recently generated active row.
  * @returns {StoryCommunityProfile | null}
  */
-export function getCommunityProfile({ profileRepository, story_version_uuid, generator_version }) {
+export function getCommunityProfile({ profileRepository, story_version_uuid, community_profile_version }) {
   if (!profileRepository) throw new Error('getCommunityProfile: profileRepository required');
   if (typeof story_version_uuid !== 'string') {
     throw new Error('getCommunityProfile: story_version_uuid required');
   }
-  if (typeof generator_version === 'string' && generator_version) {
+  if (typeof community_profile_version === 'string' && community_profile_version) {
     return profileRepository.findActiveByStoryVersionAndGenerator(
       story_version_uuid,
-      generator_version,
+      community_profile_version,
     );
   }
   return profileRepository.findActiveByStoryVersion(story_version_uuid);
@@ -113,9 +113,9 @@ export function ensureCommunityProfile({
   if (!version) {
     throw new Error(`ensureCommunityProfile: unknown story_version '${story_version_uuid}'`);
   }
-  const generator_version =
-    (options && options.generator_version)
-    || `${COMMUNITY_PROFILE_GENERATOR_VERSION.identifier}@${COMMUNITY_PROFILE_GENERATOR_VERSION.rules_version}`;
+  const community_profile_version =
+    (options && options.community_profile_version)
+    || COMMUNITY_PROFILE_GENERATOR_VERSION.rules_version;
   // 1. Idempotent return when an active profile already exists AND its
   //    content_hash matches what the caller would produce. When the
   //    caller passes a seed that hashes to a DIFFERENT content_hash
@@ -124,7 +124,7 @@ export function ensureCommunityProfile({
   //    explicit admin step.
   const existing = profileRepository.findActiveByStoryVersionAndGenerator(
     story_version_uuid,
-    generator_version,
+    community_profile_version,
   );
   if (existing && options && options.seed) {
     // Probe-build the would-be content so we can compare hashes
@@ -135,7 +135,7 @@ export function ensureCommunityProfile({
       story_version_checksum: version.checksum,
       locale: options.locale,
       source: options.source || 'mock-fixture',
-      generator_version,
+      community_profile_version,
       topics: options.seed.topics,
       queries: options.seed.queries,
       knowledge_queries: options.seed.knowledge_queries,
@@ -159,7 +159,7 @@ export function ensureCommunityProfile({
       story_version_checksum: version.checksum,
       locale: options.locale,
       source: (options && options.source) || 'mock-fixture',
-      generator_version,
+      community_profile_version,
       topics: options.seed.topics,
       queries: options.seed.queries,
       knowledge_queries: options.seed.knowledge_queries,
@@ -176,7 +176,7 @@ export function ensureCommunityProfile({
       story_version_uuid: version.version_uuid,
       story_version_checksum: version.checksum,
       story,
-      generator_version,
+      community_profile_version,
       locale: options && options.locale,
       // ClickUp 16.1 P2 fix (2026-09-06): propagate the caller's
       // `options.source` to the stub builder so a real-provider

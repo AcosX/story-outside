@@ -29,9 +29,11 @@ import {
   startSessionSnapshot,
 } from './stories/index.mjs';
 import {
+  COMMUNITY_PROFILE_GENERATOR_VERSION,
   createInMemoryCommunityProfileRepository,
   seedCommunityProfiles,
 } from './community/index.mjs';
+import { getCommunityProfile } from './community/service.mjs';
 import {
   bootstrapSessionFromWork,
   commitNarrativeEvent,
@@ -54,6 +56,10 @@ import {
 } from './agent/runtime.mjs';
 import { snapshotAll as snapshotMetricsAll, snapshotSession as snapshotMetricsSession } from './observability/metrics.mjs';
 import { snapshotAll as snapshotCacheStatsAll } from './observability/cacheStats.mjs';
+import {
+  attachRelevance,
+  createEcosystemHotOrchestrator,
+} from './providers/ecosystem/hot.mjs';
 import {
   createStoriesHookContext,
   onSessionCreate,
@@ -429,6 +435,21 @@ const { repository: storyRepo, fixtures: storyFixtures } = createSeededRepositor
 // story_version the seed loop did not cover.
 const communityProfileRepo = createInMemoryCommunityProfileRepository();
 seedCommunityProfiles(storyRepo, communityProfileRepo);
+// Test hook (NO production consumers): the regression suite reads
+// the live repo so it can install / override rows for the
+// community_profile_version_mismatch path. The hook is NOT exported
+// on any public surface; it is a process-global symbol that ONLY
+// exists when the server is running inside a test harness.
+if (typeof globalThis !== 'undefined') {
+  /** @type {any} */ (globalThis).__storyOutsideCommunityRepoForTests = communityProfileRepo;
+}
+
+// ClickUp 16.4 P1.v2 fix (2026-09-07): home-page 知乎热榜 orchestrator.
+// Owns its own pair-key cache so two callers with different identity
+// triples share the upstream data but see distinct relevance
+// projections. The orchestrator is created once per process so its
+// cache survives across requests; tests can build a fresh one.
+const ecosystemHotOrchestrator = createEcosystemHotOrchestrator();
 
 // sessionService deliberately keeps its state private to the repository. The
 // route layer keeps only the request's non-secret pinned metadata so recovery
@@ -1551,6 +1572,37 @@ async function handleRequest(req, res) {
   // ---------------------------------------------------------------------
   const PUBLIC_DECORATE = () => ({ demo: currentDemoFlag() });
 
+  /**
+   * ClickUp 16.4 P1.v2 fix (2026-09-07): look up the canonical
+   * community_profile_version for a story_version_uuid by reading
+   * the same community-profile repo the /v1/ecosystem/hot
+   * orchestrator reads. When the row is missing we fall back to the
+   * process-wide `COMMUNITY_PROFILE_GENERATOR_VERSION.rules_version`
+   * (a strict MAJOR.MINOR.PATCH semver) so the bootstrap response
+   * always carries a valid triple for the browser.
+   *
+   * @param {object} input
+   * @param {object} input.profileRepository
+   * @param {string} input.story_version_uuid
+   * @returns {string}
+   */
+  function resolveCanonicalCommunityProfileVersion({ profileRepository, story_version_uuid }) {
+    const fallback = COMMUNITY_PROFILE_GENERATOR_VERSION.rules_version;
+    if (!profileRepository || typeof story_version_uuid !== 'string' || !story_version_uuid) {
+      return fallback;
+    }
+    let profile;
+    try {
+      profile = getCommunityProfile({ profileRepository, story_version_uuid });
+    } catch {
+      profile = null;
+    }
+    if (!profile || typeof profile.community_profile_version !== 'string') {
+      return fallback;
+    }
+    return profile.community_profile_version;
+  }
+
   // POST /api/sessions — atomic session bootstrap from a story + role.
   if (method === 'POST' && pathname === '/api/sessions') {
     let body = {};
@@ -1662,6 +1714,16 @@ async function handleRequest(req, res) {
         opening_cursor: result.session.opening_cursor,
         cache_reused: result.cache_reused,
         version_reused: result.version_reused,
+        // ClickUp 16.4 P1.v2 fix (2026-09-07): surface the canonical
+        // community_profile_version on the bootstrap response so the
+        // browser can publish the identity triple WITHOUT a second
+        // round-trip. The value comes from the same source the
+        // /v1/ecosystem/hot orchestrator reads, so a mismatch is
+        // impossible unless the row was regenerated between calls.
+        community_profile_version: resolveCanonicalCommunityProfileVersion({
+          profileRepository: communityProfileRepo,
+          story_version_uuid: result.story_version_uuid,
+        }),
         pinned,
       });
     } catch (err) {
@@ -2048,6 +2110,119 @@ async function handleRequest(req, res) {
       });
     } catch (err) {
       return sessionErrorResponse(res, err);
+    }
+  }
+
+  // GET /v1/ecosystem/hot — home-page 知乎热榜 façade (ClickUp 16.4 P1.v2).
+  //
+  // Public surface (no DEV_FLAG banner). Identity triple is optional:
+  // when story_uuid / story_version_uuid / community_profile_version
+  // are all supplied AND the community_profile_version (canonical,
+  // MAJOR.MINOR.PATCH semver) matches the row that
+  // `getCommunityProfile` returns, the response carries
+  // `relevant_to_story` and every hot entry carries
+  // `relevant: { score, matched_terms }`. Related entries (score > 0)
+  // sort to the top.
+  //
+  // P1.v2 contract (2026-09-07):
+  //   * When the supplied `community_profile_version` does NOT match
+  //     the canonical row, the route returns 400
+  //     `community_profile_version_mismatch` with the expected vs
+  //     actual versions. The data-contract mismatch is now
+  //     observable instead of silently degrading to "0 terms".
+  //   * When ANY identity field is omitted, the route degrades to a
+  //     plain hot list (no `relevant_to_story`, no per-entry
+  //     `relevant`).
+  if (method === 'GET' && pathname === '/v1/ecosystem/hot') {
+    const queryCategory = url.searchParams.get('category');
+    const queryStoryUuid = url.searchParams.get('story_uuid');
+    const queryStoryVersionUuid = url.searchParams.get('story_version_uuid');
+    const queryCommunityProfileVersion = url.searchParams.get('community_profile_version');
+    try {
+      const baseResponse = await ecosystemHotOrchestrator.fetchHot({
+        category: typeof queryCategory === 'string' && queryCategory ? queryCategory : undefined,
+      });
+      const identity = {
+        story_uuid: typeof queryStoryUuid === 'string' ? queryStoryUuid : '',
+        story_version_uuid: typeof queryStoryVersionUuid === 'string' ? queryStoryVersionUuid : '',
+        community_profile_version: typeof queryCommunityProfileVersion === 'string'
+          ? queryCommunityProfileVersion
+          : '',
+      };
+      const allIdentityFieldsSupplied = Boolean(identity.story_uuid)
+        && Boolean(identity.story_version_uuid)
+        && Boolean(identity.community_profile_version);
+      if (!allIdentityFieldsSupplied) {
+        // Plain list path. Strip any spurious `relevant` projection
+        // (defence in depth: the orchestrator does not attach one in
+        // this path, but a future refactor must keep the wire shape
+        // clean when identity is partial).
+        if (Array.isArray(baseResponse.hot)) {
+          for (const e of baseResponse.hot) {
+            if (e && 'relevant' in e) delete e.relevant;
+          }
+        }
+        return jsonResponse(res, 200, { ...PUBLIC_DECORATE(), ...baseResponse });
+      }
+      // Full identity path: attach relevance. Validation errors here
+      // (bad UUID, bad semver, version mismatch, missing profile)
+      // become an explicit 400 with the public decoration so the
+      // home-page module can surface the data-contract mismatch.
+      const result = attachRelevance(baseResponse, identity, {
+        profileRepository: communityProfileRepo,
+      });
+      if (!result.attached) {
+        if (result.reason === 'mismatch') {
+          return jsonResponse(res, 400, {
+            error: 'community_profile_version_mismatch',
+            message: 'The supplied community_profile_version does not match the canonical profile row for this story_version_uuid.',
+            ...PUBLIC_DECORATE(),
+            expected_community_profile_version: result.expected_version || '',
+            actual_community_profile_version: result.actual_version || '',
+          });
+        }
+        if (result.reason === 'profile_missing') {
+          return jsonResponse(res, 400, {
+            error: 'community_profile_missing',
+            message: 'No community profile row exists for this story_version_uuid; the import path must call ensureCommunityProfile first.',
+            ...PUBLIC_DECORATE(),
+            story_version_uuid: identity.story_version_uuid,
+            actual_community_profile_version: result.actual_version || '',
+          });
+        }
+        // reason: 'identity_incomplete' — could be either a missing
+        // field (handled earlier with a plain 200) or a malformed
+        // community_profile_version (semver check failed). When the
+        // matcher set a `detail` (semver validator message) the wire
+        // layer surfaces 400 invalid_identity so callers cannot
+        // accidentally observe a 0-terms silent degradation.
+        if (result.detail) {
+          return jsonResponse(res, 400, {
+            error: 'invalid_identity',
+            message: 'community_profile_version must be a strict MAJOR.MINOR.PATCH semver string.',
+            ...PUBLIC_DECORATE(),
+            ...(result.actual_version ? { actual_community_profile_version: result.actual_version } : {}),
+            ...(result.detail ? { detail: result.detail } : {}),
+          });
+        }
+        if (Array.isArray(result.response && result.response.hot)) {
+          for (const e of result.response.hot) {
+            if (e && 'relevant' in e) delete e.relevant;
+          }
+        }
+        return jsonResponse(res, 200, {
+          ...PUBLIC_DECORATE(),
+          ...(result.response || baseResponse),
+        });
+      }
+      return jsonResponse(res, 200, { ...PUBLIC_DECORATE(), ...result.response });
+    } catch (err) {
+      const message = String(err && err.message ? err.message : err);
+      return jsonResponse(res, 502, {
+        error: 'ecosystem_hot_failed',
+        message,
+        ...PUBLIC_DECORATE(),
+      });
     }
   }
 

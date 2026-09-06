@@ -6,7 +6,7 @@
 //     ending-page search) share a single, stable, version-bound set
 //     of topics / queries / hot keywords without re-running the
 //     understanding pass per request / per user.
-//   * Profile is versioned via `generator_version` + `story_version_checksum`
+//   * Profile is versioned via `community_profile_version` + `story_version_checksum`
 //     so a rule change OR a story_version change produces a NEW profile
 //     row, never an in-place overwrite. Old rows are kept so a future
 //     regression can re-pin a session to a previous profile by uuid.
@@ -57,7 +57,12 @@ import { canonicalSha256 } from '../stories/canonicalHash.mjs';
  * @property {string} story_uuid
  * @property {string} story_version_uuid
  * @property {string} story_version_checksum        Pin to the original story.
- * @property {string} generator_version             Rule version that produced this profile.
+ * @property {string} community_profile_version             Strict MAJOR.MINOR.PATCH semver
+ *                                                          (e.g. "1.0.0") of the rule that produced
+ *                                                          this profile. Renamed from the legacy
+ *                                                          `generator_version` field so the home-
+ *                                                          page orchestrator reads the canonical
+ *                                                          field by name instead of an alias.
  * @property {string} generated_at                  ISO timestamp (UTC).
  * @property {string} source                        'mock-fixture' | 'mock-generated' | 'real-generated' | 'manual'.
  * @property {string} locale                        BCP-47 / language tag.
@@ -73,12 +78,19 @@ import { canonicalSha256 } from '../stories/canonicalHash.mjs';
 
 /**
  * Current rule version. Bump this string when the prompt / generation
- * logic changes; older rows keep their old `generator_version` so the
- * history of profile generations is auditable.
+ * logic changes; older rows keep their old `community_profile_version` so the
+ * history of profile generations is auditable. The value MUST be a
+ * strict MAJOR.MINOR.PATCH semver string (no v-prefix, no pre-release,
+ * no build metadata); see `COMMUNITY_PROFILE_VERSION_PATTERN` and
+ * `assertCommunityProfileVersionSemver`. The previous default
+ * `community-profile@community-profile-rules/1` looked like a package
+ * coordinate but was neither stable nor semver, so it was renamed to
+ * `1.0.0` (the new canonical default) and read directly off the
+ * profile shape with a strict semver validator at every read seam.
  */
 export const COMMUNITY_PROFILE_GENERATOR_VERSION = Object.freeze({
   identifier: 'community-profile',
-  rules_version: 'community-profile-rules/1',
+  rules_version: '1.0.0',
 });
 
 /**
@@ -113,7 +125,7 @@ export const PROFILE_TOP_LEVEL_KEYS = Object.freeze([
   'story_uuid',
   'story_version_uuid',
   'story_version_checksum',
-  'generator_version',
+  'community_profile_version',
   'generated_at',
   'source',
   'locale',
@@ -158,6 +170,34 @@ export function assertRecordAllowlist(path, seen, allowed) {
 }
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+// ClickUp 16.4 P1.v2 fix (2026-09-07): this field's value MUST be a
+// strict MAJOR.MINOR.PATCH semver string (no leading 'v', no
+// pre-release, no build metadata). The validator turns a data-
+// contract mismatch into an explicit error so callers can see
+// exactly which version they sent, instead of silently falling
+// back to "0 terms" the way PR #23 (ce7f03a) did.
+export const COMMUNITY_PROFILE_VERSION_PATTERN = /^[0-9]+\.[0-9]+\.[0-9]+$/;
+export const COMMUNITY_PROFILE_VERSION_FORMAT_DESCRIPTION = 'MAJOR.MINOR.PATCH (semver, no v-prefix, no pre-release, no build metadata)';
+
+/**
+ * @param {string} label
+ * @param {unknown} value
+ */
+export function assertCommunityProfileVersionSemver(label, value) {
+  if (typeof value !== 'string' || !value) {
+    throw new Error(
+      `communityProfile: ${label} must be a non-empty string in `
+      + `format ${COMMUNITY_PROFILE_VERSION_FORMAT_DESCRIPTION}`,
+    );
+  }
+  if (!COMMUNITY_PROFILE_VERSION_PATTERN.test(value)) {
+    throw new Error(
+      `communityProfile: ${label} '${value}' is not a valid `
+      + `${COMMUNITY_PROFILE_VERSION_FORMAT_DESCRIPTION}`,
+    );
+  }
+}
 
 function uuidv4() {
   const bytes = new Uint8Array(16);
@@ -271,7 +311,12 @@ export function assertCommunityProfileShape(profile) {
   assertUuid('story_uuid', p.story_uuid);
   assertUuid('story_version_uuid', p.story_version_uuid);
   assertNonEmptyString('story_version_checksum', p.story_version_checksum);
-  assertNonEmptyString('generator_version', p.generator_version);
+  // ClickUp 16.4 P1.v2 fix (2026-09-07): strict semver validation
+  // here replaces the previous "non-empty string" check so a data-
+  // contract mismatch is reported as an explicit 400 (see the
+  // server route layer for the error code name) instead of silently
+  // degrading to "0 terms" downstream.
+  assertCommunityProfileVersionSemver('community_profile_version', p.community_profile_version);
   assertNonEmptyString('generated_at', p.generated_at);
   assertNonEmptyString('source', p.source);
   if (!PROFILE_SOURCES.includes(p.source)) {
@@ -394,7 +439,7 @@ function stableSubId(kind, story_version_checksum, slug) {
  * @param {string} input.story_version_checksum
  * @param {string} [input.locale]                Default 'zh-CN'.
  * @param {string} [input.source]                Default 'mock-fixture'.
- * @param {string} [input.generator_version]     Override the rule version.
+ * @param {string} [input.community_profile_version]     Override the rule version.
  * @param {Array<{id?: string, label: string, summary: string}>} input.topics
  * @param {Array<{id?: string, query: string, kind: 'web' | 'knowledge' | 'hot' | 'mixed'}>} input.queries
  * @param {Array<{id?: string, query: string, kind: 'web' | 'knowledge' | 'hot' | 'mixed'}>} input.knowledge_queries
@@ -432,9 +477,9 @@ export function buildCommunityProfileFromSeed(input) {
   const hotKeywordsInput = Array.isArray(input.hot_keywords)
     ? input.hot_keywords
     : input.seed.hot_keywords;
-  const generator_version =
-    input.generator_version
-    || `${COMMUNITY_PROFILE_GENERATOR_VERSION.identifier}@${COMMUNITY_PROFILE_GENERATOR_VERSION.rules_version}`;
+  const community_profile_version =
+    input.community_profile_version
+    || COMMUNITY_PROFILE_GENERATOR_VERSION.rules_version;
   const locale = typeof input.locale === 'string' && input.locale ? input.locale : 'zh-CN';
   const source = typeof input.source === 'string' && input.source ? input.source : 'mock-fixture';
   /** @type {CommunityProfileTopic[]} */
@@ -491,7 +536,7 @@ export function buildCommunityProfileFromSeed(input) {
     story_uuid: input.story_uuid,
     story_version_uuid: input.story_version_uuid,
     story_version_checksum: input.story_version_checksum,
-    generator_version,
+    community_profile_version,
     generated_at: '1970-01-01T00:00:00.000Z', // overwritten below when not pinned
     source,
     locale,
@@ -509,7 +554,7 @@ export function buildCommunityProfileFromSeed(input) {
         story_uuid: profile.story_uuid,
         story_version_uuid: profile.story_version_uuid,
         story_version_checksum: profile.story_version_checksum,
-        generator_version: profile.generator_version,
+        community_profile_version: profile.community_profile_version,
         topics: profile.topics,
         queries: profile.queries,
         knowledge_queries: profile.knowledge_queries,
@@ -534,11 +579,11 @@ export function buildCommunityProfileFromSeed(input) {
  * @param {string} input.story_version_uuid
  * @param {string} input.story_version_checksum
  * @param {{ id: string, title: string, hook: string }} input.story
- * @param {string} [input.generator_version]      Override the rule version.
+ * @param {string} [input.community_profile_version]      Override the rule version.
  * @param {string} [input.locale]                 Default 'zh-CN'.
  * @returns {StoryCommunityProfile}
  */
-export function buildStubCommunityProfile({ story_uuid, story_version_uuid, story_version_checksum, story, generator_version, locale, source }) {
+export function buildStubCommunityProfile({ story_uuid, story_version_uuid, story_version_checksum, story, community_profile_version, locale, source }) {
   assertUuid('story_uuid', story_uuid);
   assertUuid('story_version_uuid', story_version_uuid);
   assertNonEmptyString('story_version_checksum', story_version_checksum);
@@ -581,7 +626,7 @@ export function buildStubCommunityProfile({ story_uuid, story_version_uuid, stor
     story_version_checksum,
     source: resolvedSource,
     locale: typeof locale === 'string' && locale ? locale : 'zh-CN',
-    generator_version,
+    community_profile_version,
     topics,
     queries,
     knowledge_queries,

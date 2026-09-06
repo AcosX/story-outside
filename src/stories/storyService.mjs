@@ -236,7 +236,7 @@ export async function importStoryAndEnsureCache({
   // `seedCommunityProfiles` (in community/importHook.mjs) previously
   // handled for mock fixtures only. Real-provider imports now also
   // get a deterministic stub profile on the canonical
-  // generator_version, so the four ecology capabilities
+  // community_profile_version, so the four ecology capabilities
   // (search / follow / hot / knowledge) always have a profile to
   // read from without an extra import-time dance.
   if (profileRepository) {

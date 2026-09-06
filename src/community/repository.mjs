@@ -9,7 +9,7 @@
 //     profile by uuid.
 //   * findActiveCommunityProfile returns the canonical "current"
 //     profile for a story_version: the most recent valid row for that
-//     story_version under the matching generator_version. If none
+//     story_version under the matching community_profile_version. If none
 //     exists, a new profile is generated and stored.
 //   * No column or sub-field on the row is allowed to reference
 //     user / role / session / model output. The store REJECTS any
@@ -18,7 +18,7 @@
 //
 // The store mirrors the design of src/stories/repository.mjs:
 //   * keyed by profile_uuid
-//   * keyed by story_version_uuid + generator_version for fast lookup
+//   * keyed by story_version_uuid + community_profile_version for fast lookup
 //   * versioned by story_version_checksum so the same story_version
 //     with two checksums (rare, but possible when content_payload is
 //     corrected) keeps separate profiles.
@@ -134,7 +134,7 @@ function rejectForbiddenKeys(value, path) {
 /**
  * @typedef {Object} CommunityProfileRepository
  * @property {(story_version_uuid: string) => StoryCommunityProfile | null} findActiveByStoryVersion
- * @property {(story_version_uuid: string, generator_version: string) => StoryCommunityProfile | null} findActiveByStoryVersionAndGenerator
+ * @property {(story_version_uuid: string, community_profile_version: string) => StoryCommunityProfile | null} findActiveByStoryVersionAndGenerator
  * @property {(profile_uuid: string) => StoryCommunityProfile | null} findByUuid
  * @property {(input: { story_version_uuid: string }) => StoryCommunityProfile[]} listByStoryVersion
  * @property {(input: StoryCommunityProfile) => StoryCommunityProfile} setCommunityProfile
@@ -146,7 +146,7 @@ function rejectForbiddenKeys(value, path) {
  * Build a fresh in-memory state. Pure factory.
  * @returns {{
  *   profiles: Map<string, StoryCommunityProfile>,                 // keyed by profile_uuid
- *   activeByStoryVersion: Map<string, string>,                    // story_version_uuid|generator_version → profile_uuid
+ *   activeByStoryVersion: Map<string, string>,                    // story_version_uuid|community_profile_version → profile_uuid
  *   byUuid: Map<string, StoryCommunityProfile>,
  * }}
  */
@@ -162,13 +162,13 @@ function createEmptyState() {
  * Stable scope key for the active lookup. The story_version_uuid
  * alone is NOT enough: when the rule version bumps the old profile
  * stays active for the previous generation so old sessions can keep
- * reading the same row. Hence `generator_version` is part of the key.
+ * reading the same row. Hence `community_profile_version` is part of the key.
  *
  * @param {string} story_version_uuid
- * @param {string} generator_version
+ * @param {string} community_profile_version
  */
-function activeKey(story_version_uuid, generator_version) {
-  return `${story_version_uuid}|${generator_version}`;
+function activeKey(story_version_uuid, community_profile_version) {
+  return `${story_version_uuid}|${community_profile_version}`;
 }
 
 /**
@@ -196,23 +196,23 @@ export function createInMemoryCommunityProfileRepository() {
         if (row.generated_at > bestProfile.generated_at) {
           bestProfile = row;
         }
-        // Tie-break: larger generator_version wins so a rule bump
+        // Tie-break: larger community_profile_version wins so a rule bump
         // immediately retires the previous generation for new reads.
         if (
           row.generated_at === bestProfile.generated_at
-          && row.generator_version > bestProfile.generator_version
+          && row.community_profile_version > bestProfile.community_profile_version
         ) {
           bestProfile = row;
         }
       }
       return bestProfile;
     },
-    findActiveByStoryVersionAndGenerator(story_version_uuid, generator_version) {
+    findActiveByStoryVersionAndGenerator(story_version_uuid, community_profile_version) {
       assertUuid('story_version_uuid', story_version_uuid);
-      if (typeof generator_version !== 'string' || !generator_version) {
-        throw new Error('communityRepository: generator_version required');
+      if (typeof community_profile_version !== 'string' || !community_profile_version) {
+        throw new Error('communityRepository: community_profile_version required');
       }
-      const key = activeKey(story_version_uuid, generator_version);
+      const key = activeKey(story_version_uuid, community_profile_version);
       const uuid = state.activeByStoryVersion.get(key);
       if (!uuid) return null;
       return state.profiles.get(uuid) || null;
@@ -250,11 +250,11 @@ export function createInMemoryCommunityProfileRepository() {
       //    hand-curated seed. The profile module already enforces the
       //    shape, but this is the second guard.
       rejectForbiddenKeys(profile, '$');
-      // 3. Idempotency on (story_version_uuid, generator_version,
+      // 3. Idempotency on (story_version_uuid, community_profile_version,
       //    content_hash). When the caller regenerates with the same
       //    content, we MUST NOT create a duplicate active row — we
       //    return the existing one instead.
-      const key = activeKey(profile.story_version_uuid, profile.generator_version);
+      const key = activeKey(profile.story_version_uuid, profile.community_profile_version);
       const existingUuid = state.activeByStoryVersion.get(key);
       if (existingUuid) {
         const existing = state.profiles.get(existingUuid);

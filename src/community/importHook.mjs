@@ -9,7 +9,7 @@
 //     get a deterministic, hand-curated profile; stories without a
 //     curated seed get a deterministic stub built from the story
 //     title + hook. In both cases the profile is stored under the
-//     canonical generator_version, so subsequent reads via
+//     canonical community_profile_version, so subsequent reads via
 //     `getCommunityProfile` return the same instance.
 //   * The function is idempotent: a second call returns the existing
 //     profile for each story_version without re-generating.
