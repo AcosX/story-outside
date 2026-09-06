@@ -158,6 +158,18 @@ function buildPanel() {
   followBtn.type = 'button';
   followBtn.textContent = '加关注';
   actions.appendChild(followBtn);
+  // ClickUp 16.3 P1 v1-4 fresh-flow: a "创建 session" button shown
+  // when no session exists yet (the panel mounted before
+  // `bootstrapSession` ran). Clicking it calls
+  // `POST /api/sessions` and dispatches `session:changed` so the
+  // share / unshare buttons appear. The button is hidden by
+  // default — `mount()` reveals it when no session is remembered.
+  const createSessionBtn = document.createElement('button');
+  createSessionBtn.id = 'social-panel-create-session-btn';
+  createSessionBtn.type = 'button';
+  createSessionBtn.textContent = '创建 session';
+  createSessionBtn.hidden = true;
+  actions.appendChild(createSessionBtn);
   const shareBtn = document.createElement('button');
   shareBtn.id = 'social-panel-share-btn';
   shareBtn.type = 'button';
@@ -175,7 +187,7 @@ function buildPanel() {
   refreshBtn.type = 'button';
   refreshBtn.textContent = '刷新关注流';
   actions.appendChild(refreshBtn);
-  for (const btn of [followBtn, shareBtn, unshareBtn, refreshBtn]) {
+  for (const btn of [followBtn, createSessionBtn, shareBtn, unshareBtn, refreshBtn]) {
     Object.assign(btn.style, {
       padding: '4px 10px',
       borderRadius: '6px',
@@ -218,6 +230,7 @@ function buildPanel() {
 
   closeBtn.addEventListener('click', () => { host.style.display = 'none'; });
   followBtn.addEventListener('click', () => { void handleFollow(); });
+  createSessionBtn.addEventListener('click', () => { void handleCreateSession(); });
   shareBtn.addEventListener('click', () => { void handleShare(); });
   unshareBtn.addEventListener('click', () => { void handleUnshare(); });
   refreshBtn.addEventListener('click', () => { void refreshFeed(); });
@@ -234,38 +247,61 @@ function setAuthStatus(text) {
   if (el) el.textContent = text;
 }
 
-// The panel reads the current session UUID from a public, read-only
-// helper that lives on `window.sessionContext` (set by player.js when
-// a session is bootstrapped) and falls back to the same
-// `story-outside:session-context` storage slot the player uses for
-// deep-link recovery. The panel does NOT interpret the value as
-// caller principal — it is just a routing hint to know which session
-// the share / unshare buttons should target.
-function currentShareTargetUuid() {
-  if (typeof window !== 'undefined') {
-    const ctx = window.sessionContext;
-    if (ctx && typeof ctx.sessionUuid === 'string') return ctx.sessionUuid;
-  }
+// ClickUp 16.3 P1 v1-4 (主人 2026-09-07 06:24 巡检 + ChatGPT
+// 复核): the panel reads the current session UUID from the single
+// helper module `/scripts/sessionContext.js` (loaded lazily by
+// player.js and re-imported here for resilience). The helper owns
+// exactly ONE storage key (`story-outside:last-session`) and
+// dispatches a `session:changed` CustomEvent on `window` whenever
+// that key changes — the panel listens for the event in `mount()`
+// and calls `refreshShareButton()` instead of re-mounting. The
+// previous bogus global session-context object on `window` and the
+// secondary session-context slot are GONE. The panel does NOT
+// interpret the value as caller principal — it is just a routing
+// hint for which session the share / unshare buttons should target.
+let _sessionContextModule = null;
+async function loadSessionContext() {
+  if (_sessionContextModule) return _sessionContextModule;
   try {
-    if (typeof window !== 'undefined' && window.sessionStorage) {
-      const raw = window.sessionStorage.getItem('story-outside:session-context');
+    _sessionContextModule = await import('/scripts/sessionContext.js');
+  } catch {
+    _sessionContextModule = null;
+  }
+  return _sessionContextModule;
+}
+
+async function currentShareTargetUuid() {
+  const helper = await loadSessionContext();
+  if (helper && typeof helper.getCurrentShareTargetUuid === 'function') {
+    try {
+      const uuid = helper.getCurrentShareTargetUuid();
+      if (typeof uuid === 'string' && uuid) return uuid;
+    } catch { /* fall through to direct read */ }
+  }
+  // Synchronous fallback so the panel always has a value: read the
+  // SINGLE storage key directly. There is no secondary key.
+  try {
+    if (typeof sessionStorage !== 'undefined') {
+      const raw = sessionStorage.getItem('story-outside:last-session');
       if (raw) {
         try {
           const parsed = JSON.parse(raw);
-          if (parsed && typeof parsed.sessionUuid === 'string') return parsed.sessionUuid;
+          if (parsed && typeof parsed.sessionUuid === 'string' && parsed.sessionUuid) return parsed.sessionUuid;
         } catch { /* ignore */ }
       }
     }
-    if (typeof window !== 'undefined' && window.localStorage) {
-      const raw = window.localStorage.getItem('story-outside:session-context');
+  } catch { /* sessionStorage disabled */ }
+  try {
+    if (typeof localStorage !== 'undefined') {
+      const raw = localStorage.getItem('story-outside:last-session');
       if (raw) {
         try {
           const parsed = JSON.parse(raw);
-          if (parsed && typeof parsed.sessionUuid === 'string') return parsed.sessionUuid;
+          if (parsed && typeof parsed.sessionUuid === 'string' && parsed.sessionUuid) return parsed.sessionUuid;
         } catch { /* ignore */ }
       }
     }
-  } catch { /* sessionStorage / localStorage disabled */ }
+  } catch { /* localStorage disabled */ }
   return null;
 }
 
@@ -281,7 +317,7 @@ async function refreshAuthStatus() {
 }
 
 async function refreshShareButton() {
-  const uuid = currentShareTargetUuid();
+  const uuid = await currentShareTargetUuid();
   const shareBtn = document.getElementById('social-panel-share-btn');
   const unshareBtn = document.getElementById('social-panel-unshare-btn');
   const targetBox = document.getElementById('social-panel-share-target');
@@ -345,7 +381,7 @@ async function handleFollow() {
 }
 
 async function handleShare() {
-  const uuid = currentShareTargetUuid();
+  const uuid = await currentShareTargetUuid();
   if (!uuid) {
     setStatus('当前没有可分享的 session');
     return;
@@ -366,7 +402,7 @@ async function handleShare() {
 }
 
 async function handleUnshare() {
-  const uuid = currentShareTargetUuid();
+  const uuid = await currentShareTargetUuid();
   if (!uuid) {
     setStatus('当前没有可撤回的 session');
     return;
@@ -385,12 +421,109 @@ async function handleUnshare() {
   void refreshFeed();
 }
 
+// mount() runs once per panel lifetime. It does NOT poll, does NOT
+// re-build the DOM, and does NOT loop. The panel subscribes to the
+// `session:changed` CustomEvent dispatched by the
+// `/scripts/sessionContext.js` helper (and by player.js directly)
+// whenever the active session UUID changes, and the handler calls
+// `refreshShareButton()` so the share / unshare buttons appear and
+// point at the new UUID without re-mounting.
 async function mount() {
   const host = buildPanel();
   host.style.display = '';
+  // Subscribe BEFORE the first refresh so we never miss the
+  // bootstrap dispatch that lands while the network calls are in
+  // flight (the event listeners on `window` keep firing even after
+  // `refreshAuthStatus` resolves).
+  attachSessionChangedListener();
   await refreshAuthStatus();
   await refreshShareButton();
   await refreshFeed();
+  // ClickUp 16.3 P1 v1-4 fresh-flow: when no session is remembered
+  // (first visit, last-session wiped, or deep link with no history)
+  // the panel shows a "创建 session" button instead of share /
+  // unshare. Clicking it boots the public /api/sessions façade,
+  // which writes the helper's storage key and dispatches
+  // `session:changed` — the listener above then refreshes the
+  // share / unshare buttons.
+  await maybeOfferCreateSessionButton();
+}
+
+function attachSessionChangedListener() {
+  const target = (typeof window !== 'undefined') ? window
+    : (typeof globalThis !== 'undefined' ? globalThis : null);
+  if (!target || typeof target.addEventListener !== 'function') return;
+  if (target.__SOCIAL_PANEL_SESSION_CHANGED_BOUND__) return;
+  target.__SOCIAL_PANEL_SESSION_CHANGED_BOUND__ = true;
+  target.addEventListener('session:changed', () => {
+    // The player is the single source of truth for session changes;
+    // re-render only what depends on the session UUID.
+    void refreshShareButton();
+    void maybeOfferCreateSessionButton();
+  });
+}
+
+async function maybeOfferCreateSessionButton() {
+  const createBtn = document.getElementById('social-panel-create-session-btn');
+  if (!createBtn) return;
+  const uuid = await currentShareTargetUuid();
+  if (uuid) {
+    createBtn.hidden = true;
+    return;
+  }
+  createBtn.hidden = false;
+}
+
+async function handleCreateSession() {
+  const createBtn = document.getElementById('social-panel-create-session-btn');
+  if (createBtn) createBtn.disabled = true;
+  setStatus('创建 session 中…');
+  try {
+    const helper = await loadSessionContext();
+    const { status, data } = await fetchJson('/api/sessions', {
+      method: 'POST',
+      body: JSON.stringify({ work_id: 'cafe-rain', role_id: 'stranger' }),
+    });
+    if (status !== 200 || !data || !data.session_uuid) {
+      setStatus(`创建 session 失败 status=${status} ${data && data.error ? data.error : ''}`);
+      if (createBtn) createBtn.disabled = false;
+      return;
+    }
+    // ClickUp 16.3 P1 v1-4: write the helper so the panel's
+    // session:changed listener refreshes immediately, AND so the
+    // player can read the same value on a subsequent reload.
+    if (helper && typeof helper.setCurrentShareTargetUuid === 'function') {
+      helper.setCurrentShareTargetUuid(data.session_uuid, {
+        storyTitle: '',
+        roleLabel: '',
+        source: 'socialPanel.handleCreateSession',
+      });
+    } else {
+      // Fallback path — write the SINGLE storage key directly and
+      // dispatch the event manually.
+      try {
+        if (typeof sessionStorage !== 'undefined') {
+          sessionStorage.setItem('story-outside:last-session', JSON.stringify({
+            sessionUuid: data.session_uuid,
+            storyTitle: '',
+            roleLabel: '',
+          }));
+        }
+      } catch { /* storage disabled — in-memory cache in the helper will still see it */ }
+      // Dispatch the event so listeners refresh even when the helper
+      // never loaded.
+      const target = (typeof window !== 'undefined') ? window : (typeof globalThis !== 'undefined' ? globalThis : null);
+      if (target && typeof target.dispatchEvent === 'function' && typeof target.CustomEvent === 'function') {
+        target.dispatchEvent(new target.CustomEvent('session:changed', { detail: { sessionUuid: data.session_uuid, source: 'socialPanel.handleCreateSession' } }));
+      } else if (typeof CustomEvent !== 'undefined' && target && typeof target.dispatchEvent === 'function') {
+        target.dispatchEvent(new CustomEvent('session:changed', { detail: { sessionUuid: data.session_uuid, source: 'socialPanel.handleCreateSession' } }));
+      }
+    }
+    setStatus('已创建 session');
+  } catch (err) {
+    setStatus(`创建 session 失败 ${err && err.message ? err.message : ''}`);
+    if (createBtn) createBtn.disabled = false;
+  }
 }
 
 function start() {
@@ -409,6 +542,8 @@ export {
   refreshShareButton,
   refreshAuthStatus,
   currentShareTargetUuid,
+  handleCreateSession,
+  maybeOfferCreateSessionButton,
 };
 
-export default { start, mount };
+export default { start, mount, handleCreateSession };

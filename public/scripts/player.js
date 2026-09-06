@@ -313,6 +313,12 @@ async function bootstrapSession({ story, role }) {
     setText('#story-name', story.title);
     setText('#role-name', role.label);
     persistSessionContext();
+    // ClickUp 16.3 P1 v1-4: tell every listener (socialPanel etc.)
+    // that a fresh session exists so share/unshare can point at it.
+    // `persistSessionContext` already dispatches through the helper
+    // when it loaded; this dispatch covers the helper-not-yet-loaded
+    // path AND the "no-helper-loaded" harness path.
+    dispatchLocalSessionChanged(state.sessionUuid || null, 'player.bootstrapSession');
     showScreen('player');
     await recoverAndStart();
   } catch (err) {
@@ -322,27 +328,75 @@ async function bootstrapSession({ story, role }) {
 }
 
 // -------- Last-session context (for the ?s=ending deep link) --------
+//
+// ClickUp 16.3 P1 v1-4 (主人 2026-09-07 06:24 巡检 + ChatGPT 复核):
+// the page now uses ONE storage key (`story-outside:last-session`)
+// and ONE helper module (`/scripts/sessionContext.js`). The previous
+// secondary session-context slot is GONE, and the bogus global
+// session-context object on `window` is GONE. Every reader and
+// writer goes through the helper, which also dispatches a
+// `session:changed` CustomEvent on `window` after every write so the
+// social panel (and any other listener) can refresh without re-mount.
 
-const LAST_SESSION_KEY = 'story-outside:last-session';
+let _sessionContextModule = null;
+async function loadSessionContext() {
+  if (_sessionContextModule) return _sessionContextModule;
+  try {
+    _sessionContextModule = await import('/scripts/sessionContext.js');
+  } catch {
+    _sessionContextModule = null;
+  }
+  return _sessionContextModule;
+}
 
 function persistSessionContext() {
-  // Remember the active session so a reload that lands on ?s=ending can
-  // re-mount the ending page for the SAME session instead of silently
-  // falling back to the picker. Best-effort: private browsing modes may
-  // block storage, in which case the deep link just shows the empty
-  // ending state.
+  // The helper is async-loaded, but the player uses a fire-and-forget
+  // pattern: write through the helper when it is available, otherwise
+  // fall back to the direct storage write so the deep-link recovery
+  // still works. Both paths write the SAME single key.
+  const meta = {
+    storyTitle: state.story ? state.story.title : '',
+    roleLabel: state.role ? state.role.label : '',
+    source: 'player.bootstrapSession',
+  };
+  const helper = _sessionContextModule;
+  if (helper && typeof helper.setCurrentShareTargetUuid === 'function') {
+    try {
+      helper.setCurrentShareTargetUuid(state.sessionUuid || null, meta);
+      return;
+    } catch { /* fall through to direct write */ }
+  }
+  // Direct write — same key as the helper. No secondary key exists.
   try {
-    sessionStorage.setItem(LAST_SESSION_KEY, JSON.stringify({
+    sessionStorage.setItem('story-outside:last-session', JSON.stringify({
       sessionUuid: state.sessionUuid || null,
-      storyTitle: state.story ? state.story.title : '',
-      roleLabel: state.role ? state.role.label : '',
+      storyTitle: meta.storyTitle,
+      roleLabel: meta.roleLabel,
     }));
   } catch { /* storage unavailable — deep link degrades to empty state */ }
+  // We still want listeners to observe the change even when the
+  // helper has not finished loading. Dispatch the event here so a
+  // panel mounted before the helper arrived will refresh when it
+  // resolves.
+  dispatchLocalSessionChanged(state.sessionUuid || null, meta.source);
+}
+
+function dispatchLocalSessionChanged(uuid, source) {
+  try {
+    const target = (typeof window !== 'undefined') ? window : (typeof globalThis !== 'undefined' ? globalThis : null);
+    if (!target || typeof target.dispatchEvent !== 'function') return;
+    const Ctor = target.CustomEvent || (typeof CustomEvent !== 'undefined' ? CustomEvent : null);
+    if (typeof Ctor !== 'function') return;
+    target.dispatchEvent(new Ctor('session:changed', { detail: { sessionUuid: uuid || null, source: source || 'player' } }));
+  } catch { /* event dispatch is best-effort */ }
 }
 
 function readSessionContext() {
+  // Synchronous read of the SINGLE storage key — the helper module
+  // resolves the same key, so a write through the helper is visible
+  // here and vice-versa. The previous secondary slot is gone.
   try {
-    const raw = sessionStorage.getItem(LAST_SESSION_KEY);
+    const raw = sessionStorage.getItem('story-outside:last-session');
     const ctx = raw ? JSON.parse(raw) : null;
     return ctx && typeof ctx.sessionUuid === 'string' ? ctx : null;
   } catch { return null; }
@@ -1237,14 +1291,18 @@ function bindEvents() {
 
 async function bootstrap() {
   bindEvents();
-  // ClickUp 16.3 P1 v1-3 (主人 2026-09-07 05:xx 巡检 + ChatGPT
-  // 复核): lazily load the public social panel so the home page DOM
-  // stays untouched. The panel mounts a single floating host element
-  // at document.body and is non-intrusive to the existing picker /
-  // story / ending-card surfaces. The panel itself never carries
-  // caller principal — see public/scripts/socialPanel.js for the
-  // hard rules.
+  // ClickUp 16.3 P1 v1-4 (主人 2026-09-07 06:24 巡检 + ChatGPT
+  // 复核): lazily load the session-context helper FIRST so the
+  // social panel can read through it. Then load the public social
+  // panel itself; the panel subscribes to the helper's
+  // `session:changed` event and refreshes in place when the player
+  // bootstraps a new session. The panel mounts a single floating
+  // host element at document.body and is non-intrusive to the
+  // existing picker / story / ending-card surfaces. The panel
+  // itself never carries caller principal — see
+  // public/scripts/socialPanel.js for the hard rules.
   try {
+    await loadSessionContext();
     const socialMod = await import('/scripts/socialPanel.js');
     if (socialMod && typeof socialMod.mount === 'function') {
       await socialMod.mount();
