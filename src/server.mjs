@@ -63,12 +63,45 @@ import {
   buildOriginalTimeline,
   buildReplay,
 } from './stories/endingService.mjs';
+import { createEcosystemHotProvider, HOT_PROVIDER_CONFIG } from './providers/ecosystem/hot.mjs';
+import { createZhihuHotSource } from './providers/ecosystem/zhihuHotSource.mjs';
+import { createInMemoryCommunityProfileRepository } from './community/repository.mjs';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 const ROOT = resolve(__dirname, '..');
 const PUBLIC_DIR = resolve(ROOT, 'public');
 const PORT = Number(process.env.PORT || 4173);
 const HOST = process.env.HOST || '127.0.0.1';
+
+// ClickUp 16.4 — ecosystem hot-list singleton.
+//
+// The hot list is the discovery rail on the home page ("知乎此刻热
+// 议"). It is NOT part of the story Runtime. The provider is wired
+// here (not in src/providers/index.mjs) because it has a completely
+// different lifecycle: read-through cache, no per-story UUID, no
+// session hooks.
+//
+// Source selection:
+//   * STORY_OUTSIDE_HOT_PROVIDER=real   → real Zhihu adapter
+//                                          (https://api.zhihu.com only)
+//   * anything else (default 'mock')    → bundled mock fixture
+//
+// Community profile repository: the hot provider matches against
+// hot_keywords from every active community profile in the in-memory
+// repo. The repo is process-local (matches the rest of this MVP) and
+// holds profiles that were generated during story import.
+//
+// All defaults align with the repo contract: no LLM calls, no OAuth,
+// no credential reads.
+const HOT_PROVIDER_NAME = process.env.STORY_OUTSIDE_HOT_PROVIDER === 'real' ? 'real' : 'mock';
+const ECOSYSTEM_HOT_SOURCE = HOT_PROVIDER_NAME === 'real'
+  ? createZhihuHotSource()
+  : null; // null → provider falls back to its built-in MOCK_HOT_SOURCE
+const ECOSYSTEM_PROFILE_REPOSITORY = createInMemoryCommunityProfileRepository();
+const ECOSYSTEM_HOT_PROVIDER = createEcosystemHotProvider(
+  ECOSYSTEM_HOT_SOURCE ? { source: ECOSYSTEM_HOT_SOURCE } : {},
+);
+void HOT_PROVIDER_CONFIG; // referenced for symmetry with other module surfaces
 
 /**
  * Build a deterministic, story-aware mock provider that satisfies the
@@ -563,8 +596,71 @@ async function handleRequest(req, res) {
       uptimeSeconds: Math.round(process.uptime()),
       nodeVersion: process.version,
       provider: providerName,
+      hot_provider: HOT_PROVIDER_NAME,
       demo: currentDemoFlag(),
     });
+  }
+
+  // ClickUp 16.4 — ecosystem hot-list façade.
+  //   GET /v1/ecosystem/hot
+  //
+  // Returns the curated slice of Zhihu hot topics, decorated with
+  // story-match results from the community profile repository. The
+  // response shape mirrors the DTO in src/providers/ecosystem/hot.mjs
+  // (hot_list[] + entries[] with optional matches[]).
+  //
+  // Query params:
+  //   ?limit=N        cap the hot_list (default 30, max 50)
+  //   ?force=1        bypass cache + refresh upstream synchronously
+  //
+  // Status semantics (mirrors hot.mjs):
+  //   fresh      → just-fetched data, TTL window
+  //   stale      → served from cache past TTL but within SWR; a
+  //                background refresh is already scheduled
+  //   unavailable→ no cache hit AND upstream failed; clients should
+  //                hide the module rather than display empty UI
+  if (method === 'GET' && pathname === '/v1/ecosystem/hot') {
+    const sp = url.searchParams;
+    const limitRaw = sp.get('limit');
+    let limit = 30;
+    if (limitRaw !== null) {
+      const n = Number(limitRaw);
+      if (!Number.isFinite(n) || n <= 0 || !Number.isInteger(n)) {
+        return jsonResponse(res, 400, {
+          error: 'invalid_limit',
+          message: 'limit must be a positive integer.',
+          demo: currentDemoFlag(),
+        });
+      }
+      limit = Math.min(50, n);
+    }
+    const force = sp.get('force') === '1' || sp.get('force') === 'true';
+    try {
+      const profiles = ECOSYSTEM_PROFILE_REPOSITORY.listAll();
+      const payload = await ECOSYSTEM_HOT_PROVIDER.matchHotList({ limit, force, profiles });
+      return jsonResponse(res, 200, {
+        demo: currentDemoFlag(),
+        hot_list: payload.hot_list,
+        entries: payload.entries,
+        ecosystem_status: payload.ecosystem_status,
+        stale: payload.stale,
+        generated_at: payload.generated_at,
+        source: payload.source,
+        rate_limit: payload.rate_limit,
+        hot_provider: HOT_PROVIDER_NAME,
+      });
+    } catch (err) {
+      // The hot-list module is supposed to swallow upstream errors
+      // and degrade to `unavailable`. The only way we end up here is
+      // a programming error (e.g. malformed args). Surface it as
+      // 500 — never crash the process.
+      const message = String(err && err.message ? err.message : err);
+      return jsonResponse(res, 500, {
+        error: 'ecosystem_hot_internal_error',
+        message,
+        demo: currentDemoFlag(),
+      });
+    }
   }
 
   // Resolve the data provider once per request; routes below call methods on it.

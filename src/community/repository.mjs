@@ -237,6 +237,27 @@ export function createInMemoryCommunityProfileRepository() {
       });
       return out;
     },
+    /**
+     * ClickUp 16.4 — list every profile currently in the repo. The
+     * activeByStoryVersion index is the canonical source of truth:
+     * any profile whose UUID is reachable through that index is
+     * "active" by construction. Profiles are returned as a frozen
+     * shallow copy so the caller cannot mutate repo state.
+     *
+     * @returns {ReadonlyArray<import('./profile.mjs').StoryCommunityProfile>}
+     */
+    listAll() {
+      const out = [];
+      const seen = new Set();
+      for (const profileUuid of state.activeByStoryVersion.values()) {
+        if (seen.has(profileUuid)) continue;
+        const row = state.profiles.get(profileUuid);
+        if (!row) continue;
+        seen.add(profileUuid);
+        out.push(row);
+      }
+      return out;
+    },
     setCommunityProfile(input) {
       // 1. Validate shape and bounds (defence in depth).
       const profile = assertCommunityProfileShape(input);
