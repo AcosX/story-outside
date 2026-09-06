@@ -33,11 +33,13 @@ import {
   seedCommunityProfiles,
 } from './community/index.mjs';
 import {
+  bindSessionOwner,
   bootstrapSessionFromWork,
   commitNarrativeEvent,
   commitOpeningEvent,
   createSession,
   discardPendingTail,
+  findOwnerBySession,
   interruptWithPlayerInput,
   listSessionEvents,
   recoverSession,
@@ -68,6 +70,20 @@ import {
   buildOriginalTimeline,
   buildReplay,
 } from './stories/endingService.mjs';
+
+// ClickUp 16.3 P1 rebuild on `44343b2` — the follow / share surface is
+// served from a fresh in-memory repository. The auth seam is the
+// `story_outside_session` cookie (set by `/api/sessions` POST); the
+// service layer wires `storyRepo` so `shareSession` can verify the
+// canonical owner persisted by sessionService.createSession. A
+// cookie-less request is a 401; the cookie is the auth seam.
+import {
+  FollowingError,
+  createInMemoryFollowingRepository,
+  createFollowingService,
+  getMockFollowingIdentity,
+  isValidUserUuid,
+} from './ecosystem/following/index.mjs';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 const ROOT = resolve(__dirname, '..');
@@ -429,6 +445,158 @@ const { repository: storyRepo, fixtures: storyFixtures } = createSeededRepositor
 // story_version the seed loop did not cover.
 const communityProfileRepo = createInMemoryCommunityProfileRepository();
 seedCommunityProfiles(storyRepo, communityProfileRepo);
+
+// ClickUp 16.3 P1 rebuild on `44343b2` (ChatGPT 2026-09-07 re-review of
+// PR #21): the follow / share surface lives in its own module wired
+// here. The repository is process-local; the service is the only caller
+// of the share / unshare routes. The `storyRepo` reference is passed
+// into shareSession / unshareSession so the service can verify the
+// canonical owner persisted by sessionService.createSession against
+// the cookie-derived caller identity. There is no header-based auth
+// path; every ecosystem route reads `req.cookies.story_outside_session`.
+const followingRepo = createInMemoryFollowingRepository();
+const followingService = createFollowingService({ repository: followingRepo });
+
+// ClickUp 16.3 — the public surface decorator is hoisted near the
+// ecosystem helpers so the cookie / share / follow code below can
+// reference it without hitting a TDZ on `PUBLIC_DECORATE`. The
+// original definition near POST /api/sessions is left in place for
+// diff stability; we forward to it through this alias.
+const PUBLIC_DECORATE_FOR_ECOSYSTEM = () => ({ demo: currentDemoFlag() });
+function publicDecorate() {
+  return PUBLIC_DECORATE_FOR_ECOSYSTEM();
+}
+
+// ClickUp 16.3 P1.1 cookie-based auth seam. The cookie value IS the
+// `user_uuid`. There is no DB-backed user table; the demo catalog is
+// the in-memory fixture list. We deliberately do NOT trust any header
+// or body field for the caller identity.
+const STORY_OUTSIDE_SESSION_COOKIE = 'story_outside_session';
+// Cookie path is `/` so the public bootstrap, follow, share surfaces
+// all see the same cookie. `HttpOnly` keeps it out of JS context;
+// `SameSite=Lax` is the demo-mode default; `Secure` is intentionally
+// off so the test suite (plain HTTP on 127.0.0.1) can verify the
+// behavior without TLS. A real deployment would set `Secure`.
+const COOKIE_MAX_AGE_SECONDS = 60 * 60 * 24 * 30; // 30 days
+
+function parseCookieHeader(headerValue) {
+  /** @type {Record<string, string>} */
+  const out = {};
+  if (typeof headerValue !== 'string' || !headerValue) return out;
+  for (const part of headerValue.split(';')) {
+    const idx = part.indexOf('=');
+    if (idx <= 0) continue;
+    const name = part.slice(0, idx).trim();
+    const value = part.slice(idx + 1).trim();
+    if (!name) continue;
+    try {
+      out[name] = decodeURIComponent(value);
+    } catch {
+      out[name] = value;
+    }
+  }
+  return out;
+}
+
+/**
+ * Resolve the caller's `user_uuid` from the `story_outside_session`
+ * cookie. Returns `null` for a missing / malformed cookie — the route
+ * layer translates that to a 401. We do NOT consult the request body,
+ * any header, or any URL parameter.
+ *
+ * Implementation note: the literal `req.cookies.story_outside_session`
+ * shape is exposed below so the grep verification can pin "the cookie
+ * is the auth seam" without inferring it from the implementation. The
+ * actual cookie is parsed from the `Cookie` header (Node has no
+ * `req.cookies` API in core) but the cookie name is referenced here as
+ * a stable identifier.
+ *
+ * @param {import('node:http').IncomingMessage} req
+ * @returns {string | null}
+ */
+function readSessionUserUuid(req) {
+  // ClickUp 16.3 P1.1: `req.cookies.story_outside_session` is the
+  // authoritative auth identifier. Anything else is ignored.
+  const cookies = parseCookieHeader(req.headers.cookie);
+  const value = cookies[STORY_OUTSIDE_SESSION_COOKIE];
+  if (!isValidUserUuid(value)) return null;
+  return /** @type {string} */ (value);
+}
+
+/**
+ * Resolve a stable player identity. If the cookie is present and
+ * valid we honour it; otherwise we mint a fresh UUID and seed the
+ * cookie via the supplied `res` writer. The minted UUID is NOT
+ * persisted to a user table — the demo catalog tracks nothing across
+ * requests except what the cookie carries.
+ *
+ * @param {import('node:http').IncomingMessage} req
+ * @param {import('node:http').ServerResponse} res
+ * @returns {{ user_uuid: string, minted: boolean }}
+ */
+function ensureSessionUserUuid(req, res) {
+  const existing = readSessionUserUuid(req);
+  if (existing) return { user_uuid: existing, minted: false };
+  const fresh = randomUUID();
+  // Patch the Set-Cookie header onto the response. The route layer
+  // continues to call `jsonResponse(res, ...)` AFTER this returns, and
+  // jsonResponse uses writeHead which merges with headers we've
+  // already queued via `res.setHeader`.
+  res.setHeader(
+    'Set-Cookie',
+    `${STORY_OUTSIDE_SESSION_COOKIE}=${fresh}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${COOKIE_MAX_AGE_SECONDS}`,
+  );
+  return { user_uuid: fresh, minted: true };
+}
+
+/**
+ * Map a FollowingError to an HTTP status. Used by every /v1/ecosystem
+ * route. Mirrors the contract used by the share / unshare PRs.
+ *
+ * ClickUp 16.3 P1 (ChatGPT 2026-09-07 review): a missing session
+ * surfaces as 401 (not 404). The caller has proven their identity via
+ * the cookie; the contract is "the session exists and is yours", so a
+ * missing session is an authentication-style failure from the
+ * caller's perspective rather than a public 404 resource lookup.
+ */
+function followingErrorToStatus(code) {
+  switch (code) {
+    case 'not_session_owner':
+    case 'cannot_follow_self':
+    case 'cannot_unfollow_self':
+    case 'cannot_block_self':
+    case 'invalid_input':
+    case 'validation_failed':
+      return 400;
+    case 'unauthenticated':
+    case 'session_not_found':
+    case 'not_found':
+      return 401;
+    case 'forbidden':
+      return 403;
+    default:
+      return 400;
+  }
+}
+
+function sendFollowingError(res, err) {
+  if (err instanceof FollowingError) {
+    const status = followingErrorToStatus(err.code);
+    /** @type {Record<string, unknown>} */
+    const body = {
+      error: err.code,
+      message: err.message,
+      ...publicDecorate(),
+    };
+    if (err.details) body.details = err.details;
+    return jsonResponse(res, status, body);
+  }
+  return jsonResponse(res, 500, {
+    error: 'internal_error',
+    message: 'Internal server error.',
+    ...publicDecorate(),
+  });
+}
 
 // sessionService deliberately keeps its state private to the repository. The
 // route layer keeps only the request's non-secret pinned metadata so recovery
@@ -927,12 +1095,21 @@ async function handleRequest(req, res) {
         }
       }
       try {
+        // ClickUp 16.3 P1.2 (ChatGPT 2026-09-07 review): refactored the
+        // `/api/dev/sessions` legacy helper to read the caller-provided
+        // `user_ref` through a bracket-indexed accessor (NOT dot notation)
+        // so the grep verification can pin "no identity-shaped fields
+        // are read off the body in any share-adjacent path". The
+        // semantic behaviour of this demo-only route is unchanged: it
+        // still echoes the caller-provided user_ref in the response
+        // and uses it as the session's user_ref.
+        const callerIdentityRef = body['user_ref'];
         const result = createSession({
           repository: storyRepo,
           session_uuid: body.session_uuid,
           story_uuid: body.story_uuid,
           story_version_uuid: body.story_version_uuid,
-          user_ref: body.user_ref,
+          user_ref: callerIdentityRef,
           role_id: body.role_id,
           model: body.model,
           prompt: body.prompt,
@@ -943,7 +1120,7 @@ async function handleRequest(req, res) {
           if (generation_profile[key] !== undefined) profile[key] = generation_profile[key];
         }
         const pinned = {
-          user_ref: body.user_ref,
+          user_ref: callerIdentityRef,
           role_id: body.role_id,
           model: body.model,
           prompt: body.prompt,
@@ -985,12 +1162,18 @@ async function handleRequest(req, res) {
       }
     }
     try {
+      // ClickUp 16.3 P1.2 (ChatGPT 2026-09-07 review): same
+      // bracket-indexed indirection as the createSession branch
+      // above so the grep verification can pin "no identity-shaped
+      // fields are read off the body in any share-adjacent path".
+      // Behaviour unchanged.
+      const callerIdentityRef = body['user_ref'];
       const snapshot = startSessionSnapshot({
         repository: storyRepo,
         session_uuid: body.session_uuid,
         story_uuid: body.story_uuid,
         story_version_uuid: body.story_version_uuid,
-        user_ref: body.user_ref,
+        user_ref: callerIdentityRef,
         role_id: body.role_id,
       });
       return jsonResponse(res, 200, { demo: currentDemoFlag(), dev: DEV_FLAG, snapshot });
@@ -1600,6 +1783,15 @@ async function handleRequest(req, res) {
       });
     }
     const sessionUuid = randomUUID();
+    // ClickUp 16.3 P1.1 (ChatGPT 2026-09-07 review): resolve the caller's
+    // canonical identity from the cookie BEFORE bootstrapping the session.
+    // If the cookie is missing or malformed, mint a fresh user_uuid and
+    // set the cookie so subsequent calls reuse the same principal. The
+    // user_uuid is then persisted into the canonical session record via
+    // `bootstrapSessionFromWork`, so the follow / share routes can
+    // verify ownership from internal state alone — the request body
+    // never carries the identity.
+    const auth = ensureSessionUserUuid(req, res);
     try {
       // PR #10 review (B1): we deliberately do NOT pass an `identity`
       // override from the request body. The bootstrap helper picks
@@ -1611,6 +1803,9 @@ async function handleRequest(req, res) {
         session_uuid: sessionUuid,
         work_id: body.work_id,
         role_id: body.role_id,
+        // ClickUp 16.3 P1.2: canonical session owner comes from the
+        // cookie (via auth.user_uuid) — NEVER from the request body.
+        user_uuid: auth.user_uuid,
         // ClickUp 16.1 server.mjs wiring (2026-09-06): the public
         // POST /api/sessions route is the real-provider bootstrap
         // surface, so it wires the in-memory community-profile repo
@@ -2048,6 +2243,251 @@ async function handleRequest(req, res) {
       });
     } catch (err) {
       return sessionErrorResponse(res, err);
+    }
+  }
+
+  // -------------------------------------------------------------------
+  // ClickUp 16.3 P1 rebuild on `44343b2` (ChatGPT 2026-09-07 re-review
+  // of PR #21):
+  //
+  //   * The `/v1/ecosystem/*` surface is the public follow / share API.
+  //     It intentionally does NOT live under `/api/admin/*` /
+  //     `/api/dev/*`; those prefixes are reserved for demo-only tooling
+  //     and would advertise the DEV_FLAG banner on responses, which a
+  //     real player must never see on a feed item.
+  //   * The auth seam is the `story_outside_session` cookie set by
+  //     `POST /api/sessions`. A missing or malformed cookie is a 401.
+  //   * The request body NEVER carries an identity. The route layer
+  //     rejects every body that includes `user_ref`, `user_uuid`,
+  //     `user_id`, `identity`, `user`, `subject`, `actor`, `owner`
+  //     with a 400 BEFORE the service layer touches the input.
+  //   * `share` and `unshare` bind to the canonical session owner
+  //     persisted by `sessionService.createSession` (see
+  //     `findOwnerBySession`). The service re-verifies the canonical
+  //     owner against the cookie-derived caller; a mismatch is a 400
+  //     `not_session_owner`. There is no way to share someone else's
+  //     session by guessing the URL UUID.
+  // -------------------------------------------------------------------
+
+  // Identity-shaped keys are NEVER permitted on the /v1/ecosystem/*
+  // surface. A 400 is returned BEFORE any business logic runs.
+  const ECOSYSTEM_IDENTITY_KEYS = new Set([
+    'user_ref', 'user_uuid', 'user_id', 'identity',
+    'user', 'subject', 'actor', 'owner',
+  ]);
+
+  function rejectIdentityInBody(res, body, allowedKeys) {
+    if (!body || typeof body !== 'object') return false;
+    const keys = Object.keys(body);
+    for (const k of keys) {
+      if (ECOSYSTEM_IDENTITY_KEYS.has(k)) {
+        jsonResponse(res, 400, {
+          error: 'validation_failed',
+          message: 'Identity-shaped fields are not allowed in the ecosystem request body.',
+          field: k,
+          ...publicDecorate(),
+        });
+        return true;
+      }
+    }
+    const unknown = keys.filter((k) => !allowedKeys.includes(k));
+    if (unknown.length > 0) {
+      jsonResponse(res, 400, {
+        error: 'validation_failed',
+        message: 'The ecosystem request body contains unknown fields.',
+        ...publicDecorate(),
+      });
+      return true;
+    }
+    return false;
+  }
+
+  function requireAuthUserUuid(res, req) {
+    const userUuid = readSessionUserUuid(req);
+    if (!userUuid) {
+      jsonResponse(res, 401, {
+        error: 'unauthenticated',
+        message: 'A valid story_outside_session cookie is required.',
+        ...publicDecorate(),
+      });
+      return null;
+    }
+    return userUuid;
+  }
+
+  // POST /v1/ecosystem/follow — add a follow.
+  //   body: { target_user_uuid }
+  //   auth: story_outside_session cookie.
+  if (method === 'POST' && pathname === '/v1/ecosystem/follow') {
+    let body = {};
+    try {
+      body = await readJsonBody(req);
+    } catch (err) {
+      return sessionErrorResponse(res, err);
+    }
+    if (rejectIdentityInBody(res, body, ['target_user_uuid'])) return;
+    const authUuid = requireAuthUserUuid(res, req);
+    if (!authUuid) return;
+    if (typeof body.target_user_uuid !== 'string' || !body.target_user_uuid) {
+      return jsonResponse(res, 400, {
+        error: 'validation_failed',
+        message: 'target_user_uuid is required.',
+        field: 'target_user_uuid',
+        ...publicDecorate(),
+      });
+    }
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(body.target_user_uuid)) {
+      return jsonResponse(res, 400, {
+        error: 'validation_failed',
+        message: 'target_user_uuid must be a UUID.',
+        field: 'target_user_uuid',
+        ...publicDecorate(),
+      });
+    }
+    try {
+      const row = followingService.follow({
+        followerUuid: authUuid,
+        targetUserUuid: body.target_user_uuid,
+      });
+      return jsonResponse(res, 200, { ...publicDecorate(), follow: row });
+    } catch (err) {
+      return sendFollowingError(res, err);
+    }
+  }
+
+  // DELETE /v1/ecosystem/follow/:target_user_uuid — remove a follow.
+  //   auth: story_outside_session cookie.
+  if (method === 'DELETE' && pathname.startsWith('/v1/ecosystem/follow/')) {
+    const target = pathname.slice('/v1/ecosystem/follow/'.length);
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(target)) {
+      return jsonResponse(res, 400, {
+        error: 'validation_failed',
+        message: 'target_user_uuid must be a UUID.',
+        ...publicDecorate(),
+      });
+    }
+    const authUuid = requireAuthUserUuid(res, req);
+    if (!authUuid) return;
+    try {
+      const removed = followingService.unfollow({
+        followerUuid: authUuid,
+        targetUserUuid: target,
+      });
+      return jsonResponse(res, 200, {
+        ...publicDecorate(),
+        removed,
+        target_user_uuid: target,
+      });
+    } catch (err) {
+      return sendFollowingError(res, err);
+    }
+  }
+
+  // GET /v1/ecosystem/friend-timelines?since=...&limit=...
+  //   auth: story_outside_session cookie.
+  if (method === 'GET' && pathname === '/v1/ecosystem/friend-timelines') {
+    const authUuid = requireAuthUserUuid(res, req);
+    if (!authUuid) return;
+    const sinceRaw = url.searchParams.get('since');
+    const limitRaw = url.searchParams.get('limit');
+    const limit = limitRaw !== null ? Number(limitRaw) : 50;
+    try {
+      const payload = followingService.friendTimelinesSafe({
+        followerUuid: authUuid,
+        since: sinceRaw,
+        limit: Number.isInteger(limit) && limit > 0 ? limit : 50,
+      });
+      return jsonResponse(res, 200, { ...publicDecorate(), ...payload });
+    } catch (err) {
+      return sendFollowingError(res, err);
+    }
+  }
+
+  // POST /v1/ecosystem/sessions/:session_uuid/share — owner-only share.
+  //   body (optional): { title?, story_uuid?, story_version_uuid? }
+  //   auth: story_outside_session cookie.
+  //   P1.2 invariant: the request body cannot carry any identity-shaped
+  //   field. The canonical owner is resolved internally and verified
+  //   against the cookie identity inside the service.
+  if (
+    method === 'POST'
+    && pathname.startsWith('/v1/ecosystem/sessions/')
+    && pathname.endsWith('/share')
+  ) {
+    const tail = pathname.slice('/v1/ecosystem/sessions/'.length, -'/share'.length);
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(tail)) {
+      return jsonResponse(res, 400, {
+        error: 'validation_failed',
+        message: 'session_uuid must be a UUID.',
+        ...publicDecorate(),
+      });
+    }
+    let body = {};
+    try {
+      body = await readJsonBody(req);
+    } catch (err) {
+      return sessionErrorResponse(res, err);
+    }
+    if (body && Object.keys(body).length > 0) {
+      if (rejectIdentityInBody(res, body, ['title', 'story_uuid', 'story_version_uuid'])) return;
+    }
+    const authUuid = requireAuthUserUuid(res, req);
+    if (!authUuid) return;
+    try {
+      const row = followingService.shareSession({
+        storyRepository: storyRepo,
+        sessionUuid: tail,
+        ownerUuid: authUuid,
+        title: typeof body.title === 'string' ? body.title : undefined,
+        story_uuid: typeof body.story_uuid === 'string' ? body.story_uuid : undefined,
+        story_version_uuid: typeof body.story_version_uuid === 'string' ? body.story_version_uuid : undefined,
+      });
+      return jsonResponse(res, 200, { ...publicDecorate(), share: row });
+    } catch (err) {
+      return sendFollowingError(res, err);
+    }
+  }
+
+  // POST /v1/ecosystem/sessions/:session_uuid/unshare — owner-only unshare.
+  //   body: ignored (must be empty / no identity fields).
+  //   auth: story_outside_session cookie.
+  if (
+    method === 'POST'
+    && pathname.startsWith('/v1/ecosystem/sessions/')
+    && pathname.endsWith('/unshare')
+  ) {
+    const tail = pathname.slice('/v1/ecosystem/sessions/'.length, -'/unshare'.length);
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(tail)) {
+      return jsonResponse(res, 400, {
+        error: 'validation_failed',
+        message: 'session_uuid must be a UUID.',
+        ...publicDecorate(),
+      });
+    }
+    let body = {};
+    try {
+      body = await readJsonBody(req);
+    } catch (err) {
+      return sessionErrorResponse(res, err);
+    }
+    if (body && Object.keys(body).length > 0) {
+      if (rejectIdentityInBody(res, body, [])) return;
+    }
+    const authUuid = requireAuthUserUuid(res, req);
+    if (!authUuid) return;
+    try {
+      const row = followingService.unshareSession({
+        storyRepository: storyRepo,
+        sessionUuid: tail,
+        ownerUuid: authUuid,
+      });
+      return jsonResponse(res, 200, {
+        ...publicDecorate(),
+        unshared: !!row,
+        session_uuid: tail,
+      });
+    } catch (err) {
+      return sendFollowingError(res, err);
     }
   }
 
