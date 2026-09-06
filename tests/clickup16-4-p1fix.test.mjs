@@ -40,6 +40,7 @@ import {
   attachRelevance,
   computeRelevance,
   createEcosystemHotOrchestrator,
+  deriveExternalCommunityProfileVersion,
   KNOWN_CATEGORIES,
   sortByRelevance,
 } from '../src/providers/ecosystem/hot.mjs';
@@ -186,13 +187,20 @@ async function runAllChecks() {
   // so we can read the actual hot_match_terms + themes.
   const { repository: storyRepo } = createSeededRepository();
   const profileRepo = createInMemoryCommunityProfileRepository();
-  const communityProfileVersion =
+  // P1.v1-3 (2026-09-07): the wire-contract community_profile_version
+  // is the EXTERNAL identity (= `${generator_version}-${shortContentHash}`)
+  // derived via `deriveExternalCommunityProfileVersion`. The internal
+  // ruleset string `'community-profile-rules/1'` is preserved on the
+  // profile row as `generator_version`, but the matcher compares
+  // against the external version. Use the helper below to compute the
+  // canonical external version from the freshly-imported profile row.
+  let communityProfileVersion =
     'community-profile@community-profile-rules/1';
 
   const cafeRainIds = FIXTURE_UUIDS['cafe-rain'];
   // Import the cafe-rain fixture profile so we know the matcher has
   // terms to read.
-  ensureCommunityProfile({
+  const cafeRainProfile = ensureCommunityProfile({
     repository: storyRepo,
     profileRepository: profileRepo,
     story_version_uuid: cafeRainIds.story_version_uuid,
@@ -202,6 +210,11 @@ async function runAllChecks() {
       seed: getCommunityFixtureSeed('cafe-rain'),
     },
   });
+  // P1.v1-3 (2026-09-07): derive the canonical EXTERNAL version from
+  // the freshly-imported profile row. The internal `generator_version`
+  // field is preserved as the ruleset version; the external string
+  // gains the content-hash suffix.
+  communityProfileVersion = deriveExternalCommunityProfileVersion(cafeRainProfile);
 
   const orchestrator = createEcosystemHotOrchestrator();
   const baseResp = await orchestrator.fetchHot({ category: 'total' });

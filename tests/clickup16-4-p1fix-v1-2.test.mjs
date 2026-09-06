@@ -55,6 +55,7 @@ import {
   attachRelevance,
   computeRelevance,
   createEcosystemHotOrchestrator,
+  deriveExternalCommunityProfileVersion,
   KNOWN_CATEGORIES,
   sortByRelevance,
 } from '../src/providers/ecosystem/hot.mjs';
@@ -198,12 +199,19 @@ async function runAllChecks() {
     });
 
     // ----- D. P1.v1-2-3: attachRelevance returns { attached, reason, ... } -----
+    // P1.v1-3 (2026-09-07) makes the wire-contract comparison target
+    // CONTENT-AWARE: `community_profile_version` on the wire is now
+    // `${generator_version}-${shortContentHash}`, derived via
+    // `deriveExternalCommunityProfileVersion`. The internal
+    // `generator_version` field on the profile row is preserved as the
+    // ruleset version; only the external identity string used for the
+    // mismatch comparison gains the content-hash suffix.
     const { repository: storyRepo } = createSeededRepository();
     const profileRepo = createInMemoryCommunityProfileRepository();
     const communityProfileVersion = COMMUNITY_PROFILE_GENERATOR_VERSION.rules_version;
 
     const cafeRainIds = FIXTURE_UUIDS['cafe-rain'];
-    ensureCommunityProfile({
+    const cafeRainProfile = ensureCommunityProfile({
       repository: storyRepo,
       profileRepository: profileRepo,
       story_version_uuid: cafeRainIds.story_version_uuid,
@@ -213,15 +221,17 @@ async function runAllChecks() {
         seed: getCommunityFixtureSeed('cafe-rain'),
       },
     });
+    // P1.v1-3: derive the canonical EXTERNAL version via the new
+    // helper so the match-path assertion supplies the right wire
+    // string. Same ruleset + same content → same external version.
+    const communityProfileVersionFull = deriveExternalCommunityProfileVersion(cafeRainProfile);
 
     const orchestrator = createEcosystemHotOrchestrator();
     const baseResp = await orchestrator.fetchHot({ category: 'total' });
 
     // Full identity for cafe-rain → attached = true (canonical row's
-    // generator_version is the v1 default which matches the supplied
-    // value the seed uses).
-    // v1 schema canonical = `${identifier}@${rules_version}`.
-    const communityProfileVersionFull = `${COMMUNITY_PROFILE_GENERATOR_VERSION.identifier}@${COMMUNITY_PROFILE_GENERATOR_VERSION.rules_version}`;
+    // external version matches the supplied value, including the
+    // content-hash suffix).
     const matched = attachRelevance(
       JSON.parse(JSON.stringify(baseResp)),
       {
@@ -252,13 +262,19 @@ async function runAllChecks() {
       assert.ok(Array.isArray(r.themes));
       assert.ok(r.themes.length >= 3);
     });
+    await check('D: attachRelevance (P1.v1-3): match path exposes content_hash on relevant_to_story', () => {
+      assert.equal(typeof matched.response.relevant_to_story.content_hash, 'string');
+      assert.ok(matched.response.relevant_to_story.content_hash.length >= 12);
+    });
 
     // Mismatch path: install a row at version '9.9.9' for cafe-rain,
     // request '1.0.0' → attached: false, reason: 'mismatch'.
+    // P1.v1-3: expected_version is now the EXTERNAL version derived
+    // from the canonical row (ruleset '9.9.9' + content-hash suffix).
     const isolatedRepo = createInMemoryCommunityProfileRepository();
     // First import cafe-rain so the story_version_uuid resolves.
     const cafeRainStory = { id: 'cafe-rain', title: '雨夜咖啡馆', hook: '凌晨的咖啡馆只剩你和她。' };
-    ensureCommunityProfile({
+    const isolatedProfile = ensureCommunityProfile({
       repository: storyRepo,
       profileRepository: isolatedRepo,
       story_version_uuid: cafeRainIds.story_version_uuid,
@@ -274,6 +290,7 @@ async function runAllChecks() {
         hot_keywords: [{ keyword: '雨夜咖啡馆', rationale: '原作标题本身的热榜匹配关键词。' }],
       },
     });
+    const isolatedExternalVersion = deriveExternalCommunityProfileVersion(isolatedProfile);
     const mismatchResult = attachRelevance(
       JSON.parse(JSON.stringify(baseResp)),
       {
@@ -286,7 +303,10 @@ async function runAllChecks() {
     await check('D: attachRelevance: wrong-version → result.attached = false + reason = "mismatch"', () => {
       assert.equal(mismatchResult.attached, false);
       assert.equal(mismatchResult.reason, 'mismatch');
-      assert.equal(mismatchResult.expected_version, '9.9.9');
+      // P1.v1-3: expected_version is the EXTERNAL identity
+      // (= generator_version + content-hash suffix), not the raw
+      // ruleset version.
+      assert.equal(mismatchResult.expected_version, isolatedExternalVersion);
       assert.equal(mismatchResult.actual_version, '1.0.0');
     });
 
@@ -351,12 +371,23 @@ async function runAllChecks() {
         generator_version: '7.7.7',
       },
     });
+    // P1.v1-3: read the canonical profile back from the SERVER-SIDE
+    // repo (the route reads from this repo) and derive the expected
+    // EXTERNAL version. The internal ruleset '7.7.7' is preserved;
+    // the external version gains the content-hash suffix.
+    const serverSideProfile = getCommunityProfile({
+      profileRepository: serverProfileRepo,
+      story_version_uuid: cafeRainIds.story_version_uuid,
+    });
+    const expectedExternalVersion = deriveExternalCommunityProfileVersion(serverSideProfile);
     const r4 = await fetch(`${baseUrl}/v1/ecosystem/hot?story_uuid=${cafeRainIds.story_uuid}&story_version_uuid=${cafeRainIds.story_version_uuid}&community_profile_version=1.0.0`);
     assert.equal(r4.status, 400);
     const j4 = await r4.json();
     await check('E: GET /v1/ecosystem/hot: P1.v1-2-4 wrong-version → 400 community_profile_version_mismatch', () => {
       assert.equal(j4.error, 'community_profile_version_mismatch');
-      assert.equal(j4.expected_community_profile_version, '7.7.7');
+      // P1.v1-3: expected_community_profile_version is the EXTERNAL
+      // identity (ruleset + content-hash suffix), not the raw ruleset.
+      assert.equal(j4.expected_community_profile_version, expectedExternalVersion);
       assert.equal(j4.actual_community_profile_version, '1.0.0');
     });
     await check('E: GET /v1/ecosystem/hot: 400 mismatch carries PUBLIC_DECORATE (demo) and NO DEV_FLAG', () => {
@@ -471,6 +502,15 @@ async function runAllChecks() {
     });
     await check('J: src/providers/ecosystem/hot.mjs: reads profile.generator_version (v1 schema)', () => {
       assert.match(hotSrc, /profile\.generator_version/);
+    });
+    await check('J: src/providers/ecosystem/hot.mjs (P1.v1-3): deriveExternalCommunityProfileVersion helper present', () => {
+      assert.match(hotSrc, /deriveExternalCommunityProfileVersion/);
+    });
+    await check('J: src/providers/ecosystem/hot.mjs (P1.v1-3): computeProfileContentHash helper present', () => {
+      assert.match(hotSrc, /computeProfileContentHash/);
+    });
+    await check('J: src/providers/ecosystem/hot.mjs (P1.v1-3): content_hash present in the module', () => {
+      assert.match(hotSrc, /content_hash/);
     });
 
     // ----- K. pure-function relevance (cross-cut sanity) ---------------------

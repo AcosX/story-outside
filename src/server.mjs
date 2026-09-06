@@ -59,6 +59,7 @@ import { snapshotAll as snapshotCacheStatsAll } from './observability/cacheStats
 import {
   attachRelevance,
   createEcosystemHotOrchestrator,
+  deriveExternalCommunityProfileVersion,
 } from './providers/ecosystem/hot.mjs';
 import {
   createStoriesHookContext,
@@ -1573,13 +1574,24 @@ async function handleRequest(req, res) {
   const PUBLIC_DECORATE = () => ({ demo: currentDemoFlag() });
 
   /**
-   * ClickUp 16.4 P1.v1-2 fix (2026-09-07): look up the canonical
-   * community_profile_version for a story_version_uuid by reading
-   * the same community-profile repo the /v1/ecosystem/hot
+   * ClickUp 16.4 P1.v1-2 + P1.v1-3 fix (2026-09-07): look up the
+   * canonical community_profile_version for a story_version_uuid by
+   * reading the same community-profile repo the /v1/ecosystem/hot
    * orchestrator reads. When the row is missing we fall back to the
    * process-wide `COMMUNITY_PROFILE_GENERATOR_VERSION.rules_version`
    * (the v1 schema string `'community-profile-rules/1'`) so the
    * bootstrap response always carries a valid triple for the browser.
+   *
+   * P1.v1-3 makes the returned string CONTENT-AWARE: the value is the
+   * EXTERNAL identity derived via `deriveExternalCommunityProfileVersion`
+   * (= `${generator_version}-${shortContentHash}`). The internal
+   * `generator_version` field on the profile row is preserved as the
+   * ruleset version; only the external identity string used on the
+   * wire contract (and echoed on the bootstrap response) gains the
+   * content-hash suffix. Two regenerations of the same ruleset with
+   * different content therefore surface distinct external versions
+   * and stale callers are rejected with 400 mismatch instead of
+   * silently observing stale relevance projections.
    *
    * @param {object} input
    * @param {object} input.profileRepository
@@ -1597,10 +1609,14 @@ async function handleRequest(req, res) {
     } catch {
       profile = null;
     }
-    if (!profile || typeof profile.generator_version !== 'string') {
-      return fallback;
+    if (!profile) return fallback;
+    try {
+      return deriveExternalCommunityProfileVersion(profile);
+    } catch {
+      return typeof profile.generator_version === 'string' && profile.generator_version
+        ? profile.generator_version
+        : fallback;
     }
-    return profile.generator_version;
   }
 
   // POST /api/sessions — atomic session bootstrap from a story + role.
