@@ -111,9 +111,9 @@ function renderHeader(ending, sessionMeta) {
     // ClickUp 16.3 P1 v1-2 (主人 2026-09-07 04:21 巡检): the
     // canonical owner is rendered on the ending page so the player
     // can see who they played as. In the OAuth-pending build this is
-    // always "待接入用户 (OAuth pending)". The server resolves
-    // identity via `currentUserProvider(req)` — the browser never
-    // mints a per-session user_uuid.
+    // always "待接入用户 (OAuth pending)". The server resolves the
+    // canonical principal via `currentUserProvider(req)` — the
+    // browser never mints a per-session principal id.
     el('p', { class: 'ending-owner', id: 'ending-owner' },
       sessionMeta && sessionMeta.ownerDisplayName
         ? `你 · ${sessionMeta.ownerDisplayName}`

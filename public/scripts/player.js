@@ -1237,13 +1237,26 @@ function bindEvents() {
 
 async function bootstrap() {
   bindEvents();
+  // ClickUp 16.3 P1 v1-3 (主人 2026-09-07 05:xx 巡检 + ChatGPT
+  // 复核): lazily load the public social panel so the home page DOM
+  // stays untouched. The panel mounts a single floating host element
+  // at document.body and is non-intrusive to the existing picker /
+  // story / ending-card surfaces. The panel itself never carries
+  // caller principal — see public/scripts/socialPanel.js for the
+  // hard rules.
+  try {
+    const socialMod = await import('/scripts/socialPanel.js');
+    if (socialMod && typeof socialMod.mount === 'function') {
+      await socialMod.mount();
+    }
+  } catch { /* panel is best-effort — the core game flow must still run */ }
   setStatus('loading');
   // ClickUp 16.3 P1 v1-2 (主人 2026-09-07 04:21 巡检): resolve the
   // canonical owner once on page load via GET /api/auth/status. The
   // server returns OAUTH_PENDING_USER until OAuth lands — we render
   // that display name on the picker and on the ending page. We do
-  // NOT mint a cookie or any per-browser user_uuid; identity flows
-  // exclusively from currentUserProvider(req) on the server.
+  // NOT mint a cookie or any per-browser principal id; the principal
+  // flows exclusively from currentUserProvider(req) on the server.
   try {
     const authStatus = await api('/api/auth/status');
     if (authStatus && authStatus.owner) {

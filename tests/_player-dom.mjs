@@ -13,6 +13,7 @@ import { dirname, resolve } from 'node:path';
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PLAYER_PATH = resolve(__dirname, '..', 'public', 'scripts', 'player.js');
 const ENDING_PAGE_PATH = resolve(__dirname, '..', 'public', 'scripts', 'endingPage.js');
+const SOCIAL_PANEL_PATH = resolve(__dirname, '..', 'public', 'scripts', 'socialPanel.js');
 
 export async function loadFixtureScript() {
   return readFile(PLAYER_PATH, 'utf-8');
@@ -22,6 +23,12 @@ let endingPageSourceCache = null;
 async function readEndingPageSource() {
   if (!endingPageSourceCache) endingPageSourceCache = readFile(ENDING_PAGE_PATH, 'utf-8');
   return endingPageSourceCache;
+}
+
+let socialPanelSourceCache = null;
+async function readSocialPanelSource() {
+  if (!socialPanelSourceCache) socialPanelSourceCache = readFile(SOCIAL_PANEL_PATH, 'utf-8');
+  return socialPanelSourceCache;
 }
 
 // The player lazy-loads the ending page via `import('/scripts/endingPage.js')`.
@@ -37,8 +44,32 @@ const PLAYER_ENDING_HOOK = 'globalThis.__HARNESS_IMPORT_ENDING_PAGE__()';
 
 async function importEndingPageForHarness() {
   const source = await readEndingPageSource();
-  const stripped = source.replace(/export\s*\{[^}]*\}\s*;?\s*$/m, '');
+  // Strip both `export {...}` and `export default {...}` so the
+  // source can be evaluated inside `new Function`.
+  const stripped = source
+    .replace(/export\s*\{[^}]*\}\s*;?\s*$/m, '')
+    .replace(/export\s+default\s+\{[^}]*\}\s*;?\s*$/m, '');
   const fn = new Function(`${stripped}\nreturn { mount, teardown, STATE };`);
+  return fn();
+}
+
+// The player lazy-loads the social panel via `import('/scripts/socialPanel.js')`
+// (ClickUp 16.3 P1 v1-3). The harness rewrites that dynamic import to a
+// hook that evaluates the REAL socialPanel.js source — the panel mounts
+// its own DOM and the player's lazy-import wiring stays under test.
+const PLAYER_SOCIAL_PANEL_IMPORT = "import('/scripts/socialPanel.js')";
+const PLAYER_SOCIAL_PANEL_HOOK = 'globalThis.__HARNESS_IMPORT_SOCIAL_PANEL__()';
+
+async function importSocialPanelForHarness() {
+  const source = await readSocialPanelSource();
+  // Strip both `export {...}` and `export default {...}` so the
+  // source can be evaluated inside `new Function` (which has no
+  // module-level export support). The named exports we want are
+  // captured in the return statement below.
+  const stripped = source
+    .replace(/export\s*\{[^}]*\}\s*;?\s*$/m, '')
+    .replace(/export\s+default\s+\{[^}]*\}\s*;?\s*$/m, '');
+  const fn = new Function(`${stripped}\nreturn { mount, refreshFeed, refreshShareButton, refreshAuthStatus, currentShareTargetUuid };`);
   return fn();
 }
 
@@ -49,7 +80,14 @@ function applyHarnessPatches(source) {
       + 'in player.js source — update PLAYER_ENDING_IMPORT in tests/_player-dom.mjs'
     );
   }
-  return source.replaceAll(PLAYER_ENDING_IMPORT, PLAYER_ENDING_HOOK);
+  let patched = source.replaceAll(PLAYER_ENDING_IMPORT, PLAYER_ENDING_HOOK);
+  // The social panel import is OPTIONAL: it was added by ClickUp 16.3
+  // P1 v1-3. Older player.js source (before the panel wiring) does
+  // not include the import, so we tolerate that.
+  if (patched.includes(PLAYER_SOCIAL_PANEL_IMPORT)) {
+    patched = patched.replaceAll(PLAYER_SOCIAL_PANEL_IMPORT, PLAYER_SOCIAL_PANEL_HOOK);
+  }
+  return patched;
 }
 
 // --- Minimal DOM polyfill ---
@@ -299,6 +337,15 @@ const document = {
   body: new Element('body'),
   head: new Element('head'),
   createElement(tag) { return new Element(tag); },
+  // getElementById: ClickUp 16.3 P1 v1-3 — the socialPanel module
+  // looks up its own host / status / feed elements by id. We map an
+  // id selector onto the existing querySelector path so the panel
+  // can mount under the harness without an extra polyfill surface.
+  getElementById(id) {
+    if (id === 'body') return document.body;
+    if (id === 'head') return document.head;
+    return querySelector(document.body, `#${id}`);
+  },
   querySelector(sel) {
     if (sel === 'body') return document.body;
     if (sel === 'head') return document.head;
@@ -585,6 +632,8 @@ export function createPlayerDom({ baseUrl, viewport = null, stepDelayMs = null, 
     globalThis.fetch = fetchStub;
     // Lazy ending-page import hook (see importEndingPageForHarness).
     globalThis.__HARNESS_IMPORT_ENDING_PAGE__ = importEndingPageForHarness;
+    // ClickUp 16.3 P1 v1-3: same hook pattern for the social panel.
+    globalThis.__HARNESS_IMPORT_SOCIAL_PANEL__ = importSocialPanelForHarness;
     if (!globalThis.crypto) globalThis.crypto = {};
     if (typeof globalThis.crypto.randomUUID !== 'function') {
       globalThis.crypto.randomUUID = () => '00000000-0000-4000-8000-000000000099';
