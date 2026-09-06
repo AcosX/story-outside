@@ -1164,9 +1164,20 @@ export function discardPendingTail({ repository, session_uuid }) {
  * @param {string} [input.identity.user_ref]
  * @param {string} [input.identity.model]
  * @param {string} [input.identity.prompt]
+ * @param {import('../community/repository.mjs').CommunityProfileRepository} [input.profileRepository]
+ *        ClickUp 16.1 server.mjs wiring fix (2026-09-06): when the
+ *        public real-provider path supplies a community-profile repo,
+ *        the underlying `importStoryAndEnsureCache` call ensures a
+ *        profile for the freshly imported story_version, tagged with
+ *        the supplied `profileOptions.source` (default `mock-generated`).
+ * @param {{ source?: string, locale?: string, seed?: object }} [input.profileOptions]
+ *        Forwarded to `importStoryAndEnsureCache` so the public
+ *        real-provider path can surface freshly-built profiles as
+ *        `source: 'real-generated'`. Omitting this argument keeps the
+ *        historical default (`mock-generated`).
  * @returns {Promise<{ session: object, opening_events: object[], cache_uuid: string, cache_status: string|null, story_uuid: string, story_version_uuid: string }>}
  */
-export async function bootstrapSessionFromWork({ repository, provider, session_uuid, work_id, role_id, identity }) {
+export async function bootstrapSessionFromWork({ repository, provider, session_uuid, work_id, role_id, identity, profileRepository, profileOptions }) {
   if (!repository) throw new Error('bootstrapSessionFromWork: repository required');
   if (!provider || typeof provider.getStory !== 'function') {
     throw new Error('bootstrapSessionFromWork: provider with getStory required');
@@ -1199,6 +1210,8 @@ export async function bootstrapSessionFromWork({ repository, provider, session_u
     provider,
     slug: work_id,
     story_uuid,
+    profileRepository,
+    profileOptions,
   });
   // Step 2: read the resulting cache so we can return opening_events[].
   const cache = repository.findOpeningCacheByUuid(ensured.opening_cache_uuid);
