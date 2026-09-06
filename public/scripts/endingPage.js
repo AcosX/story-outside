@@ -33,6 +33,7 @@ const STATE = {
   ending: null,
   originalTimeline: null,
   replay: null,
+  ecosystem: null,
   replayIndex: 0,
   mounted: false,
 };
@@ -66,6 +67,24 @@ async function fetchProjections(sessionUuid) {
     originalTimeline: originalResult.status === 'fulfilled' ? originalResult.value : { error: originalResult.reason },
     replay: replayResult.status === 'fulfilled' ? replayResult.value : { error: replayResult.reason },
   };
+}
+
+// ClickUp 16.2: fetch the ecosystem discussions for the ending-page
+// "故事之外 · 知乎在讨论什么" section. The endpoint is permissive
+// (work_id OR story_version_uuid) but we have story_version_uuid on
+// hand via sessionMeta — prefer it to avoid round-tripping through
+// work_id slug mapping.
+async function fetchEcosystemDiscussions(story_version_uuid) {
+  if (!story_version_uuid) return null;
+  try {
+    return await api('/v1/ecosystem/discussions', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ story_version_uuid }),
+    });
+  } catch (err) {
+    return { error: err };
+  }
 }
 
 // ---------- DOM helpers ----------
@@ -281,6 +300,79 @@ function renderAttribution(originalTimeline) {
   );
 }
 
+// ClickUp 16.2 — ending-page "故事之外 · 知乎在讨论什么" section.
+// Renders the ecosystem search results (a curated slice of 3-5 Zhihu
+// questions / answers). Per the 16.2 description:
+//   * 展示 title / excerpt / 互动信息和跳转知乎入口；
+//   * 故障 / 搜索超时 → 轻量失败态（“知乎社区暂不可用”）；
+//   * 不影响结局主体（本区块独立、failure 不冒泡到上方任何 section）。
+function renderEcosystemSection(ecosystem) {
+  if (!ecosystem || ecosystem.error) {
+    // 轻量失败态：单独区块、语气中性、不污染主体。
+    return el('section', { class: 'ending-section ending-ecosystem ending-ecosystem-unavailable', dataset: { section: 'ecosystem', status: 'unavailable' } },
+      el('h2', {},
+        el('span', { class: 'ecosystem-icon' }, '知乎'),
+        ' 故事之外 · 知乎在讨论什么'),
+      el('p', { class: 'ecosystem-unavailable', id: 'ecosystem-unavailable-text' },
+        '知乎社区暂不可用，跳转链接可以稍后手动搜索。'),
+    );
+  }
+  const results = Array.isArray(ecosystem.results) ? ecosystem.results : [];
+  const status = ecosystem.ecosystem_status || 'empty';
+  if (status === 'empty' || results.length === 0) {
+    return el('section', { class: 'ending-section ending-ecosystem ending-ecosystem-empty', dataset: { section: 'ecosystem', status: 'empty' } },
+      el('h2', {},
+        el('span', { class: 'ecosystem-icon' }, '知乎'),
+        ' 故事之外 · 知乎在讨论什么'),
+      el('p', { class: 'ecosystem-empty' }, '本次没有检索到相关问题。'),
+    );
+  }
+  // 正常状态：列表 + 每条点击跳转知乎。target="_blank" 加 rel="noopener"
+  // 保证安全（不允许 target_opener 读原页面句柄）。
+  return el('section', { class: 'ending-section ending-ecosystem', dataset: { section: 'ecosystem', status: 'ok' } },
+    el('h2', {},
+      el('span', { class: 'ecosystem-icon' }, '知乎'),
+      ' 故事之外 · 知乎在讨论什么'),
+    el('p', { class: 'ecosystem-hint' },
+      '以下问题来自知乎社区，跟本作有关，不属于本页生成的内容。点击跳转知乎查看讨论。'),
+    el('ol', { class: 'ecosystem-list', id: 'ecosystem-list' },
+      ...results.map((item, index) => {
+        const url = typeof item.url === 'string' ? item.url : '#';
+        const title = typeof item.title === 'string' ? item.title : '';
+        const excerpt = typeof item.excerpt === 'string' ? item.excerpt : '';
+        const likeCount = Number.isInteger(item.like_count) ? item.like_count : 0;
+        const commentCount = Number.isInteger(item.comment_count) ? item.comment_count : 0;
+        const authority = typeof item.authority_level === 'string' ? item.authority_level : 'medium';
+        const kind = typeof item.kind === 'string' ? item.kind : 'question';
+        return el('li', {
+          class: 'ecosystem-item',
+          dataset: { index: String(index), authority, kind },
+        },
+          el('a', {
+            class: 'ecosystem-link',
+            href: url,
+            target: '_blank',
+            rel: 'noopener noreferrer',
+            title: title,
+          }, title),
+          excerpt ? el('p', { class: 'ecosystem-excerpt' }, excerpt) : null,
+          el('div', { class: 'ecosystem-meta' },
+            kind === 'question'
+              ? el('span', { class: 'ecosystem-kind' }, '问题')
+              : kind === 'answer'
+                ? el('span', { class: 'ecosystem-kind' }, '回答')
+                : el('span', { class: 'ecosystem-kind' }, kind),
+            el('span', { class: 'ecosystem-stats' }, `点赞 ${likeCount} · 评论 ${commentCount}`),
+            authority === 'top' || authority === 'high'
+              ? el('span', { class: 'ecosystem-authority' }, '高权威')
+              : null,
+          ),
+        );
+      }),
+    ),
+  );
+}
+
 function replayProgressText(current, total) {
   return `${Math.min(current, total)} / ${total}`;
 }
@@ -360,6 +452,20 @@ async function mount({ sessionUuid, sessionMeta } = {}) {
   STATE.ending = projections.ending && !projections.ending.error ? projections.ending : null;
   STATE.originalTimeline = projections.originalTimeline && !projections.originalTimeline.error ? projections.originalTimeline : null;
   STATE.replay = projections.replay && !projections.replay.error ? projections.replay : null;
+  // ClickUp 16.2 ecosystem search (结局页 "故事之外 · 知乎在讨论什么").
+  // Fetched in parallel with the three projections so a slow / failed
+  // search does not delay the ending-page main body. story_version_uuid
+  // is preferred over work_id — sessionMeta carries the canonical UUID
+  // for the currently pinned story_version. A missing sessionMeta does
+  // NOT throw: the section simply renders the "知乎社区暂不可用" light
+  // failure state.
+  const storyVersionUuid = sessionMeta && sessionMeta.story_version_uuid;
+  if (storyVersionUuid) {
+    const eco = await fetchEcosystemDiscussions(storyVersionUuid);
+    STATE.ecosystem = eco && !eco.error ? eco : { ecosystem_status: 'unavailable', results: [], error: eco && eco.error };
+  } else {
+    STATE.ecosystem = null;
+  }
   STATE.replayIndex = 0;
   render(screen, sessionMeta || {});
   STATE.mounted = true;
@@ -387,6 +493,12 @@ function render(screen, sessionMeta) {
   const outcomes = renderCharacterOutcomesSection(STATE.ending); if (outcomes) blocks.push(outcomes);
   const analysis = renderAnalysisSection(STATE.ending); if (analysis) blocks.push(analysis);
   const comparison = renderComparisonSection(STATE.originalTimeline, STATE.ending, STATE.replay); if (comparison) blocks.push(comparison);
+  // ClickUp 16.2 ecosystem search section — inserted BEFORE the replay
+  // section so the user's "你走过的剧情" stays the visual anchor. A
+  // failure here ONLY degrades this section; the rest of the page is
+  // untouched.
+  const ecosystem = renderEcosystemSection(STATE.ecosystem);
+  if (ecosystem) blocks.push(ecosystem);
   const replay = renderReplaySection(STATE.replay);
   blocks.push(replay);
   blocks.push(renderAttribution(STATE.originalTimeline));
@@ -403,6 +515,7 @@ function teardown() {
   STATE.ending = null;
   STATE.originalTimeline = null;
   STATE.replay = null;
+  STATE.ecosystem = null;
   STATE.replayIndex = 0;
   showScreen('player');
 }

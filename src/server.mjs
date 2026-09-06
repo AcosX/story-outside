@@ -63,6 +63,19 @@ import {
   buildOriginalTimeline,
   buildReplay,
 } from './stories/endingService.mjs';
+import {
+  createInMemoryEcosystemSearchCacheRepository,
+  createMockSearchAdapter,
+  createRealSearchAdapter,
+  searchZhihuDiscussions,
+} from './providers/ecosystem/index.mjs';
+import {
+  createInMemoryCommunityProfileRepository,
+} from './community/repository.mjs';
+import {
+  seedCommunityProfiles,
+} from './community/importHook.mjs';
+import { getCommunityProfile } from './community/service.mjs';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 const ROOT = resolve(__dirname, '..');
@@ -407,6 +420,39 @@ function classifyProviderError(err) {
 // having to POST a separate import for every story. The repository lives in
 // memory only; see docs/data-model.md for the MariaDB mapping.
 const { repository: storyRepo, fixtures: storyFixtures } = createSeededRepository();
+
+// ClickUp 16.1 community-profile layer (foundation for the four ecology
+// capabilities). The repository is seeded once at process start so the
+// search / hot / knowledge / follow adapters always have a stable set of
+// profiles to read from. The 16.2 ecosystem search cache is built on
+// top of this; its cache key includes community_profile_version so a
+// rule bump invalidates the cache without us having to wire any extra
+// invalidation plumbing here.
+const communityProfileRepo = createInMemoryCommunityProfileRepository();
+seedCommunityProfiles(storyRepo, communityProfileRepo);
+
+// ClickUp 16.2 ecosystem search (结局页 "故事之外 · 知乎在讨论什么").
+// The cache repository is process-local; the adapter is the mock fixture
+// by default and falls back to the mock when zhihu-cli auth is not
+// configured (ClickUp 16.2 hard rule: search failures must NEVER block
+// the ending-page main body).
+const ecosystemSearchCacheRepo = createInMemoryEcosystemSearchCacheRepository();
+const ecosystemSearchAdapter = createMockSearchAdapter({
+  slugResolver: (story_version_uuid) => {
+    for (const fix of storyFixtures) {
+      if (fix.story_version_uuid === story_version_uuid) return fix.slug;
+    }
+    return null;
+  },
+});
+// Real adapter is wired but stays inert unless STHERY_REAL_SEARCH=1 is
+// set AND zhihu-cli auth is configured (otherwise it falls back to
+// mock — see realSearchAdapter.mjs). The factory is cheap; we always
+// pay the construction cost so a deploy that flips the env var does
+// not need a restart.
+const ecosystemRealAdapter = createRealSearchAdapter({
+  isAuthConfigured: () => false, // demo mode: never enables CLI in this build
+});
 
 // sessionService deliberately keeps its state private to the repository. The
 // route layer keeps only the request's non-secret pinned metadata so recovery
@@ -1486,6 +1532,138 @@ async function handleRequest(req, res) {
       cache_stats: cacheStats,
       note: 'frontend_playback_ms can be computed per-commit from the events the client commits; this endpoint exposes storage only.',
     });
+  }
+
+  // -----------------------------------------------------------------------
+  // ClickUp 16.2 ecosystem search — ending-page "故事之外 · 知乎在讨论什么".
+  //
+  // POST /v1/ecosystem/discussions
+  //   body: { work_id?, story_version_uuid?, role_id? }
+  //     * work_id OR story_version_uuid — either identifies the target
+  //       story_version. work_id is the upstream API identifier; the
+  //       route maps it back to a story_version_uuid via the seeded
+  //       fixture map (demo) or via the live story repository.
+  //     * role_id — informational only; carried for symmetry with the
+  //       spec body but never included in cache keys (a search result
+  //       is role-agnostic per ClickUp 16.2 description).
+  //
+  //   response: { demo, ecosystem_status, results[], scope, cached,
+  //               provider?, error_code?, error_message? }
+  //
+  // The route NEVER 5xxs for search failures. timeout / 429 / 5xx /
+  // empty body all collapse into { results: [], ecosystem_status:
+  // 'unavailable' } so the ending-page main body keeps rendering
+  // even when the network is down. Cache hits short-circuit the
+  // adapter so a page refresh does not re-hit zhihu-cli (16.2
+  // description: "刷新结局页不得重复打 API").
+  // -----------------------------------------------------------------------
+  if (method === 'POST' && pathname === '/v1/ecosystem/discussions') {
+    let body = {};
+    try {
+      body = await readJsonBody(req);
+    } catch (err) {
+      const { status, code } = classifyProviderError(err);
+      return jsonResponse(res, status, { error: code, demo: currentDemoFlag(), dev: DEV_FLAG });
+    }
+    if (!validObject(body)) {
+      return jsonResponse(res, 400, {
+        error: 'validation_failed',
+        message: 'ecosystem discussions body must be an object',
+        demo: currentDemoFlag(),
+        dev: DEV_FLAG,
+      });
+    }
+    // 1. Resolve story_version_uuid from work_id OR a direct UUID.
+    let story_version_uuid = typeof body.story_version_uuid === 'string' && body.story_version_uuid
+      ? body.story_version_uuid
+      : null;
+    if (!story_version_uuid && typeof body.work_id === 'string' && body.work_id) {
+      const fix = storyFixtures.find((f) => f.slug === body.work_id || f.story_version_uuid === body.work_id);
+      story_version_uuid = fix ? fix.story_version_uuid : null;
+    }
+    if (!story_version_uuid) {
+      return jsonResponse(res, 400, {
+        error: 'validation_failed',
+        message: 'ecosystem discussions requires story_version_uuid or work_id',
+        demo: currentDemoFlag(),
+        dev: DEV_FLAG,
+      });
+    }
+    if (!isSessionUuid(story_version_uuid)) {
+      return jsonResponse(res, 400, {
+        error: 'validation_failed',
+        message: 'story_version_uuid must be a UUID',
+        demo: currentDemoFlag(),
+        dev: DEV_FLAG,
+      });
+    }
+    // 2. Read the community profile for this story_version. A profile
+    //    is required so we know which search queries to issue; the
+    //    description requires "查询词来自 StoryCommunityProfile.search_queries".
+    const profile = getCommunityProfile({
+      profileRepository: communityProfileRepo,
+      story_version_uuid,
+    });
+    if (!profile) {
+      return jsonResponse(res, 404, {
+        error: 'community_profile_not_found',
+        message: 'No active community profile for this story_version.',
+        story_version_uuid,
+        demo: currentDemoFlag(),
+        dev: DEV_FLAG,
+      });
+    }
+    // 3. Run the search through the shared service. The adapter is the
+    //    real one when its isAuthConfigured() returns true; otherwise
+    //    the real adapter itself delegates to the mock — keeping the
+    //    auth-switch seam out of this route. We always pass the mock
+    //    adapter as the inner fallback so a misconfigured CLI never
+    //    turns into a 5xx.
+    let adapter;
+    try {
+      adapter = ecosystemRealAdapter && typeof ecosystemRealAdapter.searchZhihuDiscussions === 'function'
+        ? ecosystemRealAdapter
+        : ecosystemSearchAdapter;
+    } catch {
+      adapter = ecosystemSearchAdapter;
+    }
+    const queries = profile.queries.map((q) => ({ id: q.id, query: q.query }));
+    try {
+      const outcome = await searchZhihuDiscussions({
+        adapter,
+        cacheRepository: ecosystemSearchCacheRepo,
+        story_version_uuid,
+        community_profile_version: profile.generator_version,
+        queries,
+      });
+      return jsonResponse(res, 200, {
+        demo: currentDemoFlag(),
+        dev: DEV_FLAG,
+        ecosystem_status: outcome.ecosystem_status,
+        results: outcome.results,
+        scope: outcome.scope,
+        cached: outcome.cached,
+        ...(outcome.provider ? { provider: outcome.provider } : {}),
+        ...(outcome.error_code ? { error_code: outcome.error_code } : {}),
+        ...(outcome.error_message ? { error_message: outcome.error_message } : {}),
+      });
+    } catch (err) {
+      // Defence in depth: searchZhihuDiscussions is supposed to NEVER
+      // throw (errors collapse into ecosystem_status='unavailable').
+      // If we reach here something went wrong in the cache adapter;
+      // surface a 200 with the failure metadata so the ending page
+      // keeps rendering the main body.
+      return jsonResponse(res, 200, {
+        demo: currentDemoFlag(),
+        dev: DEV_FLAG,
+        ecosystem_status: 'unavailable',
+        results: [],
+        scope: { story_version_uuid, community_profile_version: profile.generator_version },
+        cached: false,
+        error_code: 'route_unexpected',
+        error_message: String((err && err.message) || err),
+      });
+    }
   }
 
   // Root → static

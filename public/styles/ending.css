@@ -433,3 +433,112 @@
 .ending-empty .ending-title {
   font-size: 18px;
 }
+/* --- ClickUp 16.2 ecosystem search ("故事之外 · 知乎在讨论什么") --- */
+
+.ending-ecosystem {
+  border-left: 3px solid var(--accent, #4a90e2);
+  background: var(--surface-soft, rgba(74, 144, 226, 0.04));
+}
+
+.ending-ecosystem h2 .ecosystem-icon {
+  display: inline-block;
+  margin-right: 6px;
+  padding: 1px 8px;
+  background: var(--accent, #4a90e2);
+  color: #fff;
+  border-radius: 4px;
+  font-size: 12px;
+  font-weight: 600;
+  vertical-align: middle;
+}
+
+.ending-ecosystem .ecosystem-hint {
+  margin: 0 0 var(--gap-3, 12px) 0;
+  font-size: 13px;
+  color: var(--fg-mute, #7d8294);
+}
+
+.ending-ecosystem .ecosystem-list {
+  margin: 0;
+  padding-left: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: var(--gap-3, 12px);
+}
+
+.ending-ecosystem .ecosystem-item {
+  padding: var(--gap-3, 12px);
+  background: var(--surface, #1c1f26);
+  border: 1px solid var(--line, #2a2f3a);
+  border-radius: var(--radius, 8px);
+  transition: border-color 120ms ease;
+}
+
+.ending-ecosystem .ecosystem-item:hover {
+  border-color: var(--accent, #4a90e2);
+}
+
+.ending-ecosystem .ecosystem-item[data-authority="top"] {
+  border-left: 3px solid var(--accent, #4a90e2);
+}
+
+.ending-ecosystem .ecosystem-item[data-authority="high"] {
+  border-left: 3px solid var(--accent-soft, #7aa9e8);
+}
+
+.ending-ecosystem .ecosystem-link {
+  display: block;
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--fg-strong, #f0f2f5);
+  text-decoration: none;
+  line-height: 1.4;
+}
+
+.ending-ecosystem .ecosystem-link:hover {
+  color: var(--accent, #4a90e2);
+  text-decoration: underline;
+}
+
+.ending-ecosystem .ecosystem-excerpt {
+  margin: 6px 0 0 0;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--fg-mute, #7d8294);
+}
+
+.ending-ecosystem .ecosystem-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--gap-2, 8px);
+  margin-top: 6px;
+  font-size: 12px;
+  color: var(--fg-mute, #7d8294);
+}
+
+.ending-ecosystem .ecosystem-kind {
+  padding: 1px 6px;
+  background: var(--surface-soft, rgba(255, 255, 255, 0.04));
+  border-radius: 3px;
+}
+
+.ending-ecosystem .ecosystem-authority {
+  padding: 1px 6px;
+  background: var(--accent-soft, rgba(74, 144, 226, 0.18));
+  color: var(--accent, #4a90e2);
+  border-radius: 3px;
+}
+
+/* Light failure state — keeps the section visible but quiet. */
+.ending-ecosystem-unavailable .ecosystem-unavailable,
+.ending-ecosystem-empty .ecosystem-empty {
+  margin: 0;
+  font-size: 13px;
+  color: var(--fg-mute, #7d8294);
+}
+
+.ending-ecosystem-unavailable {
+  border-left-color: var(--warn-mute, #5a5a5a);
+  background: transparent;
+}

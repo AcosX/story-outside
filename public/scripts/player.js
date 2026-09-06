@@ -877,6 +877,11 @@ async function mountEndingPage(sessionMetaOverride) {
         sessionMeta: sessionMetaOverride || {
           storyTitle: state.story ? state.story.title : '',
           roleLabel: state.role ? state.role.label : '',
+          // ClickUp 16.2 ecosystem search: carry the pinned
+          // story_version_uuid so the ending page can request the
+          // "故事之外 · 知乎在讨论什么" section without an extra
+          // round-trip to look up the story mapping.
+          story_version_uuid: state.storyVersionUuid || '',
         },
       });
       return true;
