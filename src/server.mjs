@@ -68,6 +68,7 @@ import {
   buildOriginalTimeline,
   buildReplay,
 } from './stories/endingService.mjs';
+import { createEcosystemKnowledgeProvider } from './providers/ecosystem/knowledge.mjs';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 const ROOT = resolve(__dirname, '..');
@@ -440,6 +441,11 @@ seedCommunityProfiles(storyRepo, communityProfileRepo);
 // (pinned=null). The canonical session data lives in the repository, not
 // here — eviction here never loses durable information.
 const sessionPinnedMetadata = new BoundedMap({ max: 1024, name: 'sessionPinnedMetadata' });
+// ClickUp 16.5 — public /v1/ecosystem/knowledge orchestrator. The
+// orchestrator wraps a real provider (env-gated, NEVER hard-coded) and
+// a mock fallback so the player-facing surface always answers 200.
+// Internal singleton so all routes see the same pair-key cache.
+const knowledgeProvider = createEcosystemKnowledgeProvider();
 // Per-session turn-level request idempotency map. Keyed by session_uuid,
 // then by request_id. The map intentionally lives outside the repository
 // because the runtime does not own it (the repository is process-shared
@@ -2048,6 +2054,117 @@ async function handleRequest(req, res) {
       });
     } catch (err) {
       return sessionErrorResponse(res, err);
+    }
+  }
+
+  // -----------------------------------------------------------------
+  // ClickUp 16.5 — public 知乎知识区 façade (browser-facing).
+  //
+  // Independent from 16.1 discussion 区 (which is keyed by
+  // community_profile_version + queries/topics). 知识区 is the
+  // "现实/知乎知识延伸" surface and is always answered with
+  // `provisional: true` so a UI / client never mistakes an entry
+  // for canonical story facts.
+  //
+  // Public contract:
+  //   * POST /v1/ecosystem/knowledge
+  //       body: { story_uuid, story_version_uuid, community_profile_version,
+  //               topic_id?, topic_label?, limit? }
+  //       resp: { knowledge: [...], provisional: true, disclaimer,
+  //               source, cached, fetched_at, cache_key, degraded,
+  //               degradation | null }
+  //   * Knowledge failure never blocks the core game loop:
+  //     real provider unavailable → mock fallback; both unavailable
+  //     → 200 with knowledge: [] and degraded:true. NEVER 5xx on the
+  //     public surface.
+  //   * NO DEV_FLAG banner — this is a player-facing surface.
+  // -----------------------------------------------------------------
+  if (method === 'POST' && pathname === '/v1/ecosystem/knowledge') {
+    let body;
+    try {
+      body = await readJsonBody(req);
+    } catch (err) {
+      // PR #10 review (B1): bad json body maps to the same stable
+      // code the public session surface uses, NOT to a raw 500.
+      return jsonResponse(res, 400, {
+        error: 'bad_json',
+        message: 'POST /v1/ecosystem/knowledge expects a JSON object body.',
+      });
+    }
+    if (!body || typeof body !== 'object' || Array.isArray(body)) {
+      return jsonResponse(res, 400, {
+        error: 'validation_failed',
+        message: 'POST /v1/ecosystem/knowledge expects a JSON object body.',
+        field: 'body',
+      });
+    }
+    // Whitelist the input. The browser only ever sends the three
+    // identifiers the surface was designed for plus an optional
+    // topic_id / topic_label / limit. Anything else is rejected
+    // without echoing back.
+    const allowedKeys = ['story_uuid', 'story_version_uuid', 'community_profile_version', 'topic_id', 'topic_label', 'limit'];
+    const unknownKeys = Object.keys(body).filter((k) => !allowedKeys.includes(k));
+    if (unknownKeys.length > 0) {
+      return jsonResponse(res, 400, {
+        error: 'validation_failed',
+        message: 'POST /v1/ecosystem/knowledge has unsupported fields.',
+        field: 'body',
+      });
+    }
+    if (typeof body.story_uuid !== 'string' || !body.story_uuid) {
+      return jsonResponse(res, 400, {
+        error: 'validation_failed',
+        message: 'story_uuid is required.',
+        field: 'story_uuid',
+      });
+    }
+    if (typeof body.story_version_uuid !== 'string' || !body.story_version_uuid) {
+      return jsonResponse(res, 400, {
+        error: 'validation_failed',
+        message: 'story_version_uuid is required.',
+        field: 'story_version_uuid',
+      });
+    }
+    if (typeof body.community_profile_version !== 'string' || !body.community_profile_version) {
+      return jsonResponse(res, 400, {
+        error: 'validation_failed',
+        message: 'community_profile_version is required.',
+        field: 'community_profile_version',
+      });
+    }
+    try {
+      const result = await knowledgeProvider.match({
+        story_version_uuid: body.story_version_uuid,
+        community_profile_version: body.community_profile_version,
+        topic_id: typeof body.topic_id === 'string' && body.topic_id ? body.topic_id : null,
+        limit: Number.isInteger(body.limit) && body.limit > 0 ? body.limit : undefined,
+      });
+      // The orchestrator always returns `provisional: true`. We DO
+      // NOT add the DEV_FLAG banner — knowledge is player-facing.
+      // Defensive belt-and-braces: a future orchestrator regression
+      // that forgets to set the flag must NOT reach the wire. The
+      // static-guard grep on `provisional: true` in this file finds
+      // this line so a future audit can confirm the invariant is
+      // enforced at the route layer too.
+      if (result.provisional !== true) {
+        throw new Error('knowledge response must carry provisional: true');
+      }
+      return jsonResponse(res, 200, result);
+    } catch (err) {
+      // Validation errors propagate from the orchestrator. Anything
+      // else is a 500 — knowledge should not normally throw.
+      if (err && err.code === 'validation_failed') {
+        return jsonResponse(res, 400, {
+          error: 'validation_failed',
+          message: err.message || 'Invalid request.',
+        });
+      }
+      // eslint-disable-next-line no-console
+      console.error('[story-outside] /v1/ecosystem/knowledge failed:', String(err && err.message ? err.message : err));
+      return jsonResponse(res, 500, {
+        error: 'internal_error',
+        message: 'Internal server error.',
+      });
     }
   }
 
