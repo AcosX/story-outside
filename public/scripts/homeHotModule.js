@@ -1,4 +1,4 @@
-// public/scripts/homeHotModule.js — ClickUp 16.4 P1 fix (2026-09-07).
+// public/scripts/homeHotModule.js — ClickUp 16.4 P1.v1-2 fix (2026-09-07).
 //
 // Home-page 知乎热榜 module. Independent `<script type="module">` so
 // it cannot drag player.js / endingPage.js with it; loads its own DOM
@@ -6,7 +6,7 @@
 // `grep -rE "/api/(admin|dev)/" public/` MUST stay zero — this file
 // only reads /v1/ecosystem/hot (public surface).
 //
-// "相关才关联" UI contract (P1 fix):
+// "相关才关联" UI contract (P1.v1-2 fix):
 //   * Every hot entry that matches the active story's community
 //     profile (`relevant.score > 0`) is rendered with a "相关" badge
 //     AND sorted to the top.
@@ -17,13 +17,21 @@
 //     the request returns a plain list with no badges — the module
 //     shows a soft hint instead.
 //
-// Public surface:
-//   * Reads `window.STORY_OUTSIDE_ACTIVE_IDENTITY` (set by player.js)
-//     for { story_uuid, story_version_uuid, community_profile_version }.
-//   * Falls back to a no-identity GET /v1/ecosystem/hot when the
-//     identity is missing — same endpoint, no params.
-//   * Exposes no global API; integration with the picker happens via
-//     DOM mutation only.
+// P1.v1-2 TDZ fix (2026-09-07):
+//   The previous PR #23 (ce7f03a) had `const X = X.field` in
+//   `readActiveIdentity`, which threw a Temporal Dead Zone
+//   ReferenceError the moment the function was invoked. v1-2 reads
+//   the triple off `window.STORY_OUTSIDE_IDENTITY` with explicit
+//   defaults on the INPUT parameter (no closure self-reference), so
+//   the function works the instant it is called even when the global
+//   is null.
+//
+// P1.v1-2 wiring (2026-09-07):
+//   The producer lives in public/scripts/identity.js. This module
+//   reads `window.STORY_OUTSIDE_IDENTITY` (set by identity.js on
+//   page-load from sessionStorage when present) and listens for the
+//   `story:identity-changed` CustomEvent to refresh the list when
+//   the user picks / starts / finishes a story.
 
 const ROOT_ID = 'ecosystem-hot-module';
 const LIST_ID = 'ecosystem-hot-list';
@@ -33,6 +41,8 @@ const RELATED_LABEL = '相关';
 const HINT_LABEL = '选一个故事再看热榜关联';
 const EMPTY_LABEL = '暂时无法获取知乎热议';
 const LOADING_LABEL = '载入中…';
+const IDENTITY_EVENT = 'story:identity-changed';
+const IDENTITY_GLOBAL_KEY = 'STORY_OUTSIDE_IDENTITY';
 
 function getRoot() {
   return document.getElementById(ROOT_ID);
@@ -46,16 +56,38 @@ function getStatus() {
   return document.getElementById(STATUS_ID);
 }
 
+/**
+ * Read the active identity triple directly off the producer's global.
+ *
+ * P1.v1-2 TDZ fix (2026-09-07): do NOT use a `const X = X.field` pattern.
+ * We pull the global into a parameter, then destructure with explicit
+ * defaults, so no identifier self-references itself in its own
+ * declaration.
+ *
+ * @returns {{ story_uuid: string, story_version_uuid: string, community_profile_version: string } | null}
+ */
 function readActiveIdentity() {
-  const identity = /** @type {any} */ (window).STORY_OUTSIDE_ACTIVE_IDENTITY;
+  // Step 1: read the global into a local parameter (NOT a self-ref
+  // const). This is the fix for the v1 TDZ — the previous code had
+  // `const community_profile_version = typeof identity.community_profile_version === 'string' && community_profile_version ? ...`
+  // which dereferenced `community_profile_version` inside its own
+  // declaration and blew up with ReferenceError: Cannot access
+  // 'community_profile_version' before initialization.
+  const identity = /** @type {any} */ (window)[IDENTITY_GLOBAL_KEY];
   if (!identity || typeof identity !== 'object') return null;
+  // Step 2: pull each field into its own local. The defaults use the
+  // EMPTY STRING so the "all three required" check below can short-
+  // circuit on any missing piece. Note: the third clause references
+  // `identity.community_profile_version` (not the local being
+  // declared) — this is the explicit TDZ fix.
   const story_uuid = typeof identity.story_uuid === 'string' && identity.story_uuid
     ? identity.story_uuid
     : '';
   const story_version_uuid = typeof identity.story_version_uuid === 'string' && identity.story_version_uuid
     ? identity.story_version_uuid
     : '';
-  const community_profile_version = typeof identity.community_profile_version === 'string' && community_profile_version
+  const community_profile_version = typeof identity.community_profile_version === 'string'
+    && identity.community_profile_version
     ? identity.community_profile_version
     : '';
   if (!story_uuid || !story_version_uuid || !community_profile_version) return null;
@@ -150,7 +182,7 @@ function renderList(hot, hasIdentity) {
   if (!list) return;
   list.replaceChildren();
   if (!Array.isArray(hot) || hot.length === 0) {
-    setStatus(hasIdentity ? EMPTY_LABEL : EMPTY_LABEL);
+    setStatus(EMPTY_LABEL);
     return;
   }
   let relatedCount = 0;
@@ -223,32 +255,24 @@ async function loadInitial() {
 }
 
 /**
- * Re-render against a newly-set identity. The picker/player can call
- * this via a custom event:
- *
- *   document.dispatchEvent(new CustomEvent('story-outside:identity', {
- *     detail: { story_uuid, story_version_uuid, community_profile_version },
- *   }));
- *
+ * Re-render against a newly-set identity. The identity producer
+ * (public/scripts/identity.js) fires `story:identity-changed` on
+ * `document` whenever pickStory / startStory / endingPage runs;
  * `homeHotModule.js` listens for this event so it can switch from
  * the plain list to the "相关才关联" list without a full page reload.
  */
 function attachIdentityListener() {
-  document.addEventListener('story-outside:identity', async (event) => {
+  document.addEventListener(IDENTITY_EVENT, async (event) => {
     const detail = event && /** @type {any} */ (event).detail;
-    if (!detail || typeof detail !== 'object') return;
-    const identity = {
-      story_uuid: typeof detail.story_uuid === 'string' ? detail.story_uuid : '',
-      story_version_uuid: typeof detail.story_version_uuid === 'string' ? detail.story_version_uuid : '',
-      community_profile_version: typeof detail.community_profile_version === 'string' ? detail.community_profile_version : '',
-    };
-    if (!identity.story_uuid || !identity.story_version_uuid || !identity.community_profile_version) {
+    // detail === null → identity cleared; fall through to a plain
+    // list with the soft hint.
+    const identity = readActiveIdentity();
+    const root = getRoot();
+    if (!root) return;
+    if (!identity) {
       await loadInitial();
       return;
     }
-    /** @type {any} */ (window).STORY_OUTSIDE_ACTIVE_IDENTITY = identity;
-    const root = getRoot();
-    if (!root) return;
     setState(root, 'loading');
     setStatus(LOADING_LABEL);
     try {
@@ -260,6 +284,7 @@ function attachIdentityListener() {
       setState(root, 'error');
       renderEmpty();
     }
+    void detail;
   });
 }
 
@@ -268,14 +293,17 @@ function init() {
   if (!root) return;
   attachIdentityListener();
   // Defer the initial load so the picker can finish wiring the
-  // `STORY_OUTSIDE_ACTIVE_IDENTITY` global first. 0 ms is enough —
-  // the picker script's `DOMContentLoaded` handler runs first because
-  // player.js is loaded BEFORE homeHotModule.js.
+  // identity global first. 0 ms is enough — identity.js runs
+  // synchronously inside its IIFE on script load, and player.js
+  // (which may setActiveIdentity() on pickStory) loads AFTER
+  // homeHotModule.js per public/index.html ordering.
   setTimeout(() => { loadInitial(); }, 0);
 }
 
-if (document.readyState === 'loading') {
-  document.addEventListener('DOMContentLoaded', init);
-} else {
-  init();
+if (typeof document !== 'undefined') {
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', init);
+  } else {
+    init();
+  }
 }

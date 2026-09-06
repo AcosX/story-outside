@@ -216,7 +216,7 @@ async function runAllChecks() {
   });
 
   // Identity path with cafe-rain.
-  const respWithIdentity = attachRelevance(
+  const attachResult = attachRelevance(
     JSON.parse(JSON.stringify(baseResp)),
     {
       story_uuid: cafeRainIds.story_uuid,
@@ -225,6 +225,13 @@ async function runAllChecks() {
     },
     { profileRepository: profileRepo },
   );
+  // P1.v1-2 (2026-09-07): attachRelevance returns
+  // { attached, reason, expected_version, actual_version, response }.
+  // The matching response is in `result.response`.
+  const respWithIdentity = attachResult && attachResult.response ? attachResult.response : attachResult;
+  await check('attachRelevance: result.attached = true with full identity', () => {
+    assert.equal(attachResult.attached, true);
+  });
   await check('attachRelevance: relevant_to_story is set with full identity', () => {
     assert.ok(respWithIdentity.relevant_to_story);
     assert.equal(typeof respWithIdentity.relevant_to_story.score, 'number');
@@ -263,7 +270,7 @@ async function runAllChecks() {
 
   // Partial-identity path: missing one of the three → no relevance.
   await check('attachRelevance: missing story_version_uuid → no relevance', () => {
-    const resp = attachRelevance(
+    const result = attachRelevance(
       JSON.parse(JSON.stringify(baseResp)),
       {
         story_uuid: cafeRainIds.story_uuid,
@@ -272,11 +279,14 @@ async function runAllChecks() {
       },
       { profileRepository: profileRepo },
     );
+    assert.equal(result.attached, false);
+    assert.equal(result.reason, 'identity_incomplete');
+    const resp = result.response;
     assert.equal(resp.relevant_to_story, undefined);
     for (const e of resp.hot) assert.equal(e.relevant, undefined);
   });
   await check('attachRelevance: missing community_profile_version → no relevance', () => {
-    const resp = attachRelevance(
+    const result = attachRelevance(
       JSON.parse(JSON.stringify(baseResp)),
       {
         story_uuid: cafeRainIds.story_uuid,
@@ -285,7 +295,9 @@ async function runAllChecks() {
       },
       { profileRepository: profileRepo },
     );
-    assert.equal(resp.relevant_to_story, undefined);
+    assert.equal(result.attached, false);
+    assert.equal(result.reason, 'identity_incomplete');
+    assert.equal(result.response.relevant_to_story, undefined);
   });
 
   // ----- D. unrelated story → every score 0 --------------------------------------
@@ -341,7 +353,7 @@ async function runAllChecks() {
   const offTopicBase = await offTopicOrchestrator.fetchHot({ category: 'total' });
   // Use the cafe-rain profile (with on-topic terms) against an off-topic
   // hot list: every entry's score must be 0.
-  const respOff = attachRelevance(
+  const respOffResult = attachRelevance(
     JSON.parse(JSON.stringify(offTopicBase)),
     {
       story_uuid: cafeRainIds.story_uuid,
@@ -350,7 +362,9 @@ async function runAllChecks() {
     },
     { profileRepository: profileRepo },
   );
+  const respOff = respOffResult.response;
   await check('attachRelevance: unrelated hot list → every entry score 0', () => {
+    assert.ok(respOffResult.attached, 'attached must be true when profile resolves, even with 0 matches');
     assert.ok(respOff.relevant_to_story);
     for (const e of respOff.hot) {
       if (e.relevant) {

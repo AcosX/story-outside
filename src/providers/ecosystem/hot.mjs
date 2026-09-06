@@ -1,46 +1,60 @@
-// src/providers/ecosystem/hot.mjs — ClickUp 16.4 知乎热榜 orchestrator
-// rebuilt on current main 44343b2 (2026-09-07 P1 fix).
+// src/providers/ecosystem/hot.mjs — ClickUp 16.4 P1.v1-2 知乎热榜 orchestrator
+// (2026-09-07), continued on fix/clickup16-4-p1-hot-relevance branch.
 //
-// P1 fix — home-page relevance matching:
+// P1.v1-2 fix — home-page relevance matching + mismatch observability:
 //
-//   The previous round (PR #20 / ee5217b) served a plain hot list and
-//   the home-page module showed only outbound zhihu links. The
-//   owner-supervised inspection (00:21 GMT+8 2026-09-07) and ChatGPT
-//   independent review both flagged this as a P1 blocker: the home
-//   page must show "相关才关联" — only surface a hot entry as RELATED
-//   to the current story when it actually overlaps with the
-//   story's community profile.
+//   The previous round (PR #23 / ce7f03a, the v1 fix on this branch)
+//   served a relevance-bearing hot list when the caller supplied the
+//   identity triple, but a wrong-version call returned 200 with
+//   `relevant_to_story: { score: 0 }` — silently degrading to "0
+//   terms" when the real cause was a data-contract mismatch. The
+//   owner-supervised inspection (2026-09-07 04:21 GMT+8) and ChatGPT
+//   independent review both flagged this as a P1 blocker: a wrong
+//   community_profile_version MUST return 400
+//   `community_profile_version_mismatch` so callers can fix the
+//   contract instead of debugging "why is my hot list empty?".
 //
-//   This module now reads `StoryCommunityProfile.hot_match_terms`
-//   (= the profile's `hot_keywords[].keyword`) and
-//   `StoryCommunityProfile.themes` (= `topics[].label`) and computes
-//   a deterministic, non-LLM relevance score for each hot entry:
+//   v1-2 keeps the v1 schema (`StoryCommunityProfile.generator_version`)
+//   intact — the canonical 13th field on the profile shape is NOT
+//   renamed. The matcher reads the ACTIVE row for the story_version
+//   and compares the canonical `generator_version` against the caller-
+//   supplied value AFTER the read; a mismatch becomes an explicit
+//   reason instead of silently returning 0 terms.
 //
-//     score = sum_over_terms(hit_count(term, entry.text))
+//   Relevance algorithm (deterministic, non-LLM):
+//
+//     score = number of distinct terms from
+//       (hot_match_terms ∪ themes)
+//     that appear as a substring of (title + ' ' + tags.join(' ') + ' ' + excerpt).
 //
 //   where hit_count is a case-insensitive substring match against the
 //   entry's title + tags + excerpt. Hot entries with score > 0 are
 //   sorted to the top (and within the related band, by hotness desc);
 //   entries with score === 0 fall back to the regular hotness rank.
 //
-// Identity contract (ClickUp 16.4):
+// Identity contract (ClickUp 16.4 P1.v1-2):
 //
 //   GET /v1/ecosystem/hot accepts optional identity triple:
 //     story_uuid, story_version_uuid, community_profile_version
 //
-//   * When ALL THREE are provided, the response includes
-//     `relevant_to_story` with `matched_terms`, `score`, and the
-//     pinned identity triple. Hot entries carry an extra
+//   * When ALL THREE are provided AND the canonical profile row's
+//     `generator_version` matches the supplied value, the response
+//     includes `relevant_to_story` with `matched_terms`, `score`, and
+//     the pinned identity triple. Hot entries carry an extra
 //     `relevant: { score, matched_terms }` projection.
-//   * When ANY identity is omitted, the response degrades to a plain
-//     hot list (no `relevant_to_story`, no per-entry `relevant`).
-//   * The community profile is read via `getCommunityProfile` — it
-//     MUST exist (i.e. `ensureCommunityProfile` was called during
-//     story import). When the profile is missing for a given
-//     story_version_uuid, the matcher still runs against an empty
-//     `hot_match_terms`/`themes` so every score is 0; we do NOT 404
-//     the hot route, because the home page falls back to a plain
-//     list when the user has not picked a story yet.
+//   * When the supplied value does NOT match the canonical row, the
+//     matcher returns `{ attached: false, reason: 'mismatch',
+//     expected_version, actual_version }` so the route layer can
+//     return 400 `community_profile_version_mismatch` instead of
+//     silently degrading.
+//   * When ANY identity is omitted, the matcher returns
+//     `{ attached: false, reason: 'identity_incomplete', response }`
+//     and the route degrades to a plain hot list (no
+//     `relevant_to_story`, no per-entry `relevant`).
+//   * The community profile is read via `getCommunityProfile`; a
+//     missing row returns `{ attached: false, reason:
+//     'profile_missing', response }` and the route returns 400
+//     `community_profile_missing`.
 //
 // Cache strategy (rebuilt per ClickUp 16.4 spec):
 //
@@ -51,10 +65,6 @@
 //     `cached: false` so the home-page module can render the
 //     "暂时无法获取知乎热议" placeholder without taking down the
 //     picker / player / ending flow.
-//
-// ClickUp 16.4 P1 fix (2026-09-07) does NOT reuse ee5217b's code as a
-// starting point — it rebuilds from the current main 44343b2 and
-// adds the relevance layer as a fresh, additive contract.
 
 import {
   fetchMockHotList,
@@ -205,6 +215,14 @@ export function computeRelevance(entry, hotMatchTerms, themes) {
  * entry scores 0 and the route degrades to a plain list rather than
  * 404-ing the home page.
  *
+ * P1.v1-2 contract (2026-09-07):
+ *   The matcher reads the ACTIVE (latest) profile row for the
+ *   story_version, NOT a version-filtered row. The version comparison
+ *   happens AFTER the read, in `attachRelevance`; using a version-
+ *   filtered read here would always return null when the caller's
+ *   version differs, falling through to a misleading "profile_missing"
+ *   path and hiding the real data-contract mismatch.
+ *
  * @param {object} input
  * @param {object} [input.profileRepository]
  * @param {string} input.story_version_uuid
@@ -221,18 +239,23 @@ export function resolveProfileMatchTerms({ profileRepository, story_version_uuid
   if (!profileRepository) return result;
   let profile;
   try {
+    // P1.v1-2: read the ACTIVE row (no generator_version filter) so
+    // the caller-supplied version can be compared against the
+    // canonical row's version AFTER the read.
     profile = getCommunityProfile({
       profileRepository,
       story_version_uuid,
-      generator_version: typeof community_profile_version === 'string' && community_profile_version
-        ? community_profile_version
-        : undefined,
     });
   } catch {
     profile = null;
   }
   if (!profile) return result;
   result.profileUuid = profile.profile_uuid;
+  // ClickUp 16.4 P1.v1-2 fix (2026-09-07): the canonical field on the
+  // profile row is `generator_version` (v1 schema, 13 top-level keys).
+  // Future renames must update this read AND update the shape
+  // validator AND add a migration; doing so intentionally out of
+  // scope here.
   result.generatorVersion = profile.generator_version;
   if (Array.isArray(profile.hot_keywords)) {
     for (const k of profile.hot_keywords) {
@@ -465,13 +488,38 @@ export function createEcosystemHotOrchestrator(opts) {
 }
 
 /**
+ * Result of `attachRelevance`. The route layer maps this onto HTTP
+ * status codes:
+ *
+ *   * `attached: true`                                 → 200 + relevant_to_story
+ *   * `attached: false` + reason: 'mismatch'           → 400 community_profile_version_mismatch
+ *   * `attached: false` + reason: 'profile_missing'    → 400 community_profile_missing
+ *   * `attached: false` + reason: 'identity_incomplete'→ 200 (plain list, no relevance)
+ *
+ * @typedef {Object} AttachRelevanceResult
+ * @property {boolean} attached
+ * @property {string}  [reason]                 'mismatch' | 'profile_missing' | 'identity_incomplete'.
+ * @property {string}  [expected_version]       The generator_version the canonical profile carries.
+ * @property {string}  [actual_version]         The version the caller supplied.
+ * @property {string}  [detail]                 Human-readable detail (used by `invalid_identity`).
+ * @property {EcosystemHotList} response        Possibly-mutated response object.
+ */
+
+/**
  * Attach the relevance projection to a hot-list response. The cache
  * itself stays plain (relevance is request-scoped, not data-scoped)
- * so two callers with different identity triples see different order.
+ * so two callers with different identity triples share upstream data
+ * but see distinct relevance projections.
  *
- * When `identity` is missing OR incomplete, the response is returned
- * unchanged — this is the "no story picked yet" path where every hot
- * entry is just a hot entry.
+ * P1.v1-2 contract (2026-09-07):
+ *   * Identity must be COMPLETE (all three fields present and the
+ *     UUIDs well-formed) for relevance to attach.
+ *   * When the supplied `community_profile_version` does NOT match
+ *     the canonical profile row's `generator_version`, this function
+ *     returns `{ attached: false, reason: 'mismatch',
+ *     expected_version, actual_version }` so the route layer can
+ *     return 400 `community_profile_version_mismatch` instead of
+ *     silently degrading to "0 terms".
  *
  * @param {EcosystemHotList} response
  * @param {object} [identity]
@@ -480,10 +528,12 @@ export function createEcosystemHotOrchestrator(opts) {
  * @param {string} [identity.community_profile_version]
  * @param {object} [options]
  * @param {object} [options.profileRepository]
- * @returns {EcosystemHotList}
+ * @returns {AttachRelevanceResult}
  */
 export function attachRelevance(response, identity, options) {
-  if (!response || !Array.isArray(response.hot)) return response;
+  if (!response || !Array.isArray(response.hot)) {
+    return { attached: false, response, reason: 'identity_incomplete' };
+  }
   const id = identity || {};
   const story_uuid = typeof id.story_uuid === 'string' && id.story_uuid ? id.story_uuid : '';
   const story_version_uuid = typeof id.story_version_uuid === 'string' && id.story_version_uuid
@@ -493,14 +543,25 @@ export function attachRelevance(response, identity, options) {
     ? id.community_profile_version
     : '';
   // Identity must be complete (all three non-empty) for relevance to
-    // attach. Otherwise we return the plain response — the home page
-    // shows a plain hot list when the user has not picked a story.
+  // attach. Otherwise we return `{ attached: false,
+  // reason: 'identity_incomplete', response }` — the route layer
+  // degrades to a plain list with no relevance, no `relevant_to_story`.
   if (!story_uuid || !story_version_uuid || !community_profile_version) {
-    return response;
+    return { attached: false, response, reason: 'identity_incomplete' };
   }
-  assertUuid('identity.story_uuid', story_uuid);
-  assertUuid('identity.story_version_uuid', story_version_uuid);
-  assertNonEmptyString('identity.community_profile_version', community_profile_version);
+  try {
+    assertUuid('identity.story_uuid', story_uuid);
+    assertUuid('identity.story_version_uuid', story_version_uuid);
+    assertNonEmptyString('identity.community_profile_version', community_profile_version);
+  } catch (err) {
+    return {
+      attached: false,
+      response,
+      reason: 'identity_incomplete',
+      actual_version: community_profile_version,
+      detail: String(err && err.message ? err.message : err),
+    };
+  }
   const opts = options || {};
   const profileRepository = opts.profileRepository;
   const { hotMatchTerms, themes, profileUuid, generatorVersion } = resolveProfileMatchTerms({
@@ -508,6 +569,31 @@ export function attachRelevance(response, identity, options) {
     story_version_uuid,
     community_profile_version,
   });
+  // P1.v1-2 contract: when the canonical profile is missing for this
+  // story_version_uuid we MUST report it explicitly. A missing profile
+  // is a server-side bug (the import path always calls
+  // ensureCommunityProfile), NOT a "0 terms" silent degradation.
+  if (!profileUuid) {
+    return {
+      attached: false,
+      response,
+      reason: 'profile_missing',
+      actual_version: community_profile_version,
+    };
+  }
+  // P1.v1-2 contract: when the supplied community_profile_version
+  // does NOT match the canonical row's generator_version (v1 schema),
+  // return 400 instead of silently returning 0 terms. The
+  // data-contract mismatch is now observable instead of silent.
+  if (generatorVersion && generatorVersion !== community_profile_version) {
+    return {
+      attached: false,
+      response,
+      reason: 'mismatch',
+      expected_version: generatorVersion,
+      actual_version: community_profile_version,
+    };
+  }
   // Always project `relevant` onto each entry so the home page can
   // render badges deterministically (score === 0 → "not related";
   // score > 0 → "related"). The home-page badge rule is "show the
@@ -531,7 +617,7 @@ export function attachRelevance(response, identity, options) {
     themes: themes.slice(),
     ...(generatorVersion ? { generator_version: generatorVersion } : {}),
   };
-  return response;
+  return { attached: true, response };
 }
 
 // Re-export the helpers used by the route layer.
@@ -539,4 +625,6 @@ export {
   filterMockHotByCategory,
 } from './mockZhihuHotSource.mjs';
 
-void assertUuid; // keep import-style usage symmetric with sibling modules
+void assertUuid;
+void assertNonEmptyString;
+void nowIso;

@@ -214,6 +214,14 @@
       <span class="bottombar-meta">demo · 进程内会话</span>
     </footer>
 
+    <!-- ClickUp 16.4 P1.v1-2 fix (2026-09-07): load order is significant.
+         identity.js MUST run before player.js / homeHotModule.js so
+         the STORY_OUTSIDE_IDENTITY global is populated from
+         sessionStorage on first paint. homeHotModule.js depends on
+         identity.js for the global + event; player.js sets the
+         identity on pickStory / bootstrapSession. homeHotModule.js
+         is independent (no import on player.js). -->
+    <script src="/scripts/identity.js"></script>
     <script type="module" src="/scripts/player.js"></script>
     <script type="module" src="/scripts/homeHotModule.js"></script>
   </body>

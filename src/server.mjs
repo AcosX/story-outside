@@ -29,9 +29,11 @@ import {
   startSessionSnapshot,
 } from './stories/index.mjs';
 import {
+  COMMUNITY_PROFILE_GENERATOR_VERSION,
   createInMemoryCommunityProfileRepository,
   seedCommunityProfiles,
 } from './community/index.mjs';
+import { getCommunityProfile } from './community/service.mjs';
 import {
   bootstrapSessionFromWork,
   commitNarrativeEvent,
@@ -433,6 +435,14 @@ const { repository: storyRepo, fixtures: storyFixtures } = createSeededRepositor
 // story_version the seed loop did not cover.
 const communityProfileRepo = createInMemoryCommunityProfileRepository();
 seedCommunityProfiles(storyRepo, communityProfileRepo);
+// Test hook (NO production consumers): the regression suite reads
+// the live repo so it can install / override rows for the
+// community_profile_version_mismatch path. The hook is NOT exported
+// on any public surface; it is a process-global symbol that ONLY
+// exists when the server is running inside a test harness.
+if (typeof globalThis !== 'undefined') {
+  /** @type {any} */ (globalThis).__storyOutsideCommunityRepoForTests = communityProfileRepo;
+}
 
 // ClickUp 16.4 P1 fix (2026-09-07): home-page 知乎热榜 orchestrator.
 // Owns its own pair-key cache so two callers with different identity
@@ -1562,6 +1572,37 @@ async function handleRequest(req, res) {
   // ---------------------------------------------------------------------
   const PUBLIC_DECORATE = () => ({ demo: currentDemoFlag() });
 
+  /**
+   * ClickUp 16.4 P1.v1-2 fix (2026-09-07): look up the canonical
+   * community_profile_version for a story_version_uuid by reading
+   * the same community-profile repo the /v1/ecosystem/hot
+   * orchestrator reads. When the row is missing we fall back to the
+   * process-wide `COMMUNITY_PROFILE_GENERATOR_VERSION.rules_version`
+   * (the v1 schema string `'community-profile-rules/1'`) so the
+   * bootstrap response always carries a valid triple for the browser.
+   *
+   * @param {object} input
+   * @param {object} input.profileRepository
+   * @param {string} input.story_version_uuid
+   * @returns {string}
+   */
+  function resolveCanonicalCommunityProfileVersion({ profileRepository, story_version_uuid }) {
+    const fallback = COMMUNITY_PROFILE_GENERATOR_VERSION.rules_version;
+    if (!profileRepository || typeof story_version_uuid !== 'string' || !story_version_uuid) {
+      return fallback;
+    }
+    let profile;
+    try {
+      profile = getCommunityProfile({ profileRepository, story_version_uuid });
+    } catch {
+      profile = null;
+    }
+    if (!profile || typeof profile.generator_version !== 'string') {
+      return fallback;
+    }
+    return profile.generator_version;
+  }
+
   // POST /api/sessions — atomic session bootstrap from a story + role.
   if (method === 'POST' && pathname === '/api/sessions') {
     let body = {};
@@ -1673,6 +1714,17 @@ async function handleRequest(req, res) {
         opening_cursor: result.session.opening_cursor,
         cache_reused: result.cache_reused,
         version_reused: result.version_reused,
+        // ClickUp 16.4 P1.v1-2 fix (2026-09-07): surface the canonical
+        // community_profile_version on the bootstrap response so the
+        // browser can publish the identity triple WITHOUT a second
+        // round-trip. The value comes from the same source the
+        // /v1/ecosystem/hot orchestrator reads (the canonical profile
+        // row's generator_version), so a mismatch is impossible unless
+        // the row was regenerated between calls.
+        community_profile_version: resolveCanonicalCommunityProfileVersion({
+          profileRepository: communityProfileRepo,
+          story_version_uuid: result.story_version_uuid,
+        }),
         pinned,
       });
     } catch (err) {
@@ -2062,16 +2114,25 @@ async function handleRequest(req, res) {
     }
   }
 
-  // GET /v1/ecosystem/hot — home-page 知乎热榜 façade (ClickUp 16.4).
+  // GET /v1/ecosystem/hot — home-page 知乎热榜 façade (ClickUp 16.4 P1.v1-2).
   //
   // Public surface (no DEV_FLAG banner). Identity triple is optional:
   // when story_uuid / story_version_uuid / community_profile_version
-  // are all supplied, the response carries `relevant_to_story` and
-  // every hot entry carries `relevant: { score, matched_terms }`.
-  // The matcher uses `StoryCommunityProfile.hot_keywords` as the
-  // `hot_match_terms` projection and `topics[].label` as the
-  // `themes` projection. When the identity triple is missing, the
-  // response degrades to a plain hot list (no relevance field).
+  // are all supplied AND the canonical profile row's
+  // `generator_version` (v1 schema) matches the supplied value, the
+  // response carries `relevant_to_story` and every hot entry carries
+  // `relevant: { score, matched_terms }`. Related entries (score > 0)
+  // sort to the top.
+  //
+  // P1.v1-2 contract (2026-09-07):
+  //   * When the supplied `community_profile_version` does NOT match
+  //     the canonical row, the route returns 400
+  //     `community_profile_version_mismatch` with the expected vs
+  //     actual versions. The data-contract mismatch is now
+  //     observable instead of silently degrading to "0 terms".
+  //   * When ANY identity field is omitted, the route degrades to a
+  //     plain hot list (no `relevant_to_story`, no per-entry
+  //     `relevant`).
   if (method === 'GET' && pathname === '/v1/ecosystem/hot') {
     const queryCategory = url.searchParams.get('category');
     const queryStoryUuid = url.searchParams.get('story_uuid');
@@ -2103,31 +2164,59 @@ async function handleRequest(req, res) {
         }
         return jsonResponse(res, 200, { ...PUBLIC_DECORATE(), ...baseResponse });
       }
-      // Full identity path: attach relevance. Validation errors here
-      // (bad UUID, etc.) become a 400 with the public decoration so
-      // the home-page module can surface a placeholder.
-      try {
-        const responseWithRelevance = attachRelevance(baseResponse, identity, {
-          profileRepository: communityProfileRepo,
-        });
-        // ClickUp 16.4 P1 fix (2026-09-07): when the response carries
-        // `relevant_to_story`, surface that exact field name on the
-        // wire so the home-page module can read it via
-        // `response.relevant_to_story`. The orchestrator already set
-        // it on the response object; we just forward via the spread.
-        const wireResponse = responseWithRelevance && responseWithRelevance.relevant_to_story
-          ? responseWithRelevance
-          : baseResponse;
-        return jsonResponse(res, 200, { ...PUBLIC_DECORATE(), ...wireResponse });
-      } catch (relErr) {
-        const message = String(relErr && relErr.message ? relErr.message : relErr);
-        return jsonResponse(res, 400, {
-          error: 'invalid_identity',
-          message: 'story_uuid, story_version_uuid, and community_profile_version must all be valid UUIDs when supplied.',
+      // Full identity path: attach relevance. The matcher returns
+      // { attached, reason, expected_version, actual_version, response };
+      // the route layer maps the reason onto an HTTP status.
+      const result = attachRelevance(baseResponse, identity, {
+        profileRepository: communityProfileRepo,
+      });
+      if (!result.attached) {
+        if (result.reason === 'mismatch') {
+          return jsonResponse(res, 400, {
+            error: 'community_profile_version_mismatch',
+            message: 'The supplied community_profile_version does not match the canonical profile row for this story_version_uuid.',
+            ...PUBLIC_DECORATE(),
+            expected_community_profile_version: result.expected_version || '',
+            actual_community_profile_version: result.actual_version || '',
+          });
+        }
+        if (result.reason === 'profile_missing') {
+          return jsonResponse(res, 400, {
+            error: 'community_profile_missing',
+            message: 'No community profile row exists for this story_version_uuid; the import path must call ensureCommunityProfile first.',
+            ...PUBLIC_DECORATE(),
+            story_version_uuid: identity.story_version_uuid,
+            actual_community_profile_version: result.actual_version || '',
+          });
+        }
+        // reason: 'identity_incomplete' — either a missing field
+        // (handled earlier with a plain 200) or a malformed
+        // community_profile_version (assertNonEmptyString failed).
+        // When the matcher set a `detail` we surface 400 invalid_identity
+        // so callers cannot accidentally observe a 0-terms silent
+        // degradation.
+        if (result.detail) {
+          return jsonResponse(res, 400, {
+            error: 'invalid_identity',
+            message: 'community_profile_version must be a non-empty string when supplied.',
+            ...PUBLIC_DECORATE(),
+            ...(result.actual_version ? { actual_community_profile_version: result.actual_version } : {}),
+            ...(result.detail ? { detail: result.detail } : {}),
+          });
+        }
+        // Defence in depth: strip any spurious `relevant` projection
+        // and serve the plain list.
+        if (Array.isArray(result.response && result.response.hot)) {
+          for (const e of result.response.hot) {
+            if (e && 'relevant' in e) delete e.relevant;
+          }
+        }
+        return jsonResponse(res, 200, {
           ...PUBLIC_DECORATE(),
-          ...(message ? { detail: message } : {}),
+          ...(result.response || baseResponse),
         });
       }
+      return jsonResponse(res, 200, { ...PUBLIC_DECORATE(), ...result.response });
     } catch (err) {
       const message = String(err && err.message ? err.message : err);
       return jsonResponse(res, 502, {

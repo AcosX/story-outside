@@ -267,6 +267,47 @@ function selectStory(storyId) {
   setText('#role-name', '选一个视角');
   renderRoles(story.roles || []);
   $('#role-block').hidden = false;
+  // ClickUp 16.4 P1.v1-2 fix (2026-09-07): when the user picks a
+  // story, try to publish a provisional identity via the producer in
+  // public/scripts/identity.js. We DO NOT have story_uuid /
+  // story_version_uuid / community_profile_version here yet (those
+  // arrive on bootstrapSession), so the producer will reject this
+  // partial triple and the hot module stays on its "no identity"
+  // path. bootstrapSession() then publishes the complete triple.
+  publishIdentityIfAvailable();
+}
+
+/**
+ * ClickUp 16.4 P1.v1-2 fix (2026-09-07): publish the active identity
+ * via the producer exposed by /scripts/identity.js. Reads from the
+ * in-memory state (story_slug, story_title) plus the latest
+ * session-bootstrap response (story_uuid, story_version_uuid,
+ * community_profile_version). Refuses to publish a partial triple —
+ * the producer rejects missing required fields so a buggy caller
+ * cannot downgrade the home page to "0 terms" by accident.
+ */
+function publishIdentityIfAvailable() {
+  const api = /** @type {any} */ (window).STORY_OUTSIDE_IDENTITY_API;
+  if (!api || typeof api.setActiveIdentity !== 'function') return;
+  const story_uuid = state.storyUuid || '';
+  const story_version_uuid = state.storyVersionUuid || '';
+  // The community_profile_version is read from the session bootstrap
+  // payload (server surfaces the canonical value on the response).
+  // When the bootstrap has not run yet we leave the field empty and
+  // let the producer reject — bootstrapSession() republishes once
+  // the canonical value is in state.
+  const community_profile_version = typeof state.communityProfileVersion === 'string'
+    ? state.communityProfileVersion
+    : '';
+  if (!story_uuid || !story_version_uuid || !community_profile_version) return;
+  api.setActiveIdentity({
+    story_uuid,
+    story_version_uuid,
+    community_profile_version,
+    story_slug: state.story && state.story.id ? state.story.id : '',
+    story_title: state.story && state.story.title ? state.story.title : '',
+    source: 'pick',
+  });
 }
 
 // -------- Story bootstrap (session creation) --------
@@ -298,10 +339,25 @@ async function bootstrapSession({ story, role }) {
     state.cacheUuid = created.cache_uuid;
     state.storyUuid = created.story_uuid || null;
     state.storyVersionUuid = created.story_version_uuid || null;
+    // ClickUp 16.4 P1.v1-2 fix (2026-09-07): capture the canonical
+    // community_profile_version the server returns on the bootstrap
+    // response. The value comes from the same source the
+    // /v1/ecosystem/hot orchestrator reads, so a mismatch is
+    // impossible unless the row was regenerated between calls.
+    state.communityProfileVersion = typeof created.community_profile_version === 'string'
+      && created.community_profile_version
+      ? created.community_profile_version
+      : null;
     state.openingEvents = Array.isArray(created.opening_events) ? created.opening_events : [];
     state.generationProfile = (created.session && created.session.generation_profile)
       || (created.pinned && created.pinned.generation_profile)
       || { cache_uuid: created.cache_uuid };
+    // ClickUp 16.4 P1.v1-2 fix (2026-09-07): publish the complete
+    // identity triple (story_uuid / story_version_uuid /
+    // community_profile_version) so homeHotModule.js can switch
+    // from the plain hot list to "相关才关联". The producer is in
+    // /scripts/identity.js and is loaded BEFORE player.js.
+    publishIdentityIfAvailable();
     setText('#story-name', story.title);
     setText('#role-name', role.label);
     persistSessionContext();
@@ -847,12 +903,23 @@ async function mountEndingPage(sessionMetaOverride) {
   try {
     const mod = await import('/scripts/endingPage.js');
     if (mod && typeof mod.mount === 'function') {
+      // ClickUp 16.4 P1.v1-2 fix (2026-09-07): carry the canonical
+      // identity triple into the ending-page sessionMeta so the
+      // producer in /scripts/identity.js can republish on mount.
+      const identityMeta = {
+        story_uuid: state.storyUuid || '',
+        story_version_uuid: state.storyVersionUuid || '',
+        community_profile_version: state.communityProfileVersion || '',
+        story_slug: state.story && state.story.id ? state.story.id : '',
+        story_title: state.story ? state.story.title : '',
+        storyTitle: state.story ? state.story.title : '',
+        roleLabel: state.role ? state.role.label : '',
+      };
       await mod.mount({
         sessionUuid: state.sessionUuid,
-        sessionMeta: sessionMetaOverride || {
-          storyTitle: state.story ? state.story.title : '',
-          roleLabel: state.role ? state.role.label : '',
-        },
+        sessionMeta: sessionMetaOverride
+          ? { ...identityMeta, ...sessionMetaOverride }
+          : identityMeta,
       });
       return true;
     }
