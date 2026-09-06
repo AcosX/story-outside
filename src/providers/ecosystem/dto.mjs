@@ -1,27 +1,21 @@
-// src/providers/ecosystem/dto.mjs — ClickUp 16.2 知乎搜索 DTO 与契约守卫。
+// src/providers/ecosystem/dto.mjs — ClickUp 16.2 P1.v2 知乎搜索 DTO 与契约守卫。
 //
 // 公共契约（POST /v1/ecosystem/discussions）:
-//   request:                                    // ClickUp 16.2 P1 fix
+//
+//   request:
 //     {
-//       search_queries: [                       // REQUIRED, non-empty array
-//         {
-//           id: string,                         // stable id within profile
-//           query: string,                      // non-empty, ≤256 chars
-//           kind: 'web' | 'knowledge' | 'hot' | 'mixed',
-//         },
-//         ...
-//       ],
-//       story_uuid?: string,                    // optional UUID
-//       story_version_uuid?: string,            // optional UUID
-//       community_profile_version?: string,     // optional
+//       story_uuid: string,                     // REQUIRED, UUID
+//       story_version_uuid: string,             // REQUIRED, UUID
+//       community_profile_version: string,      // REQUIRED, server resolves canonical profile
 //       limit?: number,                         // 1..20, default 8 (per-query)
 //     }
+//
 //   response:
 //     {
-//       results: [                              // aggregated per query id
+//       results: [                              // aggregated per canonical profile.queries[i]
 //         {
-//           id: string,                         // echoes search_queries[i].id
-//           query: string,                      // echoes search_queries[i].query
+//           id: string,                         // echoes profile.queries[i].id
+//           query: string,                      // echoes profile.queries[i].query
 //           kind: 'web' | 'knowledge' | 'hot' | 'mixed',
 //           discussions: DiscussionDTO[],
 //           cached: boolean,
@@ -36,11 +30,14 @@
 //       ecosystem_status: 'ok' | 'unavailable',
 //     }
 //
-// 安全契约:
-//   * 不接受 session / role / user / oauth_* 任何字段
-//   * 不接受 AI-derived 字段 ending_title / key_choices / outcome
-//   * 不 echo DEV_FLAG / demo 字段
-//   * 公共响应绝不出现 /api/dev/ /api/admin/ 引用
+// 安全契约 (ClickUp 16.2 P1.v2 — 2026-09-07 ChatGPT review):
+//   * **不**接受 body.search_queries (handler must take identity only and
+//     resolve canonical queries server-side). 拒绝 → 400 'forbidden_field'.
+//   * **不**接受任何 AI-derived 字段 (ending_title / key_choices /
+//     outcome / character_outcomes). 拒绝 → 400 'forbidden_field'.
+//   * **不**接受任何身份偷渡字段 (user_id / role / oauth_* / ...).
+//   * **不** echo DEV_FLAG / demo 字段。
+//   * 公共响应绝不出现 /api/dev/ /api/admin/ 引用。
 //
 // This module is pure: no I/O, no env reads, no network.
 
@@ -57,15 +54,36 @@ const VALID_KINDS = Object.freeze(['web', 'knowledge', 'hot', 'mixed']);
 export { VALID_KINDS };
 
 /**
- * ClickUp 16.2 P1 fix (2026-09-07):
- *   AI-derived fields are FORBIDDEN at the seam. The search query
- *   MUST come from `StoryCommunityProfile.queries[]` — never from
- *   the AI-generated ending (ending_title / key_choices / outcome
- *   / character_outcomes). The handler rejects these so a future
- *   regression cannot silently re-introduce session-derived search
- *   queries.
+ * ClickUp 16.2 P1.v2 fix (2026-09-07):
+ *   The handler MUST stay server-authoritative. The body MUST NOT
+ *   carry any client-picked search query — every one of these fields
+ *   is a regression vector that lets a future caller smuggle a
+ *   AI-picked / session-derived query back in. The seam rejects
+ *   them with `forbidden_field` so a regression cannot silently
+ *   re-introduce client-controlled queries.
+ *
+ *   Notes:
+ *   * `search_queries` / `query` (singular): client-controlled query
+ *     list/string. The whole point of P1.v2 is that the client does
+ *     NOT supply queries.
+ *   * AI-derived fields: `ending_title` / `key_choices` / `outcome` /
+ *     `character_outcomes`. These were forbidden already in P1 fix;
+ *     kept here so a regression cannot smuggle them either.
+ *   * Identity-leakage fields: classic user/role/session leak vector
+ *     even on the read side.
  */
 export const ECOSYSTEM_FORBIDDEN_KEYS = Object.freeze([
+  // Client-controlled queries (the regression P1.v2 closes).
+  'search_queries',
+  'query',
+  'queries',
+  // AI-derived fields (kept from P1; still forbidden).
+  'ending_title',
+  'key_choices',
+  'outcome',
+  'character_outcomes',
+  'original_difference',
+  // Identity / leakage (defence in depth on top of the public seam).
   'user_id', 'user_ref', 'userId', 'user',
   'oauth_subject', 'subject',
   'access_token', 'app_id', 'app_key', 'access_secret',
@@ -75,13 +93,21 @@ export const ECOSYSTEM_FORBIDDEN_KEYS = Object.freeze([
   'ip', 'ip_address',
   'device_id', 'deviceId',
   'cookie', 'authorization',
-  // AI-derived fields (ClickUp 16.2 P1 fix).
-  'ending_title',
-  'key_choices',
-  'outcome',
-  'character_outcomes',
-  'original_difference',
-  'query', // legacy single-string query — replaced by search_queries[]
+]);
+
+/**
+ * ClickUp 16.2 P1.v2 fix (2026-09-07):
+ *   The handler is allowed ONLY these top-level body keys. The body
+ *   must be a plain object; any other key — including ones we have
+ *   not yet enumerated — is a regression vector. The handler refuses
+ *   unknown keys with `forbidden_field` so a future caller cannot
+ *   silently widen the surface.
+ */
+export const ECOSYSTEM_ALLOWED_BODY_KEYS = Object.freeze([
+  'story_uuid',
+  'story_version_uuid',
+  'community_profile_version',
+  'limit',
 ]);
 
 function isUuid(value) {
@@ -93,10 +119,10 @@ export function isPlainObject(value) {
 }
 
 /**
- * Validate one search-query record. Returns ok=false with code/field
- * on the first violation; the route layer surfaces the error to the
- * client. The validations mirror PROFILE_QUERY_KEYS so a profile row
- * that already passed assertCommunityProfileShape always passes here.
+ * Validate one canonical search-query record (the shape we accept
+ * inside `StoryCommunityProfile.queries[]`). The validations mirror
+ * `PROFILE_QUERY_KEYS` so a profile row that already passed
+ * `assertCommunityProfileShape` always passes here.
  *
  * @param {unknown} raw
  * @param {number} index
@@ -161,81 +187,55 @@ export function normaliseSearchQueryRecord(raw, index) {
 }
 
 /**
- * Normalise the inbound search request body.
+ * ClickUp 16.2 P1.v2 fix (2026-09-07):
+ *   Normalise the inbound identity-only body for
+ *   POST /v1/ecosystem/discussions.
  *
- * ClickUp 16.2 P1 fix (2026-09-07): the request now carries
- * `search_queries: [{id, query, kind}][]` — the SAME shape as
- * `StoryCommunityProfile.queries[]`. The handler enforces:
- *   * `search_queries` is required and non-empty
- *   * at most ECOSYSTEM_SEARCH_MAX_QUERIES items
- *   * AI-derived `query` (single-string) is FORBIDDEN — the seam
- *     rejects with code 'forbidden_field' so a regression cannot
- *     smuggle an AI-picked query back in
+ *   Hard contract:
+ *     * body MUST be a plain object.
+ *     * body MUST NOT contain any field outside
+ *       `ECOSYSTEM_ALLOWED_BODY_KEYS` (forbidden_field on unknown).
+ *     * `story_uuid` + `story_version_uuid` MUST be UUIDs.
+ *     * `community_profile_version` MUST be a non-empty string
+ *       (the server resolves the canonical profile; the client only
+ *       proves it knows the canonical version string).
+ *     * `limit` is optional integer in
+ *       `[ECOSYSTEM_SEARCH_MIN_LIMIT, ECOSYSTEM_SEARCH_MAX_LIMIT]`.
  *
- * Identity (story_uuid / story_version_uuid / community_profile_version)
- * is REQUIRED: missing identity is a 400 'missing_identity' so the
- * sentinel pair-key fallback that PR #19 used is removed.
+ *   Returns a discriminated union; the route layer maps each code to
+ *   a 400. The orchestrator (search.mjs) receives ONLY the resolved
+ *   identity triple + limit; it does NOT receive client-supplied
+ *   search_queries (there are none — that is the whole point of v2).
  *
  * @param {unknown} raw
- * @returns {{ ok: true, value: { search_queries, story_uuid, story_version_uuid, community_profile_version, limit } }
+ * @returns {{ ok: true, value: { story_uuid: string, story_version_uuid: string, community_profile_version: string, limit: number } }
  *           | { ok: false, code: string, message: string, field?: string }}
  */
 export function normaliseDiscussionsRequest(raw) {
   if (!isPlainObject(raw)) {
     return { ok: false, code: 'validation_failed', message: 'request body must be an object' };
   }
+  // 1. Forbidden keys win first (defence in depth on top of the
+  //    allowlist). If a caller passes a known-regression field, we
+  //    want the specific code, not a generic `unknown_field`.
   for (const key of Object.keys(raw)) {
     if (ECOSYSTEM_FORBIDDEN_KEYS.includes(key)) {
       return { ok: false, code: 'forbidden_field', message: `field "${key}" is not allowed`, field: key };
     }
   }
-  // search_queries is REQUIRED.
-  if (!Array.isArray(raw.search_queries)) {
-    return {
-      ok: false,
-      code: 'missing_search_queries',
-      message: 'search_queries is required and must be a non-empty array',
-      field: 'search_queries',
-    };
-  }
-  if (raw.search_queries.length === 0) {
-    return {
-      ok: false,
-      code: 'empty_search_queries',
-      message: 'search_queries must contain at least one item',
-      field: 'search_queries',
-    };
-  }
-  if (raw.search_queries.length > ECOSYSTEM_SEARCH_MAX_QUERIES) {
-    return {
-      ok: false,
-      code: 'too_many_search_queries',
-      message: `search_queries must contain at most ${ECOSYSTEM_SEARCH_MAX_QUERIES} items`,
-      field: 'search_queries',
-    };
-  }
-  const normalisedQueries = [];
-  const seenIds = new Set();
-  for (let i = 0; i < raw.search_queries.length; i += 1) {
-    const r = normaliseSearchQueryRecord(raw.search_queries[i], i);
-    if (!r.ok) return r;
-    if (seenIds.has(r.value.id)) {
-      return {
-        ok: false,
-        code: 'duplicate_search_query_id',
-        message: `search_queries[${i}].id '${r.value.id}' is duplicated`,
-        field: `search_queries[${i}].id`,
-      };
+  // 2. Allowlist pass — anything we have not explicitly blessed is
+  //    rejected. This is the v2 seal: even an unknown non-dangerous
+  //    key fails closed so a future caller cannot widen the surface.
+  for (const key of Object.keys(raw)) {
+    if (!ECOSYSTEM_ALLOWED_BODY_KEYS.includes(key)) {
+      return { ok: false, code: 'forbidden_field', message: `field "${key}" is not allowed`, field: key };
     }
-    seenIds.add(r.value.id);
-    normalisedQueries.push(r.value);
   }
-
-  // Identity is REQUIRED (ClickUp 16.2 P1 fix: no more sentinel pair-key).
+  // 3. Identity triple — REQUIRED.
   if (!isUuid(raw.story_uuid)) {
     return {
       ok: false,
-      code: 'missing_story_uuid',
+      code: 'community_profile_not_found',
       message: 'story_uuid is required and must be a UUID',
       field: 'story_uuid',
     };
@@ -243,7 +243,7 @@ export function normaliseDiscussionsRequest(raw) {
   if (!isUuid(raw.story_version_uuid)) {
     return {
       ok: false,
-      code: 'missing_story_version_uuid',
+      code: 'community_profile_not_found',
       message: 'story_version_uuid is required and must be a UUID',
       field: 'story_version_uuid',
     };
@@ -251,7 +251,7 @@ export function normaliseDiscussionsRequest(raw) {
   if (typeof raw.community_profile_version !== 'string' || !raw.community_profile_version) {
     return {
       ok: false,
-      code: 'missing_community_profile_version',
+      code: 'community_profile_version_mismatch',
       message: 'community_profile_version is required and must be a non-empty string',
       field: 'community_profile_version',
     };
@@ -259,12 +259,12 @@ export function normaliseDiscussionsRequest(raw) {
   if (raw.community_profile_version.length > 128) {
     return {
       ok: false,
-      code: 'community_profile_version_too_long',
+      code: 'community_profile_version_mismatch',
       message: 'community_profile_version exceeds 128 chars',
       field: 'community_profile_version',
     };
   }
-
+  // 4. limit — optional integer in range.
   let limit = ECOSYSTEM_SEARCH_DEFAULT_LIMIT;
   if (raw.limit !== undefined) {
     if (typeof raw.limit !== 'number' || !Number.isInteger(raw.limit)) {
@@ -280,11 +280,9 @@ export function normaliseDiscussionsRequest(raw) {
     }
     limit = raw.limit;
   }
-
   return {
     ok: true,
     value: {
-      search_queries: normalisedQueries,
       story_uuid: raw.story_uuid,
       story_version_uuid: raw.story_version_uuid,
       community_profile_version: raw.community_profile_version,
@@ -294,14 +292,66 @@ export function normaliseDiscussionsRequest(raw) {
 }
 
 /**
- * Build a deterministic pair-key cache key for one
- * `(story_version_uuid, community_profile_version, query)` tuple.
+ * Validate a canonical `StoryCommunityProfile.queries[]` for the
+ * orchestrator. The orchestrator takes the resolved profile and
+ * walks `profile.queries[]` to build per-query results.
  *
- * ClickUp 16.2 P1 fix (2026-09-07): the sentinel fallback
- * (`__no_story_version__` / `__no_profile__`) is REMOVED. Callers
- * MUST pass valid story_version_uuid + community_profile_version;
- * the handler validates them before this function is reached, so
- * the sentinel branch is unreachable in normal operation.
+ * @param {unknown} raw
+ * @returns {{ ok: true, value: { id: string, query: string, kind: string }[] }
+ *           | { ok: false, code: string, message: string, field?: string }}
+ */
+export function normaliseCanonicalSearchQueries(raw) {
+  if (!Array.isArray(raw)) {
+    return {
+      ok: false,
+      code: 'community_profile_not_found',
+      message: 'canonical profile has no queries[]',
+      field: 'profile.queries',
+    };
+  }
+  if (raw.length === 0) {
+    return {
+      ok: false,
+      code: 'community_profile_not_found',
+      message: 'canonical profile.queries[] is empty',
+      field: 'profile.queries',
+    };
+  }
+  if (raw.length > ECOSYSTEM_SEARCH_MAX_QUERIES) {
+    return {
+      ok: false,
+      code: 'community_profile_not_found',
+      message: `canonical profile.queries[] exceeds ${ECOSYSTEM_SEARCH_MAX_QUERIES} items`,
+      field: 'profile.queries',
+    };
+  }
+  const out = [];
+  const seenIds = new Set();
+  for (let i = 0; i < raw.length; i += 1) {
+    const r = normaliseSearchQueryRecord(raw[i], i);
+    if (!r.ok) return r;
+    if (seenIds.has(r.value.id)) {
+      return {
+        ok: false,
+        code: 'community_profile_not_found',
+        message: `profile.queries[${i}].id '${r.value.id}' is duplicated`,
+        field: `profile.queries[${i}].id`,
+      };
+    }
+    seenIds.add(r.value.id);
+    out.push(r.value);
+  }
+  return { ok: true, value: out };
+}
+
+/**
+ * Build a deterministic pair-key cache key for one
+ * `(story_version_uuid, community_profile_version, query_id, query)`.
+ *
+ * ClickUp 16.2 P1.v2 fix (2026-09-07): identity is ALWAYS resolved
+ * by the handler before this function is called, so the sentinel
+ * fallback is gone — keys are always anchored to a real
+ * story_version_uuid + community_profile_version pair.
  *
  * @param {object} input
  * @param {string} input.query
@@ -335,54 +385,69 @@ function hashQuery(query) {
 }
 
 /**
- * Validate the shape of a normalised discussion DTO. Used by both mock
- * and real adapters before handing results to the route layer.
+ * Build a stable 32-bit FNV-style hash of a string. Used for
+ * deterministic scoring + fixture routing in the mock.
+ */
+export function stableStringHash(input) {
+  let h = 0x811c9dc5;
+  const s = typeof input === 'string' ? input : '';
+  for (let i = 0; i < s.length; i += 1) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return h >>> 0;
+}
+
+/**
+ * Defensive shape check for a DiscussionDTO. We accept both the
+ * mock and the real (zhihu api v1) shapes.
  */
 export function isDiscussionShape(value) {
   if (!isPlainObject(value)) return false;
-  if (typeof value.thread_uuid !== 'string' || !value.thread_uuid) return false;
-  if (typeof value.title !== 'string') return false;
-  if (typeof value.snippet !== 'string') return false;
   if (typeof value.url !== 'string' || !value.url) return false;
-  if (typeof value.score !== 'number' || !Number.isFinite(value.score)) return false;
-  if (typeof value.source !== 'string' || !value.source) return false;
+  if (typeof value.title !== 'string' || !value.title) return false;
+  // id may be a string or a number (real adapter uses int64); allow both.
+  if (!(typeof value.id === 'string' || typeof value.id === 'number')) return false;
   return true;
 }
 
 /**
- * Trim a discussion list to a given limit, filtering out malformed
- * entries. Returns a NEW array — never mutates the input.
+ * Cap a discussions array to the per-query `limit`. Defensive only —
+ * the adapter is supposed to cap internally.
  */
 export function clampDiscussions(list, limit) {
-  const arr = Array.isArray(list) ? list : [];
-  const out = [];
-  for (const item of arr) {
-    if (out.length >= limit) break;
-    if (isDiscussionShape(item)) out.push(item);
-  }
-  return out;
+  if (!Array.isArray(list)) return [];
+  const cap = Number.isInteger(limit) && limit > 0 ? limit : ECOSYSTEM_SEARCH_DEFAULT_LIMIT;
+  return list.slice(0, cap);
 }
 
 /**
- * Stable, content-derived ranking: higher score first; ties broken by
- * url lexicographically. Mutates a clone, not the input.
+ * Deduplicate + rank discussions across multiple sources. Real
+ * adapter may emit more than one source per query; this collapses to
+ * a stable, sorted, deduped view.
  */
 export function dedupeAndRankZhihuDiscussions(list) {
-  const arr = Array.isArray(list) ? list.slice() : [];
-  const seen = new Set();
-  const unique = [];
-  for (const item of arr) {
-    if (!isDiscussionShape(item)) continue;
-    const k = item.url + '|' + item.thread_uuid;
-    if (seen.has(k)) continue;
-    seen.add(k);
-    unique.push(item);
+  if (!Array.isArray(list)) return [];
+  const seen = new Map();
+  for (const d of list) {
+    if (!isDiscussionShape(d)) continue;
+    const key = `${d.url}`;
+    const cur = seen.get(key);
+    if (!cur) {
+      seen.set(key, d);
+      continue;
+    }
+    // Prefer the higher score; break ties by url.
+    const curScore = Number.isFinite(cur.score) ? cur.score : 0;
+    const nextScore = Number.isFinite(d.score) ? d.score : 0;
+    if (nextScore > curScore) seen.set(key, d);
   }
-  unique.sort((a, b) => {
-    if (b.score !== a.score) return b.score - a.score;
-    if (a.url < b.url) return -1;
-    if (a.url > b.url) return 1;
-    return 0;
+  const out = Array.from(seen.values());
+  out.sort((a, b) => {
+    const sa = Number.isFinite(a.score) ? a.score : 0;
+    const sb = Number.isFinite(b.score) ? b.score : 0;
+    if (sa !== sb) return sb - sa;
+    return String(a.url).localeCompare(String(b.url));
   });
-  return unique;
+  return out;
 }

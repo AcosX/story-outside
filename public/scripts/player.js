@@ -52,15 +52,13 @@ const state = {
   storyUuid: null,
   storyVersionUuid: null,
   cacheUuid: null,
-  // ClickUp 16.2 P1 fix (2026-09-07): the player MUST forward the
-  // community profile identity + canonical queries to the ending page
-  // so POST /v1/ecosystem/discussions can be sent without a sentinel
-  // pair-key. The version + queries come from /api/sessions (POST or
-  // GET) and are also exposed as window globals for the static
-  // contract tests.
+  generationProfile: null,
+  // ClickUp 16.2 P1.v2 (2026-09-07): canonical community-profile
+  // identity returned by /api/sessions. Forwarded verbatim to
+  // /v1/ecosystem/discussions; the handler resolves the canonical
+  // profile server-side from these three values.
   communityProfileVersion: null,
   communityProfileQueries: null,
-  generationProfile: null,
   pending: null,        // { pending_id, events[], tool_call, committed_count }
   pendingIdx: 0,        // index of the NEXT pending event to display
   progressTotal: 0,     // largest known event total for progress bar
@@ -306,14 +304,16 @@ async function bootstrapSession({ story, role }) {
     state.cacheUuid = created.cache_uuid;
     state.storyUuid = created.story_uuid || null;
     state.storyVersionUuid = created.story_version_uuid || null;
-    state.openingEvents = Array.isArray(created.opening_events) ? created.opening_events : [];
-    // ClickUp 16.2 P1 fix: capture the profile identity + canonical
-    // queries so the ending page can submit /v1/ecosystem/discussions
-    // with full pair-key context (no sentinel fallback).
-    state.communityProfileVersion = created.community_profile_version || null;
-    state.communityProfileQueries = Array.isArray(created.community_profile_queries)
-      ? created.community_profile_queries.slice()
+    // ClickUp 16.2 P1.v2 (2026-09-07): forward the canonical
+    // community-profile identity into state so mountEndingPage can
+    // hand it to /v1/ecosystem/discussions verbatim.
+    state.communityProfileVersion = typeof created.community_profile_version === 'string'
+      ? created.community_profile_version
       : null;
+    state.communityProfileQueries = Array.isArray(created.community_profile_queries)
+      ? created.community_profile_queries
+      : null;
+    state.openingEvents = Array.isArray(created.opening_events) ? created.opening_events : [];
     state.generationProfile = (created.session && created.session.generation_profile)
       || (created.pinned && created.pinned.generation_profile)
       || { cache_uuid: created.cache_uuid };
@@ -343,6 +343,13 @@ function persistSessionContext() {
       sessionUuid: state.sessionUuid || null,
       storyTitle: state.story ? state.story.title : '',
       roleLabel: state.role ? state.role.label : '',
+      // ClickUp 16.2 P1.v2 (2026-09-07): forward the canonical
+      // community-profile identity so the deep link can submit
+      // /v1/ecosystem/discussions without a fresh bootstrap.
+      communityProfileVersion: state.communityProfileVersion || null,
+      communityProfileQueries: state.communityProfileQueries || null,
+      storyUuid: state.storyUuid || null,
+      storyVersionUuid: state.storyVersionUuid || null,
     }));
   } catch { /* storage unavailable — deep link degrades to empty state */ }
 }
@@ -367,15 +374,19 @@ async function recoverAndStart() {
     const recovered = await api(`/api/sessions/${state.sessionUuid}/recover`);
     state.lastRevision = recovered.revision || 0;
     state.openingCursor = recovered.opening_cursor || 0;
+    // ClickUp 16.2 P1.v2 (2026-09-07): refresh the canonical
+    // community-profile identity on /recover so a page reload still
+    // has it. If the server response does not carry one (older
+    // versions), leave the previous value as-is.
+    if (typeof recovered.community_profile_version === 'string') {
+      state.communityProfileVersion = recovered.community_profile_version;
+    }
+    if (Array.isArray(recovered.community_profile_queries)) {
+      state.communityProfileQueries = recovered.community_profile_queries;
+    }
     state.canonicalHistory = recovered.history || [];
     state.canonicalEventsById = new Map(state.canonicalHistory.map((e) => [e.event_id, e]));
     state.canonicalNarrativeCount = state.canonicalHistory.filter((e) => e.event_type === 'narrative_beat').length;
-    // ClickUp 16.2 P1 fix: refresh profile identity from /recover
-    // (e.g. after a page reload the cached local state may be stale).
-    if (recovered.community_profile_version) state.communityProfileVersion = recovered.community_profile_version;
-    if (Array.isArray(recovered.community_profile_queries)) state.communityProfileQueries = recovered.community_profile_queries.slice();
-    if (recovered.story_uuid) state.storyUuid = recovered.story_uuid;
-    if (recovered.story_version_uuid) state.storyVersionUuid = recovered.story_version_uuid;
     const log = $('#story-log');
     log.innerHTML = '';
     for (const ev of state.canonicalHistory) {
@@ -868,40 +879,23 @@ async function mountEndingPage(sessionMetaOverride) {
   try {
     const mod = await import('/scripts/endingPage.js');
     if (mod && typeof mod.mount === 'function') {
-      // ClickUp 16.2 P1 fix (2026-09-07): forward the story/profile
-      // identity to the ending page so /v1/ecosystem/discussions can
-      // build a proper pair-key (no sentinel pair). The page MUST
-      // receive storyUuid + storyVersionUuid + communityProfileVersion
-      // + communityProfileQueries — the server route enforces them
-      // all; missing identity is a 400, never a 200-with-empty-array.
-      //
-      // The server POST /v1/ecosystem/discussions expects body
-      // `search_queries: [{id, query, kind}][]` plus identity. The
-      // ending page module reshapes communityProfileQueries into
-      // `search_queries` and submits them as the body. Player must
-      // therefore forward the *exact* profile rows (id, query, kind)
-      // — not a derived "AI-picked" query — so the seam is honest.
-      const sessionMeta = sessionMetaOverride || {
+      const meta = sessionMetaOverride || {
         storyTitle: state.story ? state.story.title : '',
         roleLabel: state.role ? state.role.label : '',
       };
+      // ClickUp 16.2 P1.v2 (2026-09-07): forward the canonical
+      // community-profile identity into sessionMeta so the ending
+      // page can submit /v1/ecosystem/discussions without an extra
+      // /recover round-trip. The handler is server-authoritative,
+      // so endingPage just echoes these strings back to the API.
       await mod.mount({
         sessionUuid: state.sessionUuid,
-        sessionMeta: {
-          ...sessionMeta,
-          storyUuid: state.storyUuid || null,
-          storyVersionUuid: state.storyVersionUuid || null,
-          // ClickUp 16.2 P1 fix: prefer the live /api/sessions value
-          // but fall back to the window global so static-rendered
-          // pages (e.g. server-side test fixture) still have a
-          // non-null identity.
-          communityProfileVersion: state.communityProfileVersion
-            || (typeof window !== 'undefined' && window.STORY_OUTSIDE_COMMUNITY_PROFILE_VERSION)
-            || null,
-          communityProfileQueries: Array.isArray(state.communityProfileQueries)
-            ? state.communityProfileQueries.slice()
-            : null,
-        },
+        sessionMeta: Object.assign({}, meta, {
+          communityProfileVersion: meta.communityProfileVersion || state.communityProfileVersion,
+          communityProfileQueries: meta.communityProfileQueries || state.communityProfileQueries,
+          storyUuid: meta.storyUuid || state.storyUuid,
+          storyVersionUuid: meta.storyVersionUuid || state.storyVersionUuid,
+        }),
       });
       return true;
     }

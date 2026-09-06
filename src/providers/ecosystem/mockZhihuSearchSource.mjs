@@ -1,14 +1,18 @@
-// src/providers/ecosystem/mockZhihuSearchSource.mjs — ClickUp 16.2 mock
-// 知乎搜索 source（默认 fallback）。
+// src/providers/ecosystem/mockZhihuSearchSource.mjs — ClickUp 16.2 P1.v2
+// mock 知乎搜索 source（默认 fallback）。
 //
-// 行为契约:
+// 行为契约 (ClickUp 16.2 P1.v2 — 2026-09-07 ChatGPT review):
 //   * 永远可用：不读网络、不读 env、不读 secrets。
-//   * 决定性输出：相同 (query, community_profile_version, story_version_uuid)
-//     在同一进程内多次调用得到完全相同的结果，便于 cache 测试。
-//   * fixture key 按 `(query, community_profile_version, story_version_uuid)` 缓存，
-//     永远不会跨 pair 共享 row。
-//   * 当 STORY_OUTSIDE_PROVIDER=real 但 zhihuSearchSource 不可用时，
+//   * 决定性输出：相同 (query, community_profile_version,
+//     story_version_uuid) 在同一进程内多次调用得到完全相同的结果，
+//     便于 cache 测试。
+//   * fixture key 按 `(query, community_profile_version,
+//     story_version_uuid)` 缓存，**不**跨 pair 共享 row。
+//   * 当 STORY_OUTSIDE_ECOSYSTEM_SEARCH=real 但 zhihuSearchSource 不可用时，
 //     server.mjs 会自动降级到此 mock 并把 response.source 标为 'mock'。
+//   * 永远接受的是 `query` 字符串；adapter 层**不**关心 client 是
+//     怎么得到这条 query 的 — handler 在更上一层已经从 canonical
+//     profile 解析出来了。
 //
 // 返回 shape 与真知乎搜索 source 完全一致（见 dto.mjs），便于上层
 // 不关心当前是 mock 还是 real。
@@ -49,78 +53,59 @@ export function buildMockDiscussions(input) {
   const seed = stableHash(`${query}::${profileVersion}::${storyVersion}`);
   const base = `https://www.zhihu.com/search?type=content&q=${encodeURIComponent(query)}`;
   const out = [];
-  const count = Math.min(limit, 8);
-  for (let i = 0; i < count; i += 1) {
-    const s = stableHash(`${seed}::${i}`);
-    const threadUuid = formatUuid(s);
-    const title = `关于 "${query}" 的社区讨论 #${i + 1}`;
-    const snippet = makeSnippet(query, profileVersion, s);
-    const url = `${base}&mock_idx=${i}`;
-    const score = 100 - i * 7 + (s % 13);
+  // Generate 3 * limit candidate rows; the dedupe+rank step in
+  // dto.mjs collapses them into a stable list of ≤ limit.
+  const total = Math.max(3, Math.min(limit * 3, 24));
+  for (let i = 0; i < total; i += 1) {
+    const variant = stableHash(`${seed}::${i}`) % 7;
+    const urlVariant = (seed + i * 31) >>> 0;
+    const url = `${base}&variant=${urlVariant.toString(16)}`;
+    const titles = [
+      `知乎讨论：${query} 热门观点 #${i + 1}`,
+      `关于「${query}」的几个解读`,
+      `${query}：读者普遍认为……`,
+      `${query} 解读系列（${i + 1}）`,
+      `《${query}》读后感与延伸`,
+    ];
+    const title = titles[variant % titles.length];
+    const score = 100 - i * 7 - ((seed + i) % 5);
     out.push({
-      thread_uuid: threadUuid,
-      title,
-      snippet,
+      id: (seed + i).toString(16),
       url,
+      title,
+      excerpt: `${query} 的关键讨论片段 ${i + 1}。`,
       score,
-      source: 'mock',
+      source: 'zhihu-mock',
+      fetched_at: new Date(0).toISOString(),
     });
   }
-  return dedupeAndRankZhihuDiscussions(out);
-}
-
-function formatUuid(seed) {
-  // Compose a deterministic UUID shape from the seed. Mock-only.
-  const hex = (seed >>> 0).toString(16).padStart(8, '0');
-  const tail = (((seed * 0x9E3779B1) >>> 0).toString(16).padStart(8, '0')) +
-    (((seed * 0x85EBCA77) >>> 0).toString(16).padStart(8, '0')) +
-    (((seed * 0xC2B2AE3D) >>> 0).toString(16).padStart(8, '0'));
-  return `${hex}-0000-4000-8000-${tail.slice(0, 12)}`;
-}
-
-function makeSnippet(query, profileVersion, seed) {
-  const tags = [];
-  if (profileVersion) tags.push(`profile=${profileVersion}`);
-  if (query.length > 4) tags.push(`keyword=${query.slice(0, 4)}`);
-  const tail = (seed >>> 0).toString(16).padStart(4, '0');
-  return `来自 community_profile ${tags.join(',')} 的 mock fixture · ${query.slice(0, 24)} · ${tail}`;
+  return dedupeAndRankZhihuDiscussions(out).slice(0, limit);
 }
 
 /**
- * Mock adapter factory. Returns an object with a stable `.name`,
- * `.source`, and `.search(input)` async function matching the real
- * adapter contract. `.search` always resolves; it never rejects with
- * ProviderError-like shapes (graceful degradation is a no-op for mock).
+ * Create a mock Zhihu search source adapter. Implements the
+ * `.search({ query, kind, story_uuid, story_version_uuid,
+ * community_profile_version, limit })` contract used by
+ * search.mjs's orchestrator.
  */
 export function createMockZhihuSearchSource() {
   return Object.freeze({
-    name: 'mock-zhihu-search',
-    source: 'mock',
-    isReal: false,
+    name: 'mock-zhihu-search-source',
     /**
      * @param {object} input
-     * @param {string} input.query
-     * @param {string} [input.story_uuid]
-     * @param {string} [input.story_version_uuid]
-     * @param {string} [input.community_profile_version]
-     * @param {number} [input.limit]
      * @returns {Promise<{ discussions: object[], source: 'mock' }>}
      */
     async search(input) {
-      const limit = Number.isInteger(input && input.limit) && input.limit > 0 ? input.limit : 8;
-      const discussions = clampDiscussions(buildMockDiscussions({
+      const list = buildMockDiscussions({
         query: input && input.query,
         community_profile_version: input && input.community_profile_version,
         story_version_uuid: input && input.story_version_uuid,
-        limit,
-      }), limit);
-      return { discussions, source: 'mock' };
+        limit: input && input.limit,
+      });
+      return {
+        discussions: clampDiscussions(list, input && input.limit),
+        source: 'mock',
+      };
     },
   });
 }
-
-export const MOCK_FIXTURE_TAGS = Object.freeze({
-  deterministic: true,
-  network: false,
-  envRead: false,
-});

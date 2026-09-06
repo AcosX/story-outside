@@ -171,6 +171,35 @@ function activeKey(story_version_uuid, generator_version) {
   return `${story_version_uuid}|${generator_version}`;
 }
 
+function isPlainObject(value) {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Build the canonical `community_profile_version` string for a profile
+ * row. The format is `${generator_version}@${content_hash[:16]}` — a
+ * new value iff the profile is regenerated with a different content
+ * hash. The prefix length matches what the handler in server.mjs
+ * surfaces to the player (and what the player echoes back).
+ *
+ * ClickUp 16.2 P1.v2 fix (2026-09-07): this helper is the SINGLE
+ * authority for the version-string format. Both the producer (POST
+ * /api/sessions response) and the consumer (POST
+ * /v1/ecosystem/discussions) MUST derive the string through this
+ * function so the two sides cannot drift.
+ *
+ * @param {import('./profile.mjs').StoryCommunityProfile} profile
+ * @returns {string|null}
+ */
+export function buildCanonicalCommunityProfileVersion(profile) {
+  if (!profile || typeof profile !== 'object') return null;
+  const generator = typeof profile.generator_version === 'string' ? profile.generator_version : '';
+  const hash = profile.hash && typeof profile.hash.content_hash === 'string'
+    ? profile.hash.content_hash : '';
+  if (!generator || !hash) return null;
+  return `${generator}@${hash.slice(0, 16)}`;
+}
+
 /**
  * Build a fresh in-memory CommunityProfileRepository. Pure factory.
  * @returns {CommunityProfileRepository}
@@ -216,6 +245,149 @@ export function createInMemoryCommunityProfileRepository() {
       const uuid = state.activeByStoryVersion.get(key);
       if (!uuid) return null;
       return state.profiles.get(uuid) || null;
+    },
+    /**
+     * ClickUp 16.2 P1.v2 fix (2026-09-07) — REVISED 2026-09-07 04:21
+     * (主人巡检): server-authoritative, IMMUTABLE lookup of a
+     * `StoryCommunityProfile` row.
+     *
+     * The store retains EVERY profile row ever written (the
+     * `setCommunityProfile` contract: "a new row is created; the
+     * previous row is kept, NOT mutated in place"). When a new
+     * generator_version / content_hash supersedes an old row, the
+     * `activeByStoryVersion` index moves to the new row, but the old
+     * row stays in `state.profiles`. A pinned session must still be
+     * able to resolve its OLD profile by
+     * `community_profile_version` — the version string is the
+     * immutable locator.
+     *
+     * Hard contract:
+     *   * Walks `state.profiles` (ALL rows ever written, NOT just
+     *     `activeByStoryVersion`). An old row that was superseded by
+     *     a newer row is still resolvable.
+     *   * Matches `community_profile_version` BYTE-FOR-BYTE against
+     *     `buildCanonicalCommunityProfileVersion(row)` for each row
+     *     whose `row.story_version_uuid === story_version_uuid`.
+     *   * If exactly one row matches, returns it.
+     *   * If NO row matches, returns `community_profile_not_found`
+     *     — NEVER silently degrades to "the latest row for this
+     *     story_version".
+     *   * If any row bound to `story_version_uuid` has a different
+     *     `story_uuid` than the supplied one, returns
+     *     `story_version_mismatch` (defence in depth: a caller
+     *     cannot point one story's version at another story's
+     *     profile row).
+     *
+     * Result is a discriminated union so the route layer can map
+     * each failure mode to a specific 4xx error code:
+     *   * `{ ok: true,  profile }`
+     *   * `{ ok: false, code: 'community_profile_not_found' }`
+     *   * `{ ok: false, code: 'community_profile_version_mismatch' }`
+     *   * `{ ok: false, code: 'story_version_mismatch' }`
+     *
+     * The repo NEVER throws on identity errors; it returns the
+     * discriminated union instead. The route layer maps each code
+     * to a 400 response.
+     *
+     * Implementation note (regression guard):
+     *   * This implementation MUST NOT pick "the latest row then
+     *     compare" — that is exactly the bug v2 #28 introduced.
+     *     The immutable-lookup contract here requires walking
+     *     every row bound to the requested `story_version_uuid`
+     *     and matching the version string byte-for-byte. v1-2
+     *     (this revision) closes that bug.
+     *
+     * @param {object} input
+     * @param {string} input.story_uuid
+     * @param {string} input.story_version_uuid
+     * @param {string} input.community_profile_version
+     * @returns {{ok:true,profile:object}|{ok:false,code:string,message:string}}
+     */
+    findCanonicalByIdentity(input) {
+      // 1. Shape guard — bad inputs MUST NOT throw; route layer
+      //    already validates, but defence in depth.
+      if (!isPlainObject(input)) {
+        return { ok: false, code: 'community_profile_not_found', message: 'identity required' };
+      }
+      const storyUuid = typeof input.story_uuid === 'string' ? input.story_uuid : '';
+      const storyVersionUuid = typeof input.story_version_uuid === 'string' ? input.story_version_uuid : '';
+      const cpv = typeof input.community_profile_version === 'string'
+        ? input.community_profile_version : '';
+      if (!UUID_PATTERN.test(storyUuid) || !UUID_PATTERN.test(storyVersionUuid) || !cpv) {
+        return {
+          ok: false,
+          code: 'community_profile_not_found',
+          message: 'story_uuid, story_version_uuid, community_profile_version are all required and must be valid',
+        };
+      }
+      // 2. Walk EVERY profile row ever written (not just the
+      //    `activeByStoryVersion` index — that index points only at
+      //    the most recently generated row per
+      //    (story_version_uuid, generator_version), so a row
+      //    superseded by a newer regeneration would be invisible
+      //    to it). The store MUST retain superseded rows so pinned
+      //    sessions can re-resolve them. We narrow by
+      //    `story_version_uuid` first; rows for other story versions
+      //    are skipped.
+      let matched = null;
+      let sawStoryUuidMismatch = false;
+      for (const row of state.profiles.values()) {
+        if (!row || row.story_version_uuid !== storyVersionUuid) continue;
+        if (row.story_uuid !== storyUuid) {
+          // A row bound to the requested story_version_uuid claims a
+          // DIFFERENT story_uuid. The client tried to point one
+          // story's version at another story's profile row — refuse
+          // loudly. We keep walking in case there is also a row
+          // whose story_uuid matches AND whose version string
+          // matches; but the contract says: if ANY row under the
+          // requested story_version_uuid disagrees on story_uuid,
+          // the request is invalid. We bail here.
+          sawStoryUuidMismatch = true;
+          break;
+        }
+        const rowCpv = buildCanonicalCommunityProfileVersion(row);
+        if (rowCpv === cpv) {
+          if (matched === null) {
+            matched = row;
+          } else {
+            // Two distinct rows share the same canonical version
+            // string (should be impossible: the version string is
+            // `${generator_version}@${content_hash[:16]}` and
+            // `(generator_version, content_hash)` is unique per row
+            // by the `setCommunityProfile` idempotency contract).
+            // Treat as version_mismatch so the caller gets a
+            // distinct, actionable error instead of silent
+            // ambiguity.
+            return {
+              ok: false,
+              code: 'community_profile_version_mismatch',
+              message: 'community_profile_version matches more than one canonical row; row state is inconsistent',
+            };
+          }
+        }
+      }
+      if (sawStoryUuidMismatch) {
+        return {
+          ok: false,
+          code: 'story_version_mismatch',
+          message: 'story_uuid does not match the canonical profile bound to story_version_uuid',
+        };
+      }
+      if (matched === null) {
+        // No row under the requested story_version_uuid produces the
+        // requested community_profile_version. The store either has
+        // NO rows for this story_version (never generated), or only
+        // rows for OTHER versions (the version the client pinned to
+        // has been GC'd or never existed). In neither case do we
+        // silently fall back to the "latest" row — the request was
+        // for a specific version and we MUST honour it.
+        return {
+          ok: false,
+          code: 'community_profile_not_found',
+          message: 'no canonical community profile matches the supplied community_profile_version (immutable lookup failed)',
+        };
+      }
+      return { ok: true, profile: matched };
     },
     findByUuid(profile_uuid) {
       if (typeof profile_uuid !== 'string') return null;

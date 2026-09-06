@@ -1,9 +1,10 @@
-// src/providers/ecosystem/zhihuSearchSource.mjs — ClickUp 16.2 real
-// 知乎搜索 source（直接 HTTP，**不**复用 CLI）。
+// src/providers/ecosystem/zhihuSearchSource.mjs — ClickUp 16.2 P1.v2
+// real 知乎搜索 source（直接 HTTP，**不**复用 CLI）。
 //
-// 契约（主人 2026-09-06 22:21）：
-//   * 仅在 STORY_OUTSIDE_PROVIDER=real 且 ZHIHU_OAUTH_APP_KEY /
-//     ZHIHU_ACCESS_SECRET / ZHIHU_OAUTH_USER 配置完整时启用。
+// 契约 (ClickUp 16.2 — 2026-09-06 22:21 / 2026-09-07 P1.v2 review):
+//   * 仅在 STORY_OUTSIDE_ECOSYSTEM_SEARCH=real 且
+//     ZHIHU_OAUTH_APP_KEY / ZHIHU_ACCESS_SECRET / ZHIHU_OAUTH_USER
+//     配置完整时启用。
 //   * 调用官方 endpoint: https://api.zhihu.com/api/v1/content/search
 //     （按 ClickUp 16.2 记录的官方契约）。**不**伪造成 /openapi/feed/search。
 //   * host allowlist 仅 `https://api.zhihu.com` (default port only)。
@@ -48,296 +49,238 @@ export class EcosystemUpstreamError extends Error {
  * starts-with `https://api.zhihu.com/`. Default port only.
  */
 export function isAllowedUpstreamBaseUrl(baseUrl) {
-  if (typeof baseUrl !== 'string' || !baseUrl) return false;
-  const allow = ALLOWED_BASE;
-  if (baseUrl.length < allow.length) return false;
-  if (baseUrl.slice(0, allow.length).toLowerCase() !== allow) return false;
-  if (baseUrl.length === allow.length) return true;
-  const tail = baseUrl.charAt(allow.length);
-  if (tail !== '/' && tail !== '?' && tail !== '#') return false;
-  return true;
+  if (typeof baseUrl !== 'string') return false;
+  if (baseUrl === ALLOWED_BASE) return true;
+  if (!baseUrl.startsWith(`${ALLOWED_BASE}/`)) return false;
+  try {
+    const u = new URL(baseUrl);
+    if (u.protocol !== 'https:') return false;
+    if (u.hostname !== 'api.zhihu.com') return false;
+    if (u.port && u.port !== '443') return false;
+    return true;
+  } catch {
+    return false;
+  }
 }
 
-function assertQuery(raw) {
-  if (typeof raw !== 'string') {
-    throw new EcosystemUpstreamError('bad_query', 'query must be a string');
+/**
+ * Whitelist of characters allowed in a search query (trimmed). This
+ * is intentionally narrow — anything outside `[A-Za-z0-9 _\-—…·,.，。
+ * ？！!?\u4e00-\u9fa5]` is rejected before we touch the upstream URL.
+ */
+const QUERY_ALLOWED = /^[\sA-Za-z0-9_\-—…·,.，。？！!?'"：:()（）\u4e00-\u9fa5]*$/;
+function isSafeQueryString(q) {
+  return typeof q === 'string' && QUERY_ALLOWED.test(q);
+}
+
+/**
+ * Read OAuth credentials from env. Returns `null` when any one is
+ * missing — the route layer treats null as "use mock source".
+ */
+export function readZhihuOAuthCredentials(env = process.env) {
+  const appKey = env && typeof env.ZHIHU_OAUTH_APP_KEY === 'string' ? env.ZHIHU_OAUTH_APP_KEY : '';
+  const accessSecret = env && typeof env.ZHIHU_ACCESS_SECRET === 'string' ? env.ZHIHU_ACCESS_SECRET : '';
+  const user = env && typeof env.ZHIHU_OAUTH_USER === 'string' ? env.ZHIHU_OAUTH_USER : '';
+  if (!appKey || !accessSecret || !user) return null;
+  return { appKey, accessSecret, user };
+}
+
+/**
+ * Predicate so the server.mjs layer can short-circuit to mock when
+ * real credentials are absent. Pure read of env, no side effects.
+ */
+export function hasRealSearchCredentials(env = process.env) {
+  return readZhihuOAuthCredentials(env) !== null;
+}
+
+/**
+ * Minimal HMAC-SHA1 signing. We deliberately avoid importing the
+ * `crypto` module as a runtime dep so the mock-only path stays
+ * light; the real adapter is only constructed when credentials are
+ * present.
+ */
+async function hmacSha1(key, data) {
+  const enc = new TextEncoder();
+  const keyData = await crypto.subtle.importKey(
+    'raw',
+    enc.encode(key),
+    { name: 'HMAC', hash: 'SHA-1' },
+    false,
+    ['sign'],
+  );
+  const sig = await crypto.subtle.sign('HMAC', keyData, enc.encode(data));
+  return Array.from(new Uint8Array(sig)).map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+/**
+ * Read up to `MAX_RESPONSE_BYTES` from a fetch Response. Throws
+ * EcosystemUpstreamError on overflow / decode error.
+ */
+async function readBoundedBody(response, limit = MAX_RESPONSE_BYTES) {
+  // Use stream + manual accumulator so we can cap memory.
+  const reader = response.body && response.body.getReader ? response.body.getReader() : null;
+  if (!reader) {
+    // Fall back to response.text() if streaming API is unavailable
+    // (e.g. undici version regression). Trust that node fetch will
+    // reject pathological bodies upstream; the limit still protects
+    // us in the streaming case which is the common one.
+    return response.text();
   }
-  const trimmed = raw.trim();
+  const decoder = new TextDecoder('utf-8', { fatal: false });
+  let received = 0;
+  let acc = '';
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    received += value.byteLength;
+    if (received > limit) {
+      await reader.cancel().catch(() => {});
+      throw new EcosystemUpstreamError('upstream_body_too_large', `upstream response exceeds ${limit} bytes`);
+    }
+    acc += decoder.decode(value, { stream: true });
+  }
+  acc += decoder.decode();
+  return acc;
+}
+
+/**
+ * Issue one upstream request. Manually follows up to MAX_REDIRECTS
+ * 30x responses, re-checking the host allowlist at every hop.
+ *
+ * @param {object} args
+ * @param {string} args.url       Full URL (already validated).
+ * @param {object} args.cred      OAuth credentials.
+ * @param {number} args.timeoutMs
+ * @returns {Promise<object>}     Parsed JSON body.
+ */
+async function fetchOnce(args) {
+  const { url, cred, timeoutMs } = args;
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, {
+      method: 'GET',
+      headers: {
+        'authorization': `OAuth ${cred.appKey}`,
+        'x-zhihu-client': cred.user,
+        'accept': 'application/json',
+        'user-agent': 'story-outside-ecosystem-search/1.0',
+      },
+      signal: ac.signal,
+      redirect: 'manual',
+    });
+    // Manual redirect handling: 30x + Location → follow with re-check.
+    if (res.status >= 300 && res.status < 400) {
+      const location = res.headers.get('location');
+      if (!location) {
+        throw new EcosystemUpstreamError('upstream_redirect_missing_location', 'upstream returned 30x with no Location');
+      }
+      const next = new URL(location, url).toString();
+      if (!isAllowedUpstreamBaseUrl(next)) {
+        throw new EcosystemUpstreamError('upstream_redirect_blocked', `redirect to disallowed host: ${next}`);
+      }
+      if ((args._depth || 0) >= MAX_REDIRECTS) {
+        throw new EcosystemUpstreamError('upstream_redirect_too_deep', `too many redirects (>${MAX_REDIRECTS})`);
+      }
+      return fetchOnce({ ...args, url: next, _depth: (args._depth || 0) + 1 });
+    }
+    if (res.status === 401 || res.status === 403) {
+      throw new EcosystemUpstreamError('upstream_unauthorized', `upstream returned ${res.status}`, { status: res.status });
+    }
+    if (res.status === 429) {
+      throw new EcosystemUpstreamError('upstream_rate_limited', 'upstream returned 429', { status: res.status });
+    }
+    if (res.status < 200 || res.status >= 300) {
+      throw new EcosystemUpstreamError('upstream_http_error', `upstream returned ${res.status}`, { status: res.status });
+    }
+    const body = await readBoundedBody(res);
+    try {
+      return JSON.parse(body);
+    } catch {
+      throw new EcosystemUpstreamError('upstream_invalid_json', 'upstream body is not valid JSON');
+    }
+  } catch (err) {
+    if (err && err.name === 'AbortError') {
+      throw new EcosystemUpstreamError('upstream_timeout', `upstream timed out after ${timeoutMs}ms`);
+    }
+    if (err && err.name === 'TypeError' && /fetch failed/i.test(err.message)) {
+      throw new EcosystemUpstreamError('upstream_network_error', err.message);
+    }
+    if (err instanceof EcosystemUpstreamError) throw err;
+    throw new EcosystemUpstreamError('upstream_error', (err && err.message) || 'unknown upstream error');
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * Issue the upstream search and normalise the response. The upstream
+ * shape changes occasionally; this adapter caps the surface area to
+ * the DiscussionDTO we expose publicly.
+ */
+async function callUpstream(input, opts) {
+  const { query, kind, story_version_uuid, community_profile_version, limit } = input;
+  const trimmed = typeof query === 'string' ? query.trim() : '';
   if (!trimmed) {
-    throw new EcosystemUpstreamError('empty_query', 'query must be non-empty');
+    throw new EcosystemUpstreamError('empty_query', 'query is required');
   }
   if (trimmed.length > 256) {
     throw new EcosystemUpstreamError('query_too_long', 'query exceeds 256 chars');
   }
-  for (let i = 0; i < trimmed.length; i += 1) {
-    const code = trimmed.charCodeAt(i);
-    if (code < 0x20 || code === 0x7f) {
-      throw new EcosystemUpstreamError('forbidden_char', 'query contains a control character');
-    }
+  if (!isSafeQueryString(trimmed)) {
+    throw new EcosystemUpstreamError('unsafe_query', 'query contains characters outside the allowlist');
   }
-  return trimmed;
-}
-
-function isUuid(value) {
-  return typeof value === 'string' && UUID_PATTERN.test(value);
+  if (!UUID_PATTERN.test(story_version_uuid || '')) {
+    throw new EcosystemUpstreamError('bad_story_version_uuid', 'story_version_uuid must be a UUID');
+  }
+  if (!community_profile_version || typeof community_profile_version !== 'string') {
+    throw new EcosystemUpstreamError('bad_community_profile_version', 'community_profile_version is required');
+  }
+  const params = new URLSearchParams();
+  params.set('q', trimmed);
+  params.set('limit', String(Number.isInteger(limit) && limit > 0 ? Math.min(limit, 20) : 8));
+  if (typeof kind === 'string' && kind) params.set('kind', kind);
+  params.set('story_version_uuid', story_version_uuid);
+  params.set('community_profile_version', community_profile_version);
+  const url = `${ALLOWED_BASE}${UPSTREAM_PATH}?${params.toString()}`;
+  if (!isAllowedUpstreamBaseUrl(url)) {
+    throw new EcosystemUpstreamError('upstream_url_not_allowlisted', `URL not allowlisted: ${url}`);
+  }
+  const cred = opts.cred;
+  const timeoutMs = Number.isInteger(opts.timeoutMs) && opts.timeoutMs > 0 ? opts.timeoutMs : DEFAULT_TIMEOUT_MS;
+  const parsed = await fetchOnce({ url, cred, timeoutMs });
+  // Normalise upstream → public DiscussionDTO.
+  const raw = Array.isArray(parsed && parsed.data) ? parsed.data : [];
+  const cleaned = [];
+  for (const r of raw) {
+    if (!isDiscussionShape(r)) continue;
+    cleaned.push({
+      id: typeof r.id === 'number' ? String(r.id) : r.id,
+      url: r.url,
+      title: r.title,
+      excerpt: typeof r.excerpt === 'string' ? r.excerpt : '',
+      score: Number.isFinite(r.score) ? r.score : 0,
+      source: 'zhihu',
+      fetched_at: new Date().toISOString(),
+    });
+  }
+  return clampDiscussions(dedupeAndRankZhihuDiscussions(cleaned), limit);
 }
 
 /**
- * Build the Authorization header from credentials. We deliberately do
- * NOT include the credential in the URL or the body.
- */
-function buildAuthHeader(creds) {
-  if (!creds || typeof creds !== 'object') return null;
-  // The hackathon OAuth contract uses app_key + access_secret; we
-  // surface it as a Bearer-like header so the upstream sees a clean
-  // auth surface. Real wiring depends on the deployed token issuer.
-  if (typeof creds.app_key !== 'string' || !creds.app_key) return null;
-  if (typeof creds.access_secret !== 'string' || !creds.access_secret) return null;
-  const token = `${creds.app_key}.${creds.access_secret}`;
-  return `Bearer ${token}`;
-}
-
-/**
- * Normalise one raw upstream discussion entry into our DTO shape.
- * Returns null if the entry is malformed (caller filters out).
- */
-function normaliseUpstreamEntry(raw, idx) {
-  if (!raw || typeof raw !== 'object') return null;
-  const threadUuid = typeof raw.id === 'string' && isUuid(raw.id)
-    ? raw.id
-    : `zhihu-${stableHex(raw.id ?? idx)}-${idx}`;
-  const title = pickString(raw, ['title', 'excerpt_title', 'question_title']) || '(无标题)';
-  const snippet = pickString(raw, ['excerpt', 'content', 'summary', 'snippet']) || '';
-  const url = pickString(raw, ['url', 'link', 'target_url']);
-  if (!url) return null;
-  let safeUrl = url;
-  try {
-    const u = new URL(url);
-    if (u.hostname !== 'www.zhihu.com' && u.hostname !== 'zhihu.com') {
-      // Accept only canonical Zhihu domains for `url`. Upstream host
-      // trust is checked separately (see fetchUpstream).
-      return null;
-    }
-    safeUrl = u.toString();
-  } catch {
-    return null;
-  }
-  const score = pickNumber(raw, ['score', 'hot_score', 'rank']) || (100 - idx);
-  return {
-    thread_uuid: threadUuid,
-    title,
-    snippet,
-    url: safeUrl,
-    score,
-    source: 'zhihu',
-  };
-}
-
-function pickString(obj, keys) {
-  for (const key of keys) {
-    if (typeof obj[key] === 'string' && obj[key]) return obj[key];
-  }
-  return null;
-}
-
-function pickNumber(obj, keys) {
-  for (const key of keys) {
-    const v = obj[key];
-    if (typeof v === 'number' && Number.isFinite(v)) return v;
-  }
-  return null;
-}
-
-function stableHex(input) {
-  let h = 0x811c9dc5;
-  const s = String(input ?? '');
-  for (let i = 0; i < s.length; i += 1) {
-    h ^= s.charCodeAt(i);
-    h = Math.imul(h, 0x01000193);
-  }
-  return (h >>> 0).toString(16).padStart(8, '0');
-}
-
-/**
- * Walk a redirect chain manually. Each step MUST satisfy the host
- * allowlist; otherwise abort with EcosystemUpstreamError.
- */
-async function fetchUpstream({ url, headers, timeoutMs, maxBytes, redirectLeft, fetchImpl }) {
-  const doFetch = fetchImpl || globalThis.fetch;
-  if (typeof doFetch !== 'function') {
-    throw new EcosystemUpstreamError('fetch_unavailable', 'global fetch is not available');
-  }
-  let currentUrl = url;
-  let redirectCount = 0;
-  while (true) {
-    if (!isAllowedUpstreamBaseUrl(currentUrl)) {
-      throw new EcosystemUpstreamError('forbidden_redirect', `refusing to follow to non-allowlisted host: ${currentUrl}`);
-    }
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
-    let res;
-    try {
-      res = await doFetch(currentUrl, {
-        method: 'GET',
-        headers,
-        redirect: 'manual',
-        signal: controller.signal,
-      });
-    } catch (err) {
-      clearTimeout(timer);
-      const code = err && err.name === 'AbortError' ? 'upstream_timeout' : 'upstream_unavailable';
-      throw new EcosystemUpstreamError(code, `upstream fetch failed: ${err && err.message ? err.message : String(err)}`);
-    }
-    clearTimeout(timer);
-    // Manual redirect handling.
-    if (res.status >= 300 && res.status < 400) {
-      const loc = res.headers.get('location');
-      if (!loc) {
-        throw new EcosystemUpstreamError('redirect_no_location', `upstream returned ${res.status} without Location`);
-      }
-      redirectCount += 1;
-      if (redirectCount > MAX_REDIRECTS) {
-        throw new EcosystemUpstreamError('redirect_too_many', `exceeded ${MAX_REDIRECTS} redirects`);
-      }
-      let nextUrl;
-      try {
-        nextUrl = new URL(loc, currentUrl).toString();
-      } catch {
-        throw new EcosystemUpstreamError('bad_redirect', 'upstream returned unparseable Location');
-      }
-      currentUrl = nextUrl;
-      continue;
-    }
-    if (res.status < 200 || res.status >= 300) {
-      throw new EcosystemUpstreamError('upstream_status', `upstream returned status ${res.status}`, { status: res.status });
-    }
-    // Body cap. Tolerate two body shapes: Web ReadableStream
-    // (res.body.getReader) and our test double that yields the entire
-    // body as a single Uint8Array via res.body.getReader() returning a
-    // { read() } object whose .read() returns { value, done }.
-    if (!res.body) {
-      throw new EcosystemUpstreamError('no_body', 'upstream response has no body');
-    }
-    let received = 0;
-    let chunks = null;
-    if (typeof res.body.getReader === 'function') {
-      const reader = res.body.getReader();
-      chunks = [];
-      while (true) {
-        const { value, done } = await reader.read();
-        if (done) break;
-        received += value.byteLength;
-        if (received > maxBytes) {
-          try { await reader.cancel(); } catch { /* ignore */ }
-          throw new EcosystemUpstreamError('upstream_body_too_large', `upstream body exceeded ${maxBytes} bytes`);
-        }
-        chunks.push(value);
-      }
-    } else if (res.body && typeof res.body[Symbol.asyncIterator] === 'symbol' || typeof res.body[Symbol.asyncIterator] === 'function') {
-      chunks = [];
-      for await (const value of res.body) {
-        received += value.byteLength;
-        if (received > maxBytes) {
-          throw new EcosystemUpstreamError('upstream_body_too_large', `upstream body exceeded ${maxBytes} bytes`);
-        }
-        chunks.push(value);
-      }
-    } else {
-      throw new EcosystemUpstreamError('unsupported_body', 'upstream body shape not supported');
-    }
-    const totalLen = chunks.reduce((n, c) => n + c.byteLength, 0);
-    const body = new Uint8Array(totalLen);
-    let offset = 0;
-    for (const chunk of chunks) {
-      body.set(chunk, offset);
-      offset += chunk.byteLength;
-    }
-    return body;
-  }
-}
-
-/**
- * Real adapter factory. Returns an object matching the mock contract.
- * Use `createRealZhihuSearchSource({ fetcher, baseUrl })` to override
- * the network layer for tests.
+ * Create a real Zhihu search source adapter. Throws when credentials
+ * are missing — server.mjs checks `hasRealSearchCredentials()` first.
  */
 export function createRealZhihuSearchSource(opts = {}) {
-  const baseUrl = opts.baseUrl || ALLOWED_BASE;
-  if (!isAllowedUpstreamBaseUrl(baseUrl)) {
-    throw new EcosystemUpstreamError('forbidden_base', `refusing to use non-allowlisted base: ${baseUrl}`);
+  const cred = readZhihuOAuthCredentials(opts.env || process.env);
+  if (!cred) {
+    throw new EcosystemUpstreamError('missing_credentials', 'ZHIHU_OAUTH_APP_KEY / ZHIHU_ACCESS_SECRET / ZHIHU_OAUTH_USER are required');
   }
-  const timeoutMs = Number.isInteger(opts.timeoutMs) && opts.timeoutMs > 0 ? opts.timeoutMs : DEFAULT_TIMEOUT_MS;
-  const maxBytes = Number.isInteger(opts.maxBytes) && opts.maxBytes > 0 ? opts.maxBytes : MAX_RESPONSE_BYTES;
-  const fetchImpl = opts.fetcher || (typeof globalThis.fetch === 'function' ? globalThis.fetch.bind(globalThis) : null);
-  const creds = opts.credentials || null;
-
   return Object.freeze({
-    name: 'real-zhihu-search',
-    source: 'zhihu',
-    isReal: true,
-    baseUrl,
-    /**
-     * @param {object} input
-     * @param {string} input.query
-     * @param {string} [input.story_uuid]
-     * @param {string} [input.story_version_uuid]
-     * @param {string} [input.community_profile_version]
-     * @param {number} [input.limit]
-     * @returns {Promise<{ discussions: object[], source: 'zhihu' }>}
-     * @throws EcosystemUpstreamError on any network / parse failure
-     */
+    name: 'real-zhihu-search-source',
     async search(input) {
-      const query = assertQuery(input && input.query);
-      const limit = Number.isInteger(input && input.limit) && input.limit > 0
-        ? Math.min(input.limit, 20) : 8;
-      const url = `${baseUrl}${UPSTREAM_PATH}?q=${encodeURIComponent(query)}&count=${limit}&type=content`;
-      const headers = {
-        accept: 'application/json',
-        'user-agent': 'story-outside/0.1 (zhihu-hackathon-2026-p2; read-only)',
-      };
-      const auth = buildAuthHeader(creds);
-      if (auth) headers.authorization = auth;
-      const body = await fetchUpstream({
-        url,
-        headers,
-        timeoutMs,
-        maxBytes,
-        redirectLeft: MAX_REDIRECTS,
-        fetchImpl,
-      });
-      let parsed;
-      try {
-        parsed = JSON.parse(Buffer.from(body).toString('utf-8'));
-      } catch {
-        throw new EcosystemUpstreamError('upstream_body_invalid', 'upstream returned non-JSON');
-      }
-      const rawList = Array.isArray(parsed && parsed.data)
-        ? parsed.data
-        : Array.isArray(parsed) ? parsed : [];
-      const out = [];
-      for (let i = 0; i < rawList.length; i += 1) {
-        const normalised = normaliseUpstreamEntry(rawList[i], i);
-        if (normalised && isDiscussionShape(normalised)) out.push(normalised);
-      }
-      const ranked = dedupeAndRankZhihuDiscussions(out);
-      const clamped = clampDiscussions(ranked, limit);
-      return { discussions: clamped, source: 'zhihu' };
+      const discussions = await callUpstream(input, { cred, timeoutMs: opts.timeoutMs });
+      return { discussions, source: 'live' };
     },
   });
-}
-
-export { delay };
-
-/**
- * Probe whether real-source auth is configured. Reads env via opts.env
- * only — never reaches into globalThis. Used by server.mjs to decide
- * real vs mock at startup.
- */
-export function hasRealSearchCredentials(env = process.env) {
-  if (!env || typeof env !== 'object') return false;
-  const appKey = env.ZHIHU_OAUTH_APP_KEY;
-  const secret = env.ZHIHU_ACCESS_SECRET;
-  const hasKey = typeof appKey === 'string' && appKey.length > 0;
-  const hasSecret = typeof secret === 'string' && secret.length > 0;
-  return !!(hasKey && hasSecret);
 }

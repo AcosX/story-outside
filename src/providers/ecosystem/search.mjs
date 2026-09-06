@@ -1,31 +1,31 @@
-// src/providers/ecosystem/search.mjs — ClickUp 16.2 知乎搜索 cache 与
-// orchestrator。
+// src/providers/ecosystem/search.mjs — ClickUp 16.2 P1.v2 知乎搜索 cache 与
+// orchestrator.
 //
-// 关键 P1 修复（主人 + ChatGPT 2026-09-06 / 09-07 巡检）：
-//   * Search queries **必须**来自 `StoryCommunityProfile.queries[]`，
-//     **不**由 AI 拼（AI-generated fields are FORBIDDEN at the seam）。
-//     请求体
-//     强校验：`search_queries: [{id, query, kind}][]` 必填；AI 字段
-//     → 400 'forbidden_field'。
-//   * 多 query 聚合：handler 对每个 `{id, query, kind}` 独立走 cache
-//     pair-key (`story_version_uuid`, `community_profile_version`,
-//     `query_id`, `query_hash`)，结果按 `id` 分组返回。
-//   * 去掉 sentinel cache 退化：identity (story_uuid,
-//     story_version_uuid, community_profile_version) 缺省 → 400
-//     `missing_*`，**不**再走 `__no_story_version__` /
-//     `__no_profile__` sentinel pair。
+// 关键 P1.v2 修复（主人 + ChatGPT 2026-09-07 巡检）：
+//   * Search queries **必须**来自服务端解析出的 canonical
+//     `StoryCommunityProfile.queries[]`，**不**由 client 拼。
+//     handler 接 `story_uuid + story_version_uuid +
+//     community_profile_version`，**不**接 `body.search_queries`。
+//   * 多 query 聚合：orchestrator 对 canonical profile.queries[i]
+//     每个 `{id, query, kind}` 独立走 cache pair-key
+//     (`story_version_uuid`, `community_profile_version`,
+//     `query_id`, `query_hash`)，结果按 `id` 分组返回 results[]。
+//   * 去掉 sentinel cache 退化：identity 缺省 → 400，**不**再走
+//     `__no_story_version__` / `__no_profile__` sentinel pair。
+//   * **不**接受 client-supplied queries；任何 caller 想注入 query
+//     必须改 canonical profile（生成 → 校验 → 入库 → 才有新版本）。
 //
-// TTL + stale-while-revalidate（per pair-key row）：
+// TTL + stale-while-revalidate (per pair-key row):
 //   * fresh → 直接返回；cached=true, provenance='cache'
 //   * stale-but-usable → 立刻返回旧值并异步刷新
 //   * expired / missing → 阻塞刷新；失败 → graceful degradation
-//     （per-query ecosystem_status='unavailable'，整体 status 仍 'ok'
-//     只要至少一组成功）。
+//     (per-query ecosystem_status='unavailable'，整体 status 仍 'ok'
+//      只要至少一组成功)
 //
-// 公共契约（per-query result）：
+// 公共契约 (per-query result):
 //   {
-//     id: string,                  // echoes search_queries[i].id
-//     query: string,               // echoes search_queries[i].query
+//     id: string,                  // echoes profile.queries[i].id
+//     query: string,               // echoes profile.queries[i].query
 //     kind: 'web'|'knowledge'|'hot'|'mixed',
 //     discussions: DiscussionDTO[],
 //     provenance: 'live'|'cache'|'mock'|'unavailable',
@@ -34,7 +34,7 @@
 //     error?: { code, message },
 //   }
 //
-// 公共契约（top-level response）：
+// 公共契约 (top-level response):
 //   {
 //     results: PerQueryResult[],
 //     provenance: 'live'|'cache'|'mock'|'unavailable',
@@ -47,6 +47,7 @@ import {
   clampDiscussions,
   isDiscussionShape,
   isPlainObject,
+  normaliseCanonicalSearchQueries,
 } from './dto.mjs';
 import { EcosystemUpstreamError } from './zhihuSearchSource.mjs';
 
@@ -333,21 +334,28 @@ function scheduleBackgroundRefresh(input) {
 }
 
 /**
- * Orchestrator. ClickUp 16.2 P1 fix (2026-09-07): input MUST carry
- * `search_queries: [{id, query, kind}][]` plus the three identity
- * fields. Sentinel fallback for missing identity is REMOVED — the
- * route layer enforces identity before this function runs.
+ * Orchestrator. ClickUp 16.2 P1.v2 fix (2026-09-07):
+ *   Input is the **resolved canonical profile** + identity triple,
+ *   NOT the raw client body. The route layer resolves
+ *   `communityProfileRepo.findCanonicalByIdentity(...)` and passes
+ *   the resulting `profile` here; this function walks
+ *   `profile.queries[]` and runs each one through the pair-key
+ *   cache + adapter.
+ *
+ *   The orchestrator never trusts caller-supplied query strings; if
+ *   the resolved profile has zero queries, the route is a 4xx, not
+ *   a silent 200 with empty results.
  *
  * @param {object} input
  * @param {object} input.cache
  * @param {object} input.adapter
- * @param {{ id: string, query: string, kind: string }[]} input.search_queries
+ * @param {object} input.profile                 Canonical StoryCommunityProfile.
  * @param {string} input.story_uuid
  * @param {string} input.story_version_uuid
  * @param {string} input.community_profile_version
  * @param {number} [input.limit]
  * @param {AbortSignal} [input.signal]
- * @returns {Promise<{ results: object[], provenance, cached, ecosystem_status }>}
+ * @returns {Promise<{ results: object[], provenance, cached, ecosystem_status, error?: { code, message } }>}
  */
 export async function searchEcosystemDiscussions(input) {
   if (!isPlainObject(input)) {
@@ -379,24 +387,11 @@ export async function searchEcosystemDiscussions(input) {
       error: { code: 'bad_cache', message: 'cache.get/put missing' },
     };
   }
-  const searchQueries = Array.isArray(input.search_queries) ? input.search_queries : [];
-  if (searchQueries.length === 0) {
-    return {
-      results: [],
-      provenance: 'unavailable',
-      cached: false,
-      ecosystem_status: 'unavailable',
-      error: { code: 'empty_search_queries', message: 'search_queries required' },
-    };
-  }
   const story_uuid = typeof input.story_uuid === 'string' ? input.story_uuid : null;
   const story_version_uuid = typeof input.story_version_uuid === 'string' ? input.story_version_uuid : null;
   const community_profile_version = typeof input.community_profile_version === 'string'
     ? input.community_profile_version
     : null;
-  // Identity is REQUIRED. The route layer enforces it via normaliseDiscussionsRequest,
-  // but defend in depth: missing identity → 400-style unavailable payload
-  // (never a sentinel pair-key).
   if (!story_uuid || !story_version_uuid || !community_profile_version) {
     return {
       results: [],
@@ -409,13 +404,44 @@ export async function searchEcosystemDiscussions(input) {
       },
     };
   }
-
+  const profile = input.profile;
+  if (!isPlainObject(profile) || !profile.profile_uuid) {
+    return {
+      results: [],
+      provenance: 'unavailable',
+      cached: false,
+      ecosystem_status: 'unavailable',
+      error: {
+        code: 'community_profile_not_found',
+        message: 'canonical profile is required (resolved server-side)',
+      },
+    };
+  }
+  // Canonical queries (server-authoritative). Never trust caller-supplied
+  // queries — there are none at this point (handler already rejected them).
+  //
+  // The canonical field on StoryCommunityProfile is `profile.queries[]`.
+  // Some call sites reference `profile.search_queries` as a clearer
+  // alias (it is the same array, just renamed for the consumer surface);
+  // accept either so a future caller can pick the most readable name.
+  const profileQueries = Array.isArray(profile.search_queries)
+    ? profile.search_queries
+    : profile.queries;
+  const normalised = normaliseCanonicalSearchQueries(profileQueries);
+  if (!normalised.ok) {
+    return {
+      results: [],
+      provenance: 'unavailable',
+      cached: false,
+      ecosystem_status: 'unavailable',
+      error: { code: normalised.code, message: normalised.message },
+    };
+  }
+  const searchQueries = normalised.value;
   const limit = Number.isInteger(input.limit) && input.limit > 0 ? input.limit : ECOSYSTEM_SEARCH_DEFAULT_LIMIT;
   const signal = input.signal;
 
-  // Fetch each query in parallel (with cache-level dedup). Sequential
-  // would also be correct but slower; mock adapter is sync so this is
-  // mainly to keep the real adapter latency-bound to one round-trip.
+  // Fetch each canonical query in parallel (with cache-level dedup).
   const perQueryPromises = searchQueries.map((sq) => fetchOneQuery({
     cache,
     adapter,

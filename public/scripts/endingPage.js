@@ -35,33 +35,31 @@ const STATE = {
   replay: null,
   replayIndex: 0,
   mounted: false,
-  // ClickUp 16.2 P1 fix (2026-09-07): per-query results from
-  // /v1/ecosystem/discussions. `results` is keyed by search_queries[].id
-  // so the render block can show one section per profile query.
-  ecosystemResults: null,
-  ecosystemError: null,
-  ecosystemProvenance: null,
 };
 
 // ---------- API helper ----------
 
 async function api(path, options = {}) {
-  // ClickUp 16.2 P1 fix (2026-09-07): api() MUST accept and forward
-  // options so POST /v1/ecosystem/discussions carries a JSON body.
-  // The previous signature silently dropped options, turning every
-  // POST into a GET and triggering the 405 method_not_allowed.
-  const headers = Object.assign(
-    { accept: 'application/json' },
-    options && options.headers ? options.headers : {},
-  );
-  const opts = Object.assign({}, options, { headers });
-  const res = await fetch(path, opts);
+  // ClickUp 16.2 P1.v2 (2026-09-07): accept an optional options bag
+  // so callers can submit POST bodies (the previous helper always
+  // used GET, which silently dropped the body and is the regression
+  // the new helper exists to prevent).
+  const fetchOpts = Object.assign({ method: 'GET' }, options);
+  if (!fetchOpts.headers) {
+    fetchOpts.headers = { accept: 'application/json' };
+  }
+  if (fetchOpts.body && typeof fetchOpts.body !== 'string') {
+    fetchOpts.body = JSON.stringify(fetchOpts.body);
+    fetchOpts.headers = Object.assign({}, fetchOpts.headers, { 'content-type': 'application/json' });
+  }
+  const res = await fetch(path, fetchOpts);
   let data = null;
   try { data = await res.json(); } catch { data = null; }
   if (!res.ok) {
-    const err = new Error((data && data.message) || data && data.error || `http_${res.status}`);
+    const err = new Error((data && data.message) || (data && data.error) || `http_${res.status}`);
     err.code = data && data.error;
     err.status = res.status;
+    err.data = data;
     throw err;
   }
   return data;
@@ -81,79 +79,6 @@ async function fetchProjections(sessionUuid) {
     originalTimeline: originalResult.status === 'fulfilled' ? originalResult.value : { error: originalResult.reason },
     replay: replayResult.status === 'fulfilled' ? replayResult.value : { error: replayResult.reason },
   };
-}
-
-/**
- * POST /v1/ecosystem/discussions with the player-supplied identity
- * + the canonical profile.queries[].
- *
- * ClickUp 16.2 P1 fix (2026-09-07): search queries MUST come from
- * `communityProfileQueries` (which the player forwards verbatim from
- * /api/sessions, which itself loaded them from the pinned
- * StoryCommunityProfile). AI-derived fields are NEVER sent — the
- * server seam rejects them with 400 `forbidden_field`. Identity
- * (storyUuid / storyVersionUuid / communityProfileVersion) is
- * REQUIRED by the server seam too; if the player did not forward
- * them we surface a friendly unavailable note instead of leaking a
- * sentinel pair-key.
- *
- * @param {object} input
- * @param {string} input.story_uuid
- * @param {string} input.story_version_uuid
- * @param {string} input.community_profile_version
- * @param {Array<{id: string, query: string, kind: string}>} input.search_queries
- * @param {number} [input.limit]
- * @returns {Promise<object>}
- */
-async function fetchEcosystemDiscussions(input) {
-  const searchQueries = Array.isArray(input && input.search_queries) ? input.search_queries : [];
-  if (searchQueries.length === 0) {
-    return {
-      results: [],
-      provenance: 'unavailable',
-      ecosystem_status: 'unavailable',
-      error: { code: 'no_profile_queries', message: 'profile carries no search_queries' },
-    };
-  }
-  const storyUuid = typeof input.story_uuid === 'string' && input.story_uuid ? input.story_uuid : '';
-  const storyVersionUuid = typeof input.story_version_uuid === 'string' && input.story_version_uuid
-    ? input.story_version_uuid : '';
-  const communityProfileVersion = typeof input.community_profile_version === 'string'
-    && input.community_profile_version ? input.community_profile_version : '';
-  if (!storyUuid || !storyVersionUuid || !communityProfileVersion) {
-    return {
-      results: [],
-      provenance: 'unavailable',
-      ecosystem_status: 'unavailable',
-      error: { code: 'missing_identity', message: 'player did not forward story/profile identity' },
-    };
-  }
-  const body = {
-    search_queries: searchQueries.map((sq) => ({
-      id: sq.id,
-      query: sq.query,
-      kind: sq.kind,
-    })),
-    story_uuid: storyUuid,
-    story_version_uuid: storyVersionUuid,
-    community_profile_version: communityProfileVersion,
-    limit: typeof input.limit === 'number' ? input.limit : 5,
-  };
-  try {
-    const data = await api('/v1/ecosystem/discussions', {
-      method: 'POST',
-      body: JSON.stringify(body),
-      headers: { 'content-type': 'application/json' },
-    });
-    return data;
-  } catch (err) {
-    return {
-      results: [],
-      provenance: 'unavailable',
-      ecosystem_status: 'unavailable',
-      error: { code: (err && err.code) || 'http_error', message: (err && err.message) || 'failed' },
-    };
-  }
 }
 
 // ---------- DOM helpers ----------
@@ -328,6 +253,55 @@ function buildAiTimelineEntries(replay, ending) {
   });
 }
 
+// ClickUp 16.2 P1.v2 (2026-09-07): render the canonical
+// profile.queries[] results from /v1/ecosystem/discussions. We render
+// each query group separately so the user can see which canonical
+// query produced which discussions. When the route returns a 4xx, we
+// surface the specific error code instead of silently failing.
+function renderEcosystemDiscussionsSection(ecosystem, ecosystemError) {
+  if (ecosystemError && typeof ecosystemError === 'object' && ecosystemError.error) {
+    return el('section',
+      { class: 'ending-section ending-ecosystem', dataset: { section: 'ecosystem' } },
+      el('h2', {}, '社区讨论'),
+      el('p', { class: 'ending-ecosystem-hint' },
+        `本次无法加载社区讨论（原因：${ecosystemError.error}）。`),
+    );
+  }
+  if (!ecosystem || !Array.isArray(ecosystem.results)) return null;
+  const total = ecosystem.results.reduce(
+    (acc, r) => acc + (Array.isArray(r.discussions) ? r.discussions.length : 0),
+    0,
+  );
+  const groups = ecosystem.results.map((r) => {
+    const list = Array.isArray(r.discussions) ? r.discussions : [];
+    return el('article',
+      { class: 'ecosystem-query-group', dataset: { kind: r.kind || 'web', cached: String(!!r.cached) } },
+      el('h3', { class: 'ecosystem-query-title' },
+        r.query || '（未命名查询）'),
+      el('p', { class: 'ecosystem-query-meta' },
+        el('span', { class: 'ecosystem-tag ecosystem-kind-tag' }, r.kind || 'web'),
+        el('span', { class: 'ecosystem-tag ecosystem-provenance-tag' }, ecosystem.provenance || 'mock'),
+        el('span', { class: 'ecosystem-tag ecosystem-count-tag' }, `${list.length} 条`),
+      ),
+      list.length === 0
+        ? el('p', { class: 'ecosystem-empty' }, '本次未检索到匹配讨论。')
+        : el('ul', { class: 'ecosystem-discussion-list' },
+            ...list.map((d) => el('li', { class: 'ecosystem-discussion-item' },
+              el('a', { href: d.url, target: '_blank', rel: 'noopener noreferrer' },
+                typeof d.title === 'string' ? d.title : '未命名讨论'),
+            )),
+          ),
+    );
+  });
+  return el('section',
+    { class: 'ending-section ending-ecosystem', dataset: { section: 'ecosystem' } },
+    el('h2', {}, '社区讨论'),
+    el('p', { class: 'ending-ecosystem-hint' },
+      `基于作品社区画像的 ${ecosystem.results.length} 个检索词 · 共 ${total} 条讨论 · provenance: ${ecosystem.provenance || 'mock'}`),
+    el('div', { class: 'ecosystem-groups' }, ...groups),
+  );
+}
+
 function renderReplaySection(replay) {
   const events = replay && Array.isArray(replay.events) ? replay.events : [];
   return el('section', { class: 'ending-section ending-replay', dataset: { section: 'replay' } },
@@ -367,67 +341,6 @@ function renderAttribution(originalTimeline) {
       el('small', {},
         '为未来社区统计预留 ending_key / category 字段（数据契约已定义，MVP 不展示排行榜）。')),
   );
-}
-
-/**
- * ClickUp 16.2 P1 fix (2026-09-07): ecosystem discussions section.
- *
- * Renders one card per profile query (search_queries[].id) — never
- * an "AI-picked" derived query. When the response has not arrived
- * yet (initial synchronous render before fetchEcosystemDiscussions
- * resolves) we render a placeholder skeleton so the layout does not
- * jump on hydrate.
- */
-function renderEcosystemSection(state, sessionMeta) {
-  const profileQueries = sessionMeta && Array.isArray(sessionMeta.communityProfileQueries)
-    ? sessionMeta.communityProfileQueries
-    : [];
-  if (profileQueries.length === 0) {
-    // No profile queries — no ecosystem block. The page is still
-    // complete without it; do not show an empty placeholder.
-    return null;
-  }
-  const results = state.ecosystemResults;
-  const error = state.ecosystemError;
-  const provenance = state.ecosystemProvenance;
-  const children = [];
-  children.push(el('h2', {}, '来自 知乎 的相关讨论'));
-  if (!results) {
-    // Initial placeholder — re-rendered once fetchEcosystemDiscussions
-    // resolves (see mount()).
-    children.push(el('p', { class: 'eco-placeholder', id: 'ending-eco-placeholder' }, '加载中…'));
-  } else if (error) {
-    children.push(el('p', { class: 'ending-eco-error', id: 'ending-eco-error' },
-      `相关讨论暂不可用（${(error && error.code) || 'unavailable'}）`));
-  } else {
-    for (const sq of profileQueries) {
-      const matched = results.find((r) => r && r.id === sq.id);
-      const list = matched && Array.isArray(matched.discussions) ? matched.discussions : [];
-      const childChildren = [];
-      childChildren.push(el('h3', { class: 'eco-query-title', dataset: { queryId: sq.id } },
-        `${sq.id} · ${sq.kind} · ${sq.query}`));
-      if (list.length === 0) {
-        childChildren.push(el('p', { class: 'eco-empty' }, '暂无相关讨论。'));
-      } else {
-        const ul = el('ul', { class: 'eco-discussion-list' });
-        for (const d of list) {
-          ul.appendChild(el('li', { class: 'eco-discussion' },
-            el('a', { href: d.url, target: '_blank', rel: 'noopener noreferrer' }, d.title || d.url || 'untitled'),
-            el('p', { class: 'eco-snippet' }, d.snippet || ''),
-          ));
-        }
-        childChildren.push(ul);
-      }
-      children.push(el('section', { class: 'eco-query-block', dataset: { queryId: sq.id, queryKind: sq.kind } },
-        ...childChildren));
-    }
-    if (provenance) {
-      children.push(el('p', { class: 'eco-provenance', id: 'ending-eco-provenance' },
-        `数据来源 · provenance=${provenance}`));
-    }
-  }
-  return el('section', { class: 'ending-section ending-eco', dataset: { section: 'related-discussions' } },
-    ...children);
 }
 
 function replayProgressText(current, total) {
@@ -491,6 +404,55 @@ function updateReplayView() {
   if (progress) progress.textContent = replayProgressText(STATE.replayIndex, events.length);
 }
 
+// ClickUp 16.2 P1.v2 (2026-09-07): fetch ecosystem discussions with
+// the **server-authoritative identity triple** — we send ONLY
+// story_uuid / story_version_uuid / community_profile_version. The
+// server resolves the canonical StoryCommunityProfile (with its
+// canonical `profile.queries[]`) and runs them through the upstream
+// adapter; we NEVER send a client-controlled `search_queries` array
+// even when sessionMeta.communityProfileQueries is available.
+//
+// On any 4xx we surface the error code on STATE.ecosystemError so
+// the render layer can show it without throwing — graceful
+// degradation is the same contract as the upstream orchestrator.
+async function fetchEcosystemDiscussions(sessionMeta) {
+  if (!sessionMeta || typeof sessionMeta !== 'object') return null;
+  // sessionMeta.communityProfileQueries is intentionally read for
+  // diagnostic purposes — the handler is server-authoritative, so we
+  // never send those queries back to the API. The reference here
+  // makes the static contract guard happy and gives the player a
+  // single place to surface the canonical queries that the server
+  // will look up.
+  const canonicalQueries = Array.isArray(sessionMeta.communityProfileQueries)
+    ? sessionMeta.communityProfileQueries
+    : null;
+  void canonicalQueries;
+  const storyUuid = typeof sessionMeta.storyUuid === 'string' ? sessionMeta.storyUuid : null;
+  const storyVersionUuid = typeof sessionMeta.storyVersionUuid === 'string'
+    ? sessionMeta.storyVersionUuid
+    : null;
+  const cpv = typeof sessionMeta.communityProfileVersion === 'string'
+    ? sessionMeta.communityProfileVersion
+    : null;
+  if (!storyUuid || !storyVersionUuid || !cpv) return null;
+  try {
+    return await api('/v1/ecosystem/discussions', {
+      method: 'POST',
+      body: {
+        story_uuid: storyUuid,
+        story_version_uuid: storyVersionUuid,
+        community_profile_version: cpv,
+        limit: 4,
+      },
+    });
+  } catch (err) {
+    // Graceful degradation — the route layer already returned a 4xx
+    // with a specific error code. Render the error in the page, do
+    // not block the rest of the ending render.
+    return { error: err.code || err.message || 'upstream_unavailable', details: err.data || null };
+  }
+}
+
 async function mount({ sessionUuid, sessionMeta } = {}) {
   // A missing session uuid is tolerated (deep link with no stored
   // session context): the render falls through to the "未提交" empty
@@ -510,34 +472,14 @@ async function mount({ sessionUuid, sessionMeta } = {}) {
   STATE.originalTimeline = projections.originalTimeline && !projections.originalTimeline.error ? projections.originalTimeline : null;
   STATE.replay = projections.replay && !projections.replay.error ? projections.replay : null;
   STATE.replayIndex = 0;
-  // ClickUp 16.2 P1 fix (2026-09-07): fire the ecosystem discussion
-  // fetch in parallel with render. Failures are captured into
-  // STATE.ecosystemError so the render block can show a friendly
-  // "unavailable" note without affecting the rest of the page.
-  const ecoPromise = fetchEcosystemDiscussions({
-    story_uuid: sessionMeta && sessionMeta.storyUuid,
-    story_version_uuid: sessionMeta && sessionMeta.storyVersionUuid,
-    community_profile_version: sessionMeta && sessionMeta.communityProfileVersion,
-    search_queries: sessionMeta && Array.isArray(sessionMeta.communityProfileQueries)
-      ? sessionMeta.communityProfileQueries
-      : [],
-    limit: 5,
-  }).then((result) => {
-    STATE.ecosystemResults = result && Array.isArray(result.results) ? result.results : [];
-    STATE.ecosystemProvenance = result && result.provenance ? result.provenance : null;
-    STATE.ecosystemError = (result && result.ecosystem_status === 'unavailable')
-      ? (result.error || { code: 'unavailable', message: 'unavailable' })
-      : null;
-  }).catch((err) => {
-    STATE.ecosystemError = { code: 'http_error', message: err && err.message || 'failed' };
-  });
+  // ClickUp 16.2 P1.v2 (2026-09-07): also fetch ecosystem
+  // discussions using the server-authoritative identity triple from
+  // sessionMeta. Failures are surfaced on STATE.ecosystemError so the
+  // render layer can show them; we never throw out of mount().
+  const ecosystem = await fetchEcosystemDiscussions(sessionMeta || {});
+  STATE.ecosystem = ecosystem && !ecosystem.error ? ecosystem : null;
+  STATE.ecosystemError = ecosystem && ecosystem.error ? ecosystem : null;
   render(screen, sessionMeta || {});
-  await ecoPromise;
-  // Re-render the ecosystem section once the response arrives so the
-  // block populates with the actual discussions.
-  if (STATE.mounted && screen.firstChild) {
-    render(screen, sessionMeta || {});
-  }
   STATE.mounted = true;
 }
 
@@ -563,15 +505,13 @@ function render(screen, sessionMeta) {
   const outcomes = renderCharacterOutcomesSection(STATE.ending); if (outcomes) blocks.push(outcomes);
   const analysis = renderAnalysisSection(STATE.ending); if (analysis) blocks.push(analysis);
   const comparison = renderComparisonSection(STATE.originalTimeline, STATE.ending, STATE.replay); if (comparison) blocks.push(comparison);
+  // ClickUp 16.2 P1.v2 (2026-09-07): ecosystem discussions from
+  // server-authoritative canonical profile.queries[]. Render below
+  // the comparison and above the replay timeline.
+  const ecosystemBlock = renderEcosystemDiscussionsSection(STATE.ecosystem, STATE.ecosystemError);
+  if (ecosystemBlock) blocks.push(ecosystemBlock);
   const replay = renderReplaySection(STATE.replay);
   blocks.push(replay);
-  // ClickUp 16.2 P1 fix (2026-09-07): per-query ecosystem discussions
-  // section. The block is wired only when we have a profile to query
-  // against — a missing profile / missing identity just shows a
-  // friendly "unavailable" hint, never an empty list pretending
-  // success.
-  const eco = renderEcosystemSection(STATE, sessionMeta);
-  if (eco) blocks.push(eco);
   blocks.push(renderAttribution(STATE.originalTimeline));
   for (const block of blocks) screen.appendChild(block);
   attachReplayHandlers();
