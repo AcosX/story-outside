@@ -31,6 +31,7 @@ import {
 import {
   createInMemoryCommunityProfileRepository,
   seedCommunityProfiles,
+  getCommunityProfile,
 } from './community/index.mjs';
 import {
   bootstrapSessionFromWork,
@@ -68,6 +69,9 @@ import {
   buildOriginalTimeline,
   buildReplay,
 } from './stories/endingService.mjs';
+import {
+  createEcosystemKnowledgeProvider,
+} from './providers/ecosystem/knowledge.mjs';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 const ROOT = resolve(__dirname, '..');
@@ -429,6 +433,14 @@ const { repository: storyRepo, fixtures: storyFixtures } = createSeededRepositor
 // story_version the seed loop did not cover.
 const communityProfileRepo = createInMemoryCommunityProfileRepository();
 seedCommunityProfiles(storyRepo, communityProfileRepo);
+
+// ClickUp 16.5 — public /v1/ecosystem/knowledge orchestrator. The
+// route layer (handler further down) calls `knowledgeProvider.match()`
+// once per canonical knowledge_query from the StoryCommunityProfile.
+// We DO NOT pre-seed a query_id/query_id/topic_label/topic/theme —
+// the topic source is always the canonical knowledge_queries[] emitted
+// by the profile generator at story_version import time.
+const knowledgeProvider = createEcosystemKnowledgeProvider();
 
 // sessionService deliberately keeps its state private to the repository. The
 // route layer keeps only the request's non-secret pinned metadata so recovery
@@ -1649,11 +1661,33 @@ async function handleRequest(req, res) {
       });
       onSessionCreate(hookCtx);
       onOpeningCacheHit(hookCtx);
+      // ClickUp 16.5 P1.1 (2026-09-07, PR #25): echo the canonical
+      // community_profile_version + knowledge_queries[] so the player
+      // can pass them straight into the knowledge handler without
+      // ever picking a topic of its own. The browser is just a
+      // courier — the canonical subject list stays in the profile.
+      let knowledgeQueries = null;
+      try {
+        const profile = getCommunityProfile({
+          profileRepository: communityProfileRepo,
+          story_version_uuid: result.story_version_uuid,
+        });
+        if (profile && Array.isArray(profile.knowledge_queries)) {
+          knowledgeQueries = profile.knowledge_queries.map((q) => ({
+            id: q.id || null,
+            query: q.query,
+            kind: q.kind,
+          }));
+        }
+      } catch { /* best-effort */ }
       return jsonResponse(res, 200, {
         ...PUBLIC_DECORATE(),
         session_uuid: sessionUuid,
         story_uuid: result.story_uuid,
         story_version_uuid: result.story_version_uuid,
+        community_profile_version: result.community_profile_version || null,
+        community_profile_uuid: result.community_profile_uuid || null,
+        knowledge_queries: knowledgeQueries,
         cache_uuid: result.cache_uuid,
         opening_cache_status: result.cache_status,
         opening_events: result.opening_events,
@@ -2048,6 +2082,231 @@ async function handleRequest(req, res) {
       });
     } catch (err) {
       return sessionErrorResponse(res, err);
+    }
+  }
+
+  // -----------------------------------------------------------------
+  // ClickUp 16.5 — public /v1/ecosystem/knowledge façade (player-facing).
+  //
+  // P1 fix (2026-09-07, PR #25): the surface accepts ONLY
+  // `knowledge_queries[]` from the StoryCommunityProfile as its topic
+  // source. Free-form `query_id` / `topic_label` / `topic` / `theme`
+  // / `subject` fields are REJECTED so the AI cannot pick its own
+  // subject matter — knowledge entries always come from the canonical
+  // profile that was generated once at story_version import.
+  //
+  // Public contract:
+  //   * POST /v1/ecosystem/knowledge
+  //       body (strict whitelist):
+  //         story_uuid                  required, string uuid
+  //         story_version_uuid          required, string uuid
+  //         community_profile_version   required, string (the active
+  //                                                     profile's
+  //                                                     generator_version
+  //                                                     or profile_uuid)
+  //         knowledge_queries           required, Array<{
+  //           id?: string,
+  //           query: string,
+  //           kind: 'web'|'knowledge'|'hot'|'mixed',
+  //         }>           canonical topic list from StoryCommunityProfile
+  //         limit?                      optional, default 4 per query
+  //       resp: { knowledge: [...], provisional: true, disclaimer,
+  //               source, cached, fetched_at, cache_key, degraded,
+  //               degradation | null,
+  //               knowledge_queries: [...],     echo of canonical input
+  //               results: [{ id, query, kind, knowledge: [...],
+  //                            source, cached, degraded }] }
+  //   * Knowledge failure never blocks the core game loop:
+  //     real provider unavailable → mock fallback; both unavailable
+  //     → 200 with knowledge: [] and degraded:true. NEVER 5xx on the
+  //     public surface.
+  //   * NO DEV_FLAG banner — this is a player-facing surface.
+  // -----------------------------------------------------------------
+  if (method === 'POST' && pathname === '/v1/ecosystem/knowledge') {
+    let body;
+    try {
+      body = await readJsonBody(req);
+    } catch (err) {
+      return jsonResponse(res, 400, {
+        error: 'bad_json',
+        message: 'POST /v1/ecosystem/knowledge expects a JSON object body.',
+      });
+    }
+    if (!body || typeof body !== 'object' || Array.isArray(body)) {
+      return jsonResponse(res, 400, {
+        error: 'validation_failed',
+        message: 'POST /v1/ecosystem/knowledge expects a JSON object body.',
+        field: 'body',
+      });
+    }
+    // P1.2 hard whitelist. The browser may ONLY send the three
+    // identity fields + the canonical knowledge_queries[] + an
+    // optional limit. Anything else — including `query_id`,
+    // `topic_label`, `topic`, `theme`, `subject`, etc. — is rejected
+    // so the handler cannot be coerced into letting the AI pick a
+    // free-form subject.
+    const allowedKeys = [
+      'story_uuid',
+      'story_version_uuid',
+      'community_profile_version',
+      'knowledge_queries',
+      'limit',
+    ];
+    const unknownKeys = Object.keys(body).filter((k) => !allowedKeys.includes(k));
+    if (unknownKeys.length > 0) {
+      return jsonResponse(res, 400, {
+        error: 'validation_failed',
+        message: 'POST /v1/ecosystem/knowledge has unsupported fields.',
+        field: 'body',
+        unknown_fields: unknownKeys,
+      });
+    }
+    if (typeof body.story_uuid !== 'string' || !body.story_uuid) {
+      return jsonResponse(res, 400, {
+        error: 'validation_failed',
+        message: 'story_uuid is required.',
+        field: 'story_uuid',
+      });
+    }
+    if (typeof body.story_version_uuid !== 'string' || !body.story_version_uuid) {
+      return jsonResponse(res, 400, {
+        error: 'validation_failed',
+        message: 'story_version_uuid is required.',
+        field: 'story_version_uuid',
+      });
+    }
+    if (typeof body.community_profile_version !== 'string' || !body.community_profile_version) {
+      return jsonResponse(res, 400, {
+        error: 'validation_failed',
+        message: 'community_profile_version is required.',
+        field: 'community_profile_version',
+      });
+    }
+    // P1.2: knowledge_queries[] is the ONLY accepted topic source.
+    if (!Array.isArray(body.knowledge_queries) || body.knowledge_queries.length === 0) {
+      return jsonResponse(res, 400, {
+        error: 'validation_failed',
+        message: 'knowledge_queries is required and must be a non-empty array of {id,query,kind}.',
+        field: 'knowledge_queries',
+      });
+    }
+    // Defensive: every entry must be an object with `query` (string)
+    // and `kind` ∈ {'web','knowledge','hot','mixed'}.
+    const KINDS = new Set(['web', 'knowledge', 'hot', 'mixed']);
+    const cleanedQueries = [];
+    for (let i = 0; i < body.knowledge_queries.length; i += 1) {
+      const q = body.knowledge_queries[i];
+      if (!q || typeof q !== 'object' || Array.isArray(q)) {
+        return jsonResponse(res, 400, {
+          error: 'validation_failed',
+          message: `knowledge_queries[${i}] must be an object.`,
+          field: `knowledge_queries[${i}]`,
+        });
+      }
+      if (typeof q.query !== 'string' || !q.query) {
+        return jsonResponse(res, 400, {
+          error: 'validation_failed',
+          message: `knowledge_queries[${i}].query is required.`,
+          field: `knowledge_queries[${i}].query`,
+        });
+      }
+      if (typeof q.kind !== 'string' || !KINDS.has(q.kind)) {
+        return jsonResponse(res, 400, {
+          error: 'validation_failed',
+          message: `knowledge_queries[${i}].kind must be one of web|knowledge|hot|mixed.`,
+          field: `knowledge_queries[${i}].kind`,
+        });
+      }
+      cleanedQueries.push({
+        id: typeof q.id === 'string' && q.id ? q.id : null,
+        query: q.query,
+        kind: q.kind,
+      });
+    }
+    const limitPerQuery = Number.isInteger(body.limit) && body.limit > 0
+      ? Math.min(body.limit, 32)
+      : 4;
+    try {
+      // P1.2: aggregate one orchestrator.match() per canonical
+      // knowledge_query. We NEVER compose a query_id/topic/theme of our
+      // own — the cache_key is derived from the (story_version_uuid,
+      // community_profile_version, query.id) tuple so the same
+      // canonical query reuses the same cache row.
+      const results = [];
+      for (const q of cleanedQueries) {
+        // Pair-key: (story_version_uuid, community_profile_version, query.id).
+        const matchResult = await knowledgeProvider.match({
+          story_version_uuid: body.story_version_uuid,
+          community_profile_version: body.community_profile_version,
+          query_id: q.id, // derived from canonical knowledge_query.id, never user-supplied
+          limit: limitPerQuery,
+        });
+        results.push({
+          id: q.id,
+          query: q.query,
+          kind: q.kind,
+          knowledge: matchResult.knowledge,
+          source: matchResult.source,
+          cached: matchResult.cached,
+          degraded: matchResult.degraded,
+          cache_key: matchResult.cache_key,
+        });
+      }
+      // Flatten + dedupe by entry id, preserving order across queries.
+      const seen = new Set();
+      const flatKnowledge = [];
+      for (const r of results) {
+        for (const entry of r.knowledge) {
+          if (entry && entry.id && !seen.has(entry.id)) {
+            seen.add(entry.id);
+            flatKnowledge.push(entry);
+          } else if (entry && !entry.id) {
+            flatKnowledge.push(entry);
+          }
+        }
+      }
+      const degraded = results.some((r) => r.degraded === true);
+      const sources = Array.from(new Set(results.map((r) => r.source).filter(Boolean)));
+      const finalResponse = Object.freeze({
+        knowledge: Object.freeze(flatKnowledge.map((e) => Object.freeze({ ...e }))),
+        provisional: true,
+        disclaimer: results[0] && results[0].knowledge[0] && results[0].knowledge[0].disclaimer
+          ? results[0].knowledge[0].disclaimer
+          : '以下内容属于现实/知乎知识延伸，不是原作设定或 AI 世界线事实',
+        source: sources.length === 1 ? sources[0] : 'mixed',
+        cached: results.every((r) => r.cached === true),
+        fetched_at: new Date().toISOString(),
+        degraded,
+        degradation: degraded ? { code: 'mixed', message: 'Some queries fell back to mock.' } : null,
+        knowledge_queries: Object.freeze(cleanedQueries.map((q) => Object.freeze({ ...q }))),
+        results: Object.freeze(results.map((r) => Object.freeze({
+          id: r.id,
+          query: r.query,
+          kind: r.kind,
+          knowledge: Object.freeze(r.knowledge.map((e) => Object.freeze({ ...e }))),
+          source: r.source,
+          cached: r.cached,
+          degraded: r.degraded,
+          cache_key: r.cache_key,
+        }))),
+      });
+      if (finalResponse.provisional !== true) {
+        throw new Error('knowledge response must carry provisional: true');
+      }
+      return jsonResponse(res, 200, finalResponse);
+    } catch (err) {
+      if (err && err.code === 'validation_failed') {
+        return jsonResponse(res, 400, {
+          error: 'validation_failed',
+          message: err.message || 'Invalid request.',
+        });
+      }
+      // eslint-disable-next-line no-console
+      console.error('[story-outside] /v1/ecosystem/knowledge failed:', String(err && err.message ? err.message : err));
+      return jsonResponse(res, 500, {
+        error: 'internal_error',
+        message: 'Internal server error.',
+      });
     }
   }
 

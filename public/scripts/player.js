@@ -298,6 +298,22 @@ async function bootstrapSession({ story, role }) {
     state.cacheUuid = created.cache_uuid;
     state.storyUuid = created.story_uuid || null;
     state.storyVersionUuid = created.story_version_uuid || null;
+    // ClickUp 16.5 P1.1 (2026-09-07, PR #25): the public
+    // /api/sessions bootstrap echoes the canonical
+    // community_profile_version + knowledge_queries[]. The player is
+    // contractually just a courier — it never picks a topic of its
+    // own; it hands the canonical list straight to the ending page
+    // (and onward to /v1/ecosystem/knowledge) so the public surface
+    // always has the three identifiers it needs.
+    state.communityProfileVersion = created.community_profile_version || null;
+    state.communityProfileUuid = created.community_profile_uuid || null;
+    state.knowledgeQueries = Array.isArray(created.knowledge_queries)
+      ? created.knowledge_queries.map((q) => ({
+        id: q && q.id ? q.id : null,
+        query: q && q.query ? String(q.query) : '',
+        kind: q && q.kind ? String(q.kind) : 'knowledge',
+      }))
+      : [];
     state.openingEvents = Array.isArray(created.opening_events) ? created.opening_events : [];
     state.generationProfile = (created.session && created.session.generation_profile)
       || (created.pinned && created.pinned.generation_profile)
@@ -323,11 +339,22 @@ function persistSessionContext() {
   // falling back to the picker. Best-effort: private browsing modes may
   // block storage, in which case the deep link just shows the empty
   // ending state.
+  //
+  // ClickUp 16.5 P1.1 (2026-09-07, PR #25): we also persist the three
+  // canonical identity fields + the knowledge_queries[] emitted by
+  // /api/sessions so a ?s=ending reload still finds them. The values
+  // come from the bootstrap response, NEVER from the player's own
+  // inputs — the player is a courier, not the topic chooser.
   try {
     sessionStorage.setItem(LAST_SESSION_KEY, JSON.stringify({
       sessionUuid: state.sessionUuid || null,
       storyTitle: state.story ? state.story.title : '',
       roleLabel: state.role ? state.role.label : '',
+      storyUuid: state.storyUuid || null,
+      storyVersionUuid: state.storyVersionUuid || null,
+      communityProfileVersion: state.communityProfileVersion || null,
+      communityProfileUuid: state.communityProfileUuid || null,
+      knowledgeQueries: Array.isArray(state.knowledgeQueries) ? state.knowledgeQueries : [],
     }));
   } catch { /* storage unavailable — deep link degrades to empty state */ }
 }
@@ -844,15 +871,40 @@ async function mountEndingPage(sessionMetaOverride) {
   // which fetches /ending + /original-timeline + /replay and renders
   // the comparison + replay UI. We lazy-load so the player.js state
   // machine does not depend on endingPage being available.
+  //
+  // ClickUp 16.5 P1.1 (2026-09-07, PR #25): the sessionMeta we pass
+  // MUST carry the three canonical identity fields
+  // (story_uuid / story_version_uuid / community_profile_version) +
+  // the canonical knowledge_queries[] emitted by /api/sessions. The
+  // values come from the bootstrap response — the player is just a
+  // courier, it NEVER picks its own topic. The previous default of
+  // `{storyTitle, roleLabel}` was the source of the
+  // `missing_identifiers` degraded fallback on the public surface.
+  const fallback = sessionMetaOverride || {
+    storyTitle: state.story ? state.story.title : '',
+    roleLabel: state.role ? state.role.label : '',
+  };
+  const sessionMeta = {
+    ...fallback,
+    story_uuid: state.storyUuid || fallback.story_uuid || null,
+    story_version_uuid: state.storyVersionUuid || fallback.story_version_uuid || null,
+    community_profile_version:
+      state.communityProfileVersion
+      || fallback.community_profile_version
+      || (typeof window !== 'undefined'
+        && typeof window.STORY_OUTSIDE_COMMUNITY_PROFILE_VERSION === 'string'
+        && window.STORY_OUTSIDE_COMMUNITY_PROFILE_VERSION)
+      || null,
+    knowledge_queries: Array.isArray(state.knowledgeQueries) && state.knowledgeQueries.length > 0
+      ? state.knowledgeQueries
+      : (Array.isArray(fallback.knowledge_queries) ? fallback.knowledge_queries : []),
+  };
   try {
     const mod = await import('/scripts/endingPage.js');
     if (mod && typeof mod.mount === 'function') {
       await mod.mount({
         sessionUuid: state.sessionUuid,
-        sessionMeta: sessionMetaOverride || {
-          storyTitle: state.story ? state.story.title : '',
-          roleLabel: state.role ? state.role.label : '',
-        },
+        sessionMeta,
       });
       return true;
     }
@@ -1240,10 +1292,24 @@ async function bootstrap() {
   try {
     if (new URLSearchParams(window.location.search).get('s') === 'ending') {
       const ctx = readSessionContext();
-      if (ctx) state.sessionUuid = ctx.sessionUuid;
+      if (ctx) {
+        state.sessionUuid = ctx.sessionUuid;
+        // ClickUp 16.5 P1.1: replay the persisted canonical identity
+        // fields + knowledge_queries[] onto `state` so the deep link
+        // path matches the live-mount path (no missing_identifiers).
+        state.storyUuid = ctx.storyUuid || state.storyUuid;
+        state.storyVersionUuid = ctx.storyVersionUuid || state.storyVersionUuid;
+        state.communityProfileVersion = ctx.communityProfileVersion || state.communityProfileVersion;
+        state.communityProfileUuid = ctx.communityProfileUuid || state.communityProfileUuid;
+        state.knowledgeQueries = Array.isArray(ctx.knowledgeQueries) ? ctx.knowledgeQueries : state.knowledgeQueries;
+      }
       deepLinkedToEnding = await mountEndingPage(ctx ? {
         storyTitle: ctx.storyTitle || '',
         roleLabel: ctx.roleLabel || '',
+        story_uuid: ctx.storyUuid || null,
+        story_version_uuid: ctx.storyVersionUuid || null,
+        community_profile_version: ctx.communityProfileVersion || null,
+        knowledge_queries: Array.isArray(ctx.knowledgeQueries) ? ctx.knowledgeQueries : [],
       } : undefined);
       if (deepLinkedToEnding) {
         state.finished = true;

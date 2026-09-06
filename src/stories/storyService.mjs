@@ -272,6 +272,26 @@ export async function importStoryAndEnsureCache({
     opening_cache_status: ensured.cache.status,
     cache_reused: ensured.reused,
   };
+  // ClickUp 16.5 P1.1 (2026-09-07, PR #25): surface the canonical
+  // community_profile_version (= generator_version) so the public
+  // /api/sessions bootstrap response can echo it to the browser.
+  // The browser hands the value straight into the knowledge
+  // orchestrator's cache_key so the player-side identity stays
+  // canonical end-to-end (no missing_identifiers → no degraded
+  // mock fallback on the public surface).
+  if (profileRepository) {
+    try {
+      const { getCommunityProfile: _getProfile } = await import('../community/service.mjs');
+      const profile = _getProfile({
+        profileRepository,
+        story_version_uuid: imported.story_version_uuid,
+      });
+      if (profile && profile.generator_version) {
+        result.community_profile_version = profile.generator_version;
+        result.community_profile_uuid = profile.profile_uuid;
+      }
+    } catch { /* swallow — caller already has the cache row */ }
+  }
   return result;
 }
 

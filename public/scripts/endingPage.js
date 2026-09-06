@@ -35,6 +35,7 @@ const STATE = {
   replay: null,
   replayIndex: 0,
   mounted: false,
+  relatedKnowledge: null,
 };
 
 // ---------- API helper ----------
@@ -66,6 +67,78 @@ async function fetchProjections(sessionUuid) {
     originalTimeline: originalResult.status === 'fulfilled' ? originalResult.value : { error: originalResult.reason },
     replay: replayResult.status === 'fulfilled' ? replayResult.value : { error: replayResult.reason },
   };
+}
+
+// ClickUp 16.5 — fetch the public 知乎知识区 (Knowledge 区) extension
+// for this ending. The Knowledge surface is INDEPENDENT from the
+// 16.2 / 16.4 Discussion 区 (queries/topics/hot_keywords); a failure
+// here MUST NOT block the ending page. Returns either a normalised
+// payload, or { degraded: true } when the public surface failed.
+//
+// P1.2 fix (2026-09-07, PR #25): the body ONLY carries the canonical
+// `knowledge_queries[]` from the StoryCommunityProfile. The previous
+// implementation sent free-form `query_id` / `topic_label` so the AI
+// could pick its own subject — that let the surface stay degraded
+// forever (`missing_identifiers`) because the handler treats any
+// free-form topic as out-of-policy. We pass through the canonical
+// list verbatim so the orchestrator always has the three identifiers
+// it needs + a stable, curated topic set.
+async function fetchRelatedKnowledge(sessionMeta) {
+  if (!sessionMeta || typeof sessionMeta !== 'object') {
+    return { degraded: true, reason: 'no_session_meta', knowledge: [] };
+  }
+  const story_uuid = sessionMeta.story_uuid || null;
+  const story_version_uuid = sessionMeta.story_version_uuid || null;
+  const community_profile_version = sessionMeta.community_profile_version || null;
+  if (!story_uuid || !story_version_uuid || !community_profile_version) {
+    // Graceful degradation — the ending still renders without the
+    // knowledge extension. The Knowledge surface is provisional.
+    return { degraded: true, reason: 'missing_identifiers', knowledge: [] };
+  }
+  // The browser is contractually a courier: it forwards the canonical
+  // knowledge_queries[] that /api/sessions already echoed. When the
+  // list is missing the handler returns 400 — we surface that as a
+  // degraded state with a stable reason so the UI can render the
+  // "知识延伸暂未启用" hint instead of pretending the topic was
+  // hand-picked.
+  const knowledge_queries = Array.isArray(sessionMeta.knowledge_queries)
+    ? sessionMeta.knowledge_queries.filter((q) => q
+      && typeof q === 'object'
+      && typeof q.query === 'string'
+      && q.query.length > 0
+      && typeof q.kind === 'string')
+    : [];
+  if (knowledge_queries.length === 0) {
+    return { degraded: true, reason: 'no_knowledge_queries', knowledge: [] };
+  }
+  try {
+    const res = await fetch('/v1/ecosystem/knowledge', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', accept: 'application/json' },
+      body: JSON.stringify({
+        story_uuid,
+        story_version_uuid,
+        community_profile_version,
+        knowledge_queries,
+        limit: 4,
+      }),
+    });
+    if (!res.ok) {
+      return { degraded: true, reason: `http_${res.status}`, knowledge: [] };
+    }
+    const data = await res.json();
+    return {
+      degraded: data.degraded === true,
+      source: data.source || null,
+      provisional: data.provisional === true,
+      disclaimer: data.disclaimer || null,
+      knowledge: Array.isArray(data.knowledge) ? data.knowledge : [],
+      knowledge_queries: Array.isArray(data.knowledge_queries) ? data.knowledge_queries : knowledge_queries,
+      results: Array.isArray(data.results) ? data.results : [],
+    };
+  } catch (err) {
+    return { degraded: true, reason: 'network_error', knowledge: [] };
+  }
 }
 
 // ---------- DOM helpers ----------
@@ -281,6 +354,105 @@ function renderAttribution(originalTimeline) {
   );
 }
 
+// ClickUp 16.5 — Knowledge 区 (现实/知乎知识延伸) section. The
+// Knowledge surface is INDEPENDENT from the 16.2 / 16.4 Discussion 区
+// surface; this DOM block NEVER mutates or replaces
+// `relatedDiscussions` and shares no class names with it.
+//
+// Contract:
+//   * Section #ending-related-knowledge is always rendered when the
+//     ending page mounts (even when the surface is degraded), so a
+//     DOM-test can assert its presence deterministically.
+//   * When `state.relatedKnowledge.degraded === true`, the section
+//     shows the disabled hint "知识延伸暂未启用" instead of an entry
+//     list. The hint's stable id is `#ending-related-knowledge-disabled`.
+//   * When entries are present, the surface disclaimer
+//     "以下内容属于现实/知乎知识延伸，不是原作设定或 AI 世界线事实"
+//     is rendered verbatim INSIDE the section (not on `relatedDiscussions`)
+//     so a UI / accessibility tool can verify the boundary on the DOM.
+function renderRelatedKnowledgeSection(knowledgeState) {
+  const state = knowledgeState || { degraded: true, knowledge: [] };
+  const entries = Array.isArray(state.knowledge) ? state.knowledge : [];
+  const degraded = state.degraded === true;
+  const header = el('h2', {}, '延伸知识（知乎）');
+  const intro = el('p', { class: 'related-knowledge-intro', id: 'ending-related-knowledge-intro' },
+    '以下内容属于现实/知乎知识延伸，不是原作设定或 AI 世界线事实。');
+  const banner = state.provisional === true
+    ? el('p', { class: 'related-knowledge-banner', id: 'ending-related-knowledge-banner', dataset: { flag: 'provisional' } },
+        '知识延伸为临时来源，不代表作品事实')
+    : null;
+  let body;
+  if (degraded) {
+    // Real provider not configured (or upstream failed). We never
+    // surface the error code on the DOM — only the stable disabled
+    // hint — so a regression that exposes the upstream error does
+    // not leak through the browser.
+    body = el('p', {
+      class: 'related-knowledge-disabled',
+      id: 'ending-related-knowledge-disabled',
+      dataset: { kind: 'disabled' },
+    }, '知识延伸暂未启用');
+  } else if (entries.length === 0) {
+    body = el('p', { class: 'related-knowledge-empty', id: 'ending-related-knowledge-empty' },
+      '本次没有匹配的延伸知识。');
+  } else {
+    body = el('ul', { class: 'related-knowledge-list', id: 'ending-related-knowledge-list' },
+      ...entries.map((entry, index) => {
+        const title = entry && entry.title ? String(entry.title) : '';
+        const summary = entry && entry.summary ? String(entry.summary) : '';
+        const source = entry && entry.source ? String(entry.source) : '';
+        const url = entry && entry.url ? String(entry.url) : '';
+        const relatedTopics = entry && Array.isArray(entry.related_topics)
+          ? entry.related_topics.filter((s) => typeof s === 'string')
+          : [];
+        const link = url
+          ? el('a', {
+              href: url,
+              rel: 'noopener noreferrer',
+              target: '_blank',
+              class: 'related-knowledge-link',
+            }, title)
+          : el('span', { class: 'related-knowledge-title' }, title);
+        return el('li', {
+          class: 'related-knowledge-item',
+          dataset: {
+            index: String(index),
+            provisional: 'true',
+          },
+        },
+          link,
+          summary ? el('p', { class: 'related-knowledge-summary' }, summary) : null,
+          relatedTopics.length > 0
+            ? el('p', { class: 'related-knowledge-topics' },
+                el('span', { class: 'related-knowledge-topics-label' }, '相关话题：'),
+                ...relatedTopics.flatMap((topic, tidx) => [
+                  tidx > 0 ? el('span', { class: 'related-knowledge-topic-sep' }, ' · ') : null,
+                  el('span', { class: 'related-knowledge-topic' }, topic),
+                ]),
+              )
+            : null,
+          source ? el('p', { class: 'related-knowledge-source' }, `来源：${source}`) : null,
+        );
+      }),
+    );
+  }
+  return el('section', {
+    class: 'ending-section ending-related-knowledge',
+    id: 'ending-related-knowledge',
+    dataset: {
+      section: 'related-knowledge',
+      surface: 'knowledge',
+      provisional: state.provisional === true ? 'true' : 'false',
+      degraded: degraded ? 'true' : 'false',
+    },
+  },
+    header,
+    intro,
+    banner,
+    body,
+  );
+}
+
 function replayProgressText(current, total) {
   return `${Math.min(current, total)} / ${total}`;
 }
@@ -361,6 +533,10 @@ async function mount({ sessionUuid, sessionMeta } = {}) {
   STATE.originalTimeline = projections.originalTimeline && !projections.originalTimeline.error ? projections.originalTimeline : null;
   STATE.replay = projections.replay && !projections.replay.error ? projections.replay : null;
   STATE.replayIndex = 0;
+  // ClickUp 16.5 — fetch the public 知乎知识区 (Knowledge 区)
+  // extension for this ending. The fetch is best-effort: a failure
+  // degrades to a disabled state and never blocks the render.
+  STATE.relatedKnowledge = await fetchRelatedKnowledge(sessionMeta || {});
   render(screen, sessionMeta || {});
   STATE.mounted = true;
 }
@@ -387,6 +563,10 @@ function render(screen, sessionMeta) {
   const outcomes = renderCharacterOutcomesSection(STATE.ending); if (outcomes) blocks.push(outcomes);
   const analysis = renderAnalysisSection(STATE.ending); if (analysis) blocks.push(analysis);
   const comparison = renderComparisonSection(STATE.originalTimeline, STATE.ending, STATE.replay); if (comparison) blocks.push(comparison);
+  // ClickUp 16.5 — Knowledge 区. Always rendered (even when degraded)
+  // so a DOM-test can assert its presence deterministically. The
+  // surface is independent from `relatedDiscussions` (16.2 / 16.4).
+  blocks.push(renderRelatedKnowledgeSection(STATE.relatedKnowledge || { degraded: true, knowledge: [] }));
   const replay = renderReplaySection(STATE.replay);
   blocks.push(replay);
   blocks.push(renderAttribution(STATE.originalTimeline));
@@ -404,6 +584,7 @@ function teardown() {
   STATE.originalTimeline = null;
   STATE.replay = null;
   STATE.replayIndex = 0;
+  STATE.relatedKnowledge = null;
   showScreen('player');
 }
 
