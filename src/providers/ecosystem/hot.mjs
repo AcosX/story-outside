@@ -1,31 +1,42 @@
-// src/providers/ecosystem/hot.mjs — ClickUp 16.4 P1.v1-3 知乎热榜 orchestrator
+// src/providers/ecosystem/hot.mjs — ClickUp 16.4 P1.v1-4 知乎热榜 orchestrator
 // (2026-09-07), continued on fix/clickup16-4-p1-hot-relevance branch.
 //
-// P1.v1-3 fix — content-hash-aware external community_profile_version:
+// P1.v1-4 fix — single community-layer helper + direct external-version
+// lookup (no active-row concept):
 //
-//   The v1-2 contract (PR #23, 33742bc) compared the caller-supplied
-//   `community_profile_version` directly against the profile row's
-//   `generator_version` field. Two profiles with the SAME
-//   `generator_version` (same rule set) but DIFFERENT content (e.g.
-//   regenerated hot_keywords / topics) were indistinguishable to the
-//   matcher — they always looked "matched" because the comparison
-//   ignored the content. The ChatGPT independent review (2026-09-07)
-//   flagged this as a P1 blocker: callers that regenerate a profile
-//   without bumping the ruleset version end up seeing stale relevance
-//   projections instead of a clean 400 `community_profile_version_mismatch`.
+//   v1-3 (commit 4b4fd72) introduced a content-hash-aware external
+//   identity string, but the helper lived as a PRIVATE function inside
+//   `hot.mjs` and the matcher used the "active" concept
+//   (`findActiveByStoryVersion`) to read the canonical profile row.
+//   That coupling meant v1-3 depended on whatever the repository
+//   considered "active" for the story_version — a coupling that
+//   silently broke when an unrelated refactor changed which row was
+//   active (the active-row bug observed in the ChatGPT independent
+//   review of `npm test` exit 1 at 2026-09-07 06:24).
 //
-//   v1-3 derives a NEW external identity string
-//     `community_profile_version = "${generator_version}-${shortContentHash}"`
-//   where `shortContentHash` is the first 12 hex chars of
-//   `sha256(canonical({ topics, queries, knowledge_queries, hot_keywords }))`.
-//   The internal `generator_version` field on the profile row is NOT
-//   renamed — the v1 schema (13 top-level fields including
-//   `generator_version`) is preserved. Only the EXTERNAL identity
-//   string used for the wire contract becomes content-aware. Two
-//   profiles with the same `generator_version` but different content
-//   now have different `community_profile_version` strings, and a
-//   caller carrying the previous generation's external version is
-//   rejected with 400 instead of silently observing stale relevance.
+//   v1-4 unwinds that coupling on the #23 branch WITHOUT copying the
+//   #24 branch's `insert_seq` schema change. Two surgical edits:
+//
+//     1. Move the external-version derivation into a PUBLIC community-
+//        layer helper (`src/community/version.mjs`). The wire format is
+//        `${generator_version}@${content_hash.slice(0, 16)}`. The `@`
+//        separator distinguishes the external identity from the
+//        internal `generator_version` string AND prevents confusion
+//        with the v1-3-era `${rules}-${hash12}` format. `hot.mjs` only
+//        imports the helper — it NEVER re-implements the format.
+//
+//     2. Add `communityProfileRepo.findByExternalVersion(externalVersion)`
+//        to the community repository. The matcher now passes the
+//        caller-supplied `community_profile_version` (the external
+//        identity string) DIRECTLY to the repo, with no "active"
+//        concept in between. When no row matches, the matcher
+//        surfaces `community_profile_not_found` (= 400) instead of
+//        silently falling through to the previous-generation row.
+//
+//   Together (1) + (2) make the matcher robust against any future
+//   refactor of the active slot: the external version is the
+//   SINGLE source of truth. The route layer's expected_version comes
+//   from the same helper, so the comparison is symmetric.
 //
 //   Relevance algorithm (deterministic, non-LLM):
 //
@@ -83,8 +94,19 @@ import {
   filterMockHotByCategory,
   KNOWN_CATEGORIES as MOCK_KNOWN_CATEGORIES,
 } from './mockZhihuHotSource.mjs';
+// P1.v1-4 (2026-09-07): import the SINGLE community-layer helper that
+// knows the wire format. We do NOT re-implement the format locally —
+// the helper is the source of truth. `computeProfileContentHash` is
+// exported by the same module so test suites that need to probe the
+// hash (e.g. for invariant checks) can also pull it from the same
+// community-layer entry point.
+import { deriveExternalCommunityProfileVersion, computeProfileContentHash } from '../../community/version.mjs';
+// P1.v1-4 (2026-09-07): the canonical-row read is now a SECONDARY
+// fallback used only to surface a useful `expected_version` when the
+// direct external-version lookup misses. The PRIMARY read goes
+// through `profileRepository.findByExternalVersion` (no active
+// concept).
 import { getCommunityProfile } from '../../community/service.mjs';
-import { canonicalSha256 } from '../../stories/canonicalHash.mjs';
 
 /**
  * Categories the orchestrator forwards to the upstream. Anything
@@ -118,76 +140,13 @@ function nowIso() {
   return new Date().toISOString();
 }
 
-/**
- * Length of the short content-hash suffix used in the EXTERNAL
- * `community_profile_version` derivation. 12 hex chars ≈ 48 bits of
- * entropy — enough to make accidental collisions in a single
- * regeneration burst effectively impossible, short enough that the
- * external version string stays human-greppable in test logs.
- */
-const EXTERNAL_CONTENT_HASH_LENGTH = 12;
-
-/**
- * ClickUp 16.4 P1.v1-3 fix (2026-09-07): compute a deterministic,
- * content-only SHA-256 over the user-editable fields of a community
- * profile. The hash intentionally EXCLUDES `generator_version`,
- * `generated_at`, `profile_uuid`, `hash`, `story_uuid`,
- * `story_version_uuid`, and `story_version_checksum` so two
- * regenerations of the SAME content (same topics / queries / knowledge
- * queries / hot_keywords) yield the same hash even if the import path
- * minted a fresh profile_uuid or bumped the timestamp. This is the
- * "did the content actually change" check that lets the matcher
- * distinguish two profile generations with identical ruleset versions.
- *
- * @param {object} profile
- * @returns {string}
- */
-export function computeProfileContentHash(profile) {
-  if (!profile || typeof profile !== 'object') {
-    throw new Error('hotOrchestrator.computeProfileContentHash: profile required');
-  }
-  const payload = {
-    topics: Array.isArray(profile.topics) ? profile.topics : [],
-    queries: Array.isArray(profile.queries) ? profile.queries : [],
-    knowledge_queries: Array.isArray(profile.knowledge_queries) ? profile.knowledge_queries : [],
-    hot_keywords: Array.isArray(profile.hot_keywords) ? profile.hot_keywords : [],
-  };
-  return canonicalSha256(payload);
-}
-
-/**
- * ClickUp 16.4 P1.v1-3 fix (2026-09-07): derive the EXTERNAL
- * `community_profile_version` string used on the wire contract from
- * the canonical profile row. The internal `generator_version` field
- * is preserved as-is (v1 schema, 13 top-level keys, NOT renamed).
- * Only the EXTERNAL identity string is content-aware:
- *
- *   `${generator_version}-${content_hash_short}`
- *
- * Same `generator_version` + same content → same external version
- *   (deterministic, idempotent across regenerations).
- * Same `generator_version` + different content → different external
- *   version (two-generation regression catches the mismatch).
- * Different `generator_version` (ruleset bump) → different external
- *   version (existing v1-2 mismatch path keeps firing).
- *
- * @param {object} profile
- * @returns {string}
- */
-export function deriveExternalCommunityProfileVersion(profile) {
-  if (!profile || typeof profile !== 'object') {
-    throw new Error('hotOrchestrator.deriveExternalCommunityProfileVersion: profile required');
-  }
-  const generatorVersion = typeof profile.generator_version === 'string' && profile.generator_version
-    ? profile.generator_version
-    : '';
-  if (!generatorVersion) {
-    throw new Error('hotOrchestrator.deriveExternalCommunityProfileVersion: profile.generator_version required');
-  }
-  const contentHash = computeProfileContentHash(profile);
-  const shortHash = contentHash.slice(0, EXTERNAL_CONTENT_HASH_LENGTH);
-  return `${generatorVersion}-${shortHash}`;
-}
+// P1.v1-4 (2026-09-07): the EXTERNAL `community_profile_version`
+// derivation has MOVED to the community layer
+// (`src/community/version.mjs`). `hot.mjs` only imports the helper;
+// the wire-format details live in exactly one place. Do NOT add a
+// local copy of `deriveExternalCommunityProfileVersion` or
+// `computeProfileContentHash` here — the import above is the single
+// source.
 
 function bucketStart(nowMs) {
   return Math.floor(nowMs / BUCKET_MS) * BUCKET_MS;
@@ -293,73 +252,67 @@ export function computeRelevance(entry, hotMatchTerms, themes) {
 }
 
 /**
- * Resolve the community profile for the identity triple. The matcher
- * reads the profile via `getCommunityProfile`; when the profile is
- * missing, the matcher still runs with an empty term list so every
- * entry scores 0 and the route degrades to a plain list rather than
- * 404-ing the home page.
+ * Resolve the community profile for the identity triple.
  *
- * P1.v1-2 contract (2026-09-07):
- *   The matcher reads the ACTIVE (latest) profile row for the
- *   story_version, NOT a version-filtered row. The version comparison
- *   happens AFTER the read, in `attachRelevance`; using a version-
- *   filtered read here would always return null when the caller's
- *   version differs, falling through to a misleading "profile_missing"
- *   path and hiding the real data-contract mismatch.
+ * P1.v1-4 contract (2026-09-07):
+ *   The PRIMARY read goes through `profileRepository.findByExternalVersion`
+ *   using the caller-supplied `community_profile_version` (= the
+ *   external identity string) as the EXACT key. There is no "active"
+ *   concept in this path: the external version IS the canonical
+ *   pointer. When the lookup misses, a SECONDARY read by
+ *   `story_version_uuid` (the canonical row for the story) is used
+ *   only to surface a useful `expected_version` for the
+ *   `mismatch` 400 path; the SECONDARY read is NEVER the source of
+ *   truth for the matched profile.
  *
- * P1.v1-3 contract (2026-09-07):
- *   The resolved object now ALSO carries `externalVersion` — the
- *   content-hash-aware external identity string derived from the
- *   canonical profile row via `deriveExternalCommunityProfileVersion`.
- *   `attachRelevance` compares the caller-supplied
- *   `community_profile_version` against THIS external version, not
- *   against the raw `generator_version`. Two profile generations with
- *   the same ruleset version but different content therefore yield
- *   distinct external versions and a stale caller is rejected with
- *   400 `community_profile_version_mismatch` instead of silently
- *   observing stale relevance projections.
+ *   This decoupling makes the matcher robust against any future
+ *   refactor of the "active" slot: even if an unrelated change moved
+ *   the active row, the external-version lookup stays correct because
+ *   the index is keyed on the canonical external identity.
  *
  * @param {object} input
  * @param {object} [input.profileRepository]
  * @param {string} input.story_version_uuid
- * @param {string} [input.community_profile_version]
- * @returns {{ hotMatchTerms: string[], themes: string[], profileUuid: string | null, generatorVersion: string | null, externalVersion: string | null, contentHash: string | null }}
+ * @param {string} input.community_profile_version   REQUIRED. The
+ *                                                   caller-supplied
+ *                                                   external version
+ *                                                   string used as the
+ *                                                   direct lookup key.
+ * @returns {{ hotMatchTerms: string[], themes: string[], profileUuid: string | null, profileStoryVersionUuid: string | null, generatorVersion: string | null, externalVersion: string | null, contentHash: string | null }}
  */
 export function resolveProfileMatchTerms({ profileRepository, story_version_uuid, community_profile_version }) {
   const result = {
     hotMatchTerms: [],
     themes: [],
     profileUuid: null,
+    // `profileStoryVersionUuid` is the `story_version_uuid` carried
+    // on the matched profile row. The route layer compares it against
+    // the caller-supplied `identity.story_version_uuid` to detect a
+    // cross-story-version external-version swap. When the primary
+    // read returns null, this field stays null.
+    profileStoryVersionUuid: null,
     generatorVersion: null,
     externalVersion: null,
     contentHash: null,
   };
   if (!profileRepository) return result;
-  let profile;
+  if (typeof community_profile_version !== 'string' || !community_profile_version) {
+    return result;
+  }
+  // PRIMARY: direct exact-string lookup against the wire contract
+  // external identity. No active concept.
+  let profile = null;
   try {
-    // P1.v1-2: read the ACTIVE row (no generator_version filter) so
-    // the caller-supplied version can be compared against the
-    // canonical row's version AFTER the read.
-    profile = getCommunityProfile({
-      profileRepository,
-      story_version_uuid,
-    });
+    if (typeof profileRepository.findByExternalVersion === 'function') {
+      profile = profileRepository.findByExternalVersion(community_profile_version);
+    }
   } catch {
     profile = null;
   }
   if (!profile) return result;
   result.profileUuid = profile.profile_uuid;
-  // ClickUp 16.4 P1.v1-2 fix (2026-09-07): the canonical field on the
-  // profile row is `generator_version` (v1 schema, 13 top-level keys).
-  // Future renames must update this read AND update the shape
-  // validator AND add a migration; doing so intentionally out of
-  // scope here.
+  result.profileStoryVersionUuid = profile.story_version_uuid;
   result.generatorVersion = profile.generator_version;
-  // ClickUp 16.4 P1.v1-3 fix (2026-09-07): derive the content-hash-
-  // aware external identity. The internal `generator_version` is
-  // preserved as the ruleset version; the external version gains a
-  // short content-hash suffix so two regenerations of the same ruleset
-  // with different content have distinct external identities.
   try {
     result.externalVersion = deriveExternalCommunityProfileVersion(profile);
   } catch {
@@ -385,6 +338,36 @@ export function resolveProfileMatchTerms({ profileRepository, story_version_uuid
     }
   }
   return result;
+}
+
+/**
+ * Resolve the canonical external version for a story_version. This
+ * is the SECONDARY read used by `attachRelevance` to surface
+ * `expected_version` when the primary direct-external-version lookup
+ * misses. The function is intentionally separate from
+ * `resolveProfileMatchTerms` so the test suite can probe the
+ * fallback independently and so the PRIMARY path stays narrow.
+ *
+ * @param {object} input
+ * @param {object} input.profileRepository
+ * @param {string} input.story_version_uuid
+ * @returns {string | null}
+ */
+export function resolveCanonicalExternalVersion({ profileRepository, story_version_uuid }) {
+  if (!profileRepository) return null;
+  if (typeof story_version_uuid !== 'string' || !story_version_uuid) return null;
+  let profile = null;
+  try {
+    profile = getCommunityProfile({ profileRepository, story_version_uuid });
+  } catch {
+    profile = null;
+  }
+  if (!profile) return null;
+  try {
+    return deriveExternalCommunityProfileVersion(profile);
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -604,15 +587,16 @@ export function createEcosystemHotOrchestrator(opts) {
  * Result of `attachRelevance`. The route layer maps this onto HTTP
  * status codes:
  *
- *   * `attached: true`                                 → 200 + relevant_to_story
- *   * `attached: false` + reason: 'mismatch'           → 400 community_profile_version_mismatch
- *   * `attached: false` + reason: 'profile_missing'    → 400 community_profile_missing
- *   * `attached: false` + reason: 'identity_incomplete'→ 200 (plain list, no relevance)
+ *   * `attached: true`                                          → 200 + relevant_to_story
+ *   * `attached: false` + reason: 'mismatch'                    → 400 community_profile_version_mismatch
+ *   * `attached: false` + reason: 'profile_missing'             → 400 community_profile_missing
+ *   * `attached: false` + reason: 'community_profile_not_found' → 400 community_profile_not_found
+ *   * `attached: false` + reason: 'identity_incomplete'         → 200 (plain list, no relevance)
  *
  * @typedef {Object} AttachRelevanceResult
  * @property {boolean} attached
- * @property {string}  [reason]                 'mismatch' | 'profile_missing' | 'identity_incomplete'.
- * @property {string}  [expected_version]       The EXTERNAL community_profile_version the canonical profile carries (= generator_version + content_hash suffix, per P1.v1-3).
+ * @property {string}  [reason]                 'mismatch' | 'profile_missing' | 'community_profile_not_found' | 'identity_incomplete'.
+ * @property {string}  [expected_version]       The EXTERNAL community_profile_version the canonical profile carries (= generator_version + content_hash suffix, per P1.v1-3/v1-4).
  * @property {string}  [actual_version]         The version the caller supplied.
  * @property {string}  [detail]                 Human-readable detail (used by `invalid_identity`).
  * @property {EcosystemHotList} response        Possibly-mutated response object.
@@ -624,29 +608,23 @@ export function createEcosystemHotOrchestrator(opts) {
  * so two callers with different identity triples share upstream data
  * but see distinct relevance projections.
  *
- * P1.v1-2 contract (2026-09-07):
+ * P1.v1-4 contract (2026-09-07):
+ *   * The PRIMARY profile read goes through
+ *     `profileRepository.findByExternalVersion(community_profile_version)`
+ *     — the wire-contract external identity string is the EXACT key.
+ *     There is NO active concept in the primary read.
  *   * Identity must be COMPLETE (all three fields present and the
  *     UUIDs well-formed) for relevance to attach.
- *   * When the supplied `community_profile_version` does NOT match
- *     the canonical profile row's `generator_version`, this function
- *     returns `{ attached: false, reason: 'mismatch',
- *     expected_version, actual_version }` so the route layer can
- *     return 400 `community_profile_version_mismatch` instead of
- *     silently degrading to "0 terms".
- *
- * P1.v1-3 contract (2026-09-07):
- *   * The comparison target is now the EXTERNAL identity string
- *     (`${generator_version}-${content_hash_short}`), derived via
- *     `deriveExternalCommunityProfileVersion`. The internal
- *     `generator_version` field on the profile row is preserved as the
- *     ruleset version; the external version is what the wire contract
- *     carries. Two profile generations with the same ruleset version
- *     but different content (e.g. regenerated hot_keywords / topics)
- *     have distinct external versions, so a stale caller is rejected
- *     with 400 mismatch instead of silently observing stale relevance.
- *   * The success path ALSO echoes `content_hash` on `relevant_to_story`
- *     for observability — callers can log the canonical content hash
- *     alongside the external version to debug two-generation drift.
+ *   * When the PRIMARY lookup misses, a SECONDARY canonical-row read
+ *     by `story_version_uuid` is used only to surface
+ *     `expected_version`:
+ *       - canonical row exists → `mismatch` with `expected_version =
+ *         canonicalExternalVersion`, `actual_version = callerVersion`.
+ *       - canonical row absent → `community_profile_not_found`.
+ *   * The success path ALSO echoes `content_hash` on
+ *     `relevant_to_story` for observability — callers can log the
+ *     canonical content hash alongside the external version to
+ *     debug two-generation drift.
  *
  * @param {EcosystemHotList} response
  * @param {object} [identity]
@@ -691,10 +669,13 @@ export function attachRelevance(response, identity, options) {
   }
   const opts = options || {};
   const profileRepository = opts.profileRepository;
+  // P1.v1-4 PRIMARY read: direct external-version lookup. No active
+  // concept. The external version IS the canonical pointer.
   const {
     hotMatchTerms,
     themes,
     profileUuid,
+    profileStoryVersionUuid,
     generatorVersion,
     externalVersion,
     contentHash,
@@ -703,33 +684,47 @@ export function attachRelevance(response, identity, options) {
     story_version_uuid,
     community_profile_version,
   });
-  // P1.v1-2 contract: when the canonical profile is missing for this
-  // story_version_uuid we MUST report it explicitly. A missing profile
-  // is a server-side bug (the import path always calls
-  // ensureCommunityProfile), NOT a "0 terms" silent degradation.
+  // PRIMARY miss: surface a useful mismatch path so callers carrying a
+  // stale external version still see the canonical expected_version.
   if (!profileUuid) {
+    const canonicalExternal = resolveCanonicalExternalVersion({
+      profileRepository,
+      story_version_uuid,
+    });
+    if (canonicalExternal) {
+      return {
+        attached: false,
+        response,
+        reason: 'mismatch',
+        expected_version: canonicalExternal,
+        actual_version: community_profile_version,
+      };
+    }
     return {
       attached: false,
       response,
-      reason: 'profile_missing',
+      reason: 'community_profile_not_found',
       actual_version: community_profile_version,
     };
   }
-  // P1.v1-3 contract (2026-09-07): the comparison target is the
-  // EXTERNAL identity string (generator_version + content_hash
-  // suffix), NOT the raw internal `generator_version`. The internal
-  // field is preserved for the ruleset version; the external string
-  // is what the wire contract carries. When the caller supplies a
-  // stale external version (e.g. carrying the previous generation's
-  // content hash), we return 400 mismatch with the canonical external
-  // version as `expected_version` so the caller can re-pin.
-  const expectedExternalVersion = externalVersion;
-  if (expectedExternalVersion && expectedExternalVersion !== community_profile_version) {
+  // Defense: the matched profile row's `story_version_uuid` MUST
+  // match the caller-supplied `story_version_uuid`. The PRIMARY
+  // `findByExternalVersion` is a GLOBAL lookup across all
+  // story_versions (the external-version string is not pre-scoped),
+  // so a swapped-uuid caller could otherwise observe the wrong
+  // relevance projection. Reject as `mismatch` with the canonical
+  // external version for the caller's `story_version_uuid` as
+  // `expected_version` so the caller can re-pin.
+  if (profileStoryVersionUuid && profileStoryVersionUuid !== story_version_uuid) {
+    const canonicalExternalForCaller = resolveCanonicalExternalVersion({
+      profileRepository,
+      story_version_uuid,
+    }) || '';
     return {
       attached: false,
       response,
       reason: 'mismatch',
-      expected_version: expectedExternalVersion,
+      expected_version: canonicalExternalForCaller,
       actual_version: community_profile_version,
     };
   }

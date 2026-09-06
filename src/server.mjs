@@ -59,8 +59,11 @@ import { snapshotAll as snapshotCacheStatsAll } from './observability/cacheStats
 import {
   attachRelevance,
   createEcosystemHotOrchestrator,
-  deriveExternalCommunityProfileVersion,
 } from './providers/ecosystem/hot.mjs';
+// P1.v1-4 (2026-09-07): the EXTERNAL `community_profile_version`
+// derivation now lives in the community layer. Import from there so
+// there is exactly one source of truth for the wire format.
+import { deriveExternalCommunityProfileVersion } from './community/version.mjs';
 import {
   createStoriesHookContext,
   onSessionCreate,
@@ -1574,7 +1577,7 @@ async function handleRequest(req, res) {
   const PUBLIC_DECORATE = () => ({ demo: currentDemoFlag() });
 
   /**
-   * ClickUp 16.4 P1.v1-2 + P1.v1-3 fix (2026-09-07): look up the
+   * ClickUp 16.4 P1.v1-2 + P1.v1-3 + P1.v1-4 fix (2026-09-07): look up the
    * canonical community_profile_version for a story_version_uuid by
    * reading the same community-profile repo the /v1/ecosystem/hot
    * orchestrator reads. When the row is missing we fall back to the
@@ -1583,15 +1586,22 @@ async function handleRequest(req, res) {
    * bootstrap response always carries a valid triple for the browser.
    *
    * P1.v1-3 makes the returned string CONTENT-AWARE: the value is the
-   * EXTERNAL identity derived via `deriveExternalCommunityProfileVersion`
-   * (= `${generator_version}-${shortContentHash}`). The internal
-   * `generator_version` field on the profile row is preserved as the
-   * ruleset version; only the external identity string used on the
-   * wire contract (and echoed on the bootstrap response) gains the
-   * content-hash suffix. Two regenerations of the same ruleset with
-   * different content therefore surface distinct external versions
-   * and stale callers are rejected with 400 mismatch instead of
-   * silently observing stale relevance projections.
+   * EXTERNAL identity derived via `deriveExternalCommunityProfileVersion`.
+   *
+   * P1.v1-4 (2026-09-07): the wire format is now
+   *     `${generator_version}@${content_hash.slice(0, 16)}`
+   * (the `@` separator replaces the v1-3-era `-` to distinguish the
+   * external identity from the internal `generator_version` string,
+   * and the hash suffix is 16 hex chars). The helper lives in the
+   * community layer (`src/community/version.mjs`) and is the SINGLE
+   * source of truth. The internal `generator_version` field on the
+   * profile row is preserved as the ruleset version; only the
+   * external identity string used on the wire contract (and echoed
+   * on the bootstrap response) gains the content-hash suffix. Two
+   * regenerations of the same ruleset with different content
+   * therefore surface distinct external versions and stale callers
+   * are rejected with 400 mismatch instead of silently observing
+   * stale relevance projections.
    *
    * @param {object} input
    * @param {object} input.profileRepository
@@ -2200,6 +2210,21 @@ async function handleRequest(req, res) {
           return jsonResponse(res, 400, {
             error: 'community_profile_missing',
             message: 'No community profile row exists for this story_version_uuid; the import path must call ensureCommunityProfile first.',
+            ...PUBLIC_DECORATE(),
+            story_version_uuid: identity.story_version_uuid,
+            actual_community_profile_version: result.actual_version || '',
+          });
+        }
+        if (result.reason === 'community_profile_not_found') {
+          // P1.v1-4 (2026-09-07): the supplied
+          // `community_profile_version` does not match ANY profile row
+          // — there is no canonical row for the caller's
+          // story_version_uuid either. Return 400
+          // `community_profile_not_found` so a wrong/stale/typo'd
+          // version never degrades to a 0-terms silent response.
+          return jsonResponse(res, 400, {
+            error: 'community_profile_not_found',
+            message: 'The supplied community_profile_version does not match any community profile row, and no canonical row exists for this story_version_uuid.',
             ...PUBLIC_DECORATE(),
             story_version_uuid: identity.story_version_uuid,
             actual_community_profile_version: result.actual_version || '',

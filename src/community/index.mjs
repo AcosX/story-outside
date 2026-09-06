@@ -41,6 +41,12 @@ export {
 } from './service.mjs';
 
 export {
+  EXTERNAL_HASH_LENGTH,
+  computeProfileContentHash,
+  deriveExternalCommunityProfileVersion,
+} from './version.mjs';
+
+export {
   ensureCommunityProfileForStoryVersion,
   seedCommunityProfiles,
 } from './importHook.mjs';

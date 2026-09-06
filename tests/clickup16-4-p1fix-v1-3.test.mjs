@@ -46,11 +46,16 @@ import { dirname, resolve } from 'node:path';
 
 import {
   attachRelevance,
-  computeProfileContentHash,
   createEcosystemHotOrchestrator,
-  deriveExternalCommunityProfileVersion,
   KNOWN_CATEGORIES,
 } from '../src/providers/ecosystem/hot.mjs';
+// P1.v1-4 (2026-09-07): the helpers have moved to the community
+// layer. hot.mjs imports them from there — there is NO private copy
+// in hot.mjs anymore. The wire format lives in exactly one place.
+import {
+  computeProfileContentHash,
+  deriveExternalCommunityProfileVersion,
+} from '../src/community/version.mjs';
 import {
   COMMUNITY_PROFILE_GENERATOR_VERSION,
   createInMemoryCommunityProfileRepository,
@@ -161,14 +166,16 @@ async function runAllChecks() {
       const afterHash = computeProfileContentHash(mutated);
       assert.equal(afterHash, beforeHash, 'content hash MUST ignore generator_version / generated_at / profile_uuid');
     });
-    await check('B: deriveExternalCommunityProfileVersion returns `${generator_version}-${shortContentHash}`', () => {
+    await check('B: deriveExternalCommunityProfileVersion returns `${generator_version}@${shortContentHash}`', () => {
       const ev = deriveExternalCommunityProfileVersion(cafeRainProfile);
       assert.equal(typeof ev, 'string');
       // Must start with the canonical ruleset version (either
       // 'community-profile-rules/1' or the full
-      // 'community-profile@community-profile-rules/1'), then a dash,
-      // then a 12-char hex content-hash short suffix.
-      assert.match(ev, /^(?:community-profile-rules\/1|community-profile@community-profile-rules\/1)-[0-9a-f]{12}$/);
+      // 'community-profile@community-profile-rules/1'), then a `@`,
+      // then a 16-char hex content-hash short suffix. The `@`
+      // separator (P1.v1-4) replaces the v1-3-era `-`; the hash
+      // suffix is 16 hex chars (~64 bits of entropy) instead of 12.
+      assert.match(ev, /^(?:community-profile-rules\/1|community-profile@community-profile-rules\/1)@[0-9a-f]{16}$/);
     });
     await check('B: deriveExternalCommunityProfileVersion is idempotent (same profile → same external version)', () => {
       const a = deriveExternalCommunityProfileVersion(cafeRainProfile);
@@ -267,16 +274,17 @@ async function runAllChecks() {
       assert.notEqual(externalVersionA, externalVersionB, `expected distinct external versions; got both ${externalVersionA}`);
       // Both external versions still start with the canonical ruleset
       // version (either bare 'community-profile-rules/1' or full
-      // 'community-profile@community-profile-rules/1').
-      assert.match(externalVersionA, /^(?:community-profile-rules\/1|community-profile@community-profile-rules\/1)-[0-9a-f]{12}$/);
-      assert.match(externalVersionB, /^(?:community-profile-rules\/1|community-profile@community-profile-rules\/1)-[0-9a-f]{12}$/);
+      // 'community-profile@community-profile-rules/1'). The wire
+      // format (P1.v1-4) is `${generator_version}@${hash.slice(0,16)}`.
+      assert.match(externalVersionA, /^(?:community-profile-rules\/1|community-profile@community-profile-rules\/1)@[0-9a-f]{16}$/);
+      assert.match(externalVersionB, /^(?:community-profile-rules\/1|community-profile@community-profile-rules\/1)@[0-9a-f]{16}$/);
       // The hash suffix portion is what differs.
-      const hashA = externalVersionA.split('-').pop();
-      const hashB = externalVersionB.split('-').pop();
+      const hashA = externalVersionA.split('@').pop();
+      const hashB = externalVersionB.split('@').pop();
       assert.notEqual(hashA, hashB);
     });
     await check('D: both external versions share the ruleset prefix but diverge on the content hash suffix', () => {
-      const prefix = (s) => s.split('-').slice(0, -1).join('-');
+      const prefix = (s) => s.split('@').slice(0, -1).join('@');
       assert.equal(prefix(externalVersionA), prefix(externalVersionB));
     });
 
@@ -382,6 +390,19 @@ async function runAllChecks() {
       throw new Error('server-side communityProfileRepo hook missing');
     }
 
+    // P1.v1-4 (2026-09-07): reset the server-side repo so the
+    // Generation-A row installed at startup (via seedCommunityProfiles)
+    // does not pollute the F1a stale-caller assertion. v1-3 read the
+    // active row only and therefore relied on the install call below
+    // to overwrite Generation A; v1-4 reads by external-version index,
+    // so a stale Generation A row would (correctly) resolve the
+    // externalVersionA lookup to attached:true and bypass the 400
+    // mismatch path. Clearing the repo up-front restores the v1-3
+    // contract that the server-side canonical row for cafe-rain is
+    // Generation B (and Generation A is unreachable from the server
+    // side).
+    serverProfileRepo._resetForTests();
+
     // F1. Install Generation B as the canonical row on the server-side repo.
     ensureCommunityProfile({
       repository: storyRepo,
@@ -482,7 +503,7 @@ async function runAllChecks() {
       assert.ok(typeof bootstrapJson.community_profile_version === 'string');
       assert.match(
         bootstrapJson.community_profile_version,
-        /^(?:community-profile-rules\/1|community-profile@community-profile-rules\/1)-[0-9a-f]{12}$/,
+        /^(?:community-profile-rules\/1|community-profile@community-profile-rules\/1)@[0-9a-f]{16}$/,
         `bootstrap version ${bootstrapJson.community_profile_version} must match the external identity shape`,
       );
       assert.equal(bootstrapJson.community_profile_version, serverCanonicalExternal);

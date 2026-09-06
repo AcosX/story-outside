@@ -40,10 +40,13 @@ import {
   attachRelevance,
   computeRelevance,
   createEcosystemHotOrchestrator,
-  deriveExternalCommunityProfileVersion,
   KNOWN_CATEGORIES,
   sortByRelevance,
 } from '../src/providers/ecosystem/hot.mjs';
+// P1.v1-4 (2026-09-07): the helper has moved to the community layer.
+// hot.mjs no longer re-exports it (the wire format lives in exactly
+// one place). Import directly from the community-layer module.
+import { deriveExternalCommunityProfileVersion } from '../src/community/version.mjs';
 import {
   createInMemoryCommunityProfileRepository,
   ensureCommunityProfile,

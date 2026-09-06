@@ -30,6 +30,9 @@ import {
   assertCommunityProfileShape,
   findCommunityProfileBoundsViolations,
 } from './profile.mjs';
+import {
+  deriveExternalCommunityProfileVersion,
+} from './version.mjs';
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -136,6 +139,7 @@ function rejectForbiddenKeys(value, path) {
  * @property {(story_version_uuid: string) => StoryCommunityProfile | null} findActiveByStoryVersion
  * @property {(story_version_uuid: string, generator_version: string) => StoryCommunityProfile | null} findActiveByStoryVersionAndGenerator
  * @property {(profile_uuid: string) => StoryCommunityProfile | null} findByUuid
+ * @property {(externalVersion: string) => StoryCommunityProfile | null} findByExternalVersion
  * @property {(input: { story_version_uuid: string }) => StoryCommunityProfile[]} listByStoryVersion
  * @property {(input: StoryCommunityProfile) => StoryCommunityProfile} setCommunityProfile
  * @property {() => { profile_count: number }} stats
@@ -148,6 +152,7 @@ function rejectForbiddenKeys(value, path) {
  *   profiles: Map<string, StoryCommunityProfile>,                 // keyed by profile_uuid
  *   activeByStoryVersion: Map<string, string>,                    // story_version_uuid|generator_version → profile_uuid
  *   byUuid: Map<string, StoryCommunityProfile>,
+ *   byExternalVersion: Map<string, string>,                       // externalVersion → profile_uuid (lazy-derived index)
  * }}
  */
 function createEmptyState() {
@@ -155,6 +160,7 @@ function createEmptyState() {
     profiles: new Map(),
     activeByStoryVersion: new Map(),
     byUuid: new Map(),
+    byExternalVersion: new Map(),
   };
 }
 
@@ -221,6 +227,24 @@ export function createInMemoryCommunityProfileRepository() {
       if (typeof profile_uuid !== 'string') return null;
       return state.profiles.get(profile_uuid) || null;
     },
+    findByExternalVersion(externalVersion) {
+      // P1.v1-4 (2026-09-07): direct exact-string lookup against the
+      // wire contract external identity. The repository maintains a
+      // lazy-derived index keyed by `deriveExternalCommunityProfileVersion`
+      // so `attachRelevance` does NOT need to walk the active slot
+      // and does NOT need to know about the `active` concept. The
+      // caller passes the external version string it received on the
+      // wire (or computed via the public helper); the repo returns the
+      // matching row verbatim or `null` when nothing matches.
+      //
+      // Important: the index is only as fresh as `setCommunityProfile`
+      // keeps it. `setCommunityProfile` derives the external version
+      // for every insert. Reads therefore stay O(1).
+      if (typeof externalVersion !== 'string' || !externalVersion) return null;
+      const uuid = state.byExternalVersion.get(externalVersion);
+      if (!uuid) return null;
+      return state.profiles.get(uuid) || null;
+    },
     listByStoryVersion(input) {
       if (!input || typeof input !== 'object') {
         throw new Error('communityRepository.listByStoryVersion: input required');
@@ -266,6 +290,23 @@ export function createInMemoryCommunityProfileRepository() {
       state.profiles.set(profile.profile_uuid, profile);
       state.byUuid.set(profile.profile_uuid, profile);
       state.activeByStoryVersion.set(key, profile.profile_uuid);
+      // 5. P1.v1-4 (2026-09-07): maintain the external-version index
+      //    so `findByExternalVersion` is O(1). We derive the external
+      //    identity via the public helper (which is the SINGLE place
+      //    that knows the wire format). If derivation fails for any
+      //    reason, we still store the row but skip the index entry —
+      //    `findByExternalVersion` will then return `null` for this
+      //    row, which is the same observable behaviour as before.
+      try {
+        const externalVersion = deriveExternalCommunityProfileVersion(profile);
+        if (externalVersion) {
+          state.byExternalVersion.set(externalVersion, profile.profile_uuid);
+        }
+      } catch {
+        // Intentionally swallowed: shape validator already enforces
+        // `generator_version`, so derivation only fails for an
+        // in-memory invariant break. Keep the row, drop the index.
+      }
       return profile;
     },
     stats() {
@@ -276,6 +317,7 @@ export function createInMemoryCommunityProfileRepository() {
       state.profiles = fresh.profiles;
       state.activeByStoryVersion = fresh.activeByStoryVersion;
       state.byUuid = fresh.byUuid;
+      state.byExternalVersion = fresh.byExternalVersion;
     },
   };
   return repo;
