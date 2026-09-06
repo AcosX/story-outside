@@ -2,7 +2,7 @@
 //
 // Loaded lazily from public/scripts/player.js after the player state
 // machine reaches `finished`. The module fetches three read-only
-// projections from /api/dev/sessions/:uuid/* and renders a dedicated
+// projections from /api/sessions/:uuid/* and renders a dedicated
 // ending screen with:
 //   * ending title + summary + key choices + character outcomes
 //   * first deviation highlight (red anchor in the comparison view)
@@ -57,9 +57,9 @@ async function fetchProjections(sessionUuid) {
   // finish_story has not yet committed, so the caller surfaces that
   // distinctly from a network failure.
   const [endingResult, originalResult, replayResult] = await Promise.allSettled([
-    api(`/api/dev/sessions/${sessionUuid}/ending`),
-    api(`/api/dev/sessions/${sessionUuid}/original-timeline`),
-    api(`/api/dev/sessions/${sessionUuid}/replay`),
+    api(`/api/sessions/${sessionUuid}/ending`),
+    api(`/api/sessions/${sessionUuid}/original-timeline`),
+    api(`/api/sessions/${sessionUuid}/replay`),
   ]);
   return {
     ending: endingResult.status === 'fulfilled' ? endingResult.value : { error: endingResult.reason },

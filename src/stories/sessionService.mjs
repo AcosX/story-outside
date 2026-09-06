@@ -81,6 +81,33 @@
 import { randomUUID } from 'node:crypto';
 import { canonicalJsonStringify, canonicalSha256 } from './canonicalHash.mjs';
 import { SessionNotFoundError, SessionConflictError } from '../providers/dto.mjs';
+import { importStoryAndEnsureCache } from './storyService.mjs';
+
+// ---------------------------------------------------------------------------
+// ClickUp 09 / issue #9 — public-session bootstrap helper
+//
+// `bootstrapSessionFromWork` is the application-layer seam the issue-9
+// /api/sessions POST façade needs. The helper takes the ONLY two fields
+// the browser knows (work_id + role_id) and runs the canonical flow:
+//
+//   work_id
+//     → importStoryAndEnsureCache   (provider → import/reuse story →
+//                                   import/reuse version →
+//                                   ensure/reuse opening cache)
+//     → createSession              (create + pin canonical session)
+//
+// The helper is atomic on a single repository call chain and idempotent
+// across retries: importStoryAndEnsureCache reuses existing story/version
+//   /opening cache rows, and createSession fails closed on duplicate
+// session_uuid. It MUST NOT be called with a session_uuid that already
+// exists for this repository — the caller owns uuid allocation and is
+// expected to randomise on every bootstrap.
+//
+// The helper returns the new canonical session record PLUS the opening
+// payload it pinned (so the route layer can stream opening_events to
+// the browser without making a second read). Both pieces are deep-cloned
+// so the caller can serialise them straight into an HTTP response.
+// ---------------------------------------------------------------------------
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const SESSION_STATE = 'sessionState';
@@ -1092,6 +1119,129 @@ export function discardPendingTail({ repository, session_uuid }) {
     dropped_pending_id: dropped ? dropped.pending_id : null,
     dropped_pending_count: dropped ? dropped.events.length - dropped.committed_count : 0,
     state: session.state,
+  };
+}
+
+/**
+ * Issue #9 — atomic public-session bootstrap.
+ *
+ * Inputs (only what the browser knows):
+ *   * work_id   : stable story slug returned by /api/stories
+ *   * role_id   : role selected from the same story
+ *
+ * Outputs:
+ *   * session record (the createSession return value, deep-cloned)
+ *   * opening payload straight from the pinned opening cache so the
+ *     caller can stream opening_events[] to the browser without a
+ *     second read.
+ *
+ * `session_uuid` MUST be a fresh UUID (randomUUID() at the route
+ * layer) — the helper does not invent one. `user_ref`, `model`, and
+ * `prompt` are intentionally NOT part of the public API contract: the
+ * browser must not know about the model catalog or any prompt
+ * template, so the helper injects stable in-process defaults the
+ * downstream runtime pins.
+ *
+ * Validation summary (matching the dev route's contract):
+ *   * work_id  → provider story; StoryNotFoundError on unknown slug.
+ *   * role_id  → must exist in the imported story_version.roles_payload.
+ *   * cache    → ensureOpeningCache always returns a non-null cache
+ *     with status='valid'; we re-validate here defensively so a caller
+ *     cannot bootstrap a session pinned to a 'failed' cache row.
+ *
+ * Errors raised are the same stable codes the dev route already
+ * surfaces (invalid_input / story_not_found / invalid_cache /
+ * duplicate_session / session_not_found), so a single sessionError
+ * classifier at the HTTP layer handles both surfaces identically.
+ *
+ * @param {object} input
+ * @param {import('./repository.mjs').StoryRepository} input.repository
+ * @param {object} input.provider  Object exposing `getStory` (StoryProvider).
+ * @param {string} input.session_uuid
+ * @param {string} input.work_id
+ * @param {string} input.role_id
+ * @param {object} [input.identity]
+ * @param {string} [input.identity.user_ref]
+ * @param {string} [input.identity.model]
+ * @param {string} [input.identity.prompt]
+ * @returns {Promise<{ session: object, opening_events: object[], cache_uuid: string, cache_status: string|null, story_uuid: string, story_version_uuid: string }>}
+ */
+export async function bootstrapSessionFromWork({ repository, provider, session_uuid, work_id, role_id, identity }) {
+  if (!repository) throw new Error('bootstrapSessionFromWork: repository required');
+  if (!provider || typeof provider.getStory !== 'function') {
+    throw new Error('bootstrapSessionFromWork: provider with getStory required');
+  }
+  assertUuid('session_uuid', session_uuid);
+  if (typeof work_id !== 'string' || !work_id) {
+    throw new Error('bootstrapSessionFromWork: work_id required');
+  }
+  if (typeof role_id !== 'string' || !role_id) {
+    throw new Error('bootstrapSessionFromWork: role_id required');
+  }
+  // Idempotency window: if a caller (a retried browser, a test harness)
+  // reuses the same session_uuid we MUST refuse rather than silently
+  // reset the session — the dev route uses the same fail-closed code so
+  // both surfaces agree on the same wire contract.
+  const state = repositoryState(repository);
+  if (state.sessions.has(session_uuid)) {
+    throw new Error('createSession: session already exists');
+  }
+  // Reuse the existing story_uuid for the same work_id when present so
+  // repeated imports do not create duplicate catalog rows. The seeded
+  // fixture has no row for arbitrary work_ids, so a fresh UUID is
+  // allocated otherwise.
+  const existing = repository.findStoryBySlug(work_id);
+  const story_uuid = existing ? existing.story_uuid : randomUUID();
+
+  // Step 1: import (or reuse) the story + version + opening cache.
+  const ensured = await importStoryAndEnsureCache({
+    repository,
+    provider,
+    slug: work_id,
+    story_uuid,
+  });
+  // Step 2: read the resulting cache so we can return opening_events[].
+  const cache = repository.findOpeningCacheByUuid(ensured.opening_cache_uuid);
+  if (!cache || cache.status !== 'valid') {
+    // importStoryAndEnsureCache already enforces this invariant; the
+    // double-check keeps the helper safe if a future caller passes in
+    // a non-default profile or generator that produces a non-'valid'
+    // cache row.
+    throw new Error('sessionService: pinned cache must be valid');
+  }
+  const opening_events = Array.isArray(cache.content_payload && cache.content_payload.events)
+    ? cache.content_payload.events.map((ev) => clone(ev))
+    : [];
+  // Step 3: defaults the public player API does NOT expose. They are
+  // server-side identity/policy values the browser cannot influence.
+  const user_ref = identity && identity.user_ref ? String(identity.user_ref) : 'public-player';
+  const model = identity && identity.model ? String(identity.model) : 'story-outside-default';
+  const prompt = identity && identity.prompt ? String(identity.prompt) : 'public-player prompt';
+  // Step 4: build the canonical session. We pass through the cache's
+  // pinned profile directly so the session is pinned to the same
+  // generation as the cache we just streamed to the browser.
+  const generation_profile = clone(cache.generation_profile);
+  generation_profile.cache_uuid = cache.cache_uuid;
+  const session = createSession({
+    repository,
+    session_uuid,
+    story_uuid: ensured.story_uuid,
+    story_version_uuid: ensured.story_version_uuid,
+    user_ref,
+    role_id,
+    model,
+    prompt,
+    generation_profile,
+  });
+  return {
+    session,
+    opening_events,
+    cache_uuid: cache.cache_uuid,
+    cache_status: cache.status,
+    story_uuid: ensured.story_uuid,
+    story_version_uuid: ensured.story_version_uuid,
+    cache_reused: !!ensured.cache_reused,
+    version_reused: !!ensured.version_reused,
   };
 }
 
