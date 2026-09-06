@@ -212,6 +212,33 @@ export function createInMemoryCommunityProfileRepository() {
       assertUuid('story_version_uuid', story_version_uuid);
       // Walk the activeByStoryVersion index; pick the most recently
       // generated profile when multiple generator versions exist.
+      //
+      // ClickUp 16.2 P1.v1-3 fix (2026-09-07 主人巡检 + ChatGPT 复核):
+      // The previous tie-break used lexicographic comparison on
+      // `generator_version` (a caller-controlled string like
+      // 'community-profile@community-profile-rules/1'). Two distinct
+      // rows under the SAME story_version_uuid produced in the SAME
+      // millisecond (Date#toISOString only has millisecond
+      // resolution) would have their active-row choice depend on the
+      // lexicographic order of `generator_version`, which is
+      // unrelated to which row is semantically "newer". Worse, the
+      // choice could pin the OLD row as active, breaking the
+      // `generator_version-change` regression in
+      // `tests/communityProfile.test.mjs`.
+      //
+      // Contract (P1.v1-3):
+      //   1. Active row = the row with the largest `generated_at`
+      //      among rows bound to this `story_version_uuid`.
+      //   2. Tie-break when two rows share the SAME `generated_at`
+      //      millisecond MUST be deterministic AND unrelated to
+      //      caller-supplied strings. We use `profile_uuid`
+      //      (lexicographic UUID comparison) — every row has a
+      //      unique fresh UUID v4 assigned in `setCommunityProfile`,
+      //      so the comparison is a total order that does not
+      //      depend on `generator_version` semantics.
+      //   3. We explicitly do NOT use `generator_version` as a
+      //      tie-break. The caller can supply any string, and the
+      //      active-row decision must be stable regardless.
       let bestProfile = null;
       for (const [key, profileUuid] of state.activeByStoryVersion.entries()) {
         const [sv, generator] = key.split('|');
@@ -224,12 +251,16 @@ export function createInMemoryCommunityProfileRepository() {
         }
         if (row.generated_at > bestProfile.generated_at) {
           bestProfile = row;
+          continue;
         }
-        // Tie-break: larger generator_version wins so a rule bump
-        // immediately retires the previous generation for new reads.
+        // Tie-break on identical millisecond: prefer the row with
+        // the lexicographically LARGER profile_uuid (fresh UUID v4
+        // per row, total order, deterministic). Deliberately not
+        // `generator_version` — caller-controlled string is not a
+        // valid active-row discriminator.
         if (
           row.generated_at === bestProfile.generated_at
-          && row.generator_version > bestProfile.generator_version
+          && row.profile_uuid > bestProfile.profile_uuid
         ) {
           bestProfile = row;
         }

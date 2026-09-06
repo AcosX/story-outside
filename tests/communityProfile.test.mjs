@@ -28,6 +28,7 @@ import {
   getCommunityFixtureSeed,
   buildStubCommunityProfile,
   buildCommunityProfileFromSeed,
+  buildCanonicalCommunityProfileVersion,
   listCommunityFixtureSlugs,
   seedCommunityProfiles,
   setCommunityProfile,
@@ -450,6 +451,234 @@ async function runChecks() {
     // Same content_hash → same active row (no duplicate insert).
     assert.equal(storedA.profile_uuid, storedB.profile_uuid);
     assert.equal(profileRepo.stats().profile_count, 1);
+  });
+
+  // ----- ClickUp 16.2 P1.v1-3 --------------------------------------
+  //
+  // Regression guards for the active-row deterministic-order fix.
+  // P1.v1-2 closed the immutable-lookup bug (findCanonicalByIdentity
+  // walks every row by story_version_uuid and matches the version
+  // string byte-for-byte). P1.v1-3 closes the related active-row
+  // tie-break bug: when two distinct rows under the same
+  // story_version_uuid share the SAME `generated_at` millisecond
+  // (Date#toISOString only has ms resolution), the choice of
+  // "active" row MUST be deterministic AND MUST NOT depend on the
+  // caller-supplied `generator_version` string. The previous
+  // implementation used lexicographic comparison on `generator_version`,
+  // which is unrelated to which row is semantically newer — and
+  // would sometimes pin the OLD row as active, breaking the
+  // `generator_version-change` scenario above.
+  //
+  // The fix uses `profile_uuid` (a fresh UUID v4 per row) as the
+  // tie-break: stable, total order, independent of caller input.
+
+  function _buildRowWithFixedTimestamp({
+    story_uuid,
+    story_version_uuid,
+    story_version_checksum,
+    generator_version,
+    generated_at,
+    content_marker,
+  }) {
+    const profile = buildCommunityProfileFromSeed({
+      story_uuid,
+      story_version_uuid,
+      story_version_checksum,
+      generator_version,
+      source: 'mock-fixture',
+      topics: [
+        { label: `topic-${content_marker}-A`, summary: `summary-${content_marker}-A` },
+        { label: `topic-${content_marker}-B`, summary: `summary-${content_marker}-B` },
+        { label: `topic-${content_marker}-C`, summary: `summary-${content_marker}-C` },
+      ],
+      queries: [
+        { query: `query-${content_marker}-A`, kind: 'web' },
+        { query: `query-${content_marker}-B`, kind: 'web' },
+        { query: `query-${content_marker}-C`, kind: 'mixed' },
+      ],
+      knowledge_queries: [
+        { query: `knowledge-${content_marker}-A`, kind: 'knowledge' },
+        { query: `knowledge-${content_marker}-B`, kind: 'knowledge' },
+      ],
+      hot_keywords: [
+        { keyword: `hot-${content_marker}-A`, rationale: `rationale-${content_marker}-A` },
+        { keyword: `hot-${content_marker}-B`, rationale: `rationale-${content_marker}-B` },
+      ],
+    });
+    // Pin generated_at to a caller-controlled millisecond so we can
+    // exercise the same-timestamp path deterministically.
+    profile.generated_at = generated_at;
+    return profile;
+  }
+
+  // Pull the canonical story_version_checksum off the seed-built
+  // profile so the P1.v1-3 fixtures match the same
+  // (story_uuid, story_version_uuid, story_version_checksum) triple
+  // the rest of the test suite uses.
+  function _seedChecksum(profileRepo, story_version_uuid) {
+    const seeded = getCommunityProfile({ profileRepository: profileRepo, story_version_uuid });
+    assert.ok(seeded, 'seed profile must exist');
+    return seeded.story_version_checksum;
+  }
+
+  await check('same-timestamp rows under one story_version resolve to a deterministic active row (P1.v1-3)', () => {
+    // Two rows under the SAME story_version_uuid, produced in the
+    // SAME millisecond, with DIFFERENT generator_version strings.
+    // Before the fix, the active row depended on lexicographic
+    // comparison of `generator_version` — i.e., a non-deterministic
+    // outcome driven by caller-controlled input. After the fix, the
+    // active row is determined by (generated_at DESC, profile_uuid
+    // DESC) — stable, repeatable, and independent of generator_version.
+    const { repository } = createSeededRepository();
+    const profileRepo = createInMemoryCommunityProfileRepository();
+    seedCommunityProfiles(repository, profileRepo);
+    const { story_uuid, story_version_uuid } = FIXTURE_UUIDS['cafe-rain'];
+    const story_version_checksum = _seedChecksum(profileRepo, story_version_uuid);
+
+    const fixed_ts = '2026-09-07T01:02:03.456Z';
+    const row_a = _buildRowWithFixedTimestamp({
+      story_uuid,
+      story_version_uuid,
+      story_version_checksum,
+      generator_version: 'community-profile@community-profile-rules/a',
+      generated_at: fixed_ts,
+      content_marker: 'A',
+    });
+    const row_b = _buildRowWithFixedTimestamp({
+      story_uuid,
+      story_version_uuid,
+      story_version_checksum,
+      generator_version: 'community-profile@community-profile-rules/b',
+      generated_at: fixed_ts,
+      content_marker: 'B',
+    });
+    const stored_a = setCommunityProfile({ profileRepository: profileRepo, profile: row_a });
+    const stored_b = setCommunityProfile({ profileRepository: profileRepo, profile: row_b });
+    assert.notEqual(stored_a.profile_uuid, stored_b.profile_uuid);
+    assert.equal(stored_a.generated_at, fixed_ts);
+    assert.equal(stored_b.generated_at, fixed_ts);
+
+    // Run the active-row selection many times; the answer MUST be
+    // identical every call (deterministic) and MUST NOT depend on
+    // generator_version lexicographic order. We pick the expected
+    // winner by the contract: (generated_at DESC, profile_uuid DESC).
+    const expected_uuid = stored_a.profile_uuid > stored_b.profile_uuid
+      ? stored_a.profile_uuid
+      : stored_b.profile_uuid;
+    const active1 = getCommunityProfile({ profileRepository: profileRepo, story_version_uuid });
+    const active2 = getCommunityProfile({ profileRepository: profileRepo, story_version_uuid });
+    const active3 = getCommunityProfile({ profileRepository: profileRepo, story_version_uuid });
+    assert.equal(active1.profile_uuid, expected_uuid);
+    assert.equal(active2.profile_uuid, expected_uuid);
+    assert.equal(active3.profile_uuid, expected_uuid);
+
+    // listByStoryVersion must return at least the seed row + our two
+    // same-timestamp fixtures, all sharing the same story_version_uuid.
+    const all = profileRepo.listByStoryVersion({ story_version_uuid });
+    assert.ok(all.length >= 3,
+      `expected at least 3 rows for the cafe-rain story_version, got ${all.length}`);
+    const fixtureUuids = new Set([stored_a.profile_uuid, stored_b.profile_uuid]);
+    for (const row of all) {
+      assert.ok(
+        row.story_version_uuid === story_version_uuid,
+        'every listed row must share the same story_version_uuid',
+      );
+    }
+    // Both fixture rows must be present in the listing (idempotency
+    // does not collapse them: different generator_version strings,
+    // different content_hash).
+    let fixtureRowsSeen = 0;
+    for (const row of all) {
+      if (fixtureUuids.has(row.profile_uuid)) fixtureRowsSeen += 1;
+    }
+    assert.equal(fixtureRowsSeen, 2, 'both fixture rows must appear in listByStoryVersion');
+  });
+
+  await check('different-timestamp rows pick the newer generated_at as active (P1.v1-3)', () => {
+    const { repository } = createSeededRepository();
+    const profileRepo = createInMemoryCommunityProfileRepository();
+    seedCommunityProfiles(repository, profileRepo);
+    const { story_uuid, story_version_uuid } = FIXTURE_UUIDS['cafe-rain'];
+    const story_version_checksum = _seedChecksum(profileRepo, story_version_uuid);
+
+    // Older row first, then newer row.
+    const old_ts = '2026-09-07T01:00:00.000Z';
+    const new_ts = '2026-09-07T02:00:00.000Z';
+    const old_row = _buildRowWithFixedTimestamp({
+      story_uuid,
+      story_version_uuid,
+      story_version_checksum,
+      generator_version: 'community-profile@community-profile-rules/old',
+      generated_at: old_ts,
+      content_marker: 'old',
+    });
+    const new_row = _buildRowWithFixedTimestamp({
+      story_uuid,
+      story_version_uuid,
+      story_version_checksum,
+      generator_version: 'community-profile@community-profile-rules/new',
+      generated_at: new_ts,
+      content_marker: 'new',
+    });
+    setCommunityProfile({ profileRepository: profileRepo, profile: old_row });
+    setCommunityProfile({ profileRepository: profileRepo, profile: new_row });
+    const active = getCommunityProfile({ profileRepository: profileRepo, story_version_uuid });
+    assert.ok(active, 'active row must resolve');
+    assert.equal(active.profile_uuid, new_row.profile_uuid,
+      'active row must be the one with the newer generated_at, regardless of insertion order');
+    assert.equal(active.generated_at, new_ts);
+  });
+
+  await check('community_profile_version exact lookup hits the requested row even when an older active row exists (P1.v1-3)', () => {
+    // Regression for the immutable-lookup contract from P1.v1-2:
+    // even when `findActiveByStoryVersion` would resolve to the
+    // newest row, a client that pins a `community_profile_version`
+    // string built from an OLDER row must still get THAT older row
+    // back. This pairs with the active-row fix above to make sure
+    // the two mechanisms do not interfere.
+    const { repository } = createSeededRepository();
+    const profileRepo = createInMemoryCommunityProfileRepository();
+    seedCommunityProfiles(repository, profileRepo);
+    const { story_uuid, story_version_uuid } = FIXTURE_UUIDS['cafe-rain'];
+    const story_version_checksum = _seedChecksum(profileRepo, story_version_uuid);
+
+    const old_ts = '2026-09-07T01:00:00.000Z';
+    const new_ts = '2026-09-07T02:00:00.000Z';
+    const old_row = _buildRowWithFixedTimestamp({
+      story_uuid,
+      story_version_uuid,
+      story_version_checksum,
+      generator_version: 'community-profile@community-profile-rules/old',
+      generated_at: old_ts,
+      content_marker: 'exact-old',
+    });
+    const new_row = _buildRowWithFixedTimestamp({
+      story_uuid,
+      story_version_uuid,
+      story_version_checksum,
+      generator_version: 'community-profile@community-profile-rules/new',
+      generated_at: new_ts,
+      content_marker: 'exact-new',
+    });
+    setCommunityProfile({ profileRepository: profileRepo, profile: old_row });
+    setCommunityProfile({ profileRepository: profileRepo, profile: new_row });
+
+    // Active is the newer row.
+    const active = getCommunityProfile({ profileRepository: profileRepo, story_version_uuid });
+    assert.equal(active.profile_uuid, new_row.profile_uuid);
+
+    // Exact cpv lookup against the OLD row's version string MUST
+    // return the OLD row, not the active row.
+    const old_cpv = buildCanonicalCommunityProfileVersion(old_row);
+    assert.ok(old_cpv);
+    const exact = profileRepo.findCanonicalByIdentity({
+      story_uuid,
+      story_version_uuid,
+      community_profile_version: old_cpv,
+    });
+    assert.equal(exact.ok, true);
+    assert.equal(exact.profile.profile_uuid, old_row.profile_uuid);
+    assert.equal(exact.profile.generated_at, old_ts);
   });
 
   await check('ensureCommunityProfile throws on unknown story_version', () => {
