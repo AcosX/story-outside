@@ -68,6 +68,10 @@ import {
   buildOriginalTimeline,
   buildReplay,
 } from './stories/endingService.mjs';
+import {
+  createEcosystemHotProvider,
+} from './providers/ecosystem/hot.mjs';
+import { createRealZhihuHotSource } from './providers/ecosystem/zhihuHotSource.mjs';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 const ROOT = resolve(__dirname, '..');
@@ -282,6 +286,20 @@ const DEV_FLAG = Object.freeze({
     'in front before deploying beyond localhost.',
 });
 
+// Public façade decorator. Every PUBLIC route (e.g. /api/health, the
+// PR #10 /api/sessions surface, and the ClickUp 16.4 /v1/ecosystem/hot
+// surface) spreads this into the response so the demo flag travels
+// with the payload without leaking the DEV_FLAG banner that internal
+// admin / dev routes carry.
+//
+// Declared EARLY (here, right after DEV_FLAG) so any handler added
+// above the historical `/api/sessions` block can reference it.
+// (Hoisting note: arrow functions assigned to const are not hoisted,
+// but the route handlers themselves run inside `handleRequest` which
+// is invoked after module evaluation completes — so the binding is
+// live by the time any handler runs.)
+const PUBLIC_DECORATE = () => ({ demo: currentDemoFlag() });
+
 const MIME = {
   '.html': 'text/html; charset=utf-8',
   '.css': 'text/css; charset=utf-8',
@@ -440,6 +458,31 @@ seedCommunityProfiles(storyRepo, communityProfileRepo);
 // (pinned=null). The canonical session data lives in the repository, not
 // here — eviction here never loses durable information.
 const sessionPinnedMetadata = new BoundedMap({ max: 1024, name: 'sessionPinnedMetadata' });
+
+// ClickUp 16.4 ecosystem hot-list (rebuilt on current main 44343b2).
+//
+// Process-local singleton. The orchestrator owns the pair-key cache
+// (`(category, bucket)` Map). The real adapter is constructed lazily
+// on first request so a misconfigured ZHIHU_HOT_ENDPOINT fails loudly
+// at first call rather than at module-load time (which would block
+// the dev / mock default from booting). The mock provider is the
+// default fallback; STORY_OUTSIDE_HOT_PROVIDER=real is opt-in.
+const ecosystemHotProvider = createEcosystemHotProvider({
+  realSource: createRealZhihuHotSource(),
+});
+/**
+ * @returns {{ source: string, endpoint: string, ttl_ms: number, swr_ms: number, known_categories: ReadonlyArray<string> }}
+ */
+function hotProviderConfig() {
+  const cfg = ecosystemHotProvider._config();
+  return {
+    source: cfg.sourceName,
+    endpoint: cfg.endpoint,
+    ttl_ms: cfg.ttlMs,
+    swr_ms: cfg.swrMs,
+    known_categories: cfg.knownCategories,
+  };
+}
 // Per-session turn-level request idempotency map. Keyed by session_uuid,
 // then by request_id. The map intentionally lives outside the repository
 // because the runtime does not own it (the repository is process-shared
@@ -593,6 +636,7 @@ async function handleRequest(req, res) {
       uptimeSeconds: Math.round(process.uptime()),
       nodeVersion: process.version,
       provider: providerName,
+      hot_provider: hotProviderConfig(),
       demo: currentDemoFlag(),
     });
   }
@@ -607,6 +651,70 @@ async function handleRequest(req, res) {
       message: String(err && err.message ? err.message : err),
       demo: currentDemoFlag(),
     });
+  }
+
+  // -----------------------------------------------------------------------
+  // ClickUp 16.4 — ecosystem hot-list public façade (rebuilt 44343b2).
+  //
+  // GET /v1/ecosystem/hot?category=...&limit=...
+  //   * Public, NON-authenticated endpoint. Does NOT live under
+  //     /api/admin/* or /api/dev/*. Does NOT leak DEV_FLAG.
+  //   * `category` is clamped by the orchestrator to KNOWN_CATEGORIES
+  //     so a hostile query string cannot be smuggled into the
+  //     upstream URL.
+  //   * `limit` is clamped to [1, 50].
+  //   * Graceful degradation: when the upstream is failing the route
+  //     returns 200 with `cached:true` and a past-SWR cache hit if
+  //     one is available, OR 200 with `cached:false` and an empty
+  //     list so the home-page module can render the
+  //     "暂时无法获取知乎热议" placeholder. The HTTP request never
+  //     5xx's because of an upstream failure — that would break the
+  //     core game-link discovery flow.
+  // -----------------------------------------------------------------------
+  if (method === 'GET' && pathname === '/v1/ecosystem/hot') {
+    const urlObj = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
+    const rawCategory = urlObj.searchParams.get('category');
+    const rawLimit = urlObj.searchParams.get('limit');
+    let limit = 30;
+    if (rawLimit !== null && rawLimit !== '') {
+      const parsed = Number(rawLimit);
+      if (!Number.isFinite(parsed) || parsed <= 0) {
+        return jsonResponse(res, 400, {
+          error: 'invalid_limit',
+          message: 'limit must be a positive integer.',
+          ...PUBLIC_DECORATE(),
+        });
+      }
+      limit = Math.floor(parsed);
+    }
+    if (rawCategory !== null && typeof rawCategory !== 'string') {
+      return jsonResponse(res, 400, {
+        error: 'invalid_category',
+        message: 'category must be a string.',
+        ...PUBLIC_DECORATE(),
+      });
+    }
+    try {
+      const payload = await ecosystemHotProvider.getHot({
+        category: rawCategory || 'total',
+        limit,
+      });
+      return jsonResponse(res, 200, { ...PUBLIC_DECORATE(), ...payload });
+    } catch (err) {
+      // We deliberately do NOT surface ProviderError as a 5xx — the
+      // hot-list is a non-essential discovery rail and a misbehaving
+      // upstream MUST NOT take down the home page. Log it, then
+      // return an empty payload.
+      // eslint-disable-next-line no-console
+      console.warn(`[story-outside] ecosystem hot-list upstream error: ${String(err && err.message ? err.message : err)}`);
+      return jsonResponse(res, 200, {
+        ...PUBLIC_DECORATE(),
+        hot: [],
+        provenance: { source: 'mock' },
+        cached: false,
+        fetched_at: '',
+      });
+    }
   }
 
   // Story catalog
@@ -1548,8 +1656,11 @@ async function handleRequest(req, res) {
   // Provider-agnostic: works under both STORY_OUTSIDE_PROVIDER=mock
   // and =real (story content side); the narrative runtime stays bound
   // to the deterministic demo provider regardless.
+  //
+  // (PUBLIC_DECORATE is now declared at module scope, immediately
+  // after DEV_FLAG, so handlers above this block — including the
+  // ClickUp 16.4 /v1/ecosystem/hot façade — can reference it.)
   // ---------------------------------------------------------------------
-  const PUBLIC_DECORATE = () => ({ demo: currentDemoFlag() });
 
   // POST /api/sessions — atomic session bootstrap from a story + role.
   if (method === 'POST' && pathname === '/api/sessions') {

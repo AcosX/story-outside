@@ -41,6 +41,43 @@
     </header>
 
     <main id="player-main" class="player-main" aria-live="polite" tabindex="-1">
+      <!--
+        ClickUp 16.4 — ecosystem hot-list discovery rail ("知乎此刻热议").
+
+        This is a PUBLIC, independent module. It does NOT touch the
+        picker / player / ending page screens, and the homeHotModule.js
+        script below is loaded as a separate <script type="module">
+        rather than being inlined into player.js or endingPage.js —
+        that keeps the contract narrow: if the hot-list upstream is
+        failing or the cache is empty, only this module renders a
+        "暂时无法获取知乎热议" fallback. The core game-link flow
+        (picker → player → ending) is never blocked by an upstream
+        outage.
+      -->
+      <section id="ecosystem-hot-module" class="ecosystem-hot-module" data-module="ecosystem-hot" aria-label="知乎此刻热议">
+        <header class="ecosystem-hot-module__head">
+          <h2 class="ecosystem-hot-module__title">知乎此刻热议</h2>
+          <p class="ecosystem-hot-module__sub" id="ecosystem-hot-sub">
+            加载中&hellip;
+          </p>
+        </header>
+        <ol
+          class="ecosystem-hot-module__list"
+          id="ecosystem-hot-list"
+          aria-busy="true"
+          aria-label="热议列表"
+        ></ol>
+        <p
+          class="ecosystem-hot-module__empty"
+          id="ecosystem-hot-empty"
+          role="status"
+          aria-live="polite"
+          hidden
+        >
+          暂时无法获取知乎热议
+        </p>
+      </section>
+
       <section
         class="screen screen-picker active"
         id="screen-picker"
@@ -194,5 +231,6 @@
     </footer>
 
     <script type="module" src="/scripts/player.js"></script>
+    <script type="module" src="/scripts/homeHotModule.js"></script>
   </body>
 </html>
