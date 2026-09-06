@@ -33,6 +33,14 @@ import {
   seedCommunityProfiles,
 } from './community/index.mjs';
 import {
+  createInMemoryEcosystemSearchCacheRepository,
+  createMockZhihuSearchSource,
+  createRealZhihuSearchSource,
+  hasRealSearchCredentials,
+  normaliseDiscussionsRequest,
+  searchEcosystemDiscussions,
+} from './providers/ecosystem/index.mjs';
+import {
   bootstrapSessionFromWork,
   commitNarrativeEvent,
   commitOpeningEvent,
@@ -429,6 +437,24 @@ const { repository: storyRepo, fixtures: storyFixtures } = createSeededRepositor
 // story_version the seed loop did not cover.
 const communityProfileRepo = createInMemoryCommunityProfileRepository();
 seedCommunityProfiles(storyRepo, communityProfileRepo);
+
+// ClickUp 16.2 — 知乎搜索 (POST /v1/ecosystem/discussions) wiring.
+//
+// The ecosystem search route is intentionally NOT bound to the active
+// STORY_OUTSIDE_PROVIDER env var. The story-content side can be `mock`
+// or `real` independently from ecosystem search. The rule is:
+//
+//   * If ZHIHU_OAUTH_APP_KEY + ZHIHU_ACCESS_SECRET are configured AND
+//     STORY_OUTSIDE_ECOSYSTEM_SEARCH=real → use the real HTTP source.
+//   * Otherwise (the default) → use the mock source.
+//
+// The cache repository is ALWAYS the in-memory pair-key cache. Each
+// entry is keyed by (story_version_uuid, community_profile_version,
+// query_hash); there is no global cache row.
+const ecosystemSearchCacheRepo = createInMemoryEcosystemSearchCacheRepository();
+const ecosystemSearchAdapter = (process.env.STORY_OUTSIDE_ECOSYSTEM_SEARCH === 'real' && hasRealSearchCredentials())
+  ? createRealZhihuSearchSource()
+  : createMockZhihuSearchSource();
 
 // sessionService deliberately keeps its state private to the repository. The
 // route layer keeps only the request's non-secret pinned metadata so recovery
@@ -2049,6 +2075,61 @@ async function handleRequest(req, res) {
     } catch (err) {
       return sessionErrorResponse(res, err);
     }
+  }
+
+  // ---------------------------------------------------------------------
+  // ClickUp 16.2 — ecosystem search façade (public surface).
+  //
+  // POST /v1/ecosystem/discussions — pair-key cached 知乎搜索.
+  //
+  // Hard public-contract guarantees (ChatGPT review P1 fixes):
+  //   * response body carries neither the demo banner nor the dev banner.
+  //   * response body carries no internal admin/dev surface references.
+  //   * the route never echoes the request body.
+  //   * unknown / forbidden top-level keys are rejected with 400.
+  //   * upstream errors produce a graceful unavailable outcome, not a
+  //     500 — the core /api/sessions chain must keep working.
+  // ---------------------------------------------------------------------
+  if (pathname === '/v1/ecosystem/discussions') {
+    if (method !== 'POST') {
+      res.setHeader('allow', 'POST');
+      return jsonResponse(res, 405, {
+        error: 'method_not_allowed',
+        message: `Method ${method} is not allowed for ${pathname}.`,
+      });
+    }
+    let body = {};
+    try {
+      body = await readJsonBody(req);
+    } catch (err) {
+      const { status, code } = classifyProviderError(err);
+      return jsonResponse(res, status, {
+        error: code,
+        message: 'invalid JSON body',
+      });
+    }
+    const normalised = normaliseDiscussionsRequest(body);
+    if (!normalised.ok) {
+      return jsonResponse(res, 400, {
+        error: normalised.code,
+        message: normalised.message,
+        field: normalised.field,
+      });
+    }
+    const outcome = await searchEcosystemDiscussions({
+      cache: ecosystemSearchCacheRepo,
+      adapter: ecosystemSearchAdapter,
+      query: normalised.value.query,
+      story_uuid: normalised.value.story_uuid,
+      story_version_uuid: normalised.value.story_version_uuid,
+      community_profile_version: normalised.value.community_profile_version,
+      limit: normalised.value.limit,
+    });
+    // outcome already strips internal banner fields; we do not
+    // decorate with `demo` either (公开契约 only — the route lives
+    // in the public surface, not the dev/admin surface).
+    const status = outcome.ecosystem_status === 'unavailable' ? 200 : 200;
+    return jsonResponse(res, status, outcome);
   }
 
   // Root → static

@@ -35,16 +35,59 @@ const STATE = {
   replay: null,
   replayIndex: 0,
   mounted: false,
+  ecosystemDiscussions: null,
+  ecosystemError: null,
 };
 
 // ---------- API helper ----------
 
-async function api(path) {
-  const res = await fetch(path, { headers: { accept: 'application/json' } });
+/**
+ * Generic JSON helper used by both GET reads (no options) and POST
+ * writes (with `method`, `body`, `headers`).
+ *
+ * ClickUp 16.2 review (ChatGPT P1): the previous signature was
+ * `async function api(path)` which silently dropped the `options`
+ * argument. When the ending page wanted to POST
+ * `/v1/ecosystem/discussions` with a JSON body, the body vanished
+ * and the request fell back to GET — which the server then refused
+ * with 405, leaving the related-discussions block permanently blank.
+ *
+ * Now `api(path, options = {})` is the canonical signature; callers
+ * MAY pass `options = { method, body, headers }`. The default
+ * `accept: application/json` header is merged with any caller
+ * headers; explicit `content-type: application/json` is added when
+ * a string / object body is supplied.
+ */
+async function api(path, options = {}) {
+  const opts = options && typeof options === 'object' ? options : {};
+  const headers = Object.assign(
+    { accept: 'application/json' },
+    opts.headers && typeof opts.headers === 'object' ? opts.headers : {},
+  );
+  let body = opts.body;
+  if (body !== undefined && body !== null) {
+    if (typeof body === 'string') {
+      // assume caller already stringified
+      if (!headers['content-type'] && !headers['Content-Type']) {
+        headers['content-type'] = 'application/json';
+      }
+    } else if (typeof body === 'object') {
+      body = JSON.stringify(body);
+      if (!headers['content-type'] && !headers['Content-Type']) {
+        headers['content-type'] = 'application/json';
+      }
+    }
+  }
+  const fetchOptions = Object.assign({}, opts, {
+    method: opts.method || (body !== undefined && body !== null ? 'POST' : 'GET'),
+    headers,
+  });
+  if (body !== undefined && body !== null) fetchOptions.body = body;
+  const res = await fetch(path, fetchOptions);
   let data = null;
   try { data = await res.json(); } catch { data = null; }
   if (!res.ok) {
-    const err = new Error((data && data.message) || data && data.error || `http_${res.status}`);
+    const err = new Error((data && data.message) || (data && data.error) || `http_${res.status}`);
     err.code = data && data.error;
     err.status = res.status;
     throw err;
@@ -66,6 +109,75 @@ async function fetchProjections(sessionUuid) {
     originalTimeline: originalResult.status === 'fulfilled' ? originalResult.value : { error: originalResult.reason },
     replay: replayResult.status === 'fulfilled' ? replayResult.value : { error: replayResult.reason },
   };
+}
+
+/**
+ * Build the keyword overlap + tag-match scoring used to pick related
+ * discussions for an ending page. Pure: never calls the network,
+ * never reaches into LLM APIs. The result is a stable ranking so the
+ * UI block is deterministic across renders.
+ */
+function pickRelatedDiscussions(ending, discussions) {
+  if (!Array.isArray(discussions) || discussions.length === 0) return [];
+  const storyTitle = ending && typeof ending.ending_title === 'string' ? ending.ending_title : '';
+  const summary = ending && typeof ending.ending_summary === 'string' ? ending.ending_summary : '';
+  const haystack = `${storyTitle} ${summary}`.toLowerCase();
+  const keywords = tokenise(haystack);
+  const scored = [];
+  for (const d of discussions) {
+    const text = `${d.title || ''} ${d.snippet || ''}`.toLowerCase();
+    let overlap = 0;
+    for (const kw of keywords) {
+      if (kw.length < 2) continue;
+      if (text.includes(kw)) overlap += 1;
+    }
+    // tag match: if the discussion source says "mock" with profile tag,
+    // prefer discussions that share a community_profile_version label.
+    let tagBonus = 0;
+    if (typeof d.snippet === 'string' && d.snippet.includes('profile=')) tagBonus += 1;
+    scored.push({ d, score: overlap * 2 + tagBonus + (d.score || 0) / 1000 });
+  }
+  scored.sort((a, b) => b.score - a.score);
+  return scored.map((x) => x.d);
+}
+
+function tokenise(s) {
+  if (!s) return [];
+  // CJK char-level tokenisation + ASCII word split.
+  const tokens = [];
+  for (let i = 0; i < s.length; i += 1) {
+    const code = s.charCodeAt(i);
+    if (code >= 0x4e00 && code <= 0x9fff) tokens.push(s.charAt(i));
+  }
+  const ascii = (s.match(/[a-z0-9]{2,}/g) || []);
+  return tokens.concat(ascii);
+}
+
+/**
+ * POST /v1/ecosystem/discussions. We pass `options` so the helper
+ * actually sends a JSON body (ClickUp 16.2 P1 fix).
+ */
+async function fetchEcosystemDiscussions(input) {
+  const body = {
+    query: (input && typeof input.query === 'string' ? input.query : '').trim(),
+    limit: 5,
+  };
+  if (!body.query) {
+    return { discussions: [], provenance: 'unavailable', error: { code: 'empty_query', message: 'no query' } };
+  }
+  if (typeof input.story_uuid === 'string' && input.story_uuid) body.story_uuid = input.story_uuid;
+  if (typeof input.story_version_uuid === 'string' && input.story_version_uuid) body.story_version_uuid = input.story_version_uuid;
+  if (typeof input.community_profile_version === 'string' && input.community_profile_version) body.community_profile_version = input.community_profile_version;
+  try {
+    const data = await api('/v1/ecosystem/discussions', {
+      method: 'POST',
+      body,
+      headers: { 'content-type': 'application/json' },
+    });
+    return data;
+  } catch (err) {
+    return { discussions: [], provenance: 'unavailable', error: { code: err && err.code || 'http_error', message: err && err.message || 'failed' } };
+  }
 }
 
 // ---------- DOM helpers ----------
@@ -266,6 +378,33 @@ function renderReplaySection(replay) {
   );
 }
 
+function renderRelatedDiscussionsSection(ending) {
+  const list = Array.isArray(STATE.ecosystemDiscussions) ? STATE.ecosystemDiscussions : [];
+  const error = STATE.ecosystemError;
+  const header = el('h2', {}, '社区讨论');
+  const meta = el('p', { class: 'ending-eco-meta' },
+    error
+      ? `社区讨论暂不可用（${error.code || 'unavailable'}）`
+      : `来自 知乎 的相关讨论 · provenance=${list.length > 0 ? (STATE.ecosystemProvenance || 'cache') : 'unavailable'}`);
+  const items = list.length === 0
+    ? el('p', { class: 'ending-eco-empty' }, '本次结局暂时没有匹配的社区讨论。')
+    : el('ul', { class: 'ending-eco-list' },
+        ...list.slice(0, 5).map((d) => el('li', { class: 'ending-eco-item', dataset: { source: d.source || 'unknown' } },
+          el('a', { href: d.url, target: '_blank', rel: 'noopener noreferrer', class: 'ending-eco-link' },
+            d.title || '(no title)'),
+          el('span', { class: 'ending-eco-snippet' }, d.snippet || ''),
+          el('span', { class: 'ending-eco-source' }, d.source || ''),
+        )),
+      );
+  const relatedTo = ending && ending.ending_title ? `基于结局 “${ending.ending_title}” 的关键词重叠匹配` : '基于关键词重叠匹配';
+  return el('section', { class: 'ending-section ending-eco', dataset: { section: 'related-discussions' } },
+    header,
+    el('p', { class: 'ending-eco-related-to' }, relatedTo),
+    meta,
+    items,
+  );
+}
+
 function renderAttribution(originalTimeline) {
   const sourceAttribution = originalTimeline && originalTimeline.source_attribution;
   return el('section', { class: 'ending-section ending-attribution', dataset: { section: 'attribution' } },
@@ -361,8 +500,68 @@ async function mount({ sessionUuid, sessionMeta } = {}) {
   STATE.originalTimeline = projections.originalTimeline && !projections.originalTimeline.error ? projections.originalTimeline : null;
   STATE.replay = projections.replay && !projections.replay.error ? projections.replay : null;
   STATE.replayIndex = 0;
+  // ClickUp 16.2 — fetch related ecosystem discussions. Failures are
+  // captured into STATE.ecosystemError so the render block can show a
+  // friendly "unavailable" note without affecting the rest of the page.
+  await loadEcosystemDiscussionsForEnding(STATE.ending, sessionMeta);
   render(screen, sessionMeta || {});
   STATE.mounted = true;
+}
+
+/**
+ * Derive a search query from the ending (title + first key choice +
+ * first character outcome), then POST /v1/ecosystem/discussions.
+ * The result is filtered with `pickRelatedDiscussions` (keyword
+ * overlap + tag match, no LLM) so the block shows only genuinely
+ * related entries.
+ */
+async function loadEcosystemDiscussionsForEnding(ending, sessionMeta) {
+  STATE.ecosystemDiscussions = [];
+  STATE.ecosystemError = null;
+  STATE.ecosystemProvenance = null;
+  if (!ending) return;
+  const query = buildEcosystemQuery(ending);
+  if (!query) {
+    STATE.ecosystemError = { code: 'no_query', message: 'no query derivable from ending' };
+    return;
+  }
+  const storyUuid = sessionMeta && sessionMeta.storyUuid ? sessionMeta.storyUuid : null;
+  const storyVersionUuid = sessionMeta && sessionMeta.storyVersionUuid ? sessionMeta.storyVersionUuid : null;
+  const communityProfileVersion = sessionMeta && sessionMeta.communityProfileVersion ? sessionMeta.communityProfileVersion : null;
+  const result = await fetchEcosystemDiscussions({
+    query,
+    story_uuid: storyUuid,
+    story_version_uuid: storyVersionUuid,
+    community_profile_version: communityProfileVersion,
+  });
+  if (result && Array.isArray(result.discussions)) {
+    STATE.ecosystemProvenance = result.provenance || 'cache';
+    if (result.ecosystem_status === 'unavailable') {
+      STATE.ecosystemError = result.error || { code: 'unavailable', message: 'unavailable' };
+      STATE.ecosystemDiscussions = [];
+    } else {
+      STATE.ecosystemDiscussions = pickRelatedDiscussions(ending, result.discussions);
+      if (STATE.ecosystemDiscussions.length === 0) {
+        // empty result is not an error — just no matches.
+        STATE.ecosystemError = null;
+      }
+    }
+  } else {
+    STATE.ecosystemError = (result && result.error) || { code: 'unknown', message: 'unknown' };
+  }
+}
+
+function buildEcosystemQuery(ending) {
+  const parts = [];
+  if (typeof ending.ending_title === 'string') parts.push(ending.ending_title);
+  if (Array.isArray(ending.key_choices) && ending.key_choices.length > 0) {
+    parts.push(String(ending.key_choices[0]).slice(0, 40));
+  }
+  if (Array.isArray(ending.character_outcomes) && ending.character_outcomes.length > 0) {
+    const first = ending.character_outcomes[0];
+    if (first && typeof first.label === 'string') parts.push(first.label);
+  }
+  return parts.filter(Boolean).join(' ').slice(0, 256);
 }
 
 function render(screen, sessionMeta) {
@@ -389,6 +588,7 @@ function render(screen, sessionMeta) {
   const comparison = renderComparisonSection(STATE.originalTimeline, STATE.ending, STATE.replay); if (comparison) blocks.push(comparison);
   const replay = renderReplaySection(STATE.replay);
   blocks.push(replay);
+  blocks.push(renderRelatedDiscussionsSection(STATE.ending));
   blocks.push(renderAttribution(STATE.originalTimeline));
   for (const block of blocks) screen.appendChild(block);
   attachReplayHandlers();
@@ -404,6 +604,9 @@ function teardown() {
   STATE.originalTimeline = null;
   STATE.replay = null;
   STATE.replayIndex = 0;
+  STATE.ecosystemDiscussions = null;
+  STATE.ecosystemError = null;
+  STATE.ecosystemProvenance = null;
   showScreen('player');
 }
 
