@@ -136,7 +136,7 @@ try {
     check('bootstrap response carries state', typeof r.data?.state === 'string');
     check('bootstrap response carries opening_cursor', Number.isInteger(r.data?.opening_cursor));
     check('bootstrap response carries revision=0', r.data?.revision === 0);
-    check('bootstrap response includes nested session snapshot', r.data?.session?.session_uuid === r.data?.session_uuid);
+    check('bootstrap response does NOT include nested raw session snapshot', r.data?.session === undefined);
     check('bootstrap response carries pinned metadata', r.data?.pinned?.role_id === 'stranger');
     check('bootstrap does NOT advertise demo-user-09 string', !/demo-user-09/.test(JSON.stringify(r.data || {})));
     check('bootstrap does NOT advertise mock-09 string', !/mock-09/.test(JSON.stringify(r.data || {})));
@@ -203,22 +203,48 @@ try {
   }
 
   // -----------------------------------------------------------------
-  // /api/sessions/:uuid — recover + opening commit chain
+  // PR #10 review (B1, 2026-09-06) — negative contract for the public
+  // POST /api/sessions bootstrap surface. The browser is only allowed
+  // to send { work_id, role_id }; a client-supplied `identity` (or any
+  // other extra top-level key) MUST be rejected with a 400, and the
+  // response MUST NOT echo the offending values back. The response
+  // also MUST NOT expose internal server fields (user_ref, model,
+  // prompt) via the public raw `session` snapshot.
   // -----------------------------------------------------------------
-  // Create a stable session for the rest of the test by re-using the
-  // bootstrap session (already in 'opening' state, cursor=0). We
-  // re-bootstrap with an explicit identity to keep the test re-runnable
-  // and to confirm the helper accepts identity overrides.
   {
-    const r = await post('/api/sessions', {
+    const probeBody = {
       work_id: 'cafe-rain',
       role_id: 'stranger',
-      identity: { user_ref: 'public-session-test-user', model: 'story-outside-default', prompt: 'public-session-test-prompt' },
-    });
-    check('bootstrap with explicit identity 200', r.response.status === 200);
-    check('bootstrap pins role_id correctly', r.data?.session?.role_id === 'stranger');
-    check('bootstrap echoes identity.user_ref on pinned', r.data?.pinned?.user_ref === 'public-session-test-user');
-    bootstrap.session_uuid = r.data.session_uuid;
+      identity: { user_ref: 'probe-user', model: 'probe-model', prompt: 'probe-prompt' },
+      foo: 'bar',
+    };
+    const r = await post('/api/sessions', probeBody);
+    check('bootstrap with extra fields is 400 validation_failed (whitelist)',
+      r.response.status === 400 && r.data?.error === 'validation_failed');
+    const wire = JSON.stringify(r.data || {});
+    check('whitelist-rejected response does NOT echo probe-user string', !/probe-user/.test(wire));
+    check('whitelist-rejected response does NOT echo probe-model string', !/probe-model/.test(wire));
+    check('whitelist-rejected response does NOT echo probe-prompt string', !/probe-prompt/.test(wire));
+    check('whitelist-rejected response does NOT echo foo=bar string', !/bar/.test(wire));
+    check('whitelist-rejected response does NOT carry DEV_FLAG banner', r.data?.dev === undefined);
+  }
+  // Defense in depth: even if the whitelist check is bypassed in a
+  // future regression, the public response MUST NOT surface the
+  // server-side user_ref / model / prompt fields. Bootstrap a clean
+  // session and grep the response body for those three field names.
+  {
+    const clean = await post('/api/sessions', { work_id: 'cafe-rain', role_id: 'stranger' });
+    const wire = JSON.stringify(clean.data || {});
+    check('public bootstrap response does NOT include user_ref field', !/"user_ref"\s*:/.test(wire));
+    check('public bootstrap response does NOT include model field', !/"model"\s*:/.test(wire));
+    check('public bootstrap response does NOT include prompt field', !/"prompt"\s*:/.test(wire));
+    check('public bootstrap response does NOT include nested session snapshot', clean.data?.session === undefined);
+    check('public bootstrap pinned does NOT include user_ref', clean.data?.pinned?.user_ref === undefined);
+    check('public bootstrap pinned does NOT include model', clean.data?.pinned?.model === undefined);
+    check('public bootstrap pinned does NOT include prompt', clean.data?.pinned?.prompt === undefined);
+    check('public bootstrap pinned DOES include role_id', clean.data?.pinned?.role_id === 'stranger');
+    check('public bootstrap pinned DOES include generation_profile', typeof clean.data?.pinned?.generation_profile === 'object');
+    bootstrap.session_uuid = clean.data.session_uuid;
   }
   const liveSessionUuid = bootstrap.session_uuid;
 
@@ -418,10 +444,77 @@ try {
     const uuid = r.data.session_uuid;
     const missing = await post(`/api/sessions/${uuid}/first-choice`, {});
     check('first-choice missing snapshot 400', missing.response.status === 400 && missing.data?.error === 'missing_snapshot');
+    check('first-choice missing snapshot does NOT carry DEV_FLAG banner', missing.data?.dev === undefined);
     const mismatch = await post(`/api/sessions/${uuid}/first-choice`, {
       snapshot: { session_uuid: '00000000-0000-4000-9000-000000000999' },
     });
     check('first-choice session_uuid mismatch 400', mismatch.response.status === 400 && mismatch.data?.error === 'session_uuid_mismatch');
+    check('first-choice session_uuid_mismatch does NOT carry DEV_FLAG banner', mismatch.data?.dev === undefined);
+  }
+
+  // -----------------------------------------------------------------
+  // PR #10 review (B2, 2026-09-06) — negative contract for the public
+  // /api/sessions/:uuid/first-choice error path. Per the review: the
+  // public response MUST NOT carry the DEV_FLAG banner, MUST NOT echo
+  // internal "admin/dev routes are demo-only" reasoning, and MUST
+  // surface a fixed public-facing message for malformed JSON.
+  // -----------------------------------------------------------------
+  {
+    const r = await post('/api/sessions', { work_id: 'cafe-rain', role_id: 'stranger' });
+    const uuid = r.data.session_uuid;
+    // (1) malformed JSON hits the readJsonBody catch path.
+    const malformed = await request(`/api/sessions/${uuid}/first-choice`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: '{not-json',
+    });
+    check('first-choice malformed JSON is 400', malformed.response.status === 400);
+    check('first-choice malformed JSON error is bad_json', malformed.data?.error === 'bad_json');
+    check('first-choice malformed JSON carries fixed public message',
+      malformed.data?.message === 'Invalid JSON in request body.');
+    check('first-choice malformed JSON does NOT carry DEV_FLAG banner',
+      malformed.data?.dev === undefined);
+    const malformedWire = JSON.stringify(malformed.data || {});
+    check('first-choice malformed JSON does NOT leak "admin/dev routes are demo-only"',
+      !/admin\/dev routes are demo-only/i.test(malformedWire));
+    check('first-choice malformed JSON does NOT leak dev_only=true',
+      !/dev_only/.test(malformedWire));
+    // (2) service-error catch path: feed a snapshot whose session_uuid
+    // matches the URL UUID but whose body is structurally invalid in
+    // a way that makes markFirstChoiceConsumed throw a plain Error.
+    // The handler must still return JSON with PUBLIC_DECORATE (no DEV_FLAG).
+    // We trigger the throw by passing a snapshot with session_uuid set
+    // to the URL UUID, then deliberately invoking a path that throws
+    // inside the service — the only path we can exercise via HTTP that
+    // gets through the input guards is sending a snapshot whose value
+    // is an object missing required fields the service validates after
+    // the URL-mismatch guard. To force that throw without HTTP trickery,
+    // we route through a synthetic snapshot: send snapshot.session_uuid
+    // matching the URL, then add a snapshot that the service rejects
+    // because the repository's sessionFirstChoices Map is keyed by
+    // session_uuid (no throw there) — see storyService.mjs:449.
+    //
+    // The repository is robust for this call path, so we instead
+    // assert the invariant directly: the *dev* field on EVERY error
+    // response from /api/sessions/:uuid/first-choice is undefined.
+    const cases = [
+      { label: 'empty body', payload: {} },
+      { label: 'snapshot=null', payload: { snapshot: null } },
+      { label: 'snapshot=string', payload: { snapshot: 'oops' } },
+      { label: 'snapshot=array', payload: { snapshot: [] } },
+      { label: 'snapshot without session_uuid', payload: { snapshot: { foo: 'bar' } } },
+      { label: 'snapshot with mismatched session_uuid', payload: { snapshot: { session_uuid: '00000000-0000-4000-9000-000000000999' } } },
+    ];
+    for (const c of cases) {
+      const probe = await post(`/api/sessions/${uuid}/first-choice`, c.payload);
+      check(`first-choice ${c.label} error does NOT carry DEV_FLAG banner`,
+        probe.data?.dev === undefined,
+        `status=${probe.response.status} error=${probe.data?.error} dev=${JSON.stringify(probe.data?.dev)}`);
+      const probeWire = JSON.stringify(probe.data || {});
+      check(`first-choice ${c.label} error does NOT leak admin/dev internal reason`,
+        !/admin\/dev routes are demo-only/i.test(probeWire),
+        `wire=${probeWire}`);
+    }
   }
 
   // -----------------------------------------------------------------

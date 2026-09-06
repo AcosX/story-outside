@@ -1519,7 +1519,6 @@ async function handleRequest(req, res) {
   // to the deterministic demo provider regardless.
   // ---------------------------------------------------------------------
   const PUBLIC_DECORATE = () => ({ demo: currentDemoFlag() });
-  const PUBLIC_DECORATE_DEV = () => ({ demo: currentDemoFlag(), dev: DEV_FLAG });
 
   // POST /api/sessions — atomic session bootstrap from a story + role.
   if (method === 'POST' && pathname === '/api/sessions') {
@@ -1530,6 +1529,23 @@ async function handleRequest(req, res) {
       return sessionErrorResponse(res, err);
     }
     if (!validObject(body)) {
+      return jsonResponse(res, 400, {
+        error: 'validation_failed',
+        message: 'The session bootstrap request is invalid.',
+        ...PUBLIC_DECORATE(),
+      });
+    }
+    // PR #10 review (B1, 2026-09-06): public POST /api/sessions is the
+    // browser-only bootstrap surface. The player is contractually only
+    // allowed to send { work_id, role_id } — server defaults choose
+    // user_ref / model / prompt and the browser never sees them. Reject
+    // any other top-level key (including a client-supplied `identity`
+    // override) with a generic 400 so the request body is never echoed
+    // back. The whitelist is strict: unknown fields are dropped, the
+    // response is fixed-text, and no internal value leaks.
+    const allowedBootstrapKeys = ['work_id', 'role_id'];
+    const unknownBootstrapKeys = Object.keys(body).filter((k) => !allowedBootstrapKeys.includes(k));
+    if (unknownBootstrapKeys.length > 0) {
       return jsonResponse(res, 400, {
         error: 'validation_failed',
         message: 'The session bootstrap request is invalid.',
@@ -1553,22 +1569,24 @@ async function handleRequest(req, res) {
       });
     }
     const sessionUuid = randomUUID();
-    const identity = body.identity && typeof body.identity === 'object'
-      ? body.identity
-      : null;
     try {
+      // PR #10 review (B1): we deliberately do NOT pass an `identity`
+      // override from the request body. The bootstrap helper picks
+      // server-side defaults for user_ref / model / prompt and pins
+      // them into the canonical session; the player never sees them.
       const result = await bootstrapSessionFromWork({
         repository: storyRepo,
         provider,
         session_uuid: sessionUuid,
         work_id: body.work_id,
         role_id: body.role_id,
-        identity,
       });
-      // Pin the session's metadata so /recover can return it. The
-      // values are server defaults (browser does not see them), so we
-      // mirror whatever bootstrapSessionFromWork accepted — the helper
-      // already enforced sane defaults for anonymous callers.
+      // Pin the session's metadata so /recover can return it. Per the
+      // public façade contract the browser only needs role_id (so a
+      // /recover call can echo it back) plus the cached generation
+      // profile (so a replay knows which cache row to bind to). The
+      // server-side user_ref / model / prompt values are intentionally
+      // NOT mirrored here — they are internal policy, not player state.
       const profile = {};
       for (const key of ['cache_uuid', 'story_uuid', 'story_version_uuid', 'generation_hash', 'identifier', 'rules_version', 'locale', 'variant']) {
         if (result.session.generation_profile && result.session.generation_profile[key] !== undefined) {
@@ -1576,10 +1594,7 @@ async function handleRequest(req, res) {
         }
       }
       const pinned = {
-        user_ref: result.session.user_ref,
         role_id: result.session.role_id,
-        model: result.session.model,
-        prompt: result.session.prompt,
         generation_profile: profile,
       };
       sessionPinnedMetadata.set(sessionUuid, pinned);
@@ -1608,7 +1623,6 @@ async function handleRequest(req, res) {
         opening_cursor: result.session.opening_cursor,
         cache_reused: result.cache_reused,
         version_reused: result.version_reused,
-        session: { ...result.session },
         pinned,
       });
     } catch (err) {
@@ -1888,8 +1902,16 @@ async function handleRequest(req, res) {
     try {
       body = await readJsonBody(req);
     } catch (err) {
-      const { status, code } = classifyProviderError(err);
-      return jsonResponse(res, status, { error: code, ...PUBLIC_DECORATE_DEV() });
+      // PR #10 review (B2, 2026-09-06): public first-choice MUST NOT
+      // leak the DEV_FLAG banner. Malformed JSON is a 400 with a
+      // fixed, public message — the raw error from readJsonBody must
+      // never reach the wire, and PUBLIC_DECORATE (not _DEV) is the
+      // only banner that may appear on a public response.
+      return jsonResponse(res, 400, {
+        error: 'bad_json',
+        message: 'Invalid JSON in request body.',
+        ...PUBLIC_DECORATE(),
+      });
     }
     if (!body.snapshot || typeof body.snapshot !== 'object') {
       return jsonResponse(res, 400, {
@@ -1918,11 +1940,17 @@ async function handleRequest(req, res) {
       });
       return jsonResponse(res, 200, { ...PUBLIC_DECORATE(), result });
     } catch (err) {
+      // PR #10 review (B2): the service-error catch on the public
+      // first-choice surface must also use PUBLIC_DECORATE so the
+      // DEV_FLAG banner does not leak into the public response. The
+      // error code still comes from classifyProviderError so the wire
+      // contract is preserved; the internal `err.message` is
+      // intentionally NOT echoed because service-layer messages are
+      // not part of the public API.
       const { status, code } = classifyProviderError(err);
       return jsonResponse(res, status, {
         error: code,
-        message: String(err && err.message ? err.message : err),
-        ...PUBLIC_DECORATE_DEV(),
+        ...PUBLIC_DECORATE(),
       });
     }
   }
