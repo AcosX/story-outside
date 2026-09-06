@@ -84,6 +84,7 @@ import {
   getMockFollowingIdentity,
   isValidUserUuid,
 } from './ecosystem/following/index.mjs';
+import { OAUTH_PENDING_USER, currentUserProvider } from './auth/currentUserProvider.mjs';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 const ROOT = resolve(__dirname, '..');
@@ -467,87 +468,23 @@ function publicDecorate() {
   return PUBLIC_DECORATE_FOR_ECOSYSTEM();
 }
 
-// ClickUp 16.3 P1.1 cookie-based auth seam. The cookie value IS the
-// `user_uuid`. There is no DB-backed user table; the demo catalog is
-// the in-memory fixture list. We deliberately do NOT trust any header
-// or body field for the caller identity.
-const STORY_OUTSIDE_SESSION_COOKIE = 'story_outside_session';
-// Cookie path is `/` so the public bootstrap, follow, share surfaces
-// all see the same cookie. `HttpOnly` keeps it out of JS context;
-// `SameSite=Lax` is the demo-mode default; `Secure` is intentionally
-// off so the test suite (plain HTTP on 127.0.0.1) can verify the
-// behavior without TLS. A real deployment would set `Secure`.
-const COOKIE_MAX_AGE_SECONDS = 60 * 60 * 24 * 30; // 30 days
-
-function parseCookieHeader(headerValue) {
-  /** @type {Record<string, string>} */
-  const out = {};
-  if (typeof headerValue !== 'string' || !headerValue) return out;
-  for (const part of headerValue.split(';')) {
-    const idx = part.indexOf('=');
-    if (idx <= 0) continue;
-    const name = part.slice(0, idx).trim();
-    const value = part.slice(idx + 1).trim();
-    if (!name) continue;
-    try {
-      out[name] = decodeURIComponent(value);
-    } catch {
-      out[name] = value;
-    }
-  }
-  return out;
-}
-
-/**
- * Resolve the caller's `user_uuid` from the `story_outside_session`
- * cookie. Returns `null` for a missing / malformed cookie — the route
- * layer translates that to a 401. We do NOT consult the request body,
- * any header, or any URL parameter.
- *
- * Implementation note: the literal `req.cookies.story_outside_session`
- * shape is exposed below so the grep verification can pin "the cookie
- * is the auth seam" without inferring it from the implementation. The
- * actual cookie is parsed from the `Cookie` header (Node has no
- * `req.cookies` API in core) but the cookie name is referenced here as
- * a stable identifier.
- *
- * @param {import('node:http').IncomingMessage} req
- * @returns {string | null}
- */
-function readSessionUserUuid(req) {
-  // ClickUp 16.3 P1.1: `req.cookies.story_outside_session` is the
-  // authoritative auth identifier. Anything else is ignored.
-  const cookies = parseCookieHeader(req.headers.cookie);
-  const value = cookies[STORY_OUTSIDE_SESSION_COOKIE];
-  if (!isValidUserUuid(value)) return null;
-  return /** @type {string} */ (value);
-}
-
-/**
- * Resolve a stable player identity. If the cookie is present and
- * valid we honour it; otherwise we mint a fresh UUID and seed the
- * cookie via the supplied `res` writer. The minted UUID is NOT
- * persisted to a user table — the demo catalog tracks nothing across
- * requests except what the cookie carries.
- *
- * @param {import('node:http').IncomingMessage} req
- * @param {import('node:http').ServerResponse} res
- * @returns {{ user_uuid: string, minted: boolean }}
- */
-function ensureSessionUserUuid(req, res) {
-  const existing = readSessionUserUuid(req);
-  if (existing) return { user_uuid: existing, minted: false };
-  const fresh = randomUUID();
-  // Patch the Set-Cookie header onto the response. The route layer
-  // continues to call `jsonResponse(res, ...)` AFTER this returns, and
-  // jsonResponse uses writeHead which merges with headers we've
-  // already queued via `res.setHeader`.
-  res.setHeader(
-    'Set-Cookie',
-    `${STORY_OUTSIDE_SESSION_COOKIE}=${fresh}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${COOKIE_MAX_AGE_SECONDS}`,
-  );
-  return { user_uuid: fresh, minted: true };
-}
+// ClickUp 16.3 P1 v1-2 rebuild (主人 2026-09-07 04:21 巡检): the auth
+// seam is a SINGLE fixed function — `currentUserProvider(req)` from
+// src/auth/currentUserProvider.mjs — which returns OAUTH_PENDING_USER
+// regardless of the request. There is no cookie, no fake-user header,
+// no per-browser random user_uuid, no signed-token login path, and
+// no body-derived identity. Every route resolves the caller through
+// `currentUserProvider(req)`. When OAuth lands, only
+// src/auth/currentUserProvider.mjs changes.
+//
+// The previous v1 cookie path
+// (`STORY_OUTSIDE_SESSION_COOKIE`, `parseCookieHeader`,
+// `readSessionUserUuid`, `ensureSessionUserUuid`,
+// `requireAuthUserUuid`) is gone. v2's signed-login path is NOT
+// cherry-picked. The single helper that the rest of the file touches
+// is:
+//   const auth = currentUserProvider(req);
+//   // auth.user_uuid, auth.display_name, auth.auth_source
 
 /**
  * Map a FollowingError to an HTTP status. Used by every /v1/ecosystem
@@ -1734,6 +1671,26 @@ async function handleRequest(req, res) {
   // ---------------------------------------------------------------------
   const PUBLIC_DECORATE = () => ({ demo: currentDemoFlag() });
 
+  // ClickUp 16.3 P1 v1-2: GET /api/auth/status — the browser calls
+  // this BEFORE bootstrapping a session so the player.js UI can show
+  // the OAuth-pending display name on the picker / ending screens.
+  // The endpoint is intentionally idempotent and side-effect free:
+  // the server's only job is to surface the canonical owner through
+  // `currentUserProvider(req)`. There is no body parsing, no cookie
+  // minting, and no Set-Cookie header is emitted.
+  if (method === 'GET' && pathname === '/api/auth/status') {
+    const auth = currentUserProvider(req);
+    return jsonResponse(res, 200, {
+      ...PUBLIC_DECORATE(),
+      authenticated: auth.auth_source !== 'oauth_pending' ? true : false,
+      owner: {
+        user_uuid: auth.user_uuid,
+        display_name: auth.display_name,
+        auth_source: auth.auth_source,
+      },
+    });
+  }
+
   // POST /api/sessions — atomic session bootstrap from a story + role.
   if (method === 'POST' && pathname === '/api/sessions') {
     let body = {};
@@ -1749,14 +1706,32 @@ async function handleRequest(req, res) {
         ...PUBLIC_DECORATE(),
       });
     }
-    // PR #10 review (B1, 2026-09-06): public POST /api/sessions is the
+    // PR #10 review (B1, 2026-09-06) + ClickUp 16.3 P1 v1-2
+    // (主人 2026-09-07 04:21 巡检): public POST /api/sessions is the
     // browser-only bootstrap surface. The player is contractually only
     // allowed to send { work_id, role_id } — server defaults choose
-    // user_ref / model / prompt and the browser never sees them. Reject
-    // any other top-level key (including a client-supplied `identity`
-    // override) with a generic 400 so the request body is never echoed
-    // back. The whitelist is strict: unknown fields are dropped, the
-    // response is fixed-text, and no internal value leaks.
+    // user_ref / model / prompt and the browser never sees them.
+    //
+    // Identity-shaped keys (`user_ref`, `user_uuid`, `user_id`,
+    // `identity`, `user`, `subject`, `actor`, `owner`) are explicitly
+    // FORBIDDEN on this surface and return 400 `forbidden_field` —
+    // they cannot be used to spoof the canonical owner because the
+    // server resolves identity through `currentUserProvider(req)`,
+    // not from the request.
+    const BOOTSTRAP_IDENTITY_KEYS = new Set([
+      'user_ref', 'user_uuid', 'user_id', 'identity',
+      'user', 'subject', 'actor', 'owner',
+    ]);
+    for (const k of Object.keys(body)) {
+      if (BOOTSTRAP_IDENTITY_KEYS.has(k)) {
+        return jsonResponse(res, 400, {
+          error: 'forbidden_field',
+          message: 'Identity-shaped fields are not allowed in the session bootstrap body.',
+          field: k,
+          ...PUBLIC_DECORATE(),
+        });
+      }
+    }
     const allowedBootstrapKeys = ['work_id', 'role_id'];
     const unknownBootstrapKeys = Object.keys(body).filter((k) => !allowedBootstrapKeys.includes(k));
     if (unknownBootstrapKeys.length > 0) {
@@ -1766,6 +1741,14 @@ async function handleRequest(req, res) {
         ...PUBLIC_DECORATE(),
       });
     }
+    // ClickUp 16.3 P1 v1-2: empty body is a legitimate request — it
+    // bootstraps the OAuth-pending canonical owner against the demo
+    // work + role defaults. This matches the wire contract the
+    // player uses before it has picked a story on the picker screen.
+    // We DO NOT change work_id/role_id when the client supplies them;
+    // we only fill in defaults when the body is absent.
+    if (!Object.prototype.hasOwnProperty.call(body, 'work_id')) body.work_id = 'cafe-rain';
+    if (!Object.prototype.hasOwnProperty.call(body, 'role_id')) body.role_id = 'stranger';
     if (typeof body.work_id !== 'string' || !body.work_id) {
       return jsonResponse(res, 400, {
         error: 'validation_failed',
@@ -1783,15 +1766,12 @@ async function handleRequest(req, res) {
       });
     }
     const sessionUuid = randomUUID();
-    // ClickUp 16.3 P1.1 (ChatGPT 2026-09-07 review): resolve the caller's
-    // canonical identity from the cookie BEFORE bootstrapping the session.
-    // If the cookie is missing or malformed, mint a fresh user_uuid and
-    // set the cookie so subsequent calls reuse the same principal. The
-    // user_uuid is then persisted into the canonical session record via
-    // `bootstrapSessionFromWork`, so the follow / share routes can
-    // verify ownership from internal state alone — the request body
-    // never carries the identity.
-    const auth = ensureSessionUserUuid(req, res);
+    // ClickUp 16.3 P1 v1-2 (主人 2026-09-07 04:21 巡检): the canonical
+    // session owner comes from `currentUserProvider(req)`. The fixed
+    // function returns OAUTH_PENDING_USER regardless of cookies,
+    // headers, or body. There is NO cookie minting, NO Set-Cookie
+    // header is emitted, and the player never supplies the identity.
+    const auth = currentUserProvider(req);
     try {
       // PR #10 review (B1): we deliberately do NOT pass an `identity`
       // override from the request body. The bootstrap helper picks
@@ -1803,8 +1783,8 @@ async function handleRequest(req, res) {
         session_uuid: sessionUuid,
         work_id: body.work_id,
         role_id: body.role_id,
-        // ClickUp 16.3 P1.2: canonical session owner comes from the
-        // cookie (via auth.user_uuid) — NEVER from the request body.
+        // ClickUp 16.3 P1 v1-2: canonical session owner comes from
+        // `currentUserProvider(req)` — NEVER from the request body.
         user_uuid: auth.user_uuid,
         // ClickUp 16.1 server.mjs wiring (2026-09-06): the public
         // POST /api/sessions route is the real-provider bootstrap
@@ -1858,6 +1838,15 @@ async function handleRequest(req, res) {
         cache_reused: result.cache_reused,
         version_reused: result.version_reused,
         pinned,
+        // ClickUp 16.3 P1 v1-2: echo the canonical owner back so the
+        // browser can render the OAuth-pending display name without
+        // minting its own. `auth_source === 'oauth_pending'` is the
+        // contract — the UI must NEVER treat this as a real identity.
+        owner: {
+          user_uuid: auth.user_uuid,
+          display_name: auth.display_name,
+          auth_source: auth.auth_source,
+        },
       });
     } catch (err) {
       return sessionErrorResponse(res, err);
@@ -2302,17 +2291,13 @@ async function handleRequest(req, res) {
     return false;
   }
 
+  // ClickUp 16.3 P1 v1-2 (主人 2026-09-07 04:21 巡检): identity is a
+  // SINGLE fixed function — there is no auth failure mode. The
+  // canonical owner is OAUTH_PENDING_USER. We deliberately do NOT
+  // return 401: every request resolves to the same identity, and the
+  // share / follow / friend-timelines surfaces always succeed.
   function requireAuthUserUuid(res, req) {
-    const userUuid = readSessionUserUuid(req);
-    if (!userUuid) {
-      jsonResponse(res, 401, {
-        error: 'unauthenticated',
-        message: 'A valid story_outside_session cookie is required.',
-        ...publicDecorate(),
-      });
-      return null;
-    }
-    return userUuid;
+    return currentUserProvider(req).user_uuid;
   }
 
   // POST /v1/ecosystem/follow — add a follow.
@@ -2422,6 +2407,26 @@ async function handleRequest(req, res) {
         ...publicDecorate(),
       });
     }
+    // ClickUp 16.3 P1 v1-2: in the OAuth-pending model the share
+    // handler takes NO body. The contract is strict — even an empty
+    // JSON object body is forbidden. The client must POST without a
+    // body (Content-Length: 0). The `Content-Length` header check
+    // below pins this contract to the wire.
+    const contentLengthRaw = req.headers['content-length'];
+    const contentLength = contentLengthRaw === undefined ? 0 : Number(contentLengthRaw);
+    if (!Number.isFinite(contentLength) || contentLength > 0) {
+      jsonResponse(res, 400, {
+        error: 'forbidden_field',
+        message: 'The /share request must not carry a body in the OAuth-pending build.',
+        field: 'body',
+        ...publicDecorate(),
+      });
+      return;
+    }
+    // Drain any body bytes (we still need to consume the stream so the
+    // keep-alive socket does not stall) and reject if anything was
+    // actually written. We do this with the existing readJsonBody so
+    // the rest of the handler logic stays symmetric with /api/sessions.
     let body = {};
     try {
       body = await readJsonBody(req);
@@ -2429,7 +2434,13 @@ async function handleRequest(req, res) {
       return sessionErrorResponse(res, err);
     }
     if (body && Object.keys(body).length > 0) {
-      if (rejectIdentityInBody(res, body, ['title', 'story_uuid', 'story_version_uuid'])) return;
+      jsonResponse(res, 400, {
+        error: 'forbidden_field',
+        message: 'The /share request must not carry a body in the OAuth-pending build.',
+        field: Object.keys(body)[0],
+        ...publicDecorate(),
+      });
+      return;
     }
     const authUuid = requireAuthUserUuid(res, req);
     if (!authUuid) return;
@@ -2438,11 +2449,18 @@ async function handleRequest(req, res) {
         storyRepository: storyRepo,
         sessionUuid: tail,
         ownerUuid: authUuid,
-        title: typeof body.title === 'string' ? body.title : undefined,
-        story_uuid: typeof body.story_uuid === 'string' ? body.story_uuid : undefined,
-        story_version_uuid: typeof body.story_version_uuid === 'string' ? body.story_version_uuid : undefined,
       });
-      return jsonResponse(res, 200, { ...publicDecorate(), share: row });
+      return jsonResponse(res, 200, {
+        ...publicDecorate(),
+        share: row,
+        // ClickUp 16.3 P1 v1-2: surface the canonical owner so the
+        // UI can render the OAuth-pending display name.
+        owner: {
+          user_uuid: currentUserProvider(req).user_uuid,
+          display_name: currentUserProvider(req).display_name,
+          auth_source: currentUserProvider(req).auth_source,
+        },
+      });
     } catch (err) {
       return sendFollowingError(res, err);
     }

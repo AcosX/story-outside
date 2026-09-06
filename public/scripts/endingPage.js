@@ -108,6 +108,16 @@ function renderHeader(ending, sessionMeta) {
       sessionMeta && sessionMeta.storyTitle ? `${sessionMeta.storyTitle} · ${sessionMeta.roleLabel || ''}` : ''),
     el('span', { class: 'ending-tag ending-tag-ai', id: 'ending-ai-tag', title: '本页 AI 生成的时间线仅供平行体验，不视为原作' },
       'AI 生成平行时间线'),
+    // ClickUp 16.3 P1 v1-2 (主人 2026-09-07 04:21 巡检): the
+    // canonical owner is rendered on the ending page so the player
+    // can see who they played as. In the OAuth-pending build this is
+    // always "待接入用户 (OAuth pending)". The server resolves
+    // identity via `currentUserProvider(req)` — the browser never
+    // mints a per-session user_uuid.
+    el('p', { class: 'ending-owner', id: 'ending-owner' },
+      sessionMeta && sessionMeta.ownerDisplayName
+        ? `你 · ${sessionMeta.ownerDisplayName}`
+        : '你 · 待接入用户 (OAuth pending)'),
   );
 }
 
@@ -353,6 +363,18 @@ async function mount({ sessionUuid, sessionMeta } = {}) {
   if (!screen) {
     throw new Error('endingPage.mount: #screen-ending not found in DOM');
   }
+  // ClickUp 16.3 P1 v1-2: fetch the canonical owner from
+  // /api/auth/status so the ending header can render the
+  // OAuth-pending display name. The sessionMeta fallback covers the
+  // case where the bootstrap path already cached the value and
+  // passed it through.
+  let ownerDisplayName = sessionMeta && sessionMeta.ownerDisplayName;
+  if (!ownerDisplayName) {
+    try {
+      const authStatus = await api('/api/auth/status');
+      ownerDisplayName = authStatus && authStatus.owner && authStatus.owner.display_name;
+    } catch { /* fall through to the OAuth-pending default */ }
+  }
   // Fetch the three projections in parallel; render whatever we get.
   const projections = sessionUuid
     ? await fetchProjections(sessionUuid)
@@ -361,7 +383,7 @@ async function mount({ sessionUuid, sessionMeta } = {}) {
   STATE.originalTimeline = projections.originalTimeline && !projections.originalTimeline.error ? projections.originalTimeline : null;
   STATE.replay = projections.replay && !projections.replay.error ? projections.replay : null;
   STATE.replayIndex = 0;
-  render(screen, sessionMeta || {});
+  render(screen, { ...(sessionMeta || {}), ownerDisplayName });
   STATE.mounted = true;
 }
 

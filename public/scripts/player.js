@@ -302,6 +302,14 @@ async function bootstrapSession({ story, role }) {
     state.generationProfile = (created.session && created.session.generation_profile)
       || (created.pinned && created.pinned.generation_profile)
       || { cache_uuid: created.cache_uuid };
+    // ClickUp 16.3 P1 v1-2: capture the canonical owner the server
+    // echoed back so the ending page can render the OAuth-pending
+    // display name without an extra round-trip.
+    if (created.owner) {
+      state.ownerDisplayName = created.owner.display_name || state.ownerDisplayName || '';
+      state.ownerAuthSource = created.owner.auth_source || state.ownerAuthSource || '';
+      if (state.ownerDisplayName) setText('#owner-display-name', state.ownerDisplayName);
+    }
     setText('#story-name', story.title);
     setText('#role-name', role.label);
     persistSessionContext();
@@ -1230,6 +1238,22 @@ function bindEvents() {
 async function bootstrap() {
   bindEvents();
   setStatus('loading');
+  // ClickUp 16.3 P1 v1-2 (主人 2026-09-07 04:21 巡检): resolve the
+  // canonical owner once on page load via GET /api/auth/status. The
+  // server returns OAUTH_PENDING_USER until OAuth lands — we render
+  // that display name on the picker and on the ending page. We do
+  // NOT mint a cookie or any per-browser user_uuid; identity flows
+  // exclusively from currentUserProvider(req) on the server.
+  try {
+    const authStatus = await api('/api/auth/status');
+    if (authStatus && authStatus.owner) {
+      state.ownerDisplayName = authStatus.owner.display_name || '';
+      state.ownerAuthSource = authStatus.owner.auth_source || '';
+      if (state.ownerDisplayName) {
+        setText('#owner-display-name', state.ownerDisplayName);
+      }
+    }
+  } catch { /* leave owner-display-name blank if the endpoint is unavailable */ }
   // Deep link: showScreen writes ?s=<screen> into the URL, and a reload
   // on the ending screen must land back on the ending page instead of
   // silently dropping the player into the picker. Attempt the mount
