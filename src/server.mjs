@@ -29,6 +29,10 @@ import {
   startSessionSnapshot,
 } from './stories/index.mjs';
 import {
+  createInMemoryCommunityProfileRepository,
+  seedCommunityProfiles,
+} from './community/index.mjs';
+import {
   bootstrapSessionFromWork,
   commitNarrativeEvent,
   commitOpeningEvent,
@@ -409,6 +413,23 @@ function classifyProviderError(err) {
 // memory only; see docs/data-model.md for the MariaDB mapping.
 const { repository: storyRepo, fixtures: storyFixtures } = createSeededRepository();
 
+// ClickUp 16.1 server.mjs wiring (2026-09-06): a single in-memory
+// community-profile repository is seeded once per process from the
+// mock fixtures so admin/dev tooling can introspect profiles for any
+// of the canonical stories. The PUBLIC real-provider routes
+// (`/api/stories/:workId/ensure`, `POST /api/sessions`) hand this repo
+// to the application-layer import helper so freshly imported
+// story_versions get a profile tagged `source: 'real-generated'`
+// instead of silently falling back to the `mock-generated` default.
+// Admin/dev import routes (`/api/admin/stories/:slug/import`,
+// `/api/admin/opening-cache/rebuild`) deliberately do NOT pass it:
+// those surfaces keep the historical mock-fixture profile seeded by
+// `seedCommunityProfiles` below, and the hook inside
+// `importStoryAndEnsureCache` falls back to `mock-generated` for any
+// story_version the seed loop did not cover.
+const communityProfileRepo = createInMemoryCommunityProfileRepository();
+seedCommunityProfiles(storyRepo, communityProfileRepo);
+
 // sessionService deliberately keeps its state private to the repository. The
 // route layer keeps only the request's non-secret pinned metadata so recovery
 // can return the same metadata without reaching into service internals.
@@ -762,6 +783,16 @@ async function handleRequest(req, res) {
         provider,
         slug: workId,
         story_uuid,
+        // ClickUp 16.1 server.mjs wiring (2026-09-06): the public
+        // real-provider path wires the in-memory community-profile
+        // repo AND tags the freshly built profile with
+        // `source: 'real-generated'`. Admin/dev import routes above
+        // deliberately omit both args so the hook falls back to the
+        // historical `mock-generated` default and the seeded
+        // mock-fixture profiles remain authoritative for those
+        // surfaces.
+        profileRepository: communityProfileRepo,
+        profileOptions: { source: 'real-generated' },
       });
       return jsonResponse(res, 200, {
         demo: currentDemoFlag(),
@@ -1580,6 +1611,14 @@ async function handleRequest(req, res) {
         session_uuid: sessionUuid,
         work_id: body.work_id,
         role_id: body.role_id,
+        // ClickUp 16.1 server.mjs wiring (2026-09-06): the public
+        // POST /api/sessions route is the real-provider bootstrap
+        // surface, so it wires the in-memory community-profile repo
+        // and tags freshly-built profiles with `source:
+        // 'real-generated'`. Admin/dev surfaces keep the historical
+        // mock-generated default by omitting both args.
+        profileRepository: communityProfileRepo,
+        profileOptions: { source: 'real-generated' },
       });
       // Pin the session's metadata so /recover can return it. Per the
       // public façade contract the browser only needs role_id (so a
