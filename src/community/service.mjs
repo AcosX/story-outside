@@ -178,6 +178,11 @@ export function ensureCommunityProfile({
       story,
       generator_version,
       locale: options && options.locale,
+      // ClickUp 16.1 P2 fix (2026-09-06): propagate the caller's
+      // `options.source` to the stub builder so a real-provider
+      // import surfaces as `source: 'real-generated'`, not the
+      // hard-coded 'mock-generated' default.
+      source: options && options.source,
     });
   }
   return profileRepository.setCommunityProfile(profile);

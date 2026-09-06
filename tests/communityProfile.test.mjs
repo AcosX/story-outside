@@ -318,7 +318,11 @@ async function runChecks() {
       setCommunityProfile({ profileRepository: profileRepo, profile: bad });
     } catch (err) {
       threw = true;
-      assert.match(String(err && err.message), /forbidden field 'session_uuid'/);
+      // ClickUp 16.1 P1.2 fix (2026-09-06): strict allowlist now
+      // rejects unknown nested keys with this message. The legacy
+      // black-list path is also still active as a defence-in-depth
+      // check, so the message contains the offending key.
+      assert.match(String(err && err.message), /session_uuid/);
     }
     assert.ok(threw, 'setCommunityProfile must throw on forbidden field');
     // Also try user_ref on a query and model_output on a hot_keyword.
@@ -335,7 +339,7 @@ async function runChecks() {
       setCommunityProfile({ profileRepository: profileRepo, profile: bad2 });
     } catch (err) {
       threw = true;
-      assert.match(String(err && err.message), /forbidden field 'user_ref'/);
+      assert.match(String(err && err.message), /user_ref/);
     }
     assert.ok(threw, 'setCommunityProfile must throw on forbidden field');
     const bad3 = /** @type {any} */ ({
@@ -351,7 +355,10 @@ async function runChecks() {
       setCommunityProfile({ profileRepository: profileRepo, profile: bad3 });
     } catch (err) {
       threw = true;
-      assert.match(String(err && err.message), /forbidden field 'model_output'/);
+      // ClickUp 16.1 P1.2 fix (2026-09-06): see note above — the
+      // strict allowlist now produces a 'unknown key at hot_keywords[N]'
+      // message that still contains the offending field name.
+      assert.match(String(err && err.message), /model_output/);
     }
     assert.ok(threw, 'setCommunityProfile must throw on forbidden field');
   });

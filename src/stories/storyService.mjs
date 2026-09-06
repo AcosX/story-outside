@@ -180,9 +180,25 @@ export async function importStory({ repository, provider, slug, story_uuid, prof
  * @param {string} input.slug
  * @param {string} input.story_uuid
  * @param {GenerationProfile} [input.profile]
+ * @param {import('../community/repository.mjs').CommunityProfileRepository} [input.profileRepository]
+ *        ClickUp 16.1 P1.1 fix (2026-09-06): when supplied, the
+ *        community-profile module's `ensureCommunityProfile` runs
+ *        immediately after the opening cache is created, so a fresh
+ *        import automatically materialises a profile for any new
+ *        story_version. When omitted (the default for legacy callers
+ *        like `server.mjs:importStoryFromProvider` in production
+ *        routes that don't wire the community layer), the call is
+ *        silently skipped — import semantics are unchanged.
  * @returns {Promise<ImportStoryWithCacheResult>}
  */
-export async function importStoryAndEnsureCache({ repository, provider, slug, story_uuid, profile }) {
+export async function importStoryAndEnsureCache({
+  repository,
+  provider,
+  slug,
+  story_uuid,
+  profile,
+  profileRepository,
+}) {
   if (!repository) throw new Error('importStoryAndEnsureCache: repository required');
   if (!provider || typeof provider.getStory !== 'function') {
     throw new Error('importStoryAndEnsureCache: provider with getStory required');
@@ -205,6 +221,34 @@ export async function importStoryAndEnsureCache({ repository, provider, slug, st
     story_version_uuid: imported.story_version_uuid,
     options: { profile: profile || defaultGenerationProfile() },
   });
+  // ClickUp 16.1 P1.1 fix (2026-09-06): when the caller wires a
+  // profileRepository, also ensure a community profile for the newly
+  // imported story_version. This is the integration point that
+  // `seedCommunityProfiles` (in community/importHook.mjs) previously
+  // handled for mock fixtures only. Real-provider imports now also
+  // get a deterministic stub profile on the canonical
+  // generator_version, so the four ecology capabilities
+  // (search / follow / hot / knowledge) always have a profile to
+  // read from without an extra import-time dance.
+  if (profileRepository) {
+    const { ensureCommunityProfile } = await import('../community/service.mjs');
+    const version = repository.findVersion(imported.story_version_uuid);
+    if (version) {
+      // Stub path — no curated seed. The profile is built from the
+      // story title/hook and tagged `source: 'mock-generated'` so
+      // downstream consumers can tell it's not a real-provider build.
+      // When the real-provider path is wired (ClickUp 16.7+), this
+      // hook will switch to `source: 'real-generated'` based on the
+      // provider type.
+      ensureCommunityProfile({
+        repository,
+        profileRepository,
+        story_version_uuid: imported.story_version_uuid,
+        story: /** @type {any} */ (version.content_payload),
+        options: { source: 'mock-generated' },
+      });
+    }
+  }
   /** @type {ImportStoryWithCacheResult} */
   const result = {
     story_uuid: imported.story_uuid,

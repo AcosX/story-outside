@@ -97,6 +97,66 @@ export const COMMUNITY_PROFILE_BOUNDS = Object.freeze({
   hot_keywords_max: 8,
 });
 
+/**
+ * ClickUp 16.1 P1.2 fix (2026-09-06): exact-allowlist of every
+ * known field on a StoryCommunityProfile (and on each nested
+ * sub-record). `assertCommunityProfileShape` rejects any unknown
+ * key at any depth so a session-derived dimension
+ * (e.g. `topics[0].private_context` carrying
+ * `account_hint: 'session-derived'`) cannot leak into a shared
+ * community profile. The black-list approach (`FORBIDDEN_PROFILE_KEYS`
+ * in repository.mjs) is no longer the only defence — unknown keys at
+ * any depth are now rejected by the shape validator.
+ */
+export const PROFILE_TOP_LEVEL_KEYS = Object.freeze([
+  'profile_uuid',
+  'story_uuid',
+  'story_version_uuid',
+  'story_version_checksum',
+  'generator_version',
+  'generated_at',
+  'source',
+  'locale',
+  'topics',
+  'queries',
+  'knowledge_queries',
+  'hot_keywords',
+  'hash',
+]);
+export const PROFILE_TOPIC_KEYS = Object.freeze(['id', 'label', 'summary']);
+export const PROFILE_QUERY_KEYS = Object.freeze(['id', 'query', 'kind']);
+export const PROFILE_KNOWLEDGE_QUERY_KEYS = Object.freeze(['id', 'query', 'kind']);
+export const PROFILE_HOT_KEYWORD_KEYS = Object.freeze(['id', 'keyword', 'rationale']);
+export const PROFILE_HASH_KEYS = Object.freeze(['content_hash']);
+export const PROFILE_SOURCES = Object.freeze([
+  'mock-fixture',
+  'mock-generated',
+  'real-generated',
+  'manual',
+]);
+
+/**
+ * Strict-allowlist helper. Compares the keys actually present on an
+ * object against an exact-allowlist (a frozen array of permitted
+ * property names). When an unknown key is found, throws a
+ * `ValidationError` with the path so the bug is reproducible.
+ *
+ * @param {string} path                  Human-readable path (e.g. 'topics[0]').
+ * @param {string[]} seen                Object.keys() output.
+ * @param {readonly string[]} allowed    Frozen allow-list.
+ */
+export function assertRecordAllowlist(path, seen, allowed) {
+  const allowedSet = new Set(allowed);
+  for (const key of seen) {
+    if (!allowedSet.has(key)) {
+      throw new Error(
+        `communityProfile: unknown key at ${path || '$'} → ${JSON.stringify(key)} `
+        + `(allowed: ${JSON.stringify(allowed)})`,
+      );
+    }
+  }
+}
+
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 function uuidv4() {
@@ -203,6 +263,10 @@ export function assertCommunityProfileShape(profile) {
     throw new Error('communityProfile: profile must be an object');
   }
   const p = /** @type {any} */ (profile);
+  // ClickUp 16.1 P1.2 fix (2026-09-06): strict top-level allowlist
+  // BEFORE the per-field checks. Unknown keys at any depth are now
+  // rejected so session-derived dimensions cannot leak in.
+  assertRecordAllowlist('$', Object.keys(p), PROFILE_TOP_LEVEL_KEYS);
   assertUuid('profile_uuid', p.profile_uuid);
   assertUuid('story_uuid', p.story_uuid);
   assertUuid('story_version_uuid', p.story_version_uuid);
@@ -210,6 +274,12 @@ export function assertCommunityProfileShape(profile) {
   assertNonEmptyString('generator_version', p.generator_version);
   assertNonEmptyString('generated_at', p.generated_at);
   assertNonEmptyString('source', p.source);
+  if (!PROFILE_SOURCES.includes(p.source)) {
+    throw new Error(
+      `communityProfile: source '${p.source}' is not in PROFILE_SOURCES `
+      + `(allowed: ${JSON.stringify(PROFILE_SOURCES)})`,
+    );
+  }
   assertNonEmptyString('locale', p.locale);
   if (!Array.isArray(p.topics)) throw new Error('communityProfile: topics must be an array');
   if (!Array.isArray(p.queries)) throw new Error('communityProfile: queries must be an array');
@@ -219,17 +289,38 @@ export function assertCommunityProfileShape(profile) {
   if (!Array.isArray(p.hot_keywords)) {
     throw new Error('communityProfile: hot_keywords must be an array');
   }
-  for (let i = 0; i < p.topics.length; i += 1) assertTopicShape(p.topics[i], `topics[${i}]`);
-  for (let i = 0; i < p.queries.length; i += 1) assertQueryShape(p.queries[i], `queries[${i}]`);
+  // ClickUp 16.1 P1.2 fix (2026-09-06): per-sub-record shape +
+  // strict allowlist. assertTopicShape / assertQueryShape /
+  // assertHotKeywordShape still run, but the allowlist is the new
+  // hard guarantee.
+  for (let i = 0; i < p.topics.length; i += 1) {
+    assertTopicShape(p.topics[i], `topics[${i}]`);
+    assertRecordAllowlist(`topics[${i}]`, Object.keys(p.topics[i]), PROFILE_TOPIC_KEYS);
+  }
+  for (let i = 0; i < p.queries.length; i += 1) {
+    assertQueryShape(p.queries[i], `queries[${i}]`);
+    assertRecordAllowlist(`queries[${i}]`, Object.keys(p.queries[i]), PROFILE_QUERY_KEYS);
+  }
   for (let i = 0; i < p.knowledge_queries.length; i += 1) {
     assertQueryShape(p.knowledge_queries[i], `knowledge_queries[${i}]`);
+    assertRecordAllowlist(
+      `knowledge_queries[${i}]`,
+      Object.keys(p.knowledge_queries[i]),
+      PROFILE_KNOWLEDGE_QUERY_KEYS,
+    );
   }
   for (let i = 0; i < p.hot_keywords.length; i += 1) {
     assertHotKeywordShape(p.hot_keywords[i], `hot_keywords[${i}]`);
+    assertRecordAllowlist(
+      `hot_keywords[${i}]`,
+      Object.keys(p.hot_keywords[i]),
+      PROFILE_HOT_KEYWORD_KEYS,
+    );
   }
   if (!p.hash || typeof p.hash !== 'object' || typeof p.hash.content_hash !== 'string') {
     throw new Error('communityProfile: hash.content_hash required');
   }
+  assertRecordAllowlist('hash', Object.keys(p.hash), PROFILE_HASH_KEYS);
   return /** @type {StoryCommunityProfile} */ (p);
 }
 
@@ -447,12 +538,22 @@ export function buildCommunityProfileFromSeed(input) {
  * @param {string} [input.locale]                 Default 'zh-CN'.
  * @returns {StoryCommunityProfile}
  */
-export function buildStubCommunityProfile({ story_uuid, story_version_uuid, story_version_checksum, story, generator_version, locale }) {
+export function buildStubCommunityProfile({ story_uuid, story_version_uuid, story_version_checksum, story, generator_version, locale, source }) {
   assertUuid('story_uuid', story_uuid);
   assertUuid('story_version_uuid', story_version_uuid);
   assertNonEmptyString('story_version_checksum', story_version_checksum);
   if (!story || typeof story !== 'object') {
     throw new Error('communityProfile.buildStubCommunityProfile: story required');
+  }
+  // ClickUp 16.1 P2 fix (2026-09-06): resolve + validate the provenance
+  // tag before we use it. The downstream `assertCommunityProfileShape`
+  // also checks this, but we want a clear error here at the seam.
+  const resolvedSource = typeof source === 'string' && source ? source : 'mock-generated';
+  if (!PROFILE_SOURCES.includes(resolvedSource)) {
+    throw new Error(
+      `communityProfile.buildStubCommunityProfile: source '${resolvedSource}' is not in PROFILE_SOURCES `
+      + `(allowed: ${JSON.stringify(PROFILE_SOURCES)})`,
+    );
   }
   const title = typeof story.title === 'string' && story.title ? story.title : '本作';
   const hook = typeof story.hook === 'string' && story.hook ? story.hook : '';
@@ -478,7 +579,7 @@ export function buildStubCommunityProfile({ story_uuid, story_version_uuid, stor
     story_uuid,
     story_version_uuid,
     story_version_checksum,
-    source: 'mock-generated',
+    source: resolvedSource,
     locale: typeof locale === 'string' && locale ? locale : 'zh-CN',
     generator_version,
     topics,
