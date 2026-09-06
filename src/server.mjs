@@ -20,6 +20,10 @@ import {
   StoryNotFoundError,
   ValidationError,
 } from './providers/index.mjs';
+import { createEcosystemKnowledgeProvider } from './providers/ecosystem/knowledge.mjs';
+import { createInMemoryCommunityProfileRepository } from './community/index.mjs';
+import { getCommunityProfile } from './community/service.mjs';
+import { seedCommunityProfiles } from './community/importHook.mjs';
 import {
   createSeededRepository,
   defaultGenerationProfile,
@@ -408,6 +412,13 @@ function classifyProviderError(err) {
 // memory only; see docs/data-model.md for the MariaDB mapping.
 const { repository: storyRepo, fixtures: storyFixtures } = createSeededRepository();
 
+// Community-profile repository. Seeded once per process from the mock
+// fixtures so the ecology layer (16.5 知乎知识 et al.) can look up the
+// profile by (story_version_uuid, generator_version) and decorate the
+// response with knowledge_queries-driven matches. Lives in memory only.
+const communityProfileRepo = createInMemoryCommunityProfileRepository();
+seedCommunityProfiles(storyRepo, communityProfileRepo);
+
 // sessionService deliberately keeps its state private to the repository. The
 // route layer keeps only the request's non-secret pinned metadata so recovery
 // can return the same metadata without reaching into service internals.
@@ -642,6 +653,140 @@ async function handleRequest(req, res) {
       reply: `(mock)你说了：${text.slice(0, 280)}`,
       timestamp: new Date().toISOString(),
     });
+  }
+
+  // -----------------------------------------------------------------------
+  // ClickUp 16 ecosystem layer — public read-only façade for the four
+  // 生态能力 (16.2 搜索 / 16.3 关注 / 16.4 热榜 / 16.5 知乎知识).
+  //
+  // This block is intentionally PUBLIC (no /api/admin/* prefix, no
+  // DEV_FLAG banner) because the ecosystem layer is a player-facing
+  // discovery surface, not an admin/dev tool. Every response carries
+  // the `demo` payload from currentDemoFlag() so a client can tell at
+  // a glance whether it is talking to the bundled mock or the real
+  // adapter.
+  //
+  // 知识区 vs 讨论区: 16.5 is the independent knowledge surface. It
+  // never reads / mutates community profile topics / queries / hot
+  // keywords — those belong to the 讨论区 (16.1 community profile). The
+  // 16.5 response always carries the surface_disclaimer so a client
+  // can verify the surfaces never get mixed on the wire.
+  // -----------------------------------------------------------------------
+
+  // POST /v1/ecosystem/knowledge — ClickUp 16.5.
+  //
+  // Body:
+  //   story_version_uuid         required (uuid string)
+  //   community_profile_version  required (string; the community
+  //                              profile.generator_version to pin the
+  //                              cache key against)
+  //   limit                      optional (positive integer)
+  //   force                      optional (boolean — bypass cache)
+  //   profile                    optional (StoryCommunityProfile;
+  //                              when present, response includes match
+  //                              decoration)
+  //
+  // Response shape (200 / 503):
+  //   demo                       the currentDemoFlag() payload
+  //   knowledge_list             array of ZhihuKnowledgeEntry
+  //   entries                    array of KnowledgeEntryWithMatch
+  //   ecosystem_status           'fresh' | 'stale' | 'unavailable'
+  //   stale                      boolean
+  //   generated_at               ISO timestamp (when applicable)
+  //   source                     'mock' | 'real'
+  //   story_version_uuid         echo
+  //   community_profile_version  echo
+  //   surface_disclaimer         always present so the Knowledge 区 vs
+  //                              讨论区 boundary is explicit on the
+  //                              wire
+  //
+  // Cache key: (story_version_uuid, community_profile_version).
+  // provider 故障 → HTTP 503 with ecosystem_status=unavailable.
+  const knowledgeProvider = createEcosystemKnowledgeProvider();
+  if (method === 'POST' && pathname === '/v1/ecosystem/knowledge') {
+    let body = {};
+    try {
+      body = await readJsonBody(req);
+    } catch (err) {
+      const { status, code } = classifyProviderError(err);
+      return jsonResponse(res, status, { error: code, demo: currentDemoFlag() });
+    }
+    if (!body || typeof body !== 'object' || Array.isArray(body)) {
+      return jsonResponse(res, 400, {
+        error: 'bad_json',
+        demo: currentDemoFlag(),
+        message: 'POST /v1/ecosystem/knowledge expects a JSON object body',
+      });
+    }
+    const story_version_uuid = typeof body.story_version_uuid === 'string' ? body.story_version_uuid : '';
+    const community_profile_version = typeof body.community_profile_version === 'string' ? body.community_profile_version : '';
+    if (!story_version_uuid) {
+      return jsonResponse(res, 400, {
+        error: 'validation_failed',
+        demo: currentDemoFlag(),
+        message: 'story_version_uuid is required',
+        field: 'story_version_uuid',
+      });
+    }
+    if (!community_profile_version) {
+      return jsonResponse(res, 400, {
+        error: 'validation_failed',
+        demo: currentDemoFlag(),
+        message: 'community_profile_version is required',
+        field: 'community_profile_version',
+      });
+    }
+    const limit = Number.isInteger(body.limit) && body.limit > 0 ? body.limit : undefined;
+    const force = body.force === true;
+    // Try to load the community profile for decoration. A missing
+    // profile is not a hard failure — the route still returns the
+    // raw knowledge_list with empty match entries.
+    let profile = null;
+    try {
+      profile = getCommunityProfile({
+        profileRepository: communityProfileRepo,
+        story_version_uuid,
+        generator_version: community_profile_version,
+      });
+    } catch (err) {
+      // Profile lookup failure must NOT block the knowledge surface.
+      // Log-and-continue with profile=null so the route still serves
+      // its primary payload.
+      profile = null;
+    }
+    try {
+      const result = await knowledgeProvider.matchKnowledgeList({
+        story_version_uuid,
+        community_profile_version,
+        profile: profile || undefined,
+        ...(limit !== undefined ? { limit } : {}),
+        ...(force ? { force } : {}),
+      });
+      // HTTP 503 on unavailable (per description: provider 故障 → 返空 + 503).
+      if (result.ecosystem_status === 'unavailable') {
+        return jsonResponse(res, 503, {
+          demo: currentDemoFlag(),
+          ecosystem_status: 'unavailable',
+          knowledge_list: [],
+          entries: [],
+          stale: false,
+          generated_at: '',
+          source: result.source,
+          story_version_uuid,
+          community_profile_version,
+          surface_disclaimer: result.surface_disclaimer,
+          error: 'ecosystem_unavailable',
+          message: 'Knowledge provider is currently unavailable; the surface is hidden.',
+        });
+      }
+      return jsonResponse(res, 200, {
+        demo: currentDemoFlag(),
+        ...result,
+      });
+    } catch (err) {
+      const { status, code } = classifyProviderError(err);
+      return jsonResponse(res, status, { error: code, demo: currentDemoFlag() });
+    }
   }
 
   // -----------------------------------------------------------------------
