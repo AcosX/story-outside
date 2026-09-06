@@ -53,6 +53,12 @@ const state = {
   storyVersionUuid: null,
   cacheUuid: null,
   generationProfile: null,
+  // ClickUp 16.2 P1.v2 (2026-09-07): canonical community-profile
+  // identity returned by /api/sessions. Forwarded verbatim to
+  // /v1/ecosystem/discussions; the handler resolves the canonical
+  // profile server-side from these three values.
+  communityProfileVersion: null,
+  communityProfileQueries: null,
   pending: null,        // { pending_id, events[], tool_call, committed_count }
   pendingIdx: 0,        // index of the NEXT pending event to display
   progressTotal: 0,     // largest known event total for progress bar
@@ -298,6 +304,15 @@ async function bootstrapSession({ story, role }) {
     state.cacheUuid = created.cache_uuid;
     state.storyUuid = created.story_uuid || null;
     state.storyVersionUuid = created.story_version_uuid || null;
+    // ClickUp 16.2 P1.v2 (2026-09-07): forward the canonical
+    // community-profile identity into state so mountEndingPage can
+    // hand it to /v1/ecosystem/discussions verbatim.
+    state.communityProfileVersion = typeof created.community_profile_version === 'string'
+      ? created.community_profile_version
+      : null;
+    state.communityProfileQueries = Array.isArray(created.community_profile_queries)
+      ? created.community_profile_queries
+      : null;
     state.openingEvents = Array.isArray(created.opening_events) ? created.opening_events : [];
     state.generationProfile = (created.session && created.session.generation_profile)
       || (created.pinned && created.pinned.generation_profile)
@@ -328,6 +343,13 @@ function persistSessionContext() {
       sessionUuid: state.sessionUuid || null,
       storyTitle: state.story ? state.story.title : '',
       roleLabel: state.role ? state.role.label : '',
+      // ClickUp 16.2 P1.v2 (2026-09-07): forward the canonical
+      // community-profile identity so the deep link can submit
+      // /v1/ecosystem/discussions without a fresh bootstrap.
+      communityProfileVersion: state.communityProfileVersion || null,
+      communityProfileQueries: state.communityProfileQueries || null,
+      storyUuid: state.storyUuid || null,
+      storyVersionUuid: state.storyVersionUuid || null,
     }));
   } catch { /* storage unavailable — deep link degrades to empty state */ }
 }
@@ -352,6 +374,16 @@ async function recoverAndStart() {
     const recovered = await api(`/api/sessions/${state.sessionUuid}/recover`);
     state.lastRevision = recovered.revision || 0;
     state.openingCursor = recovered.opening_cursor || 0;
+    // ClickUp 16.2 P1.v2 (2026-09-07): refresh the canonical
+    // community-profile identity on /recover so a page reload still
+    // has it. If the server response does not carry one (older
+    // versions), leave the previous value as-is.
+    if (typeof recovered.community_profile_version === 'string') {
+      state.communityProfileVersion = recovered.community_profile_version;
+    }
+    if (Array.isArray(recovered.community_profile_queries)) {
+      state.communityProfileQueries = recovered.community_profile_queries;
+    }
     state.canonicalHistory = recovered.history || [];
     state.canonicalEventsById = new Map(state.canonicalHistory.map((e) => [e.event_id, e]));
     state.canonicalNarrativeCount = state.canonicalHistory.filter((e) => e.event_type === 'narrative_beat').length;
@@ -847,12 +879,23 @@ async function mountEndingPage(sessionMetaOverride) {
   try {
     const mod = await import('/scripts/endingPage.js');
     if (mod && typeof mod.mount === 'function') {
+      const meta = sessionMetaOverride || {
+        storyTitle: state.story ? state.story.title : '',
+        roleLabel: state.role ? state.role.label : '',
+      };
+      // ClickUp 16.2 P1.v2 (2026-09-07): forward the canonical
+      // community-profile identity into sessionMeta so the ending
+      // page can submit /v1/ecosystem/discussions without an extra
+      // /recover round-trip. The handler is server-authoritative,
+      // so endingPage just echoes these strings back to the API.
       await mod.mount({
         sessionUuid: state.sessionUuid,
-        sessionMeta: sessionMetaOverride || {
-          storyTitle: state.story ? state.story.title : '',
-          roleLabel: state.role ? state.role.label : '',
-        },
+        sessionMeta: Object.assign({}, meta, {
+          communityProfileVersion: meta.communityProfileVersion || state.communityProfileVersion,
+          communityProfileQueries: meta.communityProfileQueries || state.communityProfileQueries,
+          storyUuid: meta.storyUuid || state.storyUuid,
+          storyVersionUuid: meta.storyVersionUuid || state.storyVersionUuid,
+        }),
       });
       return true;
     }

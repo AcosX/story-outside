@@ -171,6 +171,35 @@ function activeKey(story_version_uuid, generator_version) {
   return `${story_version_uuid}|${generator_version}`;
 }
 
+function isPlainObject(value) {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Build the canonical `community_profile_version` string for a profile
+ * row. The format is `${generator_version}@${content_hash[:16]}` — a
+ * new value iff the profile is regenerated with a different content
+ * hash. The prefix length matches what the handler in server.mjs
+ * surfaces to the player (and what the player echoes back).
+ *
+ * ClickUp 16.2 P1.v2 fix (2026-09-07): this helper is the SINGLE
+ * authority for the version-string format. Both the producer (POST
+ * /api/sessions response) and the consumer (POST
+ * /v1/ecosystem/discussions) MUST derive the string through this
+ * function so the two sides cannot drift.
+ *
+ * @param {import('./profile.mjs').StoryCommunityProfile} profile
+ * @returns {string|null}
+ */
+export function buildCanonicalCommunityProfileVersion(profile) {
+  if (!profile || typeof profile !== 'object') return null;
+  const generator = typeof profile.generator_version === 'string' ? profile.generator_version : '';
+  const hash = profile.hash && typeof profile.hash.content_hash === 'string'
+    ? profile.hash.content_hash : '';
+  if (!generator || !hash) return null;
+  return `${generator}@${hash.slice(0, 16)}`;
+}
+
 /**
  * Build a fresh in-memory CommunityProfileRepository. Pure factory.
  * @returns {CommunityProfileRepository}
@@ -216,6 +245,92 @@ export function createInMemoryCommunityProfileRepository() {
       const uuid = state.activeByStoryVersion.get(key);
       if (!uuid) return null;
       return state.profiles.get(uuid) || null;
+    },
+    /**
+     * ClickUp 16.2 P1.v2 fix (2026-09-07): server-authoritative
+     * resolution of the canonical StoryCommunityProfile.
+     *
+     * Returns the row whose:
+     *   * `profile.story_version_uuid === story_version_uuid`
+     *   * `profile.story_uuid === story_uuid` (defence in depth:
+     *     client cannot point one story's version at another story's
+     *     profile)
+     *   * `${profile.generator_version}@${profile.hash.content_hash[:16]}`
+     *     matches `community_profile_version` byte-for-byte.
+     *
+     * Result is a discriminated union so the route layer can map
+     * each failure mode to a specific 4xx error code:
+     *   * `{ ok: true,  profile }`
+     *   * `{ ok: false, code: 'community_profile_not_found' }`
+     *   * `{ ok: false, code: 'community_profile_version_mismatch' }`
+     *   * `{ ok: false, code: 'story_version_mismatch' }`
+     *
+     * The repo NEVER throws on identity errors; it returns the
+     * discriminated union instead. The route layer maps each code
+     * to a 400 response.
+     *
+     * @param {object} input
+     * @param {string} input.story_uuid
+     * @param {string} input.story_version_uuid
+     * @param {string} input.community_profile_version
+     * @returns {{ok:true,profile:object}|{ok:false,code:string,message:string}}
+     */
+    findCanonicalByIdentity(input) {
+      // 1. Shape guard — bad inputs MUST NOT throw; route layer
+      //    already validates, but defence in depth.
+      if (!isPlainObject(input)) {
+        return { ok: false, code: 'community_profile_not_found', message: 'identity required' };
+      }
+      const storyUuid = typeof input.story_uuid === 'string' ? input.story_uuid : '';
+      const storyVersionUuid = typeof input.story_version_uuid === 'string' ? input.story_version_uuid : '';
+      const cpv = typeof input.community_profile_version === 'string'
+        ? input.community_profile_version : '';
+      if (!UUID_PATTERN.test(storyUuid) || !UUID_PATTERN.test(storyVersionUuid) || !cpv) {
+        return {
+          ok: false,
+          code: 'community_profile_not_found',
+          message: 'story_uuid, story_version_uuid, community_profile_version are all required and must be valid',
+        };
+      }
+      // 2. Walk every profile row bound to the requested
+      //    story_version_uuid. The index is keyed by
+      //    `${story_version_uuid}|${generator_version}` so this is
+      //    O(active_generator_versions_for_this_version).
+      let candidate = null;
+      for (const [key, profileUuid] of state.activeByStoryVersion.entries()) {
+        const [sv] = key.split('|');
+        if (sv !== storyVersionUuid) continue;
+        const row = state.profiles.get(profileUuid);
+        if (!row) continue;
+        if (row.story_uuid !== storyUuid) {
+          // Client tried to point a story_version at a profile bound
+          // to a DIFFERENT story — refuse loudly.
+          return {
+            ok: false,
+            code: 'story_version_mismatch',
+            message: 'story_uuid does not match the canonical profile bound to story_version_uuid',
+          };
+        }
+        if (candidate === null || row.generated_at > candidate.generated_at) {
+          candidate = row;
+        }
+      }
+      if (candidate === null) {
+        return {
+          ok: false,
+          code: 'community_profile_not_found',
+          message: 'no canonical community profile bound to the supplied story_version_uuid',
+        };
+      }
+      const canonicalVersion = buildCanonicalCommunityProfileVersion(candidate);
+      if (canonicalVersion !== cpv) {
+        return {
+          ok: false,
+          code: 'community_profile_version_mismatch',
+          message: 'community_profile_version does not match the canonical version for the bound profile',
+        };
+      }
+      return { ok: true, profile: candidate };
     },
     findByUuid(profile_uuid) {
       if (typeof profile_uuid !== 'string') return null;
