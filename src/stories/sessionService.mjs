@@ -496,6 +496,11 @@ function publicSession(session, includeHistory = false) {
     cursor: session.cursor,
     opening_cursor: session.opening_cursor,
     revision: session.revision,
+    // ClickUp 16.3 community worldlines: expose share state on the
+    // public projection so ecosystem / friend-timeline routes can read
+    // it without touching the canonical session object directly.
+    shared: session.shared === true,
+    shared_at: typeof session.shared_at === 'string' ? session.shared_at : null,
   };
   if (includeHistory) result.history = clone(session.history);
   return result;
@@ -611,6 +616,10 @@ export function createSession({ repository, session_uuid, story_uuid, story_vers
     last_compact_status: 'idle',
     last_compact_error: null,
     compact_history: [], // append-only list of compact_attempt records (audit)
+    // ClickUp 16.3 community worldlines: default private; only share=true
+    // (set by shareSessionTimeline) makes the timeline enter the social view.
+    shared: false,
+    shared_at: null,
   };
   // Evict the least-recently-touched session if the canonical store is
   // full. Eviction drops ALL per-session state including history and

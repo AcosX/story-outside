@@ -63,6 +63,14 @@ import {
   buildOriginalTimeline,
   buildReplay,
 } from './stories/endingService.mjs';
+import {
+  createEcosystemService,
+  ECOSYSTEM_ERROR_CODES,
+  getSessionShareState,
+  resolveEcosystemProvider,
+  shareSessionTimeline,
+  unshareSessionTimeline,
+} from './providers/ecosystem/index.mjs';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 const ROOT = resolve(__dirname, '..');
@@ -407,6 +415,19 @@ function classifyProviderError(err) {
 // having to POST a separate import for every story. The repository lives in
 // memory only; see docs/data-model.md for the MariaDB mapping.
 const { repository: storyRepo, fixtures: storyFixtures } = createSeededRepository();
+
+// ClickUp 16.3 — community worldlines (关注流 / 关注关系 / 好友世界线对比)。
+//
+// 设计要点：
+//   * ecosystem service 启动时一次性构造；缓存生命周期 = 进程生命周期。
+//   * 不读对方原始 Session 历史；只读对方**主动 share=true** 的世界线。
+//   * 默认 private：session 默认私人；**绝不**因关注关系自动公开。
+//   * 降级：provider 抛错时 service 层返空；HTTP 路由不抛错给客户端。
+//   * 关注关系缓存短 TTL（5 分钟）；不永久复制完整知乎社交图。
+//
+// 路由全部挂在 /v1/ecosystem/*；刻意避开 /api/admin/* 和 /api/dev/*，
+// 保持"社交展示 = 默认公开、demo 路由 = 内部调试"的边界。
+const ecosystemService = createEcosystemService(resolveEcosystemProvider());
 
 // sessionService deliberately keeps its state private to the repository. The
 // route layer keeps only the request's non-secret pinned metadata so recovery
@@ -1492,6 +1513,245 @@ async function handleRequest(req, res) {
   if (method === 'GET' && (pathname === '/' || pathname === '/index.html')) {
     return serveStatic(req, res, '/index.html');
   }
+
+  // -------------------------------------------------------------------------
+  // ClickUp 16.3 — /v1/ecosystem/* routes.
+  //
+  // 边界：
+  //   * 这些路由只读"对方主动 share=true"的世界线，绝不返回对方的
+  //     private_history / session_uuid / user_ref。
+  //   * 没有身份认证；user_ref 来自请求体，调用方自己保证身份来源可信。
+  //     在 MVP 阶段，身份来源 = 知乎 OAuth session（由前端持有）；
+  //     服务端**不**自行读取 cookie / Authorization header——这是后续
+  //     17.x 阶段的范围。
+  //   * 任何 provider 错误 / 输入错误都返降级响应（空数组或 400），
+  //     主链 (HTTP server) 不会被一个生态请求拖垮。
+  // -------------------------------------------------------------------------
+
+  const ecosystemShareMatch = pathname.match(/^\/v1\/ecosystem\/sessions\/([0-9a-fA-F-]{36})\/share$/);
+  const ecosystemUnshareMatch = pathname.match(/^\/v1\/ecosystem\/sessions\/([0-9a-fA-F-]{36})\/unshare$/);
+
+  // POST /v1/ecosystem/followings — 返回当前 user_ref 在知乎侧的关注列表。
+  if (method === 'POST' && pathname === '/v1/ecosystem/followings') {
+    let body;
+    try {
+      body = await readJsonBody(req);
+    } catch (err) {
+      const { status, code } = classifyProviderError(err);
+      return jsonResponse(res, status, { error: code, demo: currentDemoFlag() });
+    }
+    const userRef = body && typeof body.user_ref === 'string' ? body.user_ref.trim() : '';
+    const limit = Number.isInteger(body && body.limit) ? body.limit : undefined;
+    if (!userRef) {
+      return jsonResponse(res, 400, {
+        error: ECOSYSTEM_ERROR_CODES.INVALID_INPUT,
+        message: 'user_ref is required',
+        demo: currentDemoFlag(),
+      });
+    }
+    try {
+      const list = await ecosystemService.getFollowing(userRef, { limit });
+      return jsonResponse(res, 200, {
+        demo: currentDemoFlag(),
+        user_ref: userRef,
+        followings: list,
+        provider: ecosystemService.providerName,
+        ttl_ms: ecosystemService.defaultTtlMs,
+      });
+    } catch (err) {
+      // 服务层不应当主动抛错（已包了 withDegradation）；此处仅为兜底。
+      return jsonResponse(res, 200, {
+        demo: currentDemoFlag(),
+        user_ref: userRef,
+        followings: [],
+        degraded: true,
+        reason: String(err && err.message ? err.message : err),
+      });
+    }
+  }
+
+  // POST /v1/ecosystem/following-feed — 返回当前 user_ref 的"关注人动态"。
+  if (method === 'POST' && pathname === '/v1/ecosystem/following-feed') {
+    let body;
+    try {
+      body = await readJsonBody(req);
+    } catch (err) {
+      const { status, code } = classifyProviderError(err);
+      return jsonResponse(res, status, { error: code, demo: currentDemoFlag() });
+    }
+    const userRef = body && typeof body.user_ref === 'string' ? body.user_ref.trim() : '';
+    const limit = Number.isInteger(body && body.limit) ? body.limit : undefined;
+    if (!userRef) {
+      return jsonResponse(res, 400, {
+        error: ECOSYSTEM_ERROR_CODES.INVALID_INPUT,
+        message: 'user_ref is required',
+        demo: currentDemoFlag(),
+      });
+    }
+    try {
+      const items = await ecosystemService.getFollowingFeed(userRef, { limit });
+      return jsonResponse(res, 200, {
+        demo: currentDemoFlag(),
+        user_ref: userRef,
+        feed: items,
+        provider: ecosystemService.providerName,
+        ttl_ms: ecosystemService.defaultTtlMs,
+      });
+    } catch (err) {
+      return jsonResponse(res, 200, {
+        demo: currentDemoFlag(),
+        user_ref: userRef,
+        feed: [],
+        degraded: true,
+        reason: String(err && err.message ? err.message : err),
+      });
+    }
+  }
+
+  // POST /v1/ecosystem/friend-timelines — 好友世界线对比。
+  //
+  // Body 形状：
+  //   {
+  //     user_ref: string,                    // 必填
+  //     local_identities: Array<{identity_id, user_ref, ...}>,  // 必填
+  //     story_version_uuid?: string,         // 可选
+  //   }
+  //
+  // 返回：
+  //   { demo, user_ref, friend_timelines: [...], matched_count, provider, ttl_ms }
+  //
+  // 严格不变量：
+  //   * friend_timelines 仅含 share=shared 的条目；service 层 normalise 已
+  //     剥掉 private_history / session_uuid / user_ref（隐私守门）。
+  //   * provider 故障 → 返空数组，status=200，body 含 degraded=true。
+  if (method === 'POST' && pathname === '/v1/ecosystem/friend-timelines') {
+    let body;
+    try {
+      body = await readJsonBody(req);
+    } catch (err) {
+      const { status, code } = classifyProviderError(err);
+      return jsonResponse(res, status, { error: code, demo: currentDemoFlag() });
+    }
+    if (!body || typeof body !== 'object') {
+      return jsonResponse(res, 400, {
+        error: ECOSYSTEM_ERROR_CODES.INVALID_INPUT,
+        message: 'request body must be an object',
+        demo: currentDemoFlag(),
+      });
+    }
+    const userRef = typeof body.user_ref === 'string' ? body.user_ref.trim() : '';
+    if (!userRef) {
+      return jsonResponse(res, 400, {
+        error: ECOSYSTEM_ERROR_CODES.INVALID_INPUT,
+        message: 'user_ref is required',
+        demo: currentDemoFlag(),
+      });
+    }
+    if (!Array.isArray(body.local_identities)) {
+      return jsonResponse(res, 400, {
+        error: ECOSYSTEM_ERROR_CODES.INVALID_INPUT,
+        message: 'local_identities must be an array',
+        demo: currentDemoFlag(),
+      });
+    }
+    if (body.story_version_uuid !== undefined && typeof body.story_version_uuid !== 'string') {
+      return jsonResponse(res, 400, {
+        error: ECOSYSTEM_ERROR_CODES.INVALID_INPUT,
+        message: 'story_version_uuid must be a string when present',
+        demo: currentDemoFlag(),
+      });
+    }
+    try {
+      const items = await ecosystemService.getFriendTimelines({
+        userRef,
+        localIdentities: body.local_identities,
+        storyVersionUuid: body.story_version_uuid || undefined,
+      });
+      return jsonResponse(res, 200, {
+        demo: currentDemoFlag(),
+        user_ref: userRef,
+        story_version_uuid: body.story_version_uuid || null,
+        friend_timelines: items,
+        matched_count: items.length,
+        provider: ecosystemService.providerName,
+        ttl_ms: ecosystemService.defaultTtlMs,
+      });
+    } catch (err) {
+      return jsonResponse(res, 200, {
+        demo: currentDemoFlag(),
+        user_ref: userRef,
+        story_version_uuid: body.story_version_uuid || null,
+        friend_timelines: [],
+        matched_count: 0,
+        degraded: true,
+        reason: String(err && err.message ? err.message : err),
+      });
+    }
+  }
+
+  // GET /v1/ecosystem/sessions/:uuid/share — 读出 session 当前 share 状态。
+  if (method === 'GET' && ecosystemShareMatch) {
+    const sessionUuid = ecosystemShareMatch[1];
+    const result = getSessionShareState({ repository: storyRepo, session_uuid: sessionUuid });
+    if (result.state === 'not_found') {
+      return jsonResponse(res, 404, {
+        error: 'session_not_found',
+        session_uuid: sessionUuid,
+        demo: currentDemoFlag(),
+      });
+    }
+    return jsonResponse(res, 200, {
+      demo: currentDemoFlag(),
+      session_uuid: result.session_uuid,
+      shared: result.shared,
+      state: result.state,
+      shared_at: result.shared_at,
+    });
+  }
+
+  // POST /v1/ecosystem/sessions/:uuid/share — 用户**主动**把 session 切到
+  // shared 状态（关注流 / 好友世界线展示的入场券）。**绝不**被关注关系触发。
+  if (method === 'POST' && ecosystemShareMatch) {
+    const sessionUuid = ecosystemShareMatch[1];
+    const result = shareSessionTimeline({ repository: storyRepo, session_uuid: sessionUuid });
+    if (result.state === 'not_found') {
+      return jsonResponse(res, 404, {
+        error: 'session_not_found',
+        session_uuid: sessionUuid,
+        demo: currentDemoFlag(),
+      });
+    }
+    return jsonResponse(res, 200, {
+      demo: currentDemoFlag(),
+      session_uuid: result.session_uuid,
+      shared: result.shared,
+      state: result.state,
+      shared_at: result.shared_at,
+      changed: result.changed,
+    });
+  }
+
+  // POST /v1/ecosystem/sessions/:uuid/unshare — 用户主动切回 private。
+  if (method === 'POST' && ecosystemUnshareMatch) {
+    const sessionUuid = ecosystemUnshareMatch[1];
+    const result = unshareSessionTimeline({ repository: storyRepo, session_uuid: sessionUuid });
+    if (result.state === 'not_found') {
+      return jsonResponse(res, 404, {
+        error: 'session_not_found',
+        session_uuid: sessionUuid,
+        demo: currentDemoFlag(),
+      });
+    }
+    return jsonResponse(res, 200, {
+      demo: currentDemoFlag(),
+      session_uuid: result.session_uuid,
+      shared: result.shared,
+      state: result.state,
+      shared_at: result.shared_at,
+      changed: result.changed,
+    });
+  }
+
   if (method === 'GET' || method === 'HEAD') {
     return serveStatic(req, res, pathname);
   }
@@ -1552,4 +1812,4 @@ if (isMainModule) {
   });
 }
 
-export { server, DEMO_FLAG, DEV_FLAG, classifyProviderError, sessionError, storyRepo, storyFixtures, listFixtureStorySlugs };
+export { server, DEMO_FLAG, DEV_FLAG, classifyProviderError, sessionError, storyRepo, storyFixtures, listFixtureStorySlugs, ecosystemService };
