@@ -29,6 +29,7 @@ import {
   startSessionSnapshot,
 } from './stories/index.mjs';
 import {
+  bootstrapSessionFromWork,
   commitNarrativeEvent,
   commitOpeningEvent,
   createSession,
@@ -437,6 +438,14 @@ function sessionError(err) {
   // provider surface.
   if (err instanceof ValidationError) {
     return { status: 400, code: err.code || 'validation_failed', message: 'The session request is invalid.', details: err.details || null };
+  }
+  // Issue #9 — the public /api/sessions façade calls into the
+  // provider through bootstrapSessionFromWork, so a missing story
+  // raises StoryNotFoundError. classifyProviderError already maps this
+  // to 404, and we mirror that contract here so the new route surfaces
+  // the same stable code instead of the 500 internal_error fallback.
+  if (err instanceof StoryNotFoundError) {
+    return { status: 404, code: err.code || 'story_not_found', message: err.message, details: err.details || null };
   }
   // M4 typed-error short-circuits. Errors raised inside the service carry
   // stable codes that map to specific HTTP statuses; the message-regex
@@ -1486,6 +1495,493 @@ async function handleRequest(req, res) {
       cache_stats: cacheStats,
       note: 'frontend_playback_ms can be computed per-commit from the events the client commits; this endpoint exposes storage only.',
     });
+  }
+
+  // ---------------------------------------------------------------------
+  // Issue #9 — public-session HTTP façade (browser-only surface).
+  //
+  // Every route below shares the SAME service-layer implementation as
+  // the matching /api/dev/sessions/* route (commitOpeningEvent,
+  // recoverSession, commitNarrativeEvent, etc.). The only differences
+  // are:
+  //
+  //   1. The /api/sessions POST route atomically runs the import +
+  //      ensure + create-session pipeline via bootstrapSessionFromWork
+  //      so the browser does not need to discover UUIDs, rebuild the
+  //      opening cache, or assemble a generation_profile itself.
+  //
+  //   2. The /api/sessions/:uuid/* sub-routes strip the DEV_FLAG banner
+  //      so the response body the player sees does not advertise
+  //      "demo-only" / "admin_only" — that banner is internal.
+  //
+  // Provider-agnostic: works under both STORY_OUTSIDE_PROVIDER=mock
+  // and =real (story content side); the narrative runtime stays bound
+  // to the deterministic demo provider regardless.
+  // ---------------------------------------------------------------------
+  const PUBLIC_DECORATE = () => ({ demo: currentDemoFlag() });
+  const PUBLIC_DECORATE_DEV = () => ({ demo: currentDemoFlag(), dev: DEV_FLAG });
+
+  // POST /api/sessions — atomic session bootstrap from a story + role.
+  if (method === 'POST' && pathname === '/api/sessions') {
+    let body = {};
+    try {
+      body = await readJsonBody(req);
+    } catch (err) {
+      return sessionErrorResponse(res, err);
+    }
+    if (!validObject(body)) {
+      return jsonResponse(res, 400, {
+        error: 'validation_failed',
+        message: 'The session bootstrap request is invalid.',
+        ...PUBLIC_DECORATE(),
+      });
+    }
+    if (typeof body.work_id !== 'string' || !body.work_id) {
+      return jsonResponse(res, 400, {
+        error: 'validation_failed',
+        message: 'work_id is required.',
+        field: 'work_id',
+        ...PUBLIC_DECORATE(),
+      });
+    }
+    if (typeof body.role_id !== 'string' || !body.role_id) {
+      return jsonResponse(res, 400, {
+        error: 'validation_failed',
+        message: 'role_id is required.',
+        field: 'role_id',
+        ...PUBLIC_DECORATE(),
+      });
+    }
+    const sessionUuid = randomUUID();
+    const identity = body.identity && typeof body.identity === 'object'
+      ? body.identity
+      : null;
+    try {
+      const result = await bootstrapSessionFromWork({
+        repository: storyRepo,
+        provider,
+        session_uuid: sessionUuid,
+        work_id: body.work_id,
+        role_id: body.role_id,
+        identity,
+      });
+      // Pin the session's metadata so /recover can return it. The
+      // values are server defaults (browser does not see them), so we
+      // mirror whatever bootstrapSessionFromWork accepted — the helper
+      // already enforced sane defaults for anonymous callers.
+      const profile = {};
+      for (const key of ['cache_uuid', 'story_uuid', 'story_version_uuid', 'generation_hash', 'identifier', 'rules_version', 'locale', 'variant']) {
+        if (result.session.generation_profile && result.session.generation_profile[key] !== undefined) {
+          profile[key] = result.session.generation_profile[key];
+        }
+      }
+      const pinned = {
+        user_ref: result.session.user_ref,
+        role_id: result.session.role_id,
+        model: result.session.model,
+        prompt: result.session.prompt,
+        generation_profile: profile,
+      };
+      sessionPinnedMetadata.set(sessionUuid, pinned);
+      // ClickUp 14 observability: a freshly-created session pins a
+      // valid opening cache, so this counts as a cache hit.
+      const hookCtx = createStoriesHookContext({
+        session_uuid: sessionUuid,
+        story_uuid: result.story_uuid,
+        story_version_uuid: result.story_version_uuid,
+        cache_uuid: result.cache_uuid,
+        generation_hash: result.session.generation_profile && result.session.generation_profile.generation_hash,
+        state: result.session.state,
+      });
+      onSessionCreate(hookCtx);
+      onOpeningCacheHit(hookCtx);
+      return jsonResponse(res, 200, {
+        ...PUBLIC_DECORATE(),
+        session_uuid: sessionUuid,
+        story_uuid: result.story_uuid,
+        story_version_uuid: result.story_version_uuid,
+        cache_uuid: result.cache_uuid,
+        opening_cache_status: result.cache_status,
+        opening_events: result.opening_events,
+        revision: result.session.revision,
+        state: result.session.state,
+        opening_cursor: result.session.opening_cursor,
+        cache_reused: result.cache_reused,
+        version_reused: result.version_reused,
+        session: { ...result.session },
+        pinned,
+      });
+    } catch (err) {
+      return sessionErrorResponse(res, err);
+    }
+  }
+
+  // GET /api/sessions/:uuid — canonical recover + pinned metadata.
+  const publicSessionRoot = pathname.match(/^\/api\/sessions\/([^/]+)$/);
+  if (method === 'GET' && publicSessionRoot) {
+    if (rejectInvalidSessionUuid(res, publicSessionRoot[1])) return;
+    try {
+      const recovered = recoverSession({ repository: storyRepo, session_uuid: publicSessionRoot[1] });
+      return jsonResponse(res, 200, {
+        ...PUBLIC_DECORATE(),
+        ...recovered,
+        pinned: sessionPinnedMetadata.get(publicSessionRoot[1]) || null,
+      });
+    } catch (err) {
+      return sessionErrorResponse(res, err);
+    }
+  }
+
+  // GET /api/sessions/:uuid/recover — read-only recovery projection.
+  const publicRecover = pathname.match(/^\/api\/sessions\/([^/]+)\/recover$/);
+  if (method === 'GET' && publicRecover) {
+    if (rejectInvalidSessionUuid(res, publicRecover[1])) return;
+    try {
+      const recovered = recoverSession({ repository: storyRepo, session_uuid: publicRecover[1] });
+      return jsonResponse(res, 200, {
+        ...PUBLIC_DECORATE(),
+        ...recovered,
+        pinned: sessionPinnedMetadata.get(publicRecover[1]) || null,
+      });
+    } catch (err) {
+      return sessionErrorResponse(res, err);
+    }
+  }
+
+  // POST /api/sessions/:uuid/opening-events — append one displayed
+  // opening event. Shares the same service function + validation
+  // gauntlet as /api/dev/sessions/:uuid/opening-events; only the
+  // response decoration differs (no DEV_FLAG banner).
+  const publicOpening = pathname.match(/^\/api\/sessions\/([^/]+)\/opening-events$/);
+  if (method === 'POST' && publicOpening) {
+    if (rejectInvalidSessionUuid(res, publicOpening[1])) return;
+    let body = {};
+    try {
+      body = await readJsonBody(req);
+    } catch (err) {
+      return sessionErrorResponse(res, err);
+    }
+    if (!validObject(body) || !isSessionUuid(body.cache_uuid) || !validObject(body.event) ||
+        !Number.isInteger(body.expected_revision) ||
+        typeof body.client_request_id !== 'string' || !body.client_request_id ||
+        typeof body.event.type !== 'string' || !body.event.type ||
+        !Number.isInteger(body.event.sequence) || typeof body.event.text !== 'string') {
+      return jsonResponse(res, 400, {
+        error: 'validation_failed',
+        message: 'The opening event request is invalid.',
+        ...PUBLIC_DECORATE(),
+      });
+    }
+    try {
+      const openingCommitStartedAt = Date.now();
+      const result = commitOpeningEvent({
+        repository: storyRepo,
+        session_uuid: publicOpening[1],
+        cache_uuid: body.cache_uuid,
+        event: body.event,
+        client_request_id: body.client_request_id,
+        expected_revision: body.expected_revision,
+      });
+      onOpeningCommit({
+        hookCtx: createStoriesHookContext({
+          session_uuid: publicOpening[1],
+          cache_uuid: body.cache_uuid,
+        }),
+        event: body.event,
+        latency_ms: Date.now() - openingCommitStartedAt,
+      });
+      return jsonResponse(res, 200, { ...PUBLIC_DECORATE(), ...result });
+    } catch (err) {
+      return sessionErrorResponse(res, err);
+    }
+  }
+
+  // POST /api/sessions/:uuid/narrative-events — commit exactly one
+  // displayed narrative event. Same service call as the dev route.
+  const publicNarrative = pathname.match(/^\/api\/sessions\/([^/]+)\/narrative-events$/);
+  if (method === 'POST' && publicNarrative) {
+    const sessionUuid = publicNarrative[1];
+    if (rejectInvalidSessionUuid(res, sessionUuid)) return;
+    let body = {};
+    try {
+      body = await readJsonBody(req);
+    } catch (err) {
+      return sessionErrorResponse(res, err);
+    }
+    if (!validObject(body) || typeof body.pending_id !== 'string' || !body.pending_id ||
+        !Number.isInteger(body.sequence) ||
+        !Number.isInteger(body.expected_revision) ||
+        (body.client_request_id !== undefined && (typeof body.client_request_id !== 'string' || !body.client_request_id.length))) {
+      return jsonResponse(res, 400, {
+        error: 'validation_failed',
+        message: 'The narrative-event commit request is invalid.',
+        ...PUBLIC_DECORATE(),
+      });
+    }
+    try {
+      const result = commitNarrativeEvent({
+        repository: storyRepo,
+        session_uuid: sessionUuid,
+        pending_id: body.pending_id,
+        sequence: body.sequence,
+        expected_revision: body.expected_revision,
+        ...(body.client_request_id ? { client_request_id: body.client_request_id } : {}),
+      });
+      return jsonResponse(res, 200, { ...PUBLIC_DECORATE(), ...result });
+    } catch (err) {
+      return sessionErrorResponse(res, err);
+    }
+  }
+
+  // POST /api/sessions/:uuid/interrupt — player free-text interrupt.
+  const publicInterrupt = pathname.match(/^\/api\/sessions\/([^/]+)\/interrupt$/);
+  if (method === 'POST' && publicInterrupt) {
+    if (rejectInvalidSessionUuid(res, publicInterrupt[1])) return;
+    let body = {};
+    try {
+      body = await readJsonBody(req);
+    } catch (err) {
+      return sessionErrorResponse(res, err);
+    }
+    if (!validObject(body) || typeof body.text !== 'string' || !body.text ||
+        typeof body.client_request_id !== 'string' || !body.client_request_id ||
+        !Number.isInteger(body.expected_revision)) {
+      return jsonResponse(res, 400, {
+        error: 'validation_failed',
+        message: 'The interrupt request is invalid.',
+        ...PUBLIC_DECORATE(),
+      });
+    }
+    try {
+      const interruptStartedAt = Date.now();
+      const result = interruptWithPlayerInput({
+        repository: storyRepo,
+        session_uuid: publicInterrupt[1],
+        text: body.text,
+        client_request_id: body.client_request_id,
+        expected_revision: body.expected_revision,
+      });
+      const interruptHookCtx = createStoriesHookContext({
+        session_uuid: publicInterrupt[1],
+        state: 'realtime',
+      });
+      onInterrupt({
+        hookCtx: interruptHookCtx,
+        text_length: body.text.length,
+        latency_ms: Date.now() - interruptStartedAt,
+      });
+      // The interrupt is the supported fallback from the pinned
+      // opening cache into realtime generation — recorded as the cache
+      // miss the docs/observability.md sanity counter expects.
+      onOpeningCacheMiss(interruptHookCtx, 'player_interrupt_realtime');
+      return jsonResponse(res, 200, {
+        ...PUBLIC_DECORATE(),
+        ...result,
+        player_event: result.event,
+        realtime_transition: { state: result.state, cursor: result.cursor, revision: result.revision },
+      });
+    } catch (err) {
+      return sessionErrorResponse(res, err);
+    }
+  }
+
+  // POST /api/sessions/:uuid/generate — runtime stages a 1..4 item
+  // batch + optional tool call on the session pending slot. Same
+  // runtime contract as the dev route; only the response decoration
+  // differs.
+  const publicGenerate = pathname.match(/^\/api\/sessions\/([^/]+)\/generate$/);
+  if (method === 'POST' && publicGenerate) {
+    const sessionUuid = publicGenerate[1];
+    if (rejectInvalidSessionUuid(res, sessionUuid)) return;
+    let body = {};
+    try {
+      body = await readJsonBody(req);
+    } catch (err) {
+      return sessionErrorResponse(res, err);
+    }
+    if (!validObject(body) || typeof body.input !== 'object' || body.input === null ||
+        !Number.isInteger(body.expected_revision) ||
+        (body.request_id !== undefined && (typeof body.request_id !== 'string' || !body.request_id.length))) {
+      return jsonResponse(res, 400, {
+        error: 'validation_failed',
+        message: 'The generate request is invalid.',
+        ...PUBLIC_DECORATE(),
+      });
+    }
+    let runtime;
+    try {
+      const recovered = recoverSession({ repository: storyRepo, session_uuid: sessionUuid });
+      runtime = createAgentRuntime({
+        repository: storyRepo,
+        session_uuid: sessionUuid,
+        provider: buildDemoMockAgentProvider(body.input, sessionUuid),
+        system_prompt: { kind: 'system', text: 'demo runtime prompt' },
+        tool_definitions: [
+          { type: 'function', function: { name: 'ask_player_choice', parameters: { type: 'object' } } },
+          { type: 'function', function: { name: 'finish_story', parameters: { type: 'object' } } },
+        ],
+        expected_story_version_uuid: recovered.story_version_uuid,
+        expected_story_version_checksum: recovered.story_version_checksum,
+        expected_model: recovered.model,
+        expected_generation_profile: recovered.generation_profile,
+      });
+    } catch (err) {
+      if (err instanceof AgentRuntimeError) {
+        return jsonResponse(res, 400, {
+          error: err.code, message: err.message, ...PUBLIC_DECORATE(),
+        });
+      }
+      return sessionErrorResponse(res, err);
+    }
+    try {
+      const result = await runTurn(runtime, {
+        ...(body.request_id ? { request_id: body.request_id } : {}),
+        input: body.input,
+        expected_revision: body.expected_revision,
+      });
+      return jsonResponse(res, 200, {
+        ...PUBLIC_DECORATE(),
+        ...result,
+        session_uuid: sessionUuid,
+        pending_id: result.pending_id,
+        events: result.items,
+        revision: result.base_revision,
+        pending_remaining: result.pending_total - result.pending_committed_count,
+      });
+    } catch (err) {
+      if (err instanceof AgentRuntimeError) {
+        return jsonResponse(res, 400, {
+          error: err.code, message: err.message, ...PUBLIC_DECORATE(),
+        });
+      }
+      return sessionErrorResponse(res, err);
+    }
+  }
+
+  // POST /api/sessions/:uuid/discard-pending — drop the active
+  // pending batch without committing.
+  const publicDiscard = pathname.match(/^\/api\/sessions\/([^/]+)\/discard-pending$/);
+  if (method === 'POST' && publicDiscard) {
+    if (rejectInvalidSessionUuid(res, publicDiscard[1])) return;
+    try {
+      const result = discardPendingTail({
+        repository: storyRepo,
+        session_uuid: publicDiscard[1],
+      });
+      return jsonResponse(res, 200, {
+        ...PUBLIC_DECORATE(),
+        session_uuid: publicDiscard[1],
+        ...result,
+      });
+    } catch (err) {
+      return sessionErrorResponse(res, err);
+    }
+  }
+
+  // POST /api/sessions/:uuid/first-choice — record the first
+  // ask_player_choice on THIS session. Same service call as the dev
+  // route; only the response decoration differs.
+  const publicFirstChoice = pathname.match(/^\/api\/sessions\/([^/]+)\/first-choice$/);
+  if (method === 'POST' && publicFirstChoice) {
+    if (rejectInvalidSessionUuid(res, publicFirstChoice[1])) return;
+    let body = {};
+    try {
+      body = await readJsonBody(req);
+    } catch (err) {
+      const { status, code } = classifyProviderError(err);
+      return jsonResponse(res, status, { error: code, ...PUBLIC_DECORATE_DEV() });
+    }
+    if (!body.snapshot || typeof body.snapshot !== 'object') {
+      return jsonResponse(res, 400, {
+        error: 'missing_snapshot',
+        ...PUBLIC_DECORATE(),
+      });
+    }
+    const urlSessionUuid = publicFirstChoice[1];
+    const snapshotSessionUuid = body.snapshot.session_uuid;
+    if (typeof snapshotSessionUuid !== 'string' || snapshotSessionUuid !== urlSessionUuid) {
+      return jsonResponse(res, 400, {
+        error: 'session_uuid_mismatch',
+        ...PUBLIC_DECORATE(),
+      });
+    }
+    try {
+      const firstChoiceStartedAt = Date.now();
+      const result = markFirstChoiceConsumed({
+        repository: storyRepo,
+        snapshot: body.snapshot,
+      });
+      onToolCommit({
+        hookCtx: createStoriesHookContext({ session_uuid: urlSessionUuid }),
+        tool_name: 'ask_player_choice',
+        latency_ms: Date.now() - firstChoiceStartedAt,
+      });
+      return jsonResponse(res, 200, { ...PUBLIC_DECORATE(), result });
+    } catch (err) {
+      const { status, code } = classifyProviderError(err);
+      return jsonResponse(res, status, {
+        error: code,
+        message: String(err && err.message ? err.message : err),
+        ...PUBLIC_DECORATE_DEV(),
+      });
+    }
+  }
+
+  // GET /api/sessions/:uuid/ending — read-only finish_story projection.
+  const publicEnding = pathname.match(/^\/api\/sessions\/([^/]+)\/ending$/);
+  if (method === 'GET' && publicEnding) {
+    if (rejectInvalidSessionUuid(res, publicEnding[1])) return;
+    try {
+      const ending = buildEnding({ repository: storyRepo, session_uuid: publicEnding[1] });
+      return jsonResponse(res, 200, {
+        ...PUBLIC_DECORATE(),
+        session_uuid: publicEnding[1],
+        ...ending,
+      });
+    } catch (err) {
+      if (err && err.code === 'ending_not_committed') {
+        return jsonResponse(res, 404, {
+          error: 'ending_not_committed',
+          message: 'finish_story has not yet committed for this session.',
+          session_uuid: publicEnding[1],
+          ...PUBLIC_DECORATE(),
+        });
+      }
+      return sessionErrorResponse(res, err);
+    }
+  }
+
+  // GET /api/sessions/:uuid/original-timeline — read-only original key
+  // facts projection. Same service function as the dev route.
+  const publicOriginalTimeline = pathname.match(/^\/api\/sessions\/([^/]+)\/original-timeline$/);
+  if (method === 'GET' && publicOriginalTimeline) {
+    if (rejectInvalidSessionUuid(res, publicOriginalTimeline[1])) return;
+    try {
+      const timeline = buildOriginalTimeline({ repository: storyRepo, session_uuid: publicOriginalTimeline[1] });
+      return jsonResponse(res, 200, {
+        ...PUBLIC_DECORATE(),
+        session_uuid: publicOriginalTimeline[1],
+        ...timeline,
+      });
+    } catch (err) {
+      return sessionErrorResponse(res, err);
+    }
+  }
+
+  // GET /api/sessions/:uuid/replay — strict committed-history replay.
+  const publicReplay = pathname.match(/^\/api\/sessions\/([^/]+)\/replay$/);
+  if (method === 'GET' && publicReplay) {
+    if (rejectInvalidSessionUuid(res, publicReplay[1])) return;
+    try {
+      const replay = buildReplay({ repository: storyRepo, session_uuid: publicReplay[1] });
+      return jsonResponse(res, 200, {
+        ...PUBLIC_DECORATE(),
+        session_uuid: publicReplay[1],
+        ...replay,
+      });
+    } catch (err) {
+      return sessionErrorResponse(res, err);
+    }
   }
 
   // Root → static

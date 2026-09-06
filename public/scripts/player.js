@@ -49,6 +49,7 @@ const state = {
   story: null,
   role: null,
   sessionUuid: null,
+  storyUuid: null,
   storyVersionUuid: null,
   cacheUuid: null,
   generationProfile: null,
@@ -271,71 +272,45 @@ function selectStory(storyId) {
 // -------- Story bootstrap (session creation) --------
 
 async function bootstrapSession({ story, role }) {
+  // Issue #9: the browser no longer depends on any demo / admin route
+  // to discover UUIDs, rebuild the opening cache, or assemble a
+  // generation_profile. The public /api/sessions façade returns
+  // everything we need in a single atomic call:
+  //   session_uuid, cache_uuid, opening_events, story_uuid,
+  //   story_version_uuid, generation_profile, pinned.
+  // The server chooses the model / prompt / generation_profile defaults
+  // — the browser does not know about them, by design.
   setStatus('loading');
   setText('#picker-status', '准备开场&hellip;');
-  let cacheUuid, storyUuid, storyVersionUuid, generationProfile;
+  let cacheUuid, generationProfile;
   try {
-    const adminList = await api('/api/admin/stories');
-    const entry = (adminList.stories || []).find((row) => row.slug === story.id);
-    if (!entry || !entry.versions || !entry.versions.length) {
-      throw new Error('no_version_for_story');
-    }
-    const version = entry.versions.find((v) => v.status === 'published') || entry.versions[0];
-    storyUuid = entry.story_uuid;
-    storyVersionUuid = version.story_version_uuid;
-    const rebuilt = await api('/api/admin/opening-cache/rebuild', {
-      method: 'POST',
-      body: JSON.stringify({ story_version_uuid: storyVersionUuid }),
-    });
-    const cache = rebuilt.result.cache;
-    cacheUuid = cache.cache_uuid;
-    generationProfile = { ...cache.generation_profile, cache_uuid: cacheUuid };
-    state.openingEvents = (cache.content_payload && cache.content_payload.events) || [];
-  } catch (err) {
-    setText('#picker-status', `准备失败：${err.message}`);
-    setStatus('picker');
-    return;
-  }
-  const sessionUuid = newSessionUuid();
-  try {
-    const created = await api('/api/dev/sessions', {
+    const created = await api('/api/sessions', {
       method: 'POST',
       body: JSON.stringify({
-        session_uuid: sessionUuid,
-        story_uuid: storyUuid,
-        story_version_uuid: storyVersionUuid,
-        user_ref: 'demo-user-09',
+        work_id: story.id,
         role_id: role.id,
-        model: 'mock-09',
-        prompt: 'demo 09 prompt',
-        generation_profile: generationProfile,
       }),
     });
-    state.sessionUuid = created.session_uuid || sessionUuid;
-    state.cacheUuid = cacheUuid;
-    state.storyVersionUuid = storyVersionUuid;
-    state.generationProfile = generationProfile;
+    if (!created || !created.session_uuid || !created.cache_uuid) {
+      throw new Error('bad_session_bootstrap');
+    }
+    state.sessionUuid = created.session_uuid;
+    state.cacheUuid = created.cache_uuid;
+    state.storyUuid = created.story_uuid || null;
+    state.storyVersionUuid = created.story_version_uuid || null;
+    state.openingEvents = Array.isArray(created.opening_events) ? created.opening_events : [];
+    state.generationProfile = (created.session && created.session.generation_profile)
+      || (created.pinned && created.pinned.generation_profile)
+      || { cache_uuid: created.cache_uuid };
     setText('#story-name', story.title);
     setText('#role-name', role.label);
     persistSessionContext();
     showScreen('player');
     await recoverAndStart();
   } catch (err) {
-    setText('#picker-status', `创建会话失败：${err.message}`);
+    setText('#picker-status', `准备失败：${err.message}`);
     setStatus('picker');
   }
-}
-
-function newSessionUuid() {
-  // A stable client-side UUID keeps the demo session addressable across
-  // reloads (within the same process). crypto.randomUUID is available in
-  // modern browsers and the Node 20+ server we run against.
-  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
-    return crypto.randomUUID();
-  }
-  // Fallback: a non-cryptographic v4-shaped identifier.
-  const rnd = (n) => Array.from({ length: n }, () => Math.floor(Math.random() * 16).toString(16)).join('');
-  return `${rnd(8)}-${rnd(4)}-4${rnd(3)}-a${rnd(3)}-${rnd(12)}`;
 }
 
 // -------- Last-session context (for the ?s=ending deep link) --------
@@ -374,7 +349,7 @@ async function recoverAndStart() {
   setStatus('loading');
   clearAllPendingNodes();
   try {
-    const recovered = await api(`/api/dev/sessions/${state.sessionUuid}/recover`);
+    const recovered = await api(`/api/sessions/${state.sessionUuid}/recover`);
     state.lastRevision = recovered.revision || 0;
     state.openingCursor = recovered.opening_cursor || 0;
     state.canonicalHistory = recovered.history || [];
@@ -420,7 +395,7 @@ async function recoverAndStart() {
     // keeps the original behavior: generate the next batch.
     let endingCommitted = false;
     try {
-      await api(`/api/dev/sessions/${state.sessionUuid}/ending`);
+      await api(`/api/sessions/${state.sessionUuid}/ending`);
       endingCommitted = true;
     } catch { /* ending_not_committed (404) or transient failure */ }
     if (endingCommitted) {
@@ -501,7 +476,7 @@ async function runOpeningStep() {
   }, state.canonicalHistory.length + sequence);
   registerPendingNode(`opening:${sequence}`, placeholderEl);
   try {
-    const result = await api(`/api/dev/sessions/${state.sessionUuid}/opening-events`, {
+    const result = await api(`/api/sessions/${state.sessionUuid}/opening-events`, {
       method: 'POST',
       body: JSON.stringify({
         cache_uuid: state.cacheUuid,
@@ -707,7 +682,7 @@ async function commitNextPendingItem() {
   const pendingKey = `pending:${state.pending.pending_id}:${sequence}`;
   const placeholderEl = pendingNodes.get(pendingKey) || null;
   try {
-    const result = await api(`/api/dev/sessions/${state.sessionUuid}/narrative-events`, {
+    const result = await api(`/api/sessions/${state.sessionUuid}/narrative-events`, {
       method: 'POST',
       body: JSON.stringify({
         pending_id: state.pending.pending_id,
@@ -797,7 +772,7 @@ async function startNextBatch() {
   const inputText = state.nextBatchInput || 'hello';
   state.nextBatchInput = null;
   try {
-    const turn = await api(`/api/dev/sessions/${state.sessionUuid}/generate`, {
+    const turn = await api(`/api/sessions/${state.sessionUuid}/generate`, {
       method: 'POST',
       body: JSON.stringify({
         input: { text: inputText },
@@ -998,7 +973,7 @@ async function interruptWithPlayerText(text, { input = null, failLabel = '打断
   const previousStatus = state.status;
   setStatus('loading');
   try {
-    const result = await api(`/api/dev/sessions/${state.sessionUuid}/interrupt`, {
+    const result = await api(`/api/sessions/${state.sessionUuid}/interrupt`, {
       method: 'POST',
       body: JSON.stringify({
         text: trimmed,
