@@ -13,6 +13,8 @@ import { dirname, resolve } from 'node:path';
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PLAYER_PATH = resolve(__dirname, '..', 'public', 'scripts', 'player.js');
 const ENDING_PAGE_PATH = resolve(__dirname, '..', 'public', 'scripts', 'endingPage.js');
+const SOCIAL_PANEL_PATH = resolve(__dirname, '..', 'public', 'scripts', 'socialPanel.js');
+const SESSION_CONTEXT_PATH = resolve(__dirname, '..', 'public', 'scripts', 'sessionContext.js');
 
 export async function loadFixtureScript() {
   return readFile(PLAYER_PATH, 'utf-8');
@@ -22,6 +24,18 @@ let endingPageSourceCache = null;
 async function readEndingPageSource() {
   if (!endingPageSourceCache) endingPageSourceCache = readFile(ENDING_PAGE_PATH, 'utf-8');
   return endingPageSourceCache;
+}
+
+let socialPanelSourceCache = null;
+async function readSocialPanelSource() {
+  if (!socialPanelSourceCache) socialPanelSourceCache = readFile(SOCIAL_PANEL_PATH, 'utf-8');
+  return socialPanelSourceCache;
+}
+
+let sessionContextSourceCache = null;
+async function readSessionContextSource() {
+  if (!sessionContextSourceCache) sessionContextSourceCache = readFile(SESSION_CONTEXT_PATH, 'utf-8');
+  return sessionContextSourceCache;
 }
 
 // The player lazy-loads the ending page via `import('/scripts/endingPage.js')`.
@@ -37,19 +51,89 @@ const PLAYER_ENDING_HOOK = 'globalThis.__HARNESS_IMPORT_ENDING_PAGE__()';
 
 async function importEndingPageForHarness() {
   const source = await readEndingPageSource();
-  const stripped = source.replace(/export\s*\{[^}]*\}\s*;?\s*$/m, '');
+  // Strip both `export {...}` and `export default {...}` so the
+  // source can be evaluated inside `new Function`.
+  const stripped = source
+    .replace(/export\s*\{[^}]*\}\s*;?\s*$/m, '')
+    .replace(/export\s+default\s+\{[^}]*\}\s*;?\s*$/m, '');
   const fn = new Function(`${stripped}\nreturn { mount, teardown, STATE };`);
+  const mod = fn();
+  // ClickUp 16.3 P1 v1-7: wrap `mount` with a recorder so the
+  // ?s=ending deep-link regression can assert the canonical meta
+  // actually reaches `endingPage.mount({ sessionUuid, sessionMeta })`.
+  const realMount = mod.mount;
+  if (typeof realMount === 'function') {
+    mod.mount = async function spyMount(payload) {
+      try {
+        const list = globalThis.__HARNESS_ENDING_PAGE_MOUNT_CALLS__ || [];
+        list.push(payload);
+        globalThis.__HARNESS_ENDING_PAGE_MOUNT_CALLS__ = list;
+      } catch { /* ignore recording failures */ }
+      return realMount.call(this, payload);
+    };
+  }
+  return mod;
+}
+
+// The player lazy-loads the social panel via `import('/scripts/socialPanel.js')`
+// (ClickUp 16.3 P1 v1-3). The harness rewrites that dynamic import to a
+// hook that evaluates the REAL socialPanel.js source — the panel mounts
+// its own DOM and the player's lazy-import wiring stays under test.
+const PLAYER_SOCIAL_PANEL_IMPORT = "import('/scripts/socialPanel.js')";
+const PLAYER_SOCIAL_PANEL_HOOK = 'globalThis.__HARNESS_IMPORT_SOCIAL_PANEL__()';
+
+async function importSocialPanelForHarness() {
+  const source = await readSocialPanelSource();
+  const patched = applyHarnessPatches(source);
+  // Strip both `export {...}` and `export default {...}` so the
+  // source can be evaluated inside `new Function` (which has no
+  // module-level export support). The named exports we want are
+  // captured in the return statement below.
+  const stripped = patched
+    .replace(/export\s*\{[^}]*\}\s*;?\s*$/m, '')
+    .replace(/export\s+default\s+\{[^}]*\}\s*;?\s*$/m, '');
+  const fn = new Function(`${stripped}\nreturn { mount, refreshFeed, refreshShareButton, refreshAuthStatus, currentShareTargetUuid };`);
+  return fn();
+}
+
+async function importSessionContextForHarness() {
+  const source = await readSessionContextSource();
+  const patched = applyHarnessPatches(source);
+  const stripped = patched
+    .replace(/export\s*\{[^}]*\}\s*;?\s*$/m, '')
+    .replace(/export\s+default\s+\{[^}]*\}\s*;?\s*$/m, '');
+  // ClickUp 16.3 P1 v1-7: expose `getCurrentShareTargetMeta` so the
+  // deep-link regression test can assert the helper round-trips the
+  // canonical triple (storyUuid / storyVersionUuid /
+  // communityProfileVersion / communityProfileQueries) on reload.
+  const fn = new Function(`${stripped}\nreturn { getCurrentShareTargetUuid, getCurrentShareTargetMeta, setCurrentShareTargetUuid, clearCurrentShareTargetUuid, getLastSessionStorageKey };`);
   return fn();
 }
 
 function applyHarnessPatches(source) {
-  if (!source.includes(PLAYER_ENDING_IMPORT)) {
-    throw new Error(
-      'player harness: the dynamic import of /scripts/endingPage.js was not found '
-      + 'in player.js source — update PLAYER_ENDING_IMPORT in tests/_player-dom.mjs'
-    );
+  let patched = source;
+  // ClickUp 16.3 P1 v1-4: the player AND the social panel both
+  // lazy-import the session-context helper. Rewrite that import to
+  // a harness hook that evaluates the REAL sessionContext.js source
+  // — same pattern as the panel and ending-page hooks above.
+  const PLAYER_SESSION_CONTEXT_IMPORT = "import('/scripts/sessionContext.js')";
+  const PLAYER_SESSION_CONTEXT_HOOK = 'globalThis.__HARNESS_IMPORT_SESSION_CONTEXT__()';
+  if (patched.includes(PLAYER_SESSION_CONTEXT_IMPORT)) {
+    patched = patched.replaceAll(PLAYER_SESSION_CONTEXT_IMPORT, PLAYER_SESSION_CONTEXT_HOOK);
   }
-  return source.replaceAll(PLAYER_ENDING_IMPORT, PLAYER_ENDING_HOOK);
+  // The player dynamic import of /scripts/endingPage.js only appears
+  // in player.js; tolerate its absence for the panel / sessionContext
+  // sources.
+  if (patched.includes(PLAYER_ENDING_IMPORT)) {
+    patched = patched.replaceAll(PLAYER_ENDING_IMPORT, PLAYER_ENDING_HOOK);
+  }
+  // The social panel import is OPTIONAL: it was added by ClickUp 16.3
+  // P1 v1-3. Older player.js source (before the panel wiring) does
+  // not include the import, so we tolerate that.
+  if (patched.includes(PLAYER_SOCIAL_PANEL_IMPORT)) {
+    patched = patched.replaceAll(PLAYER_SOCIAL_PANEL_IMPORT, PLAYER_SOCIAL_PANEL_HOOK);
+  }
+  return patched;
 }
 
 // --- Minimal DOM polyfill ---
@@ -299,6 +383,15 @@ const document = {
   body: new Element('body'),
   head: new Element('head'),
   createElement(tag) { return new Element(tag); },
+  // getElementById: ClickUp 16.3 P1 v1-3 — the socialPanel module
+  // looks up its own host / status / feed elements by id. We map an
+  // id selector onto the existing querySelector path so the panel
+  // can mount under the harness without an extra polyfill surface.
+  getElementById(id) {
+    if (id === 'body') return document.body;
+    if (id === 'head') return document.head;
+    return querySelector(document.body, `#${id}`);
+  },
   querySelector(sel) {
     if (sel === 'body') return document.body;
     if (sel === 'head') return document.head;
@@ -340,7 +433,7 @@ if (typeof nativeFetch !== 'function') {
   throw new Error('player harness requires Node global fetch (Node 18+)');
 }
 
-export function createPlayerDom({ baseUrl, viewport = null, stepDelayMs = null, startScreen = null } = {}) {
+export function createPlayerDom({ baseUrl, viewport = null, stepDelayMs = null, startScreen = null, preservedSessionStorage = null, preservedLocalStorage = null } = {}) {
   // Build the DOM tree the player.js expects. Mirrors public/index.html.
   function buildDom() {
     // The document/body/head elements are shared by every harness
@@ -566,25 +659,96 @@ export function createPlayerDom({ baseUrl, viewport = null, stepDelayMs = null, 
     // Fresh sessionStorage per harness instance — each createPlayerDom()
     // stands for a fresh tab, so the player's persisted last-session
     // context never leaks across harnesses.
+    //
+    // ClickUp 16.3 P1 v1-7: callers that want to model a
+    // `location.reload()` (where the storage backing store survives
+    // the reload) can pre-seed both stores via the
+    // `preservedSessionStorage` / `preservedLocalStorage` options.
+    // The Map iterators preserve the order in which the caller
+    // inserted entries, so a seeded store round-trips identically
+    // for the new helper instance.
     const sessionStore = new Map();
+    if (preservedSessionStorage && typeof preservedSessionStorage === 'object') {
+      for (const [k, v] of Object.entries(preservedSessionStorage)) {
+        sessionStore.set(String(k), String(v));
+      }
+    }
     globalThis.sessionStorage = {
       getItem: (k) => (sessionStore.has(k) ? sessionStore.get(k) : null),
       setItem: (k, v) => { sessionStore.set(String(k), String(v)); },
       removeItem: (k) => { sessionStore.delete(k); },
       clear: () => { sessionStore.clear(); },
     };
+    // localStorage mirrors sessionStorage so the helper's fallback
+    // path sees a consistent surface. Tests can clear both via the
+    // `__HARNESS_RESET_SESSION_CONTEXT__` hook.
+    const localStore = new Map();
+    if (preservedLocalStorage && typeof preservedLocalStorage === 'object') {
+      for (const [k, v] of Object.entries(preservedLocalStorage)) {
+        localStore.set(String(k), String(v));
+      }
+    }
+    globalThis.localStorage = {
+      getItem: (k) => (localStore.has(k) ? localStore.get(k) : null),
+      setItem: (k, v) => { localStore.set(String(k), String(v)); },
+      removeItem: (k) => { localStore.delete(k); },
+      clear: () => { localStore.clear(); },
+    };
+    // Test-only escape hatch: wipe both stores and the helper's
+    // in-memory cache so the harness can model a fresh tab with no
+    // remembered session.
+    globalThis.__HARNESS_RESET_SESSION_CONTEXT__ = () => {
+      sessionStore.clear();
+      localStore.clear();
+    };
     // The viewport option lets a test simulate mobile widths by
     // overriding the inner clientWidth used by `layoutOverflow`.
     const search = startScreen ? `?s=${startScreen}` : '';
+    // ClickUp 16.3 P1 v1-4: give the harness window addEventListener /
+    // dispatchEvent / CustomEvent support so the social panel can
+    // subscribe to the session-context helper's `session:changed`
+    // CustomEvent. Without this surface the harness would silently
+    // drop every event and the listener never fires.
+    const windowListeners = new Map();
+    function windowAddEventListener(type, fn) {
+      if (!windowListeners.has(type)) windowListeners.set(type, []);
+      windowListeners.get(type).push(fn);
+    }
+    function windowRemoveEventListener(type, fn) {
+      const list = windowListeners.get(type);
+      if (!list) return;
+      const idx = list.indexOf(fn);
+      if (idx >= 0) list.splice(idx, 1);
+    }
+    function windowDispatchEvent(evt) {
+      const list = windowListeners.get(evt && evt.type) || [];
+      for (const fn of list) {
+        try { fn(evt); } catch { /* ignore handler failures */ }
+      }
+      return true;
+    }
+    function WindowCustomEvent(type, init) {
+      this.type = type;
+      this.detail = init && init.detail;
+    }
     globalThis.window = {
       location: { href: `${baseUrl}/${search}`, search },
       scrollTo: () => {},
       innerWidth: viewport?.width || 1280,
       innerHeight: viewport?.height || 800,
+      addEventListener: windowAddEventListener,
+      removeEventListener: windowRemoveEventListener,
+      dispatchEvent: windowDispatchEvent,
+      CustomEvent: WindowCustomEvent,
     };
     globalThis.fetch = fetchStub;
     // Lazy ending-page import hook (see importEndingPageForHarness).
     globalThis.__HARNESS_IMPORT_ENDING_PAGE__ = importEndingPageForHarness;
+    // ClickUp 16.3 P1 v1-3: same hook pattern for the social panel.
+    globalThis.__HARNESS_IMPORT_SOCIAL_PANEL__ = importSocialPanelForHarness;
+    // ClickUp 16.3 P1 v1-4: same hook pattern for the session-context
+    // helper (loaded by player.js AND by socialPanel.js).
+    globalThis.__HARNESS_IMPORT_SESSION_CONTEXT__ = importSessionContextForHarness;
     if (!globalThis.crypto) globalThis.crypto = {};
     if (typeof globalThis.crypto.randomUUID !== 'function') {
       globalThis.crypto.randomUUID = () => '00000000-0000-4000-8000-000000000099';

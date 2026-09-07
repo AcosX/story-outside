@@ -165,20 +165,25 @@ try {
 
   // -----------------------------------------------------------------
   // Validation: missing fields, bad uuid, unknown work_id
+  // ClickUp 16.3 P1 v1-2 (主人 2026-09-07 04:21 巡检): the public
+  // POST /api/sessions surface now accepts an empty body and falls
+  // back to demo defaults for `work_id` / `role_id` because identity
+  // is resolved server-side via `currentUserProvider(req)`. The
+  // missing-field cases below now expect the demo defaults to apply
+  // (i.e. a 200 response with canonical owner), not a 400.
   // -----------------------------------------------------------------
   {
     const r = await post('/api/sessions', { role_id: 'stranger' });
-    check('missing work_id is 400 validation_failed', r.response.status === 400 && r.data?.error === 'validation_failed');
-    check('missing work_id reports field=work_id', r.data?.field === 'work_id');
+    check('only role_id → 200 with canonical owner (v1-2)', r.response.status === 200 && r.data?.owner?.user_uuid === '00000000-0000-4000-8000-00000000cafe');
   }
   {
     const r = await post('/api/sessions', { work_id: 'cafe-rain' });
-    check('missing role_id is 400 validation_failed', r.response.status === 400 && r.data?.error === 'validation_failed');
-    check('missing role_id reports field=role_id', r.data?.field === 'role_id');
+    check('only work_id → 200 with canonical owner (v1-2)', r.response.status === 200 && r.data?.owner?.user_uuid === '00000000-0000-4000-8000-00000000cafe');
   }
   {
     const r = await post('/api/sessions', {});
-    check('empty body is 400 validation_failed', r.response.status === 400 && r.data?.error === 'validation_failed');
+    check('empty body → 200 with canonical owner (v1-2)', r.response.status === 200 && r.data?.owner?.user_uuid === '00000000-0000-4000-8000-00000000cafe');
+    check('empty body → owner.auth_source === oauth_pending (v1-2)', r.data?.owner?.auth_source === 'oauth_pending');
   }
   {
     const r = await post('/api/sessions', { work_id: 'does-not-exist', role_id: 'stranger' });
@@ -212,6 +217,12 @@ try {
   // prompt) via the public raw `session` snapshot.
   // -----------------------------------------------------------------
   {
+    // ClickUp 16.3 P1 v1-2: identity-shaped keys (`identity`,
+    // `user_ref`, `user_uuid`, ...) are explicitly forbidden and return
+    // 400 `forbidden_field`. The whitelist itself now only allows
+    // `work_id` + `role_id`; any other top-level key is rejected with
+    // the same generic 400 (no echo). The wire check still verifies
+    // that none of the probe values leak back.
     const probeBody = {
       work_id: 'cafe-rain',
       role_id: 'stranger',
@@ -219,14 +230,30 @@ try {
       foo: 'bar',
     };
     const r = await post('/api/sessions', probeBody);
-    check('bootstrap with extra fields is 400 validation_failed (whitelist)',
-      r.response.status === 400 && r.data?.error === 'validation_failed');
+    check('bootstrap with identity-shaped field is 400 forbidden_field (v1-2)',
+      r.response.status === 400 && r.data?.error === 'forbidden_field');
+    check('bootstrap with forbidden_field reports field=identity',
+      r.data?.field === 'identity');
     const wire = JSON.stringify(r.data || {});
     check('whitelist-rejected response does NOT echo probe-user string', !/probe-user/.test(wire));
     check('whitelist-rejected response does NOT echo probe-model string', !/probe-model/.test(wire));
     check('whitelist-rejected response does NOT echo probe-prompt string', !/probe-prompt/.test(wire));
     check('whitelist-rejected response does NOT echo foo=bar string', !/bar/.test(wire));
     check('whitelist-rejected response does NOT carry DEV_FLAG banner', r.data?.dev === undefined);
+  }
+  {
+    // v1-2: a non-identity, non-whitelisted extra key (e.g. `foo`)
+    // still returns 400 validation_failed (whitelist), not forbidden.
+    const probeBody = {
+      work_id: 'cafe-rain',
+      role_id: 'stranger',
+      foo: 'bar',
+    };
+    const r = await post('/api/sessions', probeBody);
+    check('bootstrap with non-identity extra field is 400 validation_failed (whitelist)',
+      r.response.status === 400 && r.data?.error === 'validation_failed');
+    const wire = JSON.stringify(r.data || {});
+    check('non-identity whitelist-rejected response does NOT echo foo=bar', !/bar/.test(wire));
   }
   // Defense in depth: even if the whitelist check is bypassed in a
   // future regression, the public response MUST NOT surface the
