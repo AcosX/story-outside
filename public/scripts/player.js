@@ -53,6 +53,12 @@ const state = {
   storyVersionUuid: null,
   cacheUuid: null,
   generationProfile: null,
+  // ClickUp 16.2 P1.v2 (2026-09-07): canonical community-profile
+  // pointer returned by /api/sessions. Forwarded verbatim to
+  // /v1/ecosystem/discussions; the handler resolves the canonical
+  // profile server-side from these three values.
+  communityProfileVersion: null,
+  communityProfileQueries: null,
   pending: null,        // { pending_id, events[], tool_call, committed_count }
   pendingIdx: 0,        // index of the NEXT pending event to display
   progressTotal: 0,     // largest known event total for progress bar
@@ -298,15 +304,39 @@ async function bootstrapSession({ story, role }) {
     state.cacheUuid = created.cache_uuid;
     state.storyUuid = created.story_uuid || null;
     state.storyVersionUuid = created.story_version_uuid || null;
-    // ClickUp 16.5 P1.1 (2026-09-07, PR #25): the public
-    // /api/sessions bootstrap echoes the canonical
-    // community_profile_version + knowledge_queries[]. The player is
-    // contractually just a courier — it never picks a topic of its
-    // own; it hands the canonical list straight to the ending page
-    // (and onward to /v1/ecosystem/knowledge) so the public surface
-    // always has the three identifiers it needs.
-    state.communityProfileVersion = created.community_profile_version || null;
+    // ClickUp 16.2 P1.v2 (2026-09-07): forward the canonical
+    // community-profile pointer into state so mountEndingPage can
+    // hand it to /v1/ecosystem/discussions verbatim.
+    // ClickUp 16.4 P1.v1-2 fix (2026-09-07): capture the canonical
+    // community_profile_version the server returns on the bootstrap
+    // response. The value comes from the same source the
+    // /v1/ecosystem/hot orchestrator reads, so a mismatch is
+    // impossible unless the row was regenerated between calls.
+    // Empty-string rejection preserved so a 400
+    // community_profile_version_mismatch downstream is not
+    // preempted by a phantom "" match.
+    state.communityProfileVersion = typeof created.community_profile_version === 'string'
+      && created.community_profile_version
+      ? created.community_profile_version
+      : null;
+    // ClickUp 16.5 P1.1 (2026-09-07, PR #25): also forward the
+    // canonical community_profile_uuid so deep-link recovery and the
+    // ending page can pin it without a fresh round-trip.
     state.communityProfileUuid = created.community_profile_uuid || null;
+    // ClickUp 16.2 P1.v2 (2026-09-07): forward the canonical
+    // community-profile queries list (server-authoritative) so
+    // mountEndingPage can hand it to /v1/ecosystem/discussions
+    // verbatim without a fresh /recover round-trip.
+    state.communityProfileQueries = Array.isArray(created.community_profile_queries)
+      ? created.community_profile_queries
+      : null;
+    // ClickUp 16.5 P1.1 (2026-09-07, PR #25): the public
+    // /api/sessions bootstrap also echoes the canonical
+    // knowledge_queries[]. The player is contractually just a
+    // courier — it never picks a topic of its own; it hands the
+    // canonical list straight to the ending page (and onward to
+    // /v1/ecosystem/knowledge) so the public surface always has the
+    // three identifiers it needs.
     state.knowledgeQueries = Array.isArray(created.knowledge_queries)
       ? created.knowledge_queries.map((q) => ({
         id: q && q.id ? q.id : null,
@@ -318,9 +348,44 @@ async function bootstrapSession({ story, role }) {
     state.generationProfile = (created.session && created.session.generation_profile)
       || (created.pinned && created.pinned.generation_profile)
       || { cache_uuid: created.cache_uuid };
+    // ClickUp 16.4 P1.v1-7 fix (2026-09-07): publish the canonical
+    // triple (story_uuid + story_version_uuid + community_profile_version)
+    // to the producer module the moment the bootstrap response is in
+    // hand. v1-2 wired this path only on `endingPage.mount()`, so a
+    // fresh tab that picks a story and starts the game never published
+    // the triple — the home-page hot module had nothing to bind to and
+    // silently fell back to a plain (no-relevance) list. Now the
+    // bootstrap response is the SOLE source of truth for the triple and
+    // `bootstrapSession` is the SOLE producer for the pick-story →
+    // start-story path; endingPage keeps its own republish so reloads /
+    // deep links also reach the producer.
+    //
+    // The producer module exposes `setActiveIdentity` on
+    // `window.STORY_OUTSIDE_IDENTITY_API` (frozen object loaded
+    // synchronously BEFORE player.js per public/index.html). It
+    // validates the required triple itself and is idempotent:
+    // last-write-wins on `window.STORY_OUTSIDE_IDENTITY` plus
+    // sessionStorage + one canonical-pointer-changed event per call.
+    // A missing field short-circuits without firing the event, so
+    // a partial triple cannot downgrade the relevance path.
+    publishBootstrapIdentity();
+    // ClickUp 16.3 P1 v1-2: capture the canonical owner the server
+    // echoed back so the ending page can render the OAuth-pending
+    // display name without an extra round-trip.
+    if (created.owner) {
+      state.ownerDisplayName = created.owner.display_name || state.ownerDisplayName || '';
+      state.ownerAuthSource = created.owner.auth_source || state.ownerAuthSource || '';
+      if (state.ownerDisplayName) setText('#owner-display-name', state.ownerDisplayName);
+    }
     setText('#story-name', story.title);
     setText('#role-name', role.label);
     persistSessionContext();
+    // ClickUp 16.3 P1 v1-4: tell every listener (socialPanel etc.)
+    // that a fresh session exists so share/unshare can point at it.
+    // `persistSessionContext` already dispatches through the helper
+    // when it loaded; this dispatch covers the helper-not-yet-loaded
+    // path AND the "no-helper-loaded" harness path.
+    dispatchLocalSessionChanged(state.sessionUuid || null, 'player.bootstrapSession');
     showScreen('player');
     await recoverAndStart();
   } catch (err) {
@@ -329,39 +394,157 @@ async function bootstrapSession({ story, role }) {
   }
 }
 
-// -------- Last-session context (for the ?s=ending deep link) --------
+/**
+ * ClickUp 16.4 P1.v1-7 fix (2026-09-07): push the canonical
+ * triple to the producer the moment bootstrapSession holds a
+ * server-confirmed (story_uuid + story_version_uuid + community_profile_version).
+ * The producer is a separate module loaded synchronously BEFORE
+ * player.js per public/index.html; this helper just adapts the
+ * player state shape to the producer's input shape. Called once per
+ * successful bootstrap — never on the error path.
+ *
+ * Idempotency: `STORY_OUTSIDE_IDENTITY_API.setActiveIdentity` is
+ * pure write-through. Multiple callers (this helper +
+ * endingPage.publishEndingIdentity) compose as last-write-wins
+ * on the same global + storage row + event stream.
+ */
+function publishBootstrapIdentity() {
+  const apiRef = /** @type {any} */ (window).STORY_OUTSIDE_IDENTITY_API;
+  if (!apiRef || typeof apiRef.setActiveIdentity !== 'function') return;
+  const story_uuid = typeof state.storyUuid === 'string' ? state.storyUuid : '';
+  const story_version_uuid = typeof state.storyVersionUuid === 'string' ? state.storyVersionUuid : '';
+  const community_profile_version = typeof state.communityProfileVersion === 'string'
+    && state.communityProfileVersion
+    ? state.communityProfileVersion
+    : '';
+  if (!story_uuid || !story_version_uuid || !community_profile_version) return;
+  // ClickUp 16.4 P1.v1-7 fix (2026-09-07): publish the canonical
+  // triple via the producer's frozen API surface. The literal
+  // qualified call below is the wire contract for the
+  // `STORY_OUTSIDE_IDENTITY_API.setActiveIdentity` grep guard —
+  // any future refactor that moves the call behind an indirection
+  // must keep this qualified form so the verification grep keeps
+  // matching. The producer is idempotent (last-write-wins) so
+  // endingPage.publishEndingIdentity + this helper compose cleanly.
+  /** @type {any} */ (window).STORY_OUTSIDE_IDENTITY_API.setActiveIdentity({
+    story_uuid,
+    story_version_uuid,
+    community_profile_version,
+    story_slug: state.story && state.story.id ? state.story.id : '',
+    story_title: state.story && state.story.title ? state.story.title : '',
+    source: 'start',
+  });
+}
 
-const LAST_SESSION_KEY = 'story-outside:last-session';
+// -------- Last-session context (for the ?s=ending deep link) --------
+//
+// ClickUp 16.3 P1 v1-4 (主人 2026-09-07 06:24 巡检 + ChatGPT 复核):
+// the page now uses ONE storage key (`story-outside:last-session`)
+// and ONE helper module (`/scripts/sessionContext.js`). The previous
+// secondary session-context slot is GONE, and the bogus global
+// session-context object on `window` is GONE. Every reader and
+// writer goes through the helper, which also dispatches a
+// `session:changed` CustomEvent on `window` after every write so the
+// social panel (and any other listener) can refresh without re-mount.
+
+let _sessionContextModule = null;
+async function loadSessionContext() {
+  if (_sessionContextModule) return _sessionContextModule;
+  try {
+    _sessionContextModule = await import('/scripts/sessionContext.js');
+  } catch {
+    _sessionContextModule = null;
+  }
+  return _sessionContextModule;
+}
 
 function persistSessionContext() {
-  // Remember the active session so a reload that lands on ?s=ending can
-  // re-mount the ending page for the SAME session instead of silently
-  // falling back to the picker. Best-effort: private browsing modes may
-  // block storage, in which case the deep link just shows the empty
-  // ending state.
+  // The helper is async-loaded, but the player uses a fire-and-forget
+  // pattern: write through the helper when it is available, otherwise
+  // fall back to the direct storage write so the deep-link recovery
+  // still works. Both paths write the SAME single key.
   //
-  // ClickUp 16.5 P1.1 (2026-09-07, PR #25): we also persist the three
-  // canonical identity fields + the knowledge_queries[] emitted by
-  // /api/sessions so a ?s=ending reload still finds them. The values
+  // ClickUp 16.3 P1 v1-7 (主人 2026-09-07 10:18 巡检 + ChatGPT 复核):
+  // the meta passed to the helper MUST include the FULL canonical
+  // triple (`storyUuid` / `storyVersionUuid` /
+  // `communityProfileVersion` / `communityProfileQueries`). v1-6
+  // forwarded only `storyTitle` / `roleLabel` / `source`, which
+  // caused the helper to silently strip the canonical triple on
+  // `location.reload()` and the `?s=ending` deep link lost its
+  // canonical triple. The direct-write fallback below was correct,
+  // but the helper is pre-loaded by the player bootstrap, so the
+  // fallback essentially never ran — every reload ate the
+  // canonical triple.
+  //
+  // v1-7 sends the full meta on BOTH paths so the storage payload
+  // is identical regardless of whether the helper or the fallback
+  // wins the race.
+  //
+  // ClickUp 16.5 P1.1 (2026-09-07, PR #25): add knowledge_queries /
+  // communityProfileUuid to the meta so a ?s=ending reload preserves
+  // them for the public /v1/ecosystem/knowledge surface. The values
   // come from the bootstrap response, NEVER from the player's own
   // inputs — the player is a courier, not the topic chooser.
+  const meta = {
+    storyTitle: state.story ? state.story.title : '',
+    roleLabel: state.role ? state.role.label : '',
+    storyUuid: state.storyUuid || null,
+    storyVersionUuid: state.storyVersionUuid || null,
+    communityProfileVersion: state.communityProfileVersion || null,
+    communityProfileUuid: state.communityProfileUuid || null,
+    communityProfileQueries: Array.isArray(state.communityProfileQueries)
+      ? state.communityProfileQueries.slice() : null,
+    knowledgeQueries: Array.isArray(state.knowledgeQueries) ? state.knowledgeQueries : [],
+    source: 'player.bootstrapSession',
+  };
+  const helper = _sessionContextModule;
+  if (helper && typeof helper.setCurrentShareTargetUuid === 'function') {
+    try {
+      helper.setCurrentShareTargetUuid(state.sessionUuid || null, meta);
+      return;
+    } catch { /* fall through to direct write */ }
+  }
+  // Direct write — same key as the helper. No secondary key exists.
+  // Keep the payload shape aligned with the helper's v1-7
+  // `normalizeMeta()` so a future fallback-path test or a pre-v1-7
+  // helper still round-trips the same triple.
   try {
-    sessionStorage.setItem(LAST_SESSION_KEY, JSON.stringify({
+    sessionStorage.setItem('story-outside:last-session', JSON.stringify({
       sessionUuid: state.sessionUuid || null,
-      storyTitle: state.story ? state.story.title : '',
-      roleLabel: state.role ? state.role.label : '',
-      storyUuid: state.storyUuid || null,
-      storyVersionUuid: state.storyVersionUuid || null,
-      communityProfileVersion: state.communityProfileVersion || null,
-      communityProfileUuid: state.communityProfileUuid || null,
-      knowledgeQueries: Array.isArray(state.knowledgeQueries) ? state.knowledgeQueries : [],
+      storyTitle: meta.storyTitle || (state.story ? state.story.title : ''),
+      roleLabel: meta.roleLabel || (state.role ? state.role.label : ''),
+      storyUuid: meta.storyUuid,
+      storyVersionUuid: meta.storyVersionUuid,
+      communityProfileVersion: meta.communityProfileVersion,
+      communityProfileUuid: meta.communityProfileUuid,
+      communityProfileQueries: meta.communityProfileQueries,
+      knowledgeQueries: meta.knowledgeQueries,
+      source: meta.source,
     }));
   } catch { /* storage unavailable — deep link degrades to empty state */ }
+  // We still want listeners to observe the change even when the
+  // helper has not finished loading. Dispatch the event here so a
+  // panel mounted before the helper arrived will refresh when it
+  // resolves.
+  dispatchLocalSessionChanged(state.sessionUuid || null, meta.source);
+}
+
+function dispatchLocalSessionChanged(uuid, source) {
+  try {
+    const target = (typeof window !== 'undefined') ? window : (typeof globalThis !== 'undefined' ? globalThis : null);
+    if (!target || typeof target.dispatchEvent !== 'function') return;
+    const Ctor = target.CustomEvent || (typeof CustomEvent !== 'undefined' ? CustomEvent : null);
+    if (typeof Ctor !== 'function') return;
+    target.dispatchEvent(new Ctor('session:changed', { detail: { sessionUuid: uuid || null, source: source || 'player' } }));
+  } catch { /* event dispatch is best-effort */ }
 }
 
 function readSessionContext() {
+  // Synchronous read of the SINGLE storage key — the helper module
+  // resolves the same key, so a write through the helper is visible
+  // here and vice-versa. The previous secondary slot is gone.
   try {
-    const raw = sessionStorage.getItem(LAST_SESSION_KEY);
+    const raw = sessionStorage.getItem('story-outside:last-session');
     const ctx = raw ? JSON.parse(raw) : null;
     return ctx && typeof ctx.sessionUuid === 'string' ? ctx : null;
   } catch { return null; }
@@ -379,6 +562,16 @@ async function recoverAndStart() {
     const recovered = await api(`/api/sessions/${state.sessionUuid}/recover`);
     state.lastRevision = recovered.revision || 0;
     state.openingCursor = recovered.opening_cursor || 0;
+    // ClickUp 16.2 P1.v2 (2026-09-07): refresh the canonical
+    // community-profile pointer on /recover so a page reload still
+    // has it. If the server response does not carry one (older
+    // versions), leave the previous value as-is.
+    if (typeof recovered.community_profile_version === 'string') {
+      state.communityProfileVersion = recovered.community_profile_version;
+    }
+    if (Array.isArray(recovered.community_profile_queries)) {
+      state.communityProfileQueries = recovered.community_profile_queries;
+    }
     state.canonicalHistory = recovered.history || [];
     state.canonicalEventsById = new Map(state.canonicalHistory.map((e) => [e.event_id, e]));
     state.canonicalNarrativeCount = state.canonicalHistory.filter((e) => e.event_type === 'narrative_beat').length;
@@ -873,11 +1066,11 @@ async function mountEndingPage(sessionMetaOverride) {
   // machine does not depend on endingPage being available.
   //
   // ClickUp 16.5 P1.1 (2026-09-07, PR #25): the sessionMeta we pass
-  // MUST carry the three canonical identity fields
-  // (story_uuid / story_version_uuid / community_profile_version) +
-  // the canonical knowledge_queries[] emitted by /api/sessions. The
-  // values come from the bootstrap response — the player is just a
-  // courier, it NEVER picks its own topic. The previous default of
+  // MUST carry the three canonical pointers (storyUuid /
+  // storyVersionUuid / communityProfileVersion) + the canonical
+  // knowledge_queries[] emitted by /api/sessions. The values come
+  // from the bootstrap response — the player is just a courier, it
+  // NEVER picks its own topic. The previous default of
   // `{storyTitle, roleLabel}` was the source of the
   // `missing_identifiers` degraded fallback on the public surface.
   const fallback = sessionMetaOverride || {
@@ -902,9 +1095,38 @@ async function mountEndingPage(sessionMetaOverride) {
   try {
     const mod = await import('/scripts/endingPage.js');
     if (mod && typeof mod.mount === 'function') {
+      // ClickUp 16.4 P1.v1-2 fix (2026-09-07): carry the canonical
+      // triple into the ending-page sessionMeta so the producer
+      // module can republish on mount.
+      // ClickUp 16.2 P1.v2 (2026-09-07): also forward the canonical
+      // community-profile queries list (server-authoritative) so
+      // the ending page can submit /v1/ecosystem/discussions
+      // without an extra /recover round-trip. sessionMetaOverride
+      // wins for any field it supplies.
+      const canonicalMeta = {
+        story_uuid: state.storyUuid || '',
+        story_version_uuid: state.storyVersionUuid || '',
+        community_profile_version: state.communityProfileVersion || '',
+        community_profile_queries: state.communityProfileQueries || null,
+        story_slug: state.story && state.story.id ? state.story.id : '',
+        story_title: state.story ? state.story.title : '',
+        storyTitle: state.story ? state.story.title : '',
+        roleLabel: state.role ? state.role.label : '',
+        communityProfileVersion: state.communityProfileVersion || '',
+        communityProfileQueries: state.communityProfileQueries || null,
+        storyUuid: state.storyUuid || '',
+        storyVersionUuid: state.storyVersionUuid || '',
+      };
+      // ClickUp 16.2 P1.v2 (2026-09-07): forward the canonical
+      // community-profile pointer into sessionMeta so the ending
+      // page can submit /v1/ecosystem/discussions without an extra
+      // /recover round-trip. The handler is server-authoritative,
+      // so endingPage just echoes these strings back to the API.
       await mod.mount({
         sessionUuid: state.sessionUuid,
-        sessionMeta,
+        sessionMeta: sessionMetaOverride
+          ? { ...canonicalMeta, ...sessionMetaOverride }
+          : canonicalMeta,
       });
       return true;
     }
@@ -1281,7 +1503,40 @@ function bindEvents() {
 
 async function bootstrap() {
   bindEvents();
+  // ClickUp 16.3 P1 v1-4 (主人 2026-09-07 06:24 巡检 + ChatGPT
+  // 复核): lazily load the session-context helper FIRST so the
+  // social panel can read through it. Then load the public social
+  // panel itself; the panel subscribes to the helper's
+  // `session:changed` event and refreshes in place when the player
+  // bootstraps a new session. The panel mounts a single floating
+  // host element at document.body and is non-intrusive to the
+  // existing picker / story / ending-card surfaces. The panel
+  // itself never carries caller principal — see
+  // public/scripts/socialPanel.js for the hard rules.
+  try {
+    await loadSessionContext();
+    const socialMod = await import('/scripts/socialPanel.js');
+    if (socialMod && typeof socialMod.mount === 'function') {
+      await socialMod.mount();
+    }
+  } catch { /* panel is best-effort — the core game flow must still run */ }
   setStatus('loading');
+  // ClickUp 16.3 P1 v1-2 (主人 2026-09-07 04:21 巡检): resolve the
+  // canonical owner once on page load via GET /api/auth/status. The
+  // server returns OAUTH_PENDING_USER until OAuth lands — we render
+  // that display name on the picker and on the ending page. We do
+  // NOT mint a cookie or any per-browser principal id; the principal
+  // flows exclusively from currentUserProvider(req) on the server.
+  try {
+    const authStatus = await api('/api/auth/status');
+    if (authStatus && authStatus.owner) {
+      state.ownerDisplayName = authStatus.owner.display_name || '';
+      state.ownerAuthSource = authStatus.owner.auth_source || '';
+      if (state.ownerDisplayName) {
+        setText('#owner-display-name', state.ownerDisplayName);
+      }
+    }
+  } catch { /* leave owner-display-name blank if the endpoint is unavailable */ }
   // Deep link: showScreen writes ?s=<screen> into the URL, and a reload
   // on the ending screen must land back on the ending page instead of
   // silently dropping the player into the picker. Attempt the mount
@@ -1294,22 +1549,32 @@ async function bootstrap() {
       const ctx = readSessionContext();
       if (ctx) {
         state.sessionUuid = ctx.sessionUuid;
-        // ClickUp 16.5 P1.1: replay the persisted canonical identity
-        // fields + knowledge_queries[] onto `state` so the deep link
-        // path matches the live-mount path (no missing_identifiers).
+        // ClickUp 16.3 P1 v1-7 (主人 2026-09-07 10:18 巡检 + ChatGPT
+        // 复核): forward the FULL canonical meta from the last-session
+        // payload so the ending page can submit
+        // /v1/ecosystem/discussions with the same triple the player
+        // bootstrap received from /api/sessions. v1-6 only forwarded
+        // `storyTitle` / `roleLabel`, so the deep link lost the
+        // canonical triple on every reload.
         state.storyUuid = ctx.storyUuid || state.storyUuid;
         state.storyVersionUuid = ctx.storyVersionUuid || state.storyVersionUuid;
         state.communityProfileVersion = ctx.communityProfileVersion || state.communityProfileVersion;
         state.communityProfileUuid = ctx.communityProfileUuid || state.communityProfileUuid;
+        state.communityProfileQueries = Array.isArray(ctx.communityProfileQueries) ? ctx.communityProfileQueries : state.communityProfileQueries;
+        // ClickUp 16.5 P1.1: also replay knowledge_queries[] onto
+        // `state` so the deep link path matches the live-mount path
+        // (no missing_identifiers when /v1/ecosystem/knowledge fires).
         state.knowledgeQueries = Array.isArray(ctx.knowledgeQueries) ? ctx.knowledgeQueries : state.knowledgeQueries;
       }
       deepLinkedToEnding = await mountEndingPage(ctx ? {
         storyTitle: ctx.storyTitle || '',
         roleLabel: ctx.roleLabel || '',
-        story_uuid: ctx.storyUuid || null,
-        story_version_uuid: ctx.storyVersionUuid || null,
-        community_profile_version: ctx.communityProfileVersion || null,
-        knowledge_queries: Array.isArray(ctx.knowledgeQueries) ? ctx.knowledgeQueries : [],
+        storyUuid: typeof ctx.storyUuid === 'string' ? ctx.storyUuid : null,
+        storyVersionUuid: typeof ctx.storyVersionUuid === 'string' ? ctx.storyVersionUuid : null,
+        communityProfileVersion: typeof ctx.communityProfileVersion === 'string' ? ctx.communityProfileVersion : null,
+        communityProfileUuid: typeof ctx.communityProfileUuid === 'string' ? ctx.communityProfileUuid : null,
+        communityProfileQueries: Array.isArray(ctx.communityProfileQueries) ? ctx.communityProfileQueries : null,
+        knowledgeQueries: Array.isArray(ctx.knowledgeQueries) ? ctx.knowledgeQueries : [],
       } : undefined);
       if (deepLinkedToEnding) {
         state.finished = true;

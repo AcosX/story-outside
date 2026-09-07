@@ -575,7 +575,7 @@ function publicCompact(session) {
   };
 }
 
-export function createSession({ repository, session_uuid, story_uuid, story_version_uuid, user_ref, role_id, model, prompt, generation_profile }) {
+export function createSession({ repository, session_uuid, story_uuid, story_version_uuid, user_ref, role_id, model, prompt, generation_profile, user_uuid }) {
   if (!repository) throw new Error('createSession: repository required');
   assertUuid('session_uuid', session_uuid);
   assertUuid('story_uuid', story_uuid);
@@ -597,6 +597,20 @@ export function createSession({ repository, session_uuid, story_uuid, story_vers
   validateProfile(generation_profile, story_uuid, story_version_uuid, cache);
   const state = repositoryState(repository);
   if (state.sessions.has(session_uuid)) throw new Error('createSession: session already exists');
+  // ClickUp 16.3 P1.2 (ChatGPT 2026-09-07 review): canonical session
+  // owner identity is `user_uuid`, persisted in the canonical session
+  // record so share / unshare handlers can verify ownership from
+  // internal state. The field is OPTIONAL to keep the historical
+  // createSession contract working for callers that do not need
+  // owner-bound shares (e.g. legacy demo-mode /api/dev/sessions tests
+  // that never invoke the share surface). When omitted, the session
+  // has no canonical owner and any share attempt will fail-closed.
+  let canonicalOwnerUuid = null;
+  if (typeof user_uuid === 'string' && UUID_PATTERN.test(user_uuid)) {
+    canonicalOwnerUuid = user_uuid;
+  } else if (user_uuid !== undefined && user_uuid !== null) {
+    throw new Error('createSession: user_uuid must be a UUID when provided');
+  }
   const session = {
     session_uuid,
     story_uuid,
@@ -606,6 +620,7 @@ export function createSession({ repository, session_uuid, story_uuid, story_vers
     opening_cache_status: cache.status,
     generation_profile: clone(generation_profile),
     user_ref,
+    user_uuid: canonicalOwnerUuid,
     role_id,
     model,
     prompt,
@@ -708,6 +723,46 @@ function evictSession(state, session_uuid) {
  */
 function touchSessionRecord(session) {
   session.lastTouchedAt = nowIso();
+}
+
+// ClickUp 16.3 P1.2 owner binding (ChatGPT 2026-09-07 review):
+//   * `findOwnerBySession` returns the canonical session owner persisted
+//     at session creation. The repository is the single source of truth —
+//     the HTTP layer never trusts the request body for the caller
+//     identity.
+//   * Returns `null` for unknown sessions so the share handler can answer
+//     401 cleanly (the caller is not the owner of a session that does
+//     not exist).
+//   * Returns `null` for legacy sessions created without a `user_uuid`
+//     so the share surface fails closed: an old demo-mode session cannot
+//     accidentally become shareable because the field is missing.
+export function findOwnerBySession({ repository, session_uuid }) {
+  if (!repository) throw new Error('findOwnerBySession: repository required');
+  assertUuid('session_uuid', session_uuid);
+  const session = repositoryState(repository).sessions.get(session_uuid);
+  if (!session) return null;
+  return session.user_uuid || null;
+}
+
+// ClickUp 16.3 P1.2 owner binding: persist the canonical owner on a
+// session that was created without one. Used by the public `/api/sessions`
+// bootstrap route AFTER reading the (or minting a fresh) cookie-scoped
+// user_uuid. Fail-closed: rejects re-binding an owner that does not match
+// the persisted value (so an attacker cannot rotate the owner through
+// repeated bootstrap calls on the same session_uuid). No-ops when the
+// session already has the same owner.
+export function bindSessionOwner({ repository, session_uuid, user_uuid }) {
+  if (!repository) throw new Error('bindSessionOwner: repository required');
+  assertUuid('session_uuid', session_uuid);
+  assertUuid('user_uuid', user_uuid);
+  const session = repositoryState(repository).sessions.get(session_uuid);
+  if (!session) return false;
+  if (session.user_uuid && session.user_uuid !== user_uuid) {
+    throw new Error('bindSessionOwner: session already bound to a different user_uuid');
+  }
+  session.user_uuid = user_uuid;
+  touchSessionRecord(session);
+  return true;
 }
 
 export function commitOpeningEvent({ repository, session_uuid, cache_uuid, event, client_request_id, expected_revision }) {
@@ -1177,7 +1232,7 @@ export function discardPendingTail({ repository, session_uuid }) {
  *        historical default (`mock-generated`).
  * @returns {Promise<{ session: object, opening_events: object[], cache_uuid: string, cache_status: string|null, story_uuid: string, story_version_uuid: string }>}
  */
-export async function bootstrapSessionFromWork({ repository, provider, session_uuid, work_id, role_id, identity, profileRepository, profileOptions }) {
+export async function bootstrapSessionFromWork({ repository, provider, session_uuid, work_id, role_id, identity, profileRepository, profileOptions, user_uuid }) {
   if (!repository) throw new Error('bootstrapSessionFromWork: repository required');
   if (!provider || typeof provider.getStory !== 'function') {
     throw new Error('bootstrapSessionFromWork: provider with getStory required');
@@ -1188,6 +1243,17 @@ export async function bootstrapSessionFromWork({ repository, provider, session_u
   }
   if (typeof role_id !== 'string' || !role_id) {
     throw new Error('bootstrapSessionFromWork: role_id required');
+  }
+  // ClickUp 16.3 P1.2 (ChatGPT 2026-09-07 review): accept the canonical
+  // owner identity from the auth layer (cookie-derived `user_uuid`),
+  // NEVER from the request body. The HTTP route layer is responsible
+  // for reading the cookie and passing the value through; this helper
+  // merely validates and forwards it to `createSession`.
+  let canonicalOwnerUuid = null;
+  if (typeof user_uuid === 'string' && UUID_PATTERN.test(user_uuid)) {
+    canonicalOwnerUuid = user_uuid;
+  } else if (user_uuid !== undefined && user_uuid !== null) {
+    throw new Error('bootstrapSessionFromWork: user_uuid must be a UUID when provided');
   }
   // Idempotency window: if a caller (a retried browser, a test harness)
   // reuses the same session_uuid we MUST refuse rather than silently
@@ -1245,6 +1311,7 @@ export async function bootstrapSessionFromWork({ repository, provider, session_u
     model,
     prompt,
     generation_profile,
+    user_uuid: canonicalOwnerUuid,
   });
   return {
     session,

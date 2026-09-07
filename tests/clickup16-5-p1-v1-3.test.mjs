@@ -280,13 +280,20 @@ test('repository.findCanonicalByIdentity: A still resolves after B overtook the 
   assert.equal(active.profile_uuid, profileB.profile_uuid);
 
   // Old session pinned to A's external version → A's row.
+  // ClickUp 16.2 P1.v1-5 (PR #24, origin/main): the active
+  // `findCanonicalByIdentity` returns `{ ok:true, profile } | { ok:false, code, message }`.
+  // The PR #25 P1.v1-3 fixture was originally written for the
+  // pre-PR-24 row-or-null API; the merge-of-conflicts keeps main's
+  // API as the active definition so /discussions can still emit
+  // distinct error codes (community_profile_not_found vs
+  // community_profile_version_mismatch vs story_version_mismatch).
   const resolvedA = repo.findCanonicalByIdentity({
     story_uuid: version.story_uuid,
     story_version_uuid: version.version_uuid,
     community_profile_version: externalA,
   });
-  assert.ok(resolvedA);
-  assert.equal(resolvedA.profile_uuid, profileA.profile_uuid);
+  assert.equal(resolvedA.ok, true);
+  assert.equal(resolvedA.profile.profile_uuid, profileA.profile_uuid);
 
   // New session pinned to B's external version → B's row.
   const resolvedB = repo.findCanonicalByIdentity({
@@ -294,22 +301,26 @@ test('repository.findCanonicalByIdentity: A still resolves after B overtook the 
     story_version_uuid: version.version_uuid,
     community_profile_version: externalB,
   });
-  assert.ok(resolvedB);
-  assert.equal(resolvedB.profile_uuid, profileB.profile_uuid);
+  assert.equal(resolvedB.ok, true);
+  assert.equal(resolvedB.profile.profile_uuid, profileB.profile_uuid);
 });
 
-test('repository.findCanonicalByIdentity: unknown external version → null (no silent fallback to latest)', () => {
+test('repository.findCanonicalByIdentity: unknown external version → ok:false (no silent fallback to latest)', () => {
   const repo = createInMemoryCommunityProfileRepository();
   const { profileA, version } = installTwoGenerations(repo);
   // Pretend an old session pinned a string that does NOT match any
-  // preserved row's external version. The lookup MUST return null
-  // instead of silently resolving to the latest active row.
+  // preserved row's external version. The lookup MUST return a
+  // distinct error envelope (NOT silently resolve to the latest
+  // active row). ClickUp 16.2 P1.v1-5 (PR #24) wraps the failure
+  // in `{ ok:false, code, message }` so the route layer can map
+  // it onto a specific 400.
   const resolved = repo.findCanonicalByIdentity({
     story_uuid: version.story_uuid,
     story_version_uuid: version.version_uuid,
     community_profile_version: `${profileA.generator_version}@deadbeefcafebabe`,
   });
-  assert.equal(resolved, null);
+  assert.equal(resolved.ok, false);
+  assert.equal(resolved.code, 'community_profile_not_found');
 });
 
 // ----- 3. HTTP layer: route uses external version, not raw --------------

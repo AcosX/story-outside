@@ -44,11 +44,13 @@ export { createSeededRepository, FIXTURE_UUIDS } from './fixture.mjs';
 // functions are re-exported here too so callers of the application layer
 // do not have to reach into sessionService.mjs directly.
 export {
+  bindSessionOwner,
   bootstrapSessionFromWork,
   commitNarrativeEvent,
   commitOpeningEvent,
   createSession,
   discardPendingTail,
+  findOwnerBySession,
   getSession,
   getSessionCompact,
   interruptWithPlayerInput,

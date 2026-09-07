@@ -324,12 +324,18 @@ test('P1.v1-5-2 findCanonicalByIdentity fallback also returns C', () => {
   // findActiveByStoryVersion. Under v1-4 the fallback walked
   // activeByStoryVersion.entries() and was subject to the same
   // Map iteration-order trap.
+  // ClickUp 16.2 P1.v1-5 (PR #24, origin/main): the active
+  // `findCanonicalByIdentity` returns `{ ok:true, profile }` for
+  // the success path so the /discussions route can differentiate
+  // error codes. The PR #25 P1.v1-5 fixture was originally written
+  // for the pre-PR-24 row-or-null API; the merge-of-conflicts
+  // adapts the assertions to main's active shape.
   const fallback = repo.findCanonicalByIdentity({
     story_uuid: version.story_uuid,
     story_version_uuid: version.version_uuid,
   });
-  assert.ok(fallback);
-  assert.equal(fallback.profile_uuid, profileC.profile_uuid);
+  assert.equal(fallback.ok, true);
+  assert.equal(fallback.profile.profile_uuid, profileC.profile_uuid);
 });
 
 // ----- P1.v1-5-1: findActiveByStoryVersion is a direct Map.get ----------

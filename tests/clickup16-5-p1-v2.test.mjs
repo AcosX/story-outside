@@ -521,12 +521,19 @@ test('communityProfileService.findCanonicalByIdentity resolves the seeded profil
   const profileRepo = createInMemoryCommunityProfileRepository();
   seedCommunityProfiles(repository, profileRepo);
   // Re-resolve by identity tuple; this is what the handler does.
-  const row = profileRepo.findCanonicalByIdentity({
+  // ClickUp 16.2 P1.v1-5 (PR #24, origin/main): the active
+  // `findCanonicalByIdentity` returns `{ ok:true, profile }` for the
+  // success path so the /discussions route can differentiate error
+  // codes. The PR #25 P1.v1-5 fixture was originally written for
+  // the pre-PR-24 row-or-null API; the merge-of-conflicts adapts
+  // the assertions to main's active shape.
+  const resolved = profileRepo.findCanonicalByIdentity({
     story_uuid: CAFE_RAIN_STORY_UUID,
     story_version_uuid: CAFE_RAIN_VERSION_UUID,
     community_profile_version: cafeRainExternalVersion(),
   });
-  assert.ok(row);
+  assert.equal(resolved.ok, true);
+  const row = resolved.profile;
   assert.equal(row.story_uuid, CAFE_RAIN_STORY_UUID);
   assert.equal(row.story_version_uuid, CAFE_RAIN_VERSION_UUID);
   assert.equal(row.generator_version, CAFE_RAIN_GENERATOR_VERSION);
@@ -540,12 +547,18 @@ test('communityProfileRepo.findCanonicalByIdentity: mismatch on community_profil
   const { repository } = createSeededRepository();
   const profileRepo = createInMemoryCommunityProfileRepository();
   seedCommunityProfiles(repository, profileRepo);
-  assert.equal(
-    profileRepo.findCanonicalByIdentity({
-      story_uuid: CAFE_RAIN_STORY_UUID,
-      story_version_uuid: CAFE_RAIN_VERSION_UUID,
-      community_profile_version: '0.0.0-fake',
-    }),
-    null,
-  );
+  // ClickUp 16.2 P1.v1-5 (PR #24, origin/main): the active
+  // `findCanonicalByIdentity` returns `{ ok:false, code, message }`
+  // for the not-found path so the /discussions route can map it
+  // onto a specific 400 (`community_profile_not_found` here). The
+  // PR #25 P1.v1-5 fixture was originally written for the
+  // pre-PR-24 null-or-row API; the merge-of-conflicts adapts the
+  // assertion to main's active shape.
+  const resolved = profileRepo.findCanonicalByIdentity({
+    story_uuid: CAFE_RAIN_STORY_UUID,
+    story_version_uuid: CAFE_RAIN_VERSION_UUID,
+    community_profile_version: '0.0.0-fake',
+  });
+  assert.equal(resolved.ok, false);
+  assert.equal(resolved.code, 'community_profile_not_found');
 });

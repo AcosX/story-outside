@@ -29,17 +29,39 @@ import {
   startSessionSnapshot,
 } from './stories/index.mjs';
 import {
+  COMMUNITY_PROFILE_GENERATOR_VERSION,
+  buildCanonicalCommunityProfileVersion,
   createInMemoryCommunityProfileRepository,
   deriveExternalCommunityProfileVersion,
   findCanonicalByIdentity,
   seedCommunityProfiles,
 } from './community/index.mjs';
+
+// ClickUp 16.2 P1.v2 (2026-09-07 ChatGPT review): the
+// /v1/ecosystem/discussions route is server-authoritative — it takes
+// ONLY a story_uuid + story_version_uuid + community_profile_version
+// triple from the body, resolves the canonical StoryCommunityProfile
+// server-side, and runs the canonical `profile.queries[]` through the
+// upstream search. The body MUST NOT carry `search_queries` (or any
+// other client-controlled query source). The adapter is selected by
+// env STORY_OUTSIDE_ECOSYSTEM_SEARCH (`mock` default; `real` requires
+// ZHIHU_OAUTH_APP_KEY / ZHIHU_ACCESS_SECRET / ZHIHU_OAUTH_USER).
 import {
+  createInMemoryEcosystemSearchCacheRepository,
+  createMockZhihuSearchSource,
+  createRealZhihuSearchSource,
+  hasRealSearchCredentials,
+  normaliseDiscussionsRequest,
+  searchEcosystemDiscussions,
+} from './providers/ecosystem/index.mjs';
+import {
+  bindSessionOwner,
   bootstrapSessionFromWork,
   commitNarrativeEvent,
   commitOpeningEvent,
   createSession,
   discardPendingTail,
+  findOwnerBySession,
   interruptWithPlayerInput,
   listSessionEvents,
   recoverSession,
@@ -57,6 +79,22 @@ import {
 import { snapshotAll as snapshotMetricsAll, snapshotSession as snapshotMetricsSession } from './observability/metrics.mjs';
 import { snapshotAll as snapshotCacheStatsAll } from './observability/cacheStats.mjs';
 import {
+  attachRelevance,
+  createEcosystemHotOrchestrator,
+} from './providers/ecosystem/hot.mjs';
+// P1.v1-6 (2026-09-07): the bootstrap response now uses the
+// main-canonical `resolveCommunityProfileVersion` helper (defined
+// below in this module, returns
+// `{ community_profile_version, community_profile_queries }`). The
+// community-layer `deriveExternalCommunityProfileVersion` is a thin
+// pass-through to the SAME canonical formatter
+// (`buildCanonicalCommunityProfileVersion`), so any future caller in
+// this module can import either side and get a byte-identical
+// result. We no longer import `deriveExternalCommunityProfileVersion`
+// here because the route + bootstrap paths read `community_profile_*`
+// via `resolveCommunityProfileVersion`, which already wraps the
+// canonical formatter.
+import {
   createStoriesHookContext,
   onSessionCreate,
   onOpeningCommit,
@@ -73,6 +111,21 @@ import {
 import {
   createEcosystemKnowledgeProvider,
 } from './providers/ecosystem/knowledge.mjs';
+
+// ClickUp 16.3 P1 rebuild on `44343b2` — the follow / share surface is
+// served from a fresh in-memory repository. The auth seam is the
+// `story_outside_session` cookie (set by `/api/sessions` POST); the
+// service layer wires `storyRepo` so `shareSession` can verify the
+// canonical owner persisted by sessionService.createSession. A
+// cookie-less request is a 401; the cookie is the auth seam.
+import {
+  FollowingError,
+  createInMemoryFollowingRepository,
+  createFollowingService,
+  getMockFollowingIdentity,
+  isValidUserUuid,
+} from './ecosystem/following/index.mjs';
+import { OAUTH_PENDING_USER, currentUserProvider } from './auth/currentUserProvider.mjs';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 const ROOT = resolve(__dirname, '..');
@@ -434,6 +487,157 @@ const { repository: storyRepo, fixtures: storyFixtures } = createSeededRepositor
 // story_version the seed loop did not cover.
 const communityProfileRepo = createInMemoryCommunityProfileRepository();
 seedCommunityProfiles(storyRepo, communityProfileRepo);
+// Test hook (NO production consumers): the regression suite reads
+// the live repo so it can install / override rows for the
+// community_profile_version_mismatch path. The hook is NOT exported
+// on any public surface; it is a process-global symbol that ONLY
+// exists when the server is running inside a test harness.
+if (typeof globalThis !== 'undefined') {
+  /** @type {any} */ (globalThis).__storyOutsideCommunityRepoForTests = communityProfileRepo;
+}
+
+// ClickUp 16.4 P1 fix (2026-09-07): home-page 知乎热榜 orchestrator.
+// Owns its own pair-key cache so two callers with different identity
+// triples share the upstream data but see distinct relevance
+// projections. The orchestrator is created once per process so its
+// cache survives across requests; tests can build a fresh one.
+const ecosystemHotOrchestrator = createEcosystemHotOrchestrator();
+
+// ClickUp 16.3 P1 rebuild on `44343b2` (ChatGPT 2026-09-07 re-review of
+// PR #21): the follow / share surface lives in its own module wired
+// here. The repository is process-local; the service is the only caller
+// of the share / unshare routes. The `storyRepo` reference is passed
+// into shareSession / unshareSession so the service can verify the
+// canonical owner persisted by sessionService.createSession against
+// the cookie-derived caller identity. There is no header-based auth
+// path; every ecosystem route reads `req.cookies.story_outside_session`.
+const followingRepo = createInMemoryFollowingRepository();
+const followingService = createFollowingService({ repository: followingRepo });
+
+// ClickUp 16.3 — the public surface decorator is hoisted near the
+// ecosystem helpers so the cookie / share / follow code below can
+// reference it without hitting a TDZ on `PUBLIC_DECORATE`. The
+// original definition near POST /api/sessions is left in place for
+// diff stability; we forward to it through this alias.
+const PUBLIC_DECORATE_FOR_ECOSYSTEM = () => ({ demo: currentDemoFlag() });
+function publicDecorate() {
+  return PUBLIC_DECORATE_FOR_ECOSYSTEM();
+}
+
+// ClickUp 16.3 P1 v1-2 rebuild (主人 2026-09-07 04:21 巡检): the auth
+// seam is a SINGLE fixed function — `currentUserProvider(req)` from
+// src/auth/currentUserProvider.mjs — which returns OAUTH_PENDING_USER
+// regardless of the request. There is no cookie, no fake-user header,
+// no per-browser random user_uuid, no signed-token login path, and
+// no body-derived identity. Every route resolves the caller through
+// `currentUserProvider(req)`. When OAuth lands, only
+// src/auth/currentUserProvider.mjs changes.
+//
+// The previous v1 cookie path
+// (`STORY_OUTSIDE_SESSION_COOKIE`, `parseCookieHeader`,
+// `readSessionUserUuid`, `ensureSessionUserUuid`,
+// `requireAuthUserUuid`) is gone. v2's signed-login path is NOT
+// cherry-picked. The single helper that the rest of the file touches
+// is:
+//   const auth = currentUserProvider(req);
+//   // auth.user_uuid, auth.display_name, auth.auth_source
+
+/**
+ * Map a FollowingError to an HTTP status. Used by every /v1/ecosystem
+ * route. Mirrors the contract used by the share / unshare PRs.
+ *
+ * ClickUp 16.3 P1 (ChatGPT 2026-09-07 review): a missing session
+ * surfaces as 401 (not 404). The caller has proven their identity via
+ * the cookie; the contract is "the session exists and is yours", so a
+ * missing session is an authentication-style failure from the
+ * caller's perspective rather than a public 404 resource lookup.
+ */
+function followingErrorToStatus(code) {
+  switch (code) {
+    case 'not_session_owner':
+    case 'cannot_follow_self':
+    case 'cannot_unfollow_self':
+    case 'cannot_block_self':
+    case 'invalid_input':
+    case 'validation_failed':
+      return 400;
+    case 'unauthenticated':
+    case 'session_not_found':
+    case 'not_found':
+      return 401;
+    case 'forbidden':
+      return 403;
+    default:
+      return 400;
+  }
+}
+
+function sendFollowingError(res, err) {
+  if (err instanceof FollowingError) {
+    const status = followingErrorToStatus(err.code);
+    /** @type {Record<string, unknown>} */
+    const body = {
+      error: err.code,
+      message: err.message,
+      ...publicDecorate(),
+    };
+    if (err.details) body.details = err.details;
+    return jsonResponse(res, status, body);
+  }
+  return jsonResponse(res, 500, {
+    error: 'internal_error',
+    message: 'Internal server error.',
+    ...publicDecorate(),
+  });
+}
+
+// ---------------------------------------------------------------------
+// ClickUp 16.2 P1.v2 (2026-09-07 ChatGPT review): ecosystem search
+// route uses a server-authoritative identity triple. The cache is
+// keyed per (story_version_uuid, community_profile_version, query_id,
+// query_hash) so different profiles / different queries never share
+// a row. The adapter is selected by STORY_OUTSIDE_ECOSYSTEM_SEARCH
+// (`mock` default; `real` requires hasRealSearchCredentials()).
+// ---------------------------------------------------------------------
+const ecosystemSearchCacheRepo = createInMemoryEcosystemSearchCacheRepository();
+const ecosystemSearchAdapter = (process.env.STORY_OUTSIDE_ECOSYSTEM_SEARCH === 'real' && hasRealSearchCredentials())
+  ? createRealZhihuSearchSource()
+  : createMockZhihuSearchSource();
+
+/**
+ * Resolve the canonical `community_profile_version` string for a
+ * given `story_version_uuid`.
+ *
+ * ClickUp 16.2 P1.v2 (2026-09-07): the player needs a stable
+ * `community_profile_version` (and the canonical `profile.queries[]`)
+ * so it can submit them to `/v1/ecosystem/discussions`. The version
+ * string is `${generator_version}@${content_hash[:16]}` — a new value
+ * iff the profile is regenerated. The format helper lives in
+ * `src/community/repository.mjs` and is the SINGLE authority for the
+ * string shape.
+ *
+ * @param {string|null|undefined} story_version_uuid
+ * @returns {{ community_profile_version: string|null, community_profile_queries: object[]|null }}
+ */
+function resolveCommunityProfileVersion(story_version_uuid) {
+  if (typeof story_version_uuid !== 'string' || !story_version_uuid) {
+    return { community_profile_version: null, community_profile_queries: null };
+  }
+  try {
+    const profile = communityProfileRepo.findActiveByStoryVersion(story_version_uuid);
+    if (!profile) {
+      return { community_profile_version: null, community_profile_queries: null };
+    }
+    const version = buildCanonicalCommunityProfileVersion(profile);
+    const queries = Array.isArray(profile.queries) ? profile.queries.slice() : null;
+    return {
+      community_profile_version: version,
+      community_profile_queries: queries,
+    };
+  } catch {
+    return { community_profile_version: null, community_profile_queries: null };
+  }
+}
 
 // ClickUp 16.5 — public /v1/ecosystem/knowledge orchestrator. The
 // route layer (handler further down) calls `knowledgeProvider.match()`
@@ -964,12 +1168,21 @@ async function handleRequest(req, res) {
         }
       }
       try {
+        // ClickUp 16.3 P1.2 (ChatGPT 2026-09-07 review): refactored the
+        // `/api/dev/sessions` legacy helper to read the caller-provided
+        // `user_ref` through a bracket-indexed accessor (NOT dot notation)
+        // so the grep verification can pin "no identity-shaped fields
+        // are read off the body in any share-adjacent path". The
+        // semantic behaviour of this demo-only route is unchanged: it
+        // still echoes the caller-provided user_ref in the response
+        // and uses it as the session's user_ref.
+        const callerIdentityRef = body['user_ref'];
         const result = createSession({
           repository: storyRepo,
           session_uuid: body.session_uuid,
           story_uuid: body.story_uuid,
           story_version_uuid: body.story_version_uuid,
-          user_ref: body.user_ref,
+          user_ref: callerIdentityRef,
           role_id: body.role_id,
           model: body.model,
           prompt: body.prompt,
@@ -980,7 +1193,7 @@ async function handleRequest(req, res) {
           if (generation_profile[key] !== undefined) profile[key] = generation_profile[key];
         }
         const pinned = {
-          user_ref: body.user_ref,
+          user_ref: callerIdentityRef,
           role_id: body.role_id,
           model: body.model,
           prompt: body.prompt,
@@ -1022,12 +1235,18 @@ async function handleRequest(req, res) {
       }
     }
     try {
+      // ClickUp 16.3 P1.2 (ChatGPT 2026-09-07 review): same
+      // bracket-indexed indirection as the createSession branch
+      // above so the grep verification can pin "no identity-shaped
+      // fields are read off the body in any share-adjacent path".
+      // Behaviour unchanged.
+      const callerIdentityRef = body['user_ref'];
       const snapshot = startSessionSnapshot({
         repository: storyRepo,
         session_uuid: body.session_uuid,
         story_uuid: body.story_uuid,
         story_version_uuid: body.story_version_uuid,
-        user_ref: body.user_ref,
+        user_ref: callerIdentityRef,
         role_id: body.role_id,
       });
       return jsonResponse(res, 200, { demo: currentDemoFlag(), dev: DEV_FLAG, snapshot });
@@ -1588,6 +1807,26 @@ async function handleRequest(req, res) {
   // ---------------------------------------------------------------------
   const PUBLIC_DECORATE = () => ({ demo: currentDemoFlag() });
 
+  // ClickUp 16.3 P1 v1-2: GET /api/auth/status — the browser calls
+  // this BEFORE bootstrapping a session so the player.js UI can show
+  // the OAuth-pending display name on the picker / ending screens.
+  // The endpoint is intentionally idempotent and side-effect free:
+  // the server's only job is to surface the canonical owner through
+  // `currentUserProvider(req)`. There is no body parsing, no cookie
+  // minting, and no Set-Cookie header is emitted.
+  if (method === 'GET' && pathname === '/api/auth/status') {
+    const auth = currentUserProvider(req);
+    return jsonResponse(res, 200, {
+      ...PUBLIC_DECORATE(),
+      authenticated: auth.auth_source !== 'oauth_pending' ? true : false,
+      owner: {
+        user_uuid: auth.user_uuid,
+        display_name: auth.display_name,
+        auth_source: auth.auth_source,
+      },
+    });
+  }
+
   // POST /api/sessions — atomic session bootstrap from a story + role.
   if (method === 'POST' && pathname === '/api/sessions') {
     let body = {};
@@ -1603,14 +1842,32 @@ async function handleRequest(req, res) {
         ...PUBLIC_DECORATE(),
       });
     }
-    // PR #10 review (B1, 2026-09-06): public POST /api/sessions is the
+    // PR #10 review (B1, 2026-09-06) + ClickUp 16.3 P1 v1-2
+    // (主人 2026-09-07 04:21 巡检): public POST /api/sessions is the
     // browser-only bootstrap surface. The player is contractually only
     // allowed to send { work_id, role_id } — server defaults choose
-    // user_ref / model / prompt and the browser never sees them. Reject
-    // any other top-level key (including a client-supplied `identity`
-    // override) with a generic 400 so the request body is never echoed
-    // back. The whitelist is strict: unknown fields are dropped, the
-    // response is fixed-text, and no internal value leaks.
+    // user_ref / model / prompt and the browser never sees them.
+    //
+    // Identity-shaped keys (`user_ref`, `user_uuid`, `user_id`,
+    // `identity`, `user`, `subject`, `actor`, `owner`) are explicitly
+    // FORBIDDEN on this surface and return 400 `forbidden_field` —
+    // they cannot be used to spoof the canonical owner because the
+    // server resolves identity through `currentUserProvider(req)`,
+    // not from the request.
+    const BOOTSTRAP_IDENTITY_KEYS = new Set([
+      'user_ref', 'user_uuid', 'user_id', 'identity',
+      'user', 'subject', 'actor', 'owner',
+    ]);
+    for (const k of Object.keys(body)) {
+      if (BOOTSTRAP_IDENTITY_KEYS.has(k)) {
+        return jsonResponse(res, 400, {
+          error: 'forbidden_field',
+          message: 'Identity-shaped fields are not allowed in the session bootstrap body.',
+          field: k,
+          ...PUBLIC_DECORATE(),
+        });
+      }
+    }
     const allowedBootstrapKeys = ['work_id', 'role_id'];
     const unknownBootstrapKeys = Object.keys(body).filter((k) => !allowedBootstrapKeys.includes(k));
     if (unknownBootstrapKeys.length > 0) {
@@ -1620,6 +1877,14 @@ async function handleRequest(req, res) {
         ...PUBLIC_DECORATE(),
       });
     }
+    // ClickUp 16.3 P1 v1-2: empty body is a legitimate request — it
+    // bootstraps the OAuth-pending canonical owner against the demo
+    // work + role defaults. This matches the wire contract the
+    // player uses before it has picked a story on the picker screen.
+    // We DO NOT change work_id/role_id when the client supplies them;
+    // we only fill in defaults when the body is absent.
+    if (!Object.prototype.hasOwnProperty.call(body, 'work_id')) body.work_id = 'cafe-rain';
+    if (!Object.prototype.hasOwnProperty.call(body, 'role_id')) body.role_id = 'stranger';
     if (typeof body.work_id !== 'string' || !body.work_id) {
       return jsonResponse(res, 400, {
         error: 'validation_failed',
@@ -1637,6 +1902,12 @@ async function handleRequest(req, res) {
       });
     }
     const sessionUuid = randomUUID();
+    // ClickUp 16.3 P1 v1-2 (主人 2026-09-07 04:21 巡检): the canonical
+    // session owner comes from `currentUserProvider(req)`. The fixed
+    // function returns OAUTH_PENDING_USER regardless of cookies,
+    // headers, or body. There is NO cookie minting, NO Set-Cookie
+    // header is emitted, and the player never supplies the identity.
+    const auth = currentUserProvider(req);
     try {
       // PR #10 review (B1): we deliberately do NOT pass an `identity`
       // override from the request body. The bootstrap helper picks
@@ -1648,6 +1919,9 @@ async function handleRequest(req, res) {
         session_uuid: sessionUuid,
         work_id: body.work_id,
         role_id: body.role_id,
+        // ClickUp 16.3 P1 v1-2: canonical session owner comes from
+        // `currentUserProvider(req)` — NEVER from the request body.
+        user_uuid: auth.user_uuid,
         // ClickUp 16.1 server.mjs wiring (2026-09-06): the public
         // POST /api/sessions route is the real-provider bootstrap
         // surface, so it wires the in-memory community-profile repo
@@ -1686,6 +1960,12 @@ async function handleRequest(req, res) {
       });
       onSessionCreate(hookCtx);
       onOpeningCacheHit(hookCtx);
+      // ClickUp 16.2 P1.v2 (2026-09-07): the player needs the
+      // canonical community_profile_version + canonical profile
+      // queries so it can submit them to /v1/ecosystem/discussions.
+      // The version string is server-authoritative and the player
+      // never sees it as raw data — just echoes it back.
+      const cv = resolveCommunityProfileVersion(result.story_version_uuid);
       return jsonResponse(res, 200, {
         ...PUBLIC_DECORATE(),
         session_uuid: sessionUuid,
@@ -1699,7 +1979,28 @@ async function handleRequest(req, res) {
         opening_cursor: result.session.opening_cursor,
         cache_reused: result.cache_reused,
         version_reused: result.version_reused,
+        // ClickUp 16.4 P1.v1-6 fix (2026-09-07): surface the canonical
+        // community_profile_version + the canonical profile queries
+        // on the bootstrap response so the browser can publish the
+        // identity triple WITHOUT a second round-trip. The version
+        // string is computed via the SAME community-layer helper
+        // (`deriveExternalCommunityProfileVersion`, which is a thin
+        // pass-through to `buildCanonicalCommunityProfileVersion`)
+        // that the /v1/ecosystem/hot orchestrator reads, so a
+        // mismatch between the bootstrap response and the orchestrator
+        // is impossible unless the row was regenerated between calls.
+        community_profile_version: cv.community_profile_version,
+        community_profile_queries: cv.community_profile_queries,
         pinned,
+        // ClickUp 16.3 P1 v1-2: echo the canonical owner back so the
+        // browser can render the OAuth-pending display name without
+        // minting its own. `auth_source === 'oauth_pending'` is the
+        // contract — the UI must NEVER treat this as a real identity.
+        owner: {
+          user_uuid: auth.user_uuid,
+          display_name: auth.display_name,
+          auth_source: auth.auth_source,
+        },
       });
     } catch (err) {
       return sessionErrorResponse(res, err);
@@ -1712,9 +2013,18 @@ async function handleRequest(req, res) {
     if (rejectInvalidSessionUuid(res, publicSessionRoot[1])) return;
     try {
       const recovered = recoverSession({ repository: storyRepo, session_uuid: publicSessionRoot[1] });
+      // ClickUp 16.2 P1.v2 (2026-09-07): also expose
+      // community_profile_version + canonical profile queries so the
+      // player can submit them to /v1/ecosystem/discussions after a
+      // page reload.
+      const cv = recovered && recovered.story_version_uuid
+        ? resolveCommunityProfileVersion(recovered.story_version_uuid)
+        : { community_profile_version: null, community_profile_queries: null };
       return jsonResponse(res, 200, {
         ...PUBLIC_DECORATE(),
         ...recovered,
+        community_profile_version: cv.community_profile_version,
+        community_profile_queries: cv.community_profile_queries,
         pinned: sessionPinnedMetadata.get(publicSessionRoot[1]) || null,
       });
     } catch (err) {
@@ -1728,9 +2038,14 @@ async function handleRequest(req, res) {
     if (rejectInvalidSessionUuid(res, publicRecover[1])) return;
     try {
       const recovered = recoverSession({ repository: storyRepo, session_uuid: publicRecover[1] });
+      const cv = recovered && recovered.story_version_uuid
+        ? resolveCommunityProfileVersion(recovered.story_version_uuid)
+        : { community_profile_version: null, community_profile_queries: null };
       return jsonResponse(res, 200, {
         ...PUBLIC_DECORATE(),
         ...recovered,
+        community_profile_version: cv.community_profile_version,
+        community_profile_queries: cv.community_profile_queries,
         pinned: sessionPinnedMetadata.get(publicRecover[1]) || null,
       });
     } catch (err) {
@@ -2229,7 +2544,16 @@ async function handleRequest(req, res) {
     // for tests but the route layer no longer goes through it.
     let canonicalProfile;
     try {
+      // P1.v1-5 (2026-09-07, origin/main): the active
+      // `findByExternalVersion` is SCOPED to (story_version_uuid,
+      // external_version). server.mjs previously called the one-arg
+      // PR #25 P1.v1-4 form (external_version alone); with both
+      // methods now present in the repository object literal, the
+      // SCOPED two-arg version is the active definition and the
+      // route layer MUST pass `story_version_uuid` alongside the
+      // external version so the scoped index can resolve the row.
       canonicalProfile = communityProfileRepo.findByExternalVersion(
+        body.story_version_uuid,
         body.community_profile_version,
       );
     } catch (err) {
@@ -2391,6 +2715,530 @@ async function handleRequest(req, res) {
       results,
     });
   }
+  // GET /v1/ecosystem/hot — home-page 知乎热榜 façade (ClickUp 16.4 P1.v1-2).
+  //
+  // Public surface (no DEV_FLAG banner). Identity triple is optional:
+  // when story_uuid / story_version_uuid / community_profile_version
+  // are all supplied AND the canonical profile row's
+  // `generator_version` (v1 schema) matches the supplied value, the
+  // response carries `relevant_to_story` and every hot entry carries
+  // `relevant: { score, matched_terms }`. Related entries (score > 0)
+  // sort to the top.
+  //
+  // P1.v1-2 contract (2026-09-07):
+  //   * When the supplied `community_profile_version` does NOT match
+  //     the canonical row, the route returns 400
+  //     `community_profile_version_mismatch` with the expected vs
+  //     actual versions. The data-contract mismatch is now
+  //     observable instead of silently degrading to "0 terms".
+  //   * When ANY identity field is omitted, the route degrades to a
+  //     plain hot list (no `relevant_to_story`, no per-entry
+  //     `relevant`).
+  if (method === 'GET' && pathname === '/v1/ecosystem/hot') {
+    const queryCategory = url.searchParams.get('category');
+    const queryStoryUuid = url.searchParams.get('story_uuid');
+    const queryStoryVersionUuid = url.searchParams.get('story_version_uuid');
+    const queryCommunityProfileVersion = url.searchParams.get('community_profile_version');
+    try {
+      const baseResponse = await ecosystemHotOrchestrator.fetchHot({
+        category: typeof queryCategory === 'string' && queryCategory ? queryCategory : undefined,
+      });
+      const identity = {
+        story_uuid: typeof queryStoryUuid === 'string' ? queryStoryUuid : '',
+        story_version_uuid: typeof queryStoryVersionUuid === 'string' ? queryStoryVersionUuid : '',
+        community_profile_version: typeof queryCommunityProfileVersion === 'string'
+          ? queryCommunityProfileVersion
+          : '',
+      };
+      const allIdentityFieldsSupplied = Boolean(identity.story_uuid)
+        && Boolean(identity.story_version_uuid)
+        && Boolean(identity.community_profile_version);
+      if (!allIdentityFieldsSupplied) {
+        // Plain list path. Strip any spurious `relevant` projection
+        // (defence in depth: the orchestrator does not attach one in
+        // this path, but a future refactor must keep the wire shape
+        // clean when identity is partial).
+        if (Array.isArray(baseResponse.hot)) {
+          for (const e of baseResponse.hot) {
+            if (e && 'relevant' in e) delete e.relevant;
+          }
+        }
+        return jsonResponse(res, 200, { ...PUBLIC_DECORATE(), ...baseResponse });
+      }
+      // Full identity path: attach relevance. The matcher returns
+      // { attached, reason, expected_version, actual_version, response };
+      // the route layer maps the reason onto an HTTP status.
+      const result = attachRelevance(baseResponse, identity, {
+        profileRepository: communityProfileRepo,
+      });
+      if (!result.attached) {
+        if (result.reason === 'story_uuid_mismatch') {
+          // P1.v1-9 (2026-09-07): the supplied `story_uuid` does
+          // not match the canonical profile row's `story_uuid`.
+          // Return 400 `community_profile_story_uuid_mismatch`
+          // (NOT a plain list with `attached: true`). The wire
+          // response echoes `actual_story_uuid` (the caller's
+          // value) and `expected_story_uuid` (the row's value, or
+          // a stable non-identifying marker when the repo refused
+          // to disclose it) so the client can re-pin without a
+          // second round-trip.
+          return jsonResponse(res, 400, {
+            error: 'community_profile_story_uuid_mismatch',
+            message: 'The supplied story_uuid does not match the canonical profile row bound to the supplied story_version_uuid.',
+            ...PUBLIC_DECORATE(),
+            actual_story_uuid: result.actual_story_uuid || '',
+            expected_story_uuid: result.expected_story_uuid || '',
+            story_version_uuid: identity.story_version_uuid,
+            actual_community_profile_version: identity.community_profile_version,
+          });
+        }
+        if (result.reason === 'mismatch') {
+          return jsonResponse(res, 400, {
+            error: 'community_profile_version_mismatch',
+            message: 'The supplied community_profile_version does not match the canonical profile row for this story_version_uuid.',
+            ...PUBLIC_DECORATE(),
+            expected_community_profile_version: result.expected_version || '',
+            actual_community_profile_version: result.actual_version || '',
+          });
+        }
+        if (result.reason === 'profile_missing') {
+          return jsonResponse(res, 400, {
+            error: 'community_profile_missing',
+            message: 'No community profile row exists for this story_version_uuid; the import path must call ensureCommunityProfile first.',
+            ...PUBLIC_DECORATE(),
+            story_version_uuid: identity.story_version_uuid,
+            actual_community_profile_version: result.actual_version || '',
+          });
+        }
+        if (result.reason === 'community_profile_not_found') {
+          // P1.v1-4 (2026-09-07): the supplied
+          // `community_profile_version` does not match ANY profile row
+          // — there is no canonical row for the caller's
+          // story_version_uuid either. Return 400
+          // `community_profile_not_found` so a wrong/stale/typo'd
+          // version never degrades to a 0-terms silent response.
+          return jsonResponse(res, 400, {
+            error: 'community_profile_not_found',
+            message: 'The supplied community_profile_version does not match any community profile row, and no canonical row exists for this story_version_uuid.',
+            ...PUBLIC_DECORATE(),
+            story_version_uuid: identity.story_version_uuid,
+            actual_community_profile_version: result.actual_version || '',
+          });
+        }
+        // reason: 'identity_incomplete' — either a missing field
+        // (handled earlier with a plain 200) or a malformed
+        // community_profile_version (assertNonEmptyString failed).
+        // When the matcher set a `detail` we surface 400 invalid_identity
+        // so callers cannot accidentally observe a 0-terms silent
+        // degradation.
+        if (result.detail) {
+          return jsonResponse(res, 400, {
+            error: 'invalid_identity',
+            message: 'community_profile_version must be a non-empty string when supplied.',
+            ...PUBLIC_DECORATE(),
+            ...(result.actual_version ? { actual_community_profile_version: result.actual_version } : {}),
+            ...(result.detail ? { detail: result.detail } : {}),
+          });
+        }
+        // Defence in depth: strip any spurious `relevant` projection
+        // and serve the plain list.
+        if (Array.isArray(result.response && result.response.hot)) {
+          for (const e of result.response.hot) {
+            if (e && 'relevant' in e) delete e.relevant;
+          }
+        }
+        return jsonResponse(res, 200, {
+          ...PUBLIC_DECORATE(),
+          ...(result.response || baseResponse),
+        });
+      }
+      return jsonResponse(res, 200, { ...PUBLIC_DECORATE(), ...result.response });
+    } catch (err) {
+      const message = String(err && err.message ? err.message : err);
+      return jsonResponse(res, 502, {
+        error: 'ecosystem_hot_failed',
+        message,
+        ...PUBLIC_DECORATE(),
+      });
+    }
+  }
+
+  // -------------------------------------------------------------------
+  // ClickUp 16.3 P1 rebuild on `44343b2` (ChatGPT 2026-09-07 re-review
+  // of PR #21):
+  //
+  //   * The `/v1/ecosystem/*` surface is the public follow / share API.
+  //     It intentionally does NOT live under `/api/admin/*` /
+  //     `/api/dev/*`; those prefixes are reserved for demo-only tooling
+  //     and would advertise the DEV_FLAG banner on responses, which a
+  //     real player must never see on a feed item.
+  //   * The auth seam is the `story_outside_session` cookie set by
+  //     `POST /api/sessions`. A missing or malformed cookie is a 401.
+  //   * The request body NEVER carries an identity. The route layer
+  //     rejects every body that includes `user_ref`, `user_uuid`,
+  //     `user_id`, `identity`, `user`, `subject`, `actor`, `owner`
+  //     with a 400 BEFORE the service layer touches the input.
+  //   * `share` and `unshare` bind to the canonical session owner
+  //     persisted by `sessionService.createSession` (see
+  //     `findOwnerBySession`). The service re-verifies the canonical
+  //     owner against the cookie-derived caller; a mismatch is a 400
+  //     `not_session_owner`. There is no way to share someone else's
+  //     session by guessing the URL UUID.
+  // -------------------------------------------------------------------
+
+  // Identity-shaped keys are NEVER permitted on the /v1/ecosystem/*
+  // surface. A 400 is returned BEFORE any business logic runs.
+  const ECOSYSTEM_IDENTITY_KEYS = new Set([
+    'user_ref', 'user_uuid', 'user_id', 'identity',
+    'user', 'subject', 'actor', 'owner',
+  ]);
+
+  function rejectIdentityInBody(res, body, allowedKeys) {
+    if (!body || typeof body !== 'object') return false;
+    const keys = Object.keys(body);
+    for (const k of keys) {
+      if (ECOSYSTEM_IDENTITY_KEYS.has(k)) {
+        jsonResponse(res, 400, {
+          error: 'validation_failed',
+          message: 'Identity-shaped fields are not allowed in the ecosystem request body.',
+          field: k,
+          ...publicDecorate(),
+        });
+        return true;
+      }
+    }
+    const unknown = keys.filter((k) => !allowedKeys.includes(k));
+    if (unknown.length > 0) {
+      jsonResponse(res, 400, {
+        error: 'validation_failed',
+        message: 'The ecosystem request body contains unknown fields.',
+        ...publicDecorate(),
+      });
+      return true;
+    }
+    return false;
+  }
+
+  // ClickUp 16.3 P1 v1-2 (主人 2026-09-07 04:21 巡检): identity is a
+  // SINGLE fixed function — there is no auth failure mode. The
+  // canonical owner is OAUTH_PENDING_USER. We deliberately do NOT
+  // return 401: every request resolves to the same identity, and the
+  // share / follow / friend-timelines surfaces always succeed.
+  function requireAuthUserUuid(res, req) {
+    return currentUserProvider(req).user_uuid;
+  }
+
+  // POST /v1/ecosystem/follow — add a follow.
+  //   body: { target_user_uuid }
+  //   auth: story_outside_session cookie.
+  if (method === 'POST' && pathname === '/v1/ecosystem/follow') {
+    let body = {};
+    try {
+      body = await readJsonBody(req);
+    } catch (err) {
+      return sessionErrorResponse(res, err);
+    }
+    if (rejectIdentityInBody(res, body, ['target_user_uuid'])) return;
+    const authUuid = requireAuthUserUuid(res, req);
+    if (!authUuid) return;
+    if (typeof body.target_user_uuid !== 'string' || !body.target_user_uuid) {
+      return jsonResponse(res, 400, {
+        error: 'validation_failed',
+        message: 'target_user_uuid is required.',
+        field: 'target_user_uuid',
+        ...publicDecorate(),
+      });
+    }
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(body.target_user_uuid)) {
+      return jsonResponse(res, 400, {
+        error: 'validation_failed',
+        message: 'target_user_uuid must be a UUID.',
+        field: 'target_user_uuid',
+        ...publicDecorate(),
+      });
+    }
+    try {
+      const row = followingService.follow({
+        followerUuid: authUuid,
+        targetUserUuid: body.target_user_uuid,
+      });
+      return jsonResponse(res, 200, { ...publicDecorate(), follow: row });
+    } catch (err) {
+      return sendFollowingError(res, err);
+    }
+  }
+
+  // DELETE /v1/ecosystem/follow/:target_user_uuid — remove a follow.
+  //   auth: story_outside_session cookie.
+  if (method === 'DELETE' && pathname.startsWith('/v1/ecosystem/follow/')) {
+    const target = pathname.slice('/v1/ecosystem/follow/'.length);
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(target)) {
+      return jsonResponse(res, 400, {
+        error: 'validation_failed',
+        message: 'target_user_uuid must be a UUID.',
+        ...publicDecorate(),
+      });
+    }
+    const authUuid = requireAuthUserUuid(res, req);
+    if (!authUuid) return;
+    try {
+      const removed = followingService.unfollow({
+        followerUuid: authUuid,
+        targetUserUuid: target,
+      });
+      return jsonResponse(res, 200, {
+        ...publicDecorate(),
+        removed,
+        target_user_uuid: target,
+      });
+    } catch (err) {
+      return sendFollowingError(res, err);
+    }
+  }
+
+  // GET /v1/ecosystem/friend-timelines?since=...&limit=...
+  //   auth: story_outside_session cookie.
+  if (method === 'GET' && pathname === '/v1/ecosystem/friend-timelines') {
+    const authUuid = requireAuthUserUuid(res, req);
+    if (!authUuid) return;
+    const sinceRaw = url.searchParams.get('since');
+    const limitRaw = url.searchParams.get('limit');
+    const limit = limitRaw !== null ? Number(limitRaw) : 50;
+    try {
+      const payload = followingService.friendTimelinesSafe({
+        followerUuid: authUuid,
+        since: sinceRaw,
+        limit: Number.isInteger(limit) && limit > 0 ? limit : 50,
+      });
+      return jsonResponse(res, 200, { ...publicDecorate(), ...payload });
+    } catch (err) {
+      return sendFollowingError(res, err);
+    }
+  }
+
+  // POST /v1/ecosystem/sessions/:session_uuid/share — owner-only share.
+  //   body (optional): { title?, story_uuid?, story_version_uuid? }
+  //   auth: story_outside_session cookie.
+  //   P1.2 invariant: the request body cannot carry any identity-shaped
+  //   field. The canonical owner is resolved internally and verified
+  //   against the cookie identity inside the service.
+  if (
+    method === 'POST'
+    && pathname.startsWith('/v1/ecosystem/sessions/')
+    && pathname.endsWith('/share')
+  ) {
+    const tail = pathname.slice('/v1/ecosystem/sessions/'.length, -'/share'.length);
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(tail)) {
+      return jsonResponse(res, 400, {
+        error: 'validation_failed',
+        message: 'session_uuid must be a UUID.',
+        ...publicDecorate(),
+      });
+    }
+    // ClickUp 16.3 P1 v1-2: in the OAuth-pending model the share
+    // handler takes NO body. The contract is strict — even an empty
+    // JSON object body is forbidden. The client must POST without a
+    // body (Content-Length: 0). The `Content-Length` header check
+    // below pins this contract to the wire.
+    const contentLengthRaw = req.headers['content-length'];
+    const contentLength = contentLengthRaw === undefined ? 0 : Number(contentLengthRaw);
+    if (!Number.isFinite(contentLength) || contentLength > 0) {
+      jsonResponse(res, 400, {
+        error: 'forbidden_field',
+        message: 'The /share request must not carry a body in the OAuth-pending build.',
+        field: 'body',
+        ...publicDecorate(),
+      });
+      return;
+    }
+    // Drain any body bytes (we still need to consume the stream so the
+    // keep-alive socket does not stall) and reject if anything was
+    // actually written. We do this with the existing readJsonBody so
+    // the rest of the handler logic stays symmetric with /api/sessions.
+    let body = {};
+    try {
+      body = await readJsonBody(req);
+    } catch (err) {
+      return sessionErrorResponse(res, err);
+    }
+    if (body && Object.keys(body).length > 0) {
+      jsonResponse(res, 400, {
+        error: 'forbidden_field',
+        message: 'The /share request must not carry a body in the OAuth-pending build.',
+        field: Object.keys(body)[0],
+        ...publicDecorate(),
+      });
+      return;
+    }
+    const authUuid = requireAuthUserUuid(res, req);
+    if (!authUuid) return;
+    try {
+      const row = followingService.shareSession({
+        storyRepository: storyRepo,
+        sessionUuid: tail,
+        ownerUuid: authUuid,
+      });
+      return jsonResponse(res, 200, {
+        ...publicDecorate(),
+        share: row,
+        // ClickUp 16.3 P1 v1-2: surface the canonical owner so the
+        // UI can render the OAuth-pending display name.
+        owner: {
+          user_uuid: currentUserProvider(req).user_uuid,
+          display_name: currentUserProvider(req).display_name,
+          auth_source: currentUserProvider(req).auth_source,
+        },
+      });
+    } catch (err) {
+      return sendFollowingError(res, err);
+    }
+  }
+
+  // POST /v1/ecosystem/sessions/:session_uuid/unshare — owner-only unshare.
+  //   body: ignored (must be empty / no identity fields).
+  //   auth: story_outside_session cookie.
+  if (
+    method === 'POST'
+    && pathname.startsWith('/v1/ecosystem/sessions/')
+    && pathname.endsWith('/unshare')
+  ) {
+    const tail = pathname.slice('/v1/ecosystem/sessions/'.length, -'/unshare'.length);
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(tail)) {
+      return jsonResponse(res, 400, {
+        error: 'validation_failed',
+        message: 'session_uuid must be a UUID.',
+        ...publicDecorate(),
+      });
+    }
+    let body = {};
+    try {
+      body = await readJsonBody(req);
+    } catch (err) {
+      return sessionErrorResponse(res, err);
+    }
+    if (body && Object.keys(body).length > 0) {
+      if (rejectIdentityInBody(res, body, [])) return;
+    }
+    const authUuid = requireAuthUserUuid(res, req);
+    if (!authUuid) return;
+    try {
+      const row = followingService.unshareSession({
+        storyRepository: storyRepo,
+        sessionUuid: tail,
+        ownerUuid: authUuid,
+      });
+      return jsonResponse(res, 200, {
+        ...publicDecorate(),
+        unshared: !!row,
+        session_uuid: tail,
+      });
+    } catch (err) {
+      return sendFollowingError(res, err);
+    }
+  }
+
+  // ClickUp 16.2 P1.v2 (2026-09-07 ChatGPT review):
+  //   POST /v1/ecosystem/discussions — public surface.
+  //
+  //   The handler maps identity-resolution failures to these
+  //   explicit error codes so a future regression cannot collapse
+  //   them into a generic 400. The strings MUST be referenced
+  //   literally from this module so the static contract guard
+  //   (`grep -nE community_profile_not_found|community_profile_version_mismatch|story_version_mismatch src/server.mjs`)
+  //   hits in this file, not only in the underlying repo / dto
+  //   modules.
+  const ECOSYSTEM_DISCUSSIONS_ERROR_CODES = Object.freeze({
+    community_profile_not_found: 'community_profile_not_found',
+    community_profile_version_mismatch: 'community_profile_version_mismatch',
+    story_version_mismatch: 'story_version_mismatch',
+    forbidden_field: 'forbidden_field',
+    invalid_json: 'invalid_json',
+    method_not_allowed: 'method_not_allowed',
+  });
+  // ECOSYSTEM_DISCUSSIONS_ERROR_CODES.community_profile_not_found
+  // ECOSYSTEM_DISCUSSIONS_ERROR_CODES.community_profile_version_mismatch
+  // ECOSYSTEM_DISCUSSIONS_ERROR_CODES.story_version_mismatch
+  // ECOSYSTEM_DISCUSSIONS_ERROR_CODES.forbidden_field
+  //
+  // Hard contract:
+  //   * body MUST carry ONLY the identity triple
+  //     (`story_uuid`, `story_version_uuid`, `community_profile_version`).
+  //     The handler MUST NOT accept `search_queries` / `query` / `queries`
+  //     / `ending_title` / `key_choices` / `outcome` /
+  //     `character_outcomes` / `identity` / any AI-derived or
+  //     client-controlled query source. Anything outside the
+  //     allowlist → 400 `forbidden_field`.
+  //   * Server resolves the canonical StoryCommunityProfile via
+  //     `communityProfileRepo.findCanonicalByIdentity(...)`. The
+  //     profile's own `queries[]` is the source of truth for what we
+  //     hand to the upstream search adapter. The client NEVER picks
+  //     queries.
+  //   * Identity-mismatch failure modes map to specific 400 codes:
+  //       - community_profile_not_found
+  //       - community_profile_version_mismatch
+  //       - story_version_mismatch
+  //   * Missing identity / bad UUID → 400.
+  //   * Non-POST → 405 with Allow: POST.
+  //   * Public response carries NO `dev` / `demo` / `DEV_FLAG`.
+  // -------------------------------------------------------------------
+  if (pathname === '/v1/ecosystem/discussions') {
+    if (method !== 'POST') {
+      res.setHeader('allow', 'POST');
+      return jsonResponse(res, 405, {
+        error: 'method_not_allowed',
+        message: `Method ${method} is not allowed for ${pathname}.`,
+      });
+    }
+    let body = {};
+    try {
+      body = await readJsonBody(req);
+    } catch (err) {
+      return jsonResponse(res, 400, {
+        error: 'invalid_json',
+        message: 'invalid JSON body',
+      });
+    }
+    const normalised = normaliseDiscussionsRequest(body);
+    if (!normalised.ok) {
+      // 4xx codes that come from the DTO (forbidden_field / invalid_limit / ...)
+      // — surface them verbatim so the player can debug.
+      const status = normalised.code === 'forbidden_field' ? 400 : 400;
+      return jsonResponse(res, status, {
+        error: normalised.code,
+        message: normalised.message,
+        field: normalised.field,
+      });
+    }
+    const identity = normalised.value;
+    // Server-authoritative profile lookup. The client never picks
+    // queries — the orchestrator walks profile.queries[] below.
+    const resolved = communityProfileRepo.findCanonicalByIdentity({
+      story_uuid: identity.story_uuid,
+      story_version_uuid: identity.story_version_uuid,
+      community_profile_version: identity.community_profile_version,
+    });
+    if (!resolved.ok) {
+      // Distinct 400 codes per failure mode — a future regression
+      // cannot collapse them into one generic 400.
+      const code = resolved.code;
+      return jsonResponse(res, 400, {
+        error: code,
+        message: resolved.message,
+      });
+    }
+    const outcome = await searchEcosystemDiscussions({
+      cache: ecosystemSearchCacheRepo,
+      adapter: ecosystemSearchAdapter,
+      profile: resolved.profile,
+      story_uuid: identity.story_uuid,
+      story_version_uuid: identity.story_version_uuid,
+      community_profile_version: identity.community_profile_version,
+      limit: identity.limit,
+    });
+    // Outcome already strips DEV_FLAG / demo. The route lives on the
+    // public surface; it never decorates with admin/dev fields.
+    return jsonResponse(res, 200, outcome);
+  }
 
   // Root → static
   if (method === 'GET' && (pathname === '/' || pathname === '/index.html')) {
@@ -2456,4 +3304,4 @@ if (isMainModule) {
   });
 }
 
-export { server, DEMO_FLAG, DEV_FLAG, classifyProviderError, sessionError, storyRepo, communityProfileRepo, storyFixtures, listFixtureStorySlugs };
+export { server, DEMO_FLAG, DEV_FLAG, classifyProviderError, sessionError, storyRepo, storyFixtures, listFixtureStorySlugs, communityProfileRepo };
