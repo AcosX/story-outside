@@ -23,6 +23,36 @@
 //     with two checksums (rare, but possible when content_payload is
 //     corrected) keeps separate profiles.
 //
+// ClickUp 16.5 P1.v1-3 fix (2026-09-07 owner review): the handler
+// identity is the DERIVED external
+// `community_profile_version = <generator_version>-<content_hash_short>`,
+// NOT the raw `generator_version`. `findCanonicalByIdentity` walks
+// every preserved row for the supplied story_version, computes each
+// row's external version, and matches the requested external version
+// against those — so a row superseded by a newer content_hash stays
+// resolvable for old sessions that still pin the prior external
+// version. There is NO silent fallback to "the latest row": an exact
+// external-version lookup either returns the matching row or returns
+// `null` so the route layer can report `community_profile_not_found`.
+//
+// ClickUp 16.5 P1.v1-5 fix (2026-09-07 owner review, ChatGPT 复核):
+// `Map.set(existing key)` does NOT change the key's iteration
+// position — so the v1-4 "last insertion wins" walk over
+// `activeByStoryVersion.entries()` was still deterministically
+// WRONG when an older `generator_version` was re-inserted AFTER a
+// newer one (the older row's `activeByStoryVersion` key stayed in
+// its original slot and the walk returned the newer row's uuid
+// first, regardless of insertion order). The store now keeps an
+// EXPLICIT `latestByStoryVersion: Map<story_version_uuid,
+// profile_uuid>` pointer that is updated ONLY on fresh inserts
+// (idempotent re-inserts of the same row do NOT move the pointer
+// backwards, so a re-insert of an older row CANNOT regress the
+// active row). `findActiveByStoryVersion` is now a direct
+// `latestByStoryVersion.get(story_version_uuid)` — no Map iteration
+// at all. The `insert_seq` / ordering metadata is purely
+// repository-private; the canonical 13-field profile schema in
+// profile.mjs is unchanged.
+//
 // The module does not read env vars that look like credentials and
 // does not call any external API.
 
@@ -141,6 +171,26 @@ function rejectForbiddenKeys(value, path) {
  * @property {(profile_uuid: string) => StoryCommunityProfile | null} findByUuid
  * @property {(story_version_uuid: string, externalVersion: string) => StoryCommunityProfile | null} findByExternalVersion
  * @property {(input: { story_version_uuid: string }) => StoryCommunityProfile[]} listByStoryVersion
+ * @property {(input: { story_uuid?: string, story_version_uuid: string, community_profile_version?: string | null }) => StoryCommunityProfile | null} findCanonicalByIdentity
+ *          ClickUp 16.5 P1.v2 — server-authoritative lookup that joins
+ *          (story_uuid, story_version_uuid, community_profile_version)
+ *          into one canonical row. Caller-supplied knowledge_queries /
+ *          topic_id / topic_label / topic / theme / subject are NEVER
+ *          consulted; the route layer only ever picks a single row.
+ * @property {(external_version: string) => StoryCommunityProfile | null} findByExternalVersion
+ *          ClickUp 16.5 P1.v1-4 — pure exact-match by the EXTERNAL
+ *          community_profile_version string. Walks every preserved
+ *          row in the store, computes each row's external version
+ *          via `deriveExternalCommunityProfileVersion`, and returns
+ *          the single row whose external version equals the supplied
+ *          string. Returns `null` if no preserved row matches. There
+ *          is NO silent fallback to "the latest row" — an exact
+ *          external-version lookup either returns the matching row or
+ *          returns null so the orchestrator can surface 400
+ *          `community_profile_not_found`. This method does NOT consult
+ *          the active-by-(sv,gv) index, so it intentionally bypasses
+ *          the active-row concept for callers that want historical
+ *          exact lookup.
  * @property {(input: StoryCommunityProfile) => StoryCommunityProfile} setCommunityProfile
  * @property {() => { profile_count: number }} stats
  * @property {() => void} _resetForTests
@@ -149,8 +199,9 @@ function rejectForbiddenKeys(value, path) {
 /**
  * Build a fresh in-memory state. Pure factory.
  * @returns {{
- *   profiles: Map<string, StoryCommunityProfile>,                  // keyed by profile_uuid
- *   activeByStoryVersion: Map<string, string>,                     // story_version_uuid|generator_version → profile_uuid
+ *   profiles: Map<string, StoryCommunityProfile>,                 // keyed by profile_uuid
+ *   activeByStoryVersion: Map<string, string>,                    // story_version_uuid|generator_version → profile_uuid
+ *   latestByStoryVersion: Map<string, string>,                    // ClickUp 16.5 P1.v1-5 — explicit latest pointer, story_version_uuid → profile_uuid (NO Map iteration)
  *   byUuid: Map<string, StoryCommunityProfile>,
  *   byExternalVersion: Map<string, string>,                        // `${story_version_uuid}::${externalVersion}` → profile_uuid (P1.v1-5 SCOPED)
  *   latestByStoryVersion: Map<string, string>,                    // story_version_uuid → profile_uuid of the most recently inserted row (PRIVATE; not a row field)
@@ -160,6 +211,7 @@ function createEmptyState() {
   return {
     profiles: new Map(),
     activeByStoryVersion: new Map(),
+    latestByStoryVersion: new Map(),
     byUuid: new Map(),
     byExternalVersion: new Map(),
     // ClickUp 16.2 P1.v1-5 fix (2026-09-07): the monotonic/latest
@@ -258,35 +310,23 @@ export function createInMemoryCommunityProfileRepository() {
   const repo = {
     findActiveByStoryVersion(story_version_uuid) {
       assertUuid('story_version_uuid', story_version_uuid);
-      // ClickUp 16.2 P1.v1-5 fix (2026-09-07 主人巡检 + ChatGPT
-      // 复核): the previous v1-4 implementation walked
-      // `state.profiles` and compared per-row `insert_seq` fields
-      // to pick the active row. v1-5 replaces that surface-level
-      // computation with a single private lookup:
-      //
-      //   active_row = state.latestByStoryVersion.get(story_version_uuid)
-      //
-      // `latestByStoryVersion` is updated ONLY when
-      // `setCommunityProfile` accepts a NEW row (one that does not
-      // collapse on the existing-row same-content-hash idempotency
-      // contract). Idempotent re-inserts do NOT touch it, so the
-      // active row stays pinned across retries. This makes the
-      // "second new insert wins under same generated_at" contract
-      // robust against:
-      //
-      //   * caller-supplied randomness in `profile_uuid` (UUID v4),
-      //   * lexicographic ties on `generated_at` (Date#toISOString
-      //     has millisecond resolution),
-      //   * free-form `generator_version` strings.
-      //
-      // The previous v1-4 row-stamped `insert_seq` field is GONE:
-      // monotonic/latest metadata is no longer carried on the row.
-      // The canonical 13-field profile schema is preserved end-to-
-      // end. The Map lives in PRIVATE repository state and is never
-      // exposed through any public API.
-      const latestUuid = state.latestByStoryVersion.get(story_version_uuid);
-      if (!latestUuid) return null;
-      return state.profiles.get(latestUuid) || null;
+      // P1.v1-5 (2026-09-07 owner review, ChatGPT 复核) — direct
+      // lookup against the explicit `latestByStoryVersion` pointer.
+      // We previously walked `activeByStoryVersion.entries()` and
+      // trusted Map insertion order, but `Map.set(existing key)`
+      // does NOT move the key — so when an older `generator_version`
+      // was re-inserted AFTER a newer one (e.g. the g1/A → g2/B →
+      // g1/C ordering), the older key stayed in its original slot
+      // and the walk deterministically returned the wrong (older)
+      // row. The new contract: `latestByStoryVersion` is updated
+      // EXCLUSIVELY by `setCommunityProfile` on a fresh insert
+      // (idempotent re-inserts of an existing
+      // `(sv, generator_version, content_hash)` triple are a no-op
+      // and never move the pointer), and this lookup is a single
+      // `Map.get()` — no iteration, no ordering ambiguity.
+      const uuid = state.latestByStoryVersion.get(story_version_uuid);
+      if (!uuid) return null;
+      return state.profiles.get(uuid) || null;
     },
     findActiveByStoryVersionAndGenerator(story_version_uuid, generator_version) {
       assertUuid('story_version_uuid', story_version_uuid);
@@ -365,11 +405,66 @@ export function createInMemoryCommunityProfileRepository() {
       const storyVersionUuid = typeof input.story_version_uuid === 'string' ? input.story_version_uuid : '';
       const cpv = typeof input.community_profile_version === 'string'
         ? input.community_profile_version : '';
-      if (!UUID_PATTERN.test(storyUuid) || !UUID_PATTERN.test(storyVersionUuid) || !cpv) {
+      if (!UUID_PATTERN.test(storyVersionUuid)) {
         return {
           ok: false,
           code: 'community_profile_not_found',
-          message: 'story_uuid, story_version_uuid, community_profile_version are all required and must be valid',
+          message: 'story_version_uuid is required and must be a valid UUID',
+        };
+      }
+      // P1.v1-5 fallback (ClickUp 16.5 PR #25): when the caller
+      // omits `community_profile_version`, return the active row
+      // for `story_version_uuid`. This preserves the v1-5 contract
+      // where the in-memory repository acts as a fallback to
+      // `findActiveByStoryVersion` so the two paths agree on the
+      // same row. (When `community_profile_version` IS supplied
+      // we MUST go through the exact-match path below — a wrong
+      // / stale / typo'd version never degrades to the active
+      // row.) main's original P1.v1-5 shape guard required ALL
+      // three fields; the merge-of-conflicts adds the cpv-missing
+      // fallback so the PR #25 P1.v1-5-2 regression stays green
+      // while keeping main's `{ ok, code, message }` envelope
+      // intact.
+      if (!cpv) {
+        const latestUuid = state.latestByStoryVersion.get(storyVersionUuid);
+        if (!latestUuid) {
+          return {
+            ok: false,
+            code: 'community_profile_not_found',
+            message: 'no active row for the supplied story_version_uuid',
+          };
+        }
+        const latestRow = state.profiles.get(latestUuid);
+        if (!latestRow) {
+          return {
+            ok: false,
+            code: 'community_profile_not_found',
+            message: 'no active row for the supplied story_version_uuid',
+          };
+        }
+        // Defence in depth: when the caller supplied a story_uuid,
+        // it MUST match the active row's story_uuid.
+        if (storyUuid && !UUID_PATTERN.test(storyUuid)) {
+          return {
+            ok: false,
+            code: 'community_profile_not_found',
+            message: 'story_uuid (when supplied) must be a valid UUID',
+          };
+        }
+        if (storyUuid && latestRow.story_uuid !== storyUuid) {
+          return {
+            ok: false,
+            code: 'story_version_mismatch',
+            message: 'story_uuid does not match the active row bound to story_version_uuid',
+          };
+        }
+        return { ok: true, profile: latestRow };
+      }
+      if (!UUID_PATTERN.test(storyUuid)) {
+        return {
+          ok: false,
+          code: 'community_profile_not_found',
+          message: 'story_uuid must be a valid UUID when community_profile_version is supplied',
         };
       }
       // 2. Walk EVERY profile row ever written (not just the
@@ -445,6 +540,61 @@ export function createInMemoryCommunityProfileRepository() {
       if (typeof profile_uuid !== 'string') return null;
       return state.profiles.get(profile_uuid) || null;
     },
+    // ClickUp 16.5 P1.v1-4 — PR #25 single-arg exact-match by the
+    // EXTERNAL community_profile_version string. Kept here verbatim
+    // (per merge-of-conflict instruction "保留 main 的所有方法并在
+    // 合适位置插入 HEAD 的 findByExternalVersion") so the call
+    // surface for older callers stays source-visible. main's
+    // P1.v1-5 SCOPED two-arg `findByExternalVersion` below is the
+    // active definition at runtime (object-literal override);
+    // server.mjs's /knowledge route has been updated to call the
+    // two-arg signature.
+    findByExternalVersion(external_version) {
+      // ClickUp 16.5 P1.v1-4 — pure exact-match lookup. The orchestrator
+      // and the route layer carry the EXTERNAL community_profile_version
+      // string (`<generator_version>@<content_hash_prefix>`) supplied
+      // by the client; this method walks every preserved row in the
+      // store and returns the single row whose external version equals
+      // the supplied string. There is NO active-row concept here: a
+      // row that has been superseded by a newer content_hash for the
+      // same (story_version_uuid, generator_version) scope STILL
+      // resolves via its own external version, so an old session that
+      // pinned the prior external version keeps reading the prior
+      // row. Returns null on no match so the caller can distinguish a
+      // truly-missing profile from a profile found but with a stale
+      // active index.
+      if (typeof external_version !== 'string' || !external_version) {
+        throw new Error('communityRepository.findByExternalVersion: external_version required');
+      }
+      for (const row of state.profiles.values()) {
+        let rowExternal;
+        try {
+          rowExternal = deriveExternalCommunityProfileVersion(row);
+        } catch {
+          continue;
+        }
+        if (rowExternal === external_version) {
+          return row;
+        }
+      }
+      return null;
+    },
+    // NOTE: HEAD's PR #25 P1.v1-3 `findCanonicalByIdentity(input)`
+    // (which returned `StoryCommunityProfile | null`) is intentionally
+    // OMITTED. main's P1.v1-5 `findCanonicalByIdentity(input)` (which
+    // returns `{ ok:true, profile } | { ok:false, code, message }`)
+    // is defined EARLIER in this object literal and is the active
+    // definition. Keeping HEAD's method body here would override
+    // main's at runtime and break every test that asserts
+    // `exact.ok === true`. The PR #25 knowledge surface calls
+    // `findByExternalVersion` (above) — NOT `findCanonicalByIdentity`
+    // — for the server-side canonical lookup, so HEAD's method body
+    // is genuinely redundant.
+    // ClickUp 16.2 P1.v1-5 — PR #24 SCOPED two-arg exact-match. This
+    // definition OVERRIDES the one-arg `findByExternalVersion` above
+    // at runtime (object-literal semantics); server.mjs has been
+    // updated to call this signature with both
+    // `body.story_version_uuid` and `body.community_profile_version`.
     findByExternalVersion(story_version_uuid, externalVersion) {
       // P1.v1-5 (2026-09-07): SCOPED exact-string lookup against the
       // wire contract external identity. The repository maintains a
@@ -508,12 +658,12 @@ export function createInMemoryCommunityProfileRepository() {
       // 3. Idempotency on (story_version_uuid, generator_version,
       //    content_hash). When the caller regenerates with the same
       //    content, we MUST NOT create a duplicate active row — we
-      //    return the existing one instead. This is the critical
-      //    P1.v1-5 contract: an idempotent hit MUST NOT move the
-      //    `latestByStoryVersion` pointer. If it did, the "second
-      //    new insert wins under same generated_at" guarantee would
-      //    be undone by any caller that retries `findOrCreate`
-      //    against the already-active row.
+      //    return the existing one instead. Critically (P1.v1-5,
+      //    2026-09-07 ChatGPT 复核): an idempotent hit MUST NOT move
+      //    the `latestByStoryVersion` pointer — the active row stays
+      //    on whatever the latest FRESH insert was. This prevents a
+      //    stale re-insert of an older row from regressing the active
+      //    pointer back to itself.
       const key = activeKey(profile.story_version_uuid, profile.generator_version);
       const existingUuid = state.activeByStoryVersion.get(key);
       if (existingUuid) {
@@ -524,47 +674,36 @@ export function createInMemoryCommunityProfileRepository() {
           return existing;
         }
       }
-      // 4. Insert. ClickUp 16.2 P1.v1-5 (2026-09-07): the row is
-      //    stored AS-IS (no `insert_seq` stamp; the canonical
-      //    13-field schema is preserved). The
-      //    `latestByStoryVersion` private Map is moved to the
-      //    newly-inserted row's `profile_uuid`, so a subsequent
-      //    `findActiveByStoryVersion` returns this row regardless
-      //    of `generated_at` ties or UUID v4 randomness. A row
-      //    inserted under a fresh `generator_version` still moves
-      //    the latest pointer past any earlier row's value
-      //    (regardless of generator_version), because the pointer
-      //    is scoped to `story_version_uuid`, not to
-      //    `(story_version, generator_version)`. This guarantees
-      //    the "second new insert wins" contract no matter how
-      //    the caller partitions the active slot.
-      const stored = /** @type {any} */ ({ ...profile });
-      state.profiles.set(stored.profile_uuid, stored);
-      state.byUuid.set(stored.profile_uuid, stored);
-      state.activeByStoryVersion.set(key, stored.profile_uuid);
-      // Move the private latest pointer to the freshly-inserted
-      // row. Idempotent hits (handled above) DO NOT touch this Map
-      // — that is the entire point of separating it from the row
-      // surface.
-      state.latestByStoryVersion.set(stored.story_version_uuid, stored.profile_uuid);
-      // 5. P1.v1-5 (2026-09-07): maintain the SCOPED external-version
-      //    index so `findByExternalVersion(story_version_uuid,
-      //    externalVersion)` is O(1). The key is
-      //    `${story_version_uuid}::${externalVersion}` so two profiles
-      //    with the same external version but different
-      //    story_versions never collide on the index. We derive the
-      //    external identity via the public helper (which is the
-      //    SINGLE place that knows the wire format). If derivation
+      // 4. Insert. New row wins the active slot for its scope.
+      state.profiles.set(profile.profile_uuid, profile);
+      state.byUuid.set(profile.profile_uuid, profile);
+      state.activeByStoryVersion.set(key, profile.profile_uuid);
+      // 5. ClickUp 16.5 P1.v1-5 — update the explicit
+      //    `latestByStoryVersion` pointer ONLY on a fresh insert
+      //    (the idempotency hit above short-circuited, so we are by
+      //    construction inserting a NEW row here, possibly with a
+      //    DIFFERENT `generator_version` than the previous latest).
+      //    This pointer is what `findActiveByStoryVersion` reads; it
+      //    is NEVER touched by Map iteration, NEVER touched by
+      //    `for...of` over `activeByStoryVersion`, and NEVER moved
+      //    backwards by an idempotent re-insert of an older row.
+      state.latestByStoryVersion.set(profile.story_version_uuid, profile.profile_uuid);
+      // 6. P1.v1-5 (2026-09-07, origin/main): maintain the SCOPED
+      //    external-version index so the two-arg
+      //    `findByExternalVersion(story_version_uuid, externalVersion)`
+      //    is O(1). The key is `${story_version_uuid}::${externalVersion}`
+      //    so two profiles with the same external version but different
+      //    story_versions never collide on the index. If derivation
       //    fails for any reason, we still store the row but skip the
       //    index entry — `findByExternalVersion` will then return
       //    `null` for this row, which is the same observable
-      //    behaviour as before.
+      //    behaviour as before. (main tail, appended to HEAD body.)
       try {
-        const externalVersion = deriveExternalCommunityProfileVersion(stored);
+        const externalVersion = deriveExternalCommunityProfileVersion(profile);
         if (externalVersion) {
           state.byExternalVersion.set(
-            externalVersionKey(stored.story_version_uuid, externalVersion),
-            stored.profile_uuid,
+            externalVersionKey(profile.story_version_uuid, externalVersion),
+            profile.profile_uuid,
           );
         }
       } catch {
@@ -572,7 +711,7 @@ export function createInMemoryCommunityProfileRepository() {
         // `generator_version`, so derivation only fails for an
         // in-memory invariant break. Keep the row, drop the index.
       }
-      return stored;
+      return profile;
     },
     stats() {
       return { profile_count: state.profiles.size };
@@ -581,6 +720,7 @@ export function createInMemoryCommunityProfileRepository() {
       const fresh = createEmptyState();
       state.profiles = fresh.profiles;
       state.activeByStoryVersion = fresh.activeByStoryVersion;
+      state.latestByStoryVersion = fresh.latestByStoryVersion;
       state.byUuid = fresh.byUuid;
       state.byExternalVersion = fresh.byExternalVersion;
       state.latestByStoryVersion = fresh.latestByStoryVersion;

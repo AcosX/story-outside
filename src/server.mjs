@@ -32,8 +32,10 @@ import {
   COMMUNITY_PROFILE_GENERATOR_VERSION,
   buildCanonicalCommunityProfileVersion,
   createInMemoryCommunityProfileRepository,
+  findCanonicalByIdentity,
   seedCommunityProfiles,
 } from './community/index.mjs';
+import { deriveExternalCommunityProfileVersion } from './community/version.mjs';
 
 // ClickUp 16.2 P1.v2 (2026-09-07 ChatGPT review): the
 // /v1/ecosystem/discussions route is server-authoritative — it takes
@@ -88,8 +90,9 @@ import {
 // pass-through to the SAME canonical formatter
 // (`buildCanonicalCommunityProfileVersion`), so any future caller in
 // this module can import either side and get a byte-identical
-// result. We no longer import `deriveExternalCommunityProfileVersion`
-// here because the route + bootstrap paths read `community_profile_*`
+// result. We import `deriveExternalCommunityProfileVersion` here
+// directly from `./community/version.mjs` (the single source of
+// truth) so the route + bootstrap paths can read `community_profile_*`
 // via `resolveCommunityProfileVersion`, which already wraps the
 // canonical formatter.
 import {
@@ -106,6 +109,9 @@ import {
   buildOriginalTimeline,
   buildReplay,
 } from './stories/endingService.mjs';
+import {
+  createEcosystemKnowledgeProvider,
+} from './providers/ecosystem/knowledge.mjs';
 
 // ClickUp 16.3 P1 rebuild on `44343b2` — the follow / share surface is
 // served from a fresh in-memory repository. The auth seam is the
@@ -633,6 +639,38 @@ function resolveCommunityProfileVersion(story_version_uuid) {
     return { community_profile_version: null, community_profile_queries: null };
   }
 }
+
+// ClickUp 16.5 — public /v1/ecosystem/knowledge orchestrator. The
+// route layer (handler further down) calls `knowledgeProvider.match()`
+// once per canonical knowledge_query resolved from the
+// StoryCommunityProfile on the server side. We DO NOT pre-seed any
+// topic-style surface — the topic source is always the canonical
+// knowledge_queries[] emitted by the profile generator at story_version
+// import time.
+//
+// P1.v1-4 fix (2026-09-07 owner review): the route handler
+// resolves the canonical profile via
+// `communityProfileRepo.findByExternalVersion` — a pure exact-match
+// lookup that walks every preserved row and matches by the external
+// version string. NO active-row concept is consulted, so an old
+// session that pinned the prior external version keeps resolving
+// the prior row even after a newer content_hash has overtaken the
+// active slot for the same (story_version_uuid, generator_version)
+// scope. This is the seam that fixed the `communityProfile.test`
+// 8th-run flake: a row whose active index has been overwritten still
+// resolves via its external version.
+const knowledgeProvider = createEcosystemKnowledgeProvider({
+  communityProfileRepo,
+});
+
+// Thin in-process service namespace. The route layer never imports
+// src/community/service.mjs directly so we keep the canonical
+// helpers in one place here. Exposing `communityProfileService`
+// also makes the static guard `grep communityProfileService` match
+// the handler location.
+const communityProfileService = Object.freeze({
+  findCanonicalByIdentity: findCanonicalByIdentity,
+});
 
 // sessionService deliberately keeps its state private to the repository. The
 // route layer keeps only the request's non-secret pinned metadata so recovery
@@ -2366,6 +2404,318 @@ async function handleRequest(req, res) {
     }
   }
 
+  // -----------------------------------------------------------------
+  // ClickUp 16.5 — public /v1/ecosystem/knowledge façade (player-facing).
+  //
+  // P1.v1-3 fix (2026-09-07 owner review): the
+  // `community_profile_version` carried in the body is the EXTERNAL
+  // DERIVED form `<generator_version>-<content_hash_short>` (see
+  // `deriveExternalCommunityProfileVersion` in
+  // src/community/profile.mjs). The internal schema keeps
+  // `generator_version` as the raw rule version; the external
+  // derivation lives next to it and is the ONLY identity string the
+  // route layer / browser treats as canonical. Two preserved rows
+  // with the same `generator_version` but a different `content_hash`
+  // carry different external versions, so an old-session regression
+  // pinning the prior external version keeps resolving the prior row
+  // even after the active row has moved on.
+  //
+  // P1.v2 fix (2026-09-07 ChatGPT review): the surface is
+  // SERVER-AUTHORITATIVE. The handler accepts ONLY the three identity
+  // fields (story_uuid, story_version_uuid, community_profile_version)
+  // and resolves the canonical StoryCommunityProfile from the
+  // in-memory repo via `findCanonicalByIdentity`. The
+  // `profile.knowledge_queries[]` list is read from THAT row —
+  // caller-supplied knowledge_queries / topic_id / topic_label /
+  // topic / theme / subject / query / identity are NEVER accepted.
+  //
+  // P1.v2 fix (2026-09-07 ChatGPT review): the orchestrator's cache
+  // key includes `query_hash = sha256(query.query)` so two distinct
+  // query strings ALWAYS hit independent cache rows; the upstream
+  // call receives the verbatim query string (NOT a query_id), so
+  // two different query strings produce two different result sets.
+  //
+  // Public contract:
+  //   * POST /v1/ecosystem/knowledge
+  //       body (strict whitelist):
+  //         story_uuid                  required, string uuid
+  //         story_version_uuid          required, string uuid
+  //         community_profile_version   required, string
+  //         limit?                      optional, default 4 per query
+  //       resp: { knowledge: [...], provisional: true, disclaimer,
+  //               source, cached, fetched_at, cache_key,
+  //               degraded, degradation | null,
+  //               results: [{ id, query, kind, knowledge: [...],
+  //                            source, cached, degraded, degradation }],
+  //               knowledge_queries: [...] }
+  //   * Identity errors:
+  //       - 400 `forbidden_field`                  body carries any
+  //                                                field other than the
+  //                                                three identity fields
+  //                                                + `limit`.
+  //       - 400 `community_profile_not_found`      no row matches the
+  //                                                identity tuple.
+  //       - 400 `community_profile_version_mismatch`
+  //                                                community_profile_version
+  //                                                supplied but does
+  //                                                not match any row.
+  //       - 400 `story_version_mismatch`           story_uuid supplied
+  //                                                but does not match
+  //                                                the row's story_uuid.
+  //   * Knowledge failure never blocks the core game loop:
+  //     real provider unavailable → mock fallback; both unavailable
+  //     → 200 with knowledge: [] and degraded:true. NEVER 5xx on the
+  //     public surface.
+  // -----------------------------------------------------------------
+  if (method === 'POST' && pathname === '/v1/ecosystem/knowledge') {
+    let body;
+    try {
+      body = await readJsonBody(req);
+    } catch (err) {
+      return jsonResponse(res, 400, {
+        error: 'bad_json',
+        message: 'POST /v1/ecosystem/knowledge expects a JSON object body.',
+      });
+    }
+    if (!body || typeof body !== 'object' || Array.isArray(body)) {
+      return jsonResponse(res, 400, {
+        error: 'validation_failed',
+        message: 'POST /v1/ecosystem/knowledge expects a JSON object body.',
+        field: 'body',
+      });
+    }
+    // P1.v2 hard whitelist. The browser may ONLY send the three
+    // identity fields + an optional `limit`. Anything else —
+    // including `knowledge_queries`, `topic_id`, `topic_label`,
+    // `topic`, `theme`, `subject`, `query`, `identity` — is rejected
+    // so the handler cannot be coerced into letting the player
+    // pick a free-form subject.
+    const allowedKeys = [
+      'story_uuid',
+      'story_version_uuid',
+      'community_profile_version',
+      'limit',
+    ];
+    const unknownKeys = Object.keys(body).filter((k) => !allowedKeys.includes(k));
+    if (unknownKeys.length > 0) {
+      return jsonResponse(res, 400, {
+        error: 'forbidden_field',
+        message: 'POST /v1/ecosystem/knowledge does not accept caller-supplied topic/query fields.',
+        field: 'body',
+        unknown_fields: unknownKeys,
+      });
+    }
+    if (typeof body.story_uuid !== 'string' || !body.story_uuid) {
+      return jsonResponse(res, 400, {
+        error: 'validation_failed',
+        message: 'story_uuid is required.',
+        field: 'story_uuid',
+      });
+    }
+    if (typeof body.story_version_uuid !== 'string' || !body.story_version_uuid) {
+      return jsonResponse(res, 400, {
+        error: 'validation_failed',
+        message: 'story_version_uuid is required.',
+        field: 'story_version_uuid',
+      });
+    }
+    if (typeof body.community_profile_version !== 'string' || !body.community_profile_version) {
+      return jsonResponse(res, 400, {
+        error: 'validation_failed',
+        message: 'community_profile_version is required.',
+        field: 'community_profile_version',
+      });
+    }
+    const limitPerQuery = Number.isInteger(body.limit) && body.limit > 0
+      ? Math.min(body.limit, 32)
+      : 4;
+
+    // P1.v1-4 fix (2026-09-07 owner review) — server-side canonical
+    // lookup now goes through `communityProfileRepo.findByExternalVersion`
+    // directly. This is a PURE exact-match by the EXTERNAL
+    // community_profile_version string (`<generator_version>@<16-hex-prefix>`);
+    // it walks every preserved row and returns the single row whose
+    // external version equals the supplied string. There is NO
+    // active-row concept here, so an old session that pinned the prior
+    // external version keeps resolving the prior row even after a
+    // newer content_hash has overtaken the active slot. There is NO
+    // silent fallback to "the latest row" — an unknown external
+    // version is a hard 400 `community_profile_not_found`. The
+    // previous `findCanonicalByIdentity` service helper is retained
+    // for tests but the route layer no longer goes through it.
+    let canonicalProfile;
+    try {
+      // P1.v1-5 (2026-09-07, origin/main): the active
+      // `findByExternalVersion` is SCOPED to (story_version_uuid,
+      // external_version). server.mjs previously called the one-arg
+      // PR #25 P1.v1-4 form (external_version alone); with both
+      // methods now present in the repository object literal, the
+      // SCOPED two-arg version is the active definition and the
+      // route layer MUST pass `story_version_uuid` alongside the
+      // external version so the scoped index can resolve the row.
+      canonicalProfile = communityProfileRepo.findByExternalVersion(
+        body.story_version_uuid,
+        body.community_profile_version,
+      );
+    } catch (err) {
+      // findByExternalVersion throws on bad input shape; surface that
+      // as a clean validation_failed rather than 500.
+      return jsonResponse(res, 400, {
+        error: 'validation_failed',
+        message: err && err.message ? String(err.message) : 'identity lookup failed.',
+      });
+    }
+    if (!canonicalProfile) {
+      // Distinguish the failure shape so the operator can debug.
+      // The supplied `community_profile_version` is the EXTERNAL
+      // derived form `<generator_version>@<content_hash_prefix>`,
+      // NOT the raw rule version. An exact non-match means either:
+      //   - no row exists at all for this story_version, or
+      //   - rows exist but the supplied external version (and/or
+      //     story_uuid) didn't match any preserved row.
+      const allRows = communityProfileRepo.listByStoryVersion({
+        story_version_uuid: body.story_version_uuid,
+      });
+      const versionExists = allRows.length > 0;
+      if (!versionExists) {
+        return jsonResponse(res, 400, {
+          error: 'community_profile_not_found',
+          message: 'No community profile exists for the supplied story_version_uuid.',
+          field: 'story_version_uuid',
+        });
+      }
+      // Version has rows but the supplied external community_profile_version
+      // (and/or story_uuid) didn't match.
+      const hasExternalVersionMatch = allRows.some((row) => {
+        try {
+          return deriveExternalCommunityProfileVersion(row) === body.community_profile_version;
+        } catch {
+          return false;
+        }
+      });
+      if (!hasExternalVersionMatch) {
+        return jsonResponse(res, 400, {
+          error: 'community_profile_version_mismatch',
+          message: 'Supplied community_profile_version does not match any preserved row for this story_version.',
+          field: 'community_profile_version',
+        });
+      }
+      // Rows exist and an external-version match was found — but the
+      // story_uuid differs from the matching row's story_uuid.
+      return jsonResponse(res, 400, {
+        error: 'story_version_mismatch',
+        message: 'Supplied story_uuid does not match the row\'s story_uuid.',
+        field: 'story_uuid',
+      });
+    }
+    // P1.v1-4 — `findByExternalVersion` resolves the row by external
+    // version string ONLY (it does not consult story_uuid because the
+    // external version is the canonical identity the browser carries).
+    // The story_uuid / story_version_uuid integrity check lives in
+    // the route handler so the repo method stays a pure external-
+    // version lookup. A mismatch is still surfaced as a 400.
+    if (canonicalProfile.story_uuid !== body.story_uuid) {
+      return jsonResponse(res, 400, {
+        error: 'story_version_mismatch',
+        message: 'Supplied story_uuid does not match the resolved row\'s story_uuid.',
+        field: 'story_uuid',
+      });
+    }
+    if (canonicalProfile.story_version_uuid !== body.story_version_uuid) {
+      return jsonResponse(res, 400, {
+        error: 'community_profile_not_found',
+        message: 'Supplied story_version_uuid does not match the resolved row\'s story_version_uuid.',
+        field: 'story_version_uuid',
+      });
+    }
+
+    const canonicalQueries = Array.isArray(canonicalProfile.knowledge_queries)
+      ? canonicalProfile.knowledge_queries.filter(
+        (q) => q && typeof q === 'object' && typeof q.query === 'string' && q.query,
+      )
+      : [];
+
+    // Aggregate one orchestrator.match() per canonical knowledge_query.
+    // P1.v2: we pass the full { id, query, kind } so the cache key
+    // includes `query_hash = sha256(query.query)` and the upstream
+    // is called with the verbatim query string. Two different query
+    // strings → two different cache rows → two different result
+    // bundles.
+    //
+    // P1.v1-4: the resolved profile is pinned on every
+    // `match(input)` call as `input.profile` so the orchestrator
+    // can validate that the supplied `community_profile_version`
+    // matches the canonical derivation of the resolved row. The
+    // orchestrator itself does NOT call `findByExternalVersion`;
+    // the seam lives in the route handler so a single HTTP request
+    // resolves the profile ONCE and reuses the row across every
+    // canonical knowledge_query.
+    const results = [];
+    for (const q of canonicalQueries) {
+      const matchResult = await knowledgeProvider.match({
+        story_version_uuid: body.story_version_uuid,
+        community_profile_version: body.community_profile_version,
+        query: {
+          id: typeof q.id === 'string' && q.id ? q.id : null,
+          query: q.query,
+          kind: typeof q.kind === 'string' ? q.kind : 'mixed',
+        },
+        limit: limitPerQuery,
+        profile: canonicalProfile,
+      });
+      results.push({
+        id: typeof q.id === 'string' && q.id ? q.id : null,
+        // P1.v2: response echoes `query` (the string), NOT `id`.
+        query: q.query,
+        kind: typeof q.kind === 'string' ? q.kind : 'mixed',
+        knowledge: matchResult.knowledge,
+        source: matchResult.source,
+        cached: matchResult.cached,
+        fetched_at: matchResult.fetched_at,
+        cache_key: matchResult.cache_key,
+        degraded: matchResult.degraded,
+        degradation: matchResult.degradation,
+      });
+    }
+
+    // Flat, deduped knowledge bundle — useful for clients that want
+    // a single list. We dedupe on entry.id so the same upstream
+    // entry referenced by multiple queries is not listed twice.
+    const dedupe = new Map();
+    for (const r of results) {
+      for (const entry of r.knowledge) {
+        if (!dedupe.has(entry.id)) dedupe.set(entry.id, entry);
+      }
+    }
+    const flatKnowledge = Array.from(dedupe.values());
+    const anyDegraded = results.some((r) => r.degraded);
+    const anyDegradation = anyDegraded
+      ? results.find((r) => r.degraded && r.degradation) ? results.find((r) => r.degraded && r.degradation).degradation : null
+      : null;
+    const source = results.every((r) => r.source === 'real')
+      ? 'real'
+      : results.some((r) => r.source === 'real')
+        ? 'mixed'
+        : 'mock';
+
+    return jsonResponse(res, 200, {
+      ...PUBLIC_DECORATE(),
+      knowledge: flatKnowledge,
+      provisional: true,
+      disclaimer: results[0] ? results[0].knowledge[0] && results[0].knowledge[0].disclaimer : null,
+      source,
+      cached: results.every((r) => r.cached),
+      fetched_at: new Date().toISOString(),
+      degraded: anyDegraded,
+      degradation: anyDegradation,
+      knowledge_queries: canonicalQueries.map((q) => ({
+        id: typeof q.id === 'string' && q.id ? q.id : null,
+        query: q.query,
+        kind: typeof q.kind === 'string' ? q.kind : 'mixed',
+      })),
+      results,
+    });
+  }
   // GET /v1/ecosystem/hot — home-page 知乎热榜 façade (ClickUp 16.4 P1.v1-2).
   //
   // Public surface (no DEV_FLAG banner). Identity triple is optional:

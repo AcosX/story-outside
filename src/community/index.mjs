@@ -19,6 +19,7 @@ export {
   COMMUNITY_PROFILE_BOUNDS,
   COMMUNITY_PROFILE_GENERATOR_VERSION,
   findCommunityProfileBoundsViolations,
+  parseExternalCommunityProfileVersion,
 } from './profile.mjs';
 
 export {
@@ -38,6 +39,7 @@ export {
 
 export {
   ensureCommunityProfile,
+  findCanonicalByIdentity,
   getCommunityProfile,
   setCommunityProfile,
 } from './service.mjs';

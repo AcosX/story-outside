@@ -1322,6 +1322,8 @@ export async function bootstrapSessionFromWork({ repository, provider, session_u
     story_version_uuid: ensured.story_version_uuid,
     cache_reused: !!ensured.cache_reused,
     version_reused: !!ensured.version_reused,
+    community_profile_version: ensured.community_profile_version || null,
+    community_profile_uuid: ensured.community_profile_uuid || null,
   };
 }
 
