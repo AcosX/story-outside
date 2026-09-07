@@ -118,7 +118,7 @@ try {
     const text = await res.text();
     check("GET / 200", res.status === 200);
     check("index.html contains title", text.includes("故事之外"));
-    check("index.html contains tagline", text.includes("如果当时，由你来选"));
+    check("index.html contains tagline", text.includes("故事的下一页"));
   }
 } finally {
   await new Promise((resolve) => server.close(resolve));

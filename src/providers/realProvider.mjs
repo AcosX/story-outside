@@ -484,6 +484,24 @@ function isAllowedUpstreamHost(hostname) {
  * @param {unknown} raw
  * @returns {ReturnType<typeof normaliseStorySummary>}
  */
+function displayMetadata(entry, content = '') {
+  const image = (value) => {
+    if (typeof value !== 'string') return null;
+    try { const url = new URL(value); return url.protocol === 'https:' && !url.username && !url.password ? url.href : null; } catch { return null; }
+  };
+  const categories = Array.isArray(entry.labels) ? entry.labels.filter((label) => typeof label === 'string' && label.trim()) : [];
+  return {
+    cover_url: image(entry.artwork) || image(entry.tab_artwork),
+    banner_url: image(entry.tab_artwork) || image(entry.artwork),
+    categories,
+    category: categories[0] || '',
+    description: typeof entry.introduction === 'string' ? entry.introduction : (typeof entry.description === 'string' ? entry.description : ''),
+    author: typeof entry.author_name === 'string' ? entry.author_name : '',
+    author_avatar: image(entry.author_avatar),
+    ...(content ? { word_count: Array.from(content.replace(/<[^>]*>/g, '').replace(/\s/g, '')).length } : {}),
+  };
+}
+
 function summaryFromListEntry(raw) {
   if (!raw || typeof raw !== 'object') {
     throw new ValidationError('story list entry must be an object');
@@ -524,6 +542,7 @@ function summaryFromListEntry(raw) {
   /** @type {ZhihuStoryListEntry} */
   const enriched = /** @type {any} */ ({
     ...summary,
+    ...displayMetadata(entry),
     source: {
       raw: trimSourceRaw(entry, ['description', 'labels', 'artwork', 'tab_artwork']),
       labels: Array.isArray(entry.labels) ? entry.labels.slice() : [],
@@ -616,6 +635,7 @@ function detailFromDetailEntry(raw) {
   /** @type {Record<string, unknown>} */
   const enriched = /** @type {any} */ ({
     ...detail,
+    ...displayMetadata(entry, content),
     source: {
       raw: trimSourceRaw(entry, [
         'content',

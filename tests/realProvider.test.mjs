@@ -146,6 +146,9 @@ async function run() {
     assert.equal(list[0].id, '1747681485547843585');
     assert.equal(list[0].title, '近视眼勇闯恐怖游戏');
     assert.equal(list[0].hook, '一位近视眼的玩家闯入了恐怖游戏。');
+    assert.equal(list[0].cover_url, LIST_PAYLOAD[0].artwork);
+    assert.deepEqual(list[0].categories, ['惊悚', '脑洞']);
+    assert.equal(list[0].description, LIST_PAYLOAD[0].description);
     assert.equal(list[0].roles.length, 1);
     assert.equal(list[0].roles[0].id, 'author');
     // Source envelope preserves untrusted upstream payload + metadata.
@@ -176,6 +179,9 @@ async function run() {
     assert.equal(detail.beats.length, 1);
     assert.equal(detail.beats[0].type, 'narration');
     assert.equal(detail.beats[0].text.length, 40);
+    assert.equal(detail.author, '沈南因');
+    assert.equal(detail.author_avatar, DETAIL_PAYLOAD.author_avatar);
+    assert.equal(detail.word_count, 40);
     assert.equal(detail.source.author_name, '沈南因');
     assert.deepEqual(detail.source.labels, ['惊悚', '脑洞']);
     assert.equal(detail.source.raw.upstream_extra, 'kept under source.raw');

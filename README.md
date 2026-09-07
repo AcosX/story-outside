@@ -1,10 +1,25 @@
 # 故事之外 (Story Outside)
 
-知乎黑客松 MVP · Phase 4 · 默认 mock，可切 real（zhihu_hackathon_2026_p2 故事内容 API）
+知乎黑客松 · 蓝白故事书架与实时 AI 互动叙事
 
 > 如果当时，由你来选——进入故事，看看另一条世界线。
 
 这是一个**分支互动叙事**的小项目。Phase 2 抽出 `src/providers/` 接缝，Phase 4 抽出 `src/stories/` 应用层（canonical hash、版本化、作品级开场缓存、会话快照）。默认走 `src/providers/mockProvider.mjs` 的内存 catalog；设置 `STORY_OUTSIDE_PROVIDER=real` 后会改走 `src/providers/realProvider.mjs`，按官方契约对接 `api.zhihu.com/km-indep-home/hackathon/v2/story/*`——这些接口在 `zhihu_hackathon_2026_p2` 比赛期间不需要任何鉴权，也不发送 `Authorization` / `X-OAuth-Token`。所有写入仍然只走应用层内存仓库，**不写入 MariaDB**。
+
+## 真实 AI 与新版界面
+
+```bash
+# secrets/secret 中提供服务端 AI 配置后启动真实故事与模型
+STORY_OUTSIDE_PROVIDER=real npm start
+# 默认离线示例
+npm start
+# 全量测试固定使用 mock AI，不产生模型调用
+npm test
+```
+
+故事页提供封面、分类筛选、搜索与作品详情；进入故事后按角色逐句播放，可自动播放、随时输入打断，并在关键节点做选择。我的页面提供当前浏览器的世界线入口。AI 会从原作提取角色与短开场，开场在作品间共享缓存，剧情生成仅使用已提交历史。密钥只由服务端加载；配置与缓存说明见 [AI 接入文档](docs/ai-integration.md)。
+
+当前会话仓库仍为进程内存，服务重启后会话不可恢复；浏览器保存入口并不等同于数据库持久化。
 
 ## 仓库布局
 

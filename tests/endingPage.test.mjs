@@ -465,11 +465,13 @@ async function appendEndingScreen(dom) {
       delete globalThis.__PLAYER_STATE__;
       const dom = createPlayerDom({ baseUrl });
       await appendEndingScreen(dom);
-      await dom.waitFor(() => document.querySelectorAll('#story-list .chip').length > 0, { timeoutMs: 10000, intervalMs: 100 });
+      await dom.waitFor(() => document.querySelectorAll('#story-list .book-card').length > 0, { timeoutMs: 10000, intervalMs: 100 });
       await dom.call('simulatePickerSelect', { storyId: fixture.slug, roleId: 'stranger' });
       // The deterministic demo arc auto-emits a choice on turn 2.
       await dom.waitFor(() => (globalThis.__PLAYER_STATE__ || {}).status === 'awaiting-choice', { timeoutMs: 90000, intervalMs: 200 });
       check('player flow reached awaiting-choice', (globalThis.__PLAYER_STATE__ || {}).status === 'awaiting-choice');
+      check('choices share the story scroll container', document.querySelector('#player-choices').parentNode === document.querySelector('#story-log'));
+      check('choice labels use alphabetic order', document.querySelector('#player-choices .choice-btn')?.innerHTML.includes('>A</span>'));
       // Type the finish input and submit TWICE: the second submit must
       // be swallowed by the in-flight guard instead of replaying the
       // same client_request_id.

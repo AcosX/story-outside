@@ -203,7 +203,9 @@ class Element {
     this.id = '';
     this.type = '';
   }
+  get parentNode() { return this.parent; }
   appendChild(child) {
+    if (child.parent) child.remove();
     child.parent = this;
     this.children.push(child);
     return child;
@@ -461,6 +463,10 @@ export function createPlayerDom({ baseUrl, viewport = null, stepDelayMs = null, 
     const storiesBlock = new Element('section'); pickerShell.appendChild(storiesBlock); storiesBlock.classList.add('picker-block');
     const storiesLabel = new Element('h2'); storiesBlock.appendChild(storiesLabel); storiesLabel.id = 'picker-stories-label'; storiesLabel.classList.add('picker-label');
     const storyList = new Element('ul'); storiesBlock.appendChild(storyList); storyList.id = 'story-list'; storyList.attrs['aria-busy'] = 'true';
+    for (const [tag, id] of [['input','story-search'],['div','category-filters'],['div','story-detail'],['button','start-story-btn'],['p','detail-status'],['select','header-role-select'],['section','community-section']]) {
+      const el = new Element(tag); pickerShell.appendChild(el); el.id = id;
+    }
+    const detailScreen = new Element('section'); main.appendChild(detailScreen); detailScreen.id = 'screen-detail'; detailScreen.classList.add('screen'); detailScreen.dataset.screen = 'detail'; detailScreen.hidden = true;
     const roleBlock = new Element('section'); pickerShell.appendChild(roleBlock); roleBlock.id = 'role-block'; roleBlock.classList.add('picker-block'); roleBlock.hidden = true;
     const rolesLabel = new Element('h2'); roleBlock.appendChild(rolesLabel); rolesLabel.id = 'picker-roles-label'; rolesLabel.classList.add('picker-label');
     const roleList = new Element('ul'); roleBlock.appendChild(roleList); roleList.id = 'role-list';
@@ -523,11 +529,12 @@ export function createPlayerDom({ baseUrl, viewport = null, stepDelayMs = null, 
         };
       },
       simulatePickerSelect: async ({ storyId, roleId }) => {
-        const storyChip = document.querySelector(`#story-list .chip[data-story-id="${storyId}"]`);
+        const storyChip = document.querySelector(`#story-list .book-card[data-story-id="${storyId}"]`);
         if (storyChip) storyChip.dispatch('click');
         await new Promise((r) => setTimeout(r, 100));
         const roleChip = document.querySelector(`#role-list .chip[data-role-id="${roleId}"]`);
         if (roleChip) roleChip.dispatch('click');
+        document.querySelector('#start-story-btn')?.dispatch('click');
       },
       simulateChoiceClick: async ({ optionIndex }) => {
         const btn = document.querySelectorAll('#player-choices .choice-btn')[optionIndex || 0];
@@ -578,7 +585,7 @@ export function createPlayerDom({ baseUrl, viewport = null, stepDelayMs = null, 
       },
       firstFrameSurface: async () => {
         const title = document.querySelector('#picker-title');
-        const chips = document.querySelectorAll('#story-list .chip');
+        const chips = document.querySelectorAll('#story-list .book-card');
         return { pickerTitle: title?.textContent || '', storyChipCount: chips.length };
       },
       layoutOverflow: async () => {

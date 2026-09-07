@@ -164,6 +164,10 @@ export function canonicalStoryContent(detail) {
     hook: d.hook,
     roles,
     beats,
+    ...(Array.isArray(d.ai_opening_events) ? {
+      ai_opening_events: canonicalStoryContent({ id: d.id, title: d.title, hook: d.hook, roles: d.roles, beats: d.ai_opening_events }).beats,
+      ai_preparation_version: String(d.ai_preparation_version || ''),
+    } : {}),
   };
 }
 

@@ -167,7 +167,7 @@ function buildPanel() {
   const shareBtn = document.createElement('button');
   shareBtn.id = 'social-panel-share-btn';
   shareBtn.type = 'button';
-  shareBtn.textContent = '分享 session';
+  shareBtn.textContent = '分享这段故事';
   shareBtn.hidden = true;
   actions.appendChild(shareBtn);
   const unshareBtn = document.createElement('button');
@@ -312,7 +312,7 @@ async function currentShareTargetUuid() {
 async function refreshAuthStatus() {
   const { status, data } = await fetchJson('/api/auth/status', { method: 'GET' });
   if (status !== 200 || !data || !data.owner) {
-    setAuthStatus(`未登录 (auth status ${status})`);
+    setAuthStatus('暂时无法读取账户');
     return null;
   }
   const name = data.owner.display_name || OAUTH_PENDING_DISPLAY_NAME;
@@ -348,14 +348,14 @@ async function refreshShareButton() {
 async function refreshFeed() {
   const { status, data } = await fetchJson('/v1/ecosystem/friend-timelines?limit=20', { method: 'GET' });
   if (status !== 200 || !data) {
-    setStatus(`feed 加载失败 status=${status}`);
+    setStatus('动态暂时未能加载，请稍后刷新。');
     return;
   }
   const feed = document.getElementById('social-panel-feed');
   if (!feed) return;
   if (!Array.isArray(data.items) || data.items.length === 0) {
-    feed.innerHTML = '<div style="opacity:0.7;">关注流为空。先在下方点击"加关注"输入目标 UUID。</div>';
-    setStatus(`feed 空 · 生成于 ${data.generated_at || 'n/a'}`);
+    feed.innerHTML = '<div style="opacity:0.7;">还没有关注的故事。关注一位朋友，看看他们的选择。</div>';
+    setStatus('');
     return;
   }
   feed.innerHTML = data.items.map((item) => `
@@ -364,11 +364,11 @@ async function refreshFeed() {
       <div style="opacity:0.7;">${escapeHtml(item.shared_at || '')}</div>
     </div>
   `).join('');
-  setStatus(`feed ${data.items.length} 条 · 生成于 ${data.generated_at || 'n/a'}`);
+  setStatus(`${data.items.length} 条故事动态`);
 }
 
 async function handleFollow() {
-  const target = window.prompt('输入要关注的目标 UUID:');
+  const target = window.prompt('输入朋友的用户编号：');
   if (!target) return;
   // HARD RULE: body contains ONLY the server-required wire field.
   // The follow endpoint names that wire field after the target of
@@ -390,7 +390,7 @@ async function handleFollow() {
 async function handleShare() {
   const uuid = await currentShareTargetUuid();
   if (!uuid) {
-    setStatus('当前没有可分享的 session');
+    setStatus('当前没有可分享的故事');
     return;
   }
   // HARD RULE: no body at all. The OAuth-pending share endpoint
@@ -411,7 +411,7 @@ async function handleShare() {
 async function handleUnshare() {
   const uuid = await currentShareTargetUuid();
   if (!uuid) {
-    setStatus('当前没有可撤回的 session');
+    setStatus('当前没有可撤回的故事');
     return;
   }
   // HARD RULE: no body. Unshare rejects any non-empty body to keep

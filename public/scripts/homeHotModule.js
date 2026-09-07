@@ -39,7 +39,7 @@ const STATUS_ID = 'ecosystem-hot-status';
 const ENDPOINT = '/v1/ecosystem/hot';
 const RELATED_LABEL = '相关';
 const HINT_LABEL = '选一个故事再看热榜关联';
-const EMPTY_LABEL = '暂时无法获取知乎热议';
+const EMPTY_LABEL = '此刻还没有与书架相关的热议。';
 const LOADING_LABEL = '载入中…';
 const IDENTITY_EVENT = 'story:identity-changed';
 const IDENTITY_GLOBAL_KEY = 'STORY_OUTSIDE_IDENTITY';
@@ -127,6 +127,18 @@ function renderEntry(entry, isRelated) {
   titleLink.rel = 'noopener noreferrer';
   titleLink.textContent = typeof entry.title === 'string' && entry.title ? entry.title : '(无题)';
   titleWrap.appendChild(titleLink);
+  if (Array.isArray(entry.related_stories)) {
+    const stories = document.createElement('div'); stories.className = 'hot-related-stories';
+    for (const story of entry.related_stories.slice(0, 2)) {
+      const button = document.createElement('button'); button.type = 'button'; button.className = 'hot-story-link';
+      if (story.cover_url) { const cover = document.createElement('img'); cover.src = story.cover_url; cover.alt = ''; cover.referrerPolicy = 'no-referrer'; button.appendChild(cover); }
+      const title = document.createElement('span'); title.textContent = story.title; button.appendChild(title);
+      button.addEventListener('click', () => window.dispatchEvent(new CustomEvent('story:open', { detail: {storyId: story.id} })));
+      stories.appendChild(button);
+    }
+    titleWrap.appendChild(stories);
+  }
+
   // Meta line: heat, related badge
   const meta = document.createElement('div');
   meta.className = 'ecosystem-hot-meta';
@@ -134,7 +146,7 @@ function renderEntry(entry, isRelated) {
   heat.className = 'ecosystem-hot-heat';
   const heatValue = typeof entry.heat === 'number' ? entry.heat : 0;
   heat.textContent = `热度 ${heatValue.toLocaleString('zh-CN')}`;
-  meta.appendChild(heat);
+  if (heatValue > 0) meta.appendChild(heat);
   if (isRelated) {
     // The "相关" badge. The acceptance rule in the task says: every
     // entry whose `relevant.score > 0` MUST show "相关才关联" — this
@@ -193,15 +205,7 @@ function renderList(hot, hasIdentity) {
     if (isRelated) relatedCount += 1;
     list.appendChild(renderEntry(entry, isRelated));
   }
-  if (hasIdentity) {
-    if (relatedCount === 0) {
-      setStatus(`${hot.length} 条热议 · 与本故事无强相关（按热度排序）`);
-    } else {
-      setStatus(`${relatedCount} 条相关 · ${hot.length - relatedCount} 条按热度`);
-    }
-  } else {
-    setStatus(`${hot.length} 条热议 · 选一个故事后可看相关才关联`);
-  }
+  setStatus(`${hot.length} 条与故事有关的热议`);
 }
 
 /**

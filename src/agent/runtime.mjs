@@ -273,7 +273,31 @@ function buildToolCallEnvelope(toolCall, session_uuid, turn_id, base_revision) {
   };
 }
 
-export async function runTurn(runtime, { request_id, input, expected_revision } = {}) {
+// Repository-scoped single-flight protects paid generation across the fresh
+// runtime instances constructed by concurrent HTTP requests.
+const IN_FLIGHT_TURNS = new WeakMap();
+export async function runTurn(runtime, args = {}) {
+  const state = runtimeState(runtime);
+  const fp = fingerprint(assertFiniteJson(args.input, 'input'), args.expected_revision ?? null, args.request_id);
+  let sessions = IN_FLIGHT_TURNS.get(state.repository);
+  if (!sessions) { sessions = new Map(); IN_FLIGHT_TURNS.set(state.repository, sessions); }
+  const active = sessions.get(state.session_uuid);
+  if (active) {
+    if (active.fingerprint === fp) return clone(await active.promise);
+    const current = getSession({ repository: state.repository, session_uuid: state.session_uuid });
+    if (args.expected_revision !== current.revision) fail('revision_mismatch', 'generation was superseded by a newer player action');
+    // An interrupt advances canonical revision. Its new turn must not wait
+    // for old speculation; completion of the old promise cannot clear the
+    // new lock because the finally block checks promise identity.
+    if (!(args.expected_revision > active.revision)) fail('pending_conflict', 'another generation is in progress for this session');
+  }
+  const promise = runTurnOnce(runtime, args);
+  sessions.set(state.session_uuid, { fingerprint: fp, revision: args.expected_revision, promise });
+  try { return clone(await promise); }
+  finally { if (sessions.get(state.session_uuid)?.promise === promise) sessions.delete(state.session_uuid); }
+}
+
+async function runTurnOnce(runtime, { request_id, input, expected_revision } = {}) {
   const state = runtimeState(runtime);
   const session = getSession({ repository: state.repository, session_uuid: state.session_uuid });
   const inputJson = assertFiniteJson(input, 'input');
@@ -310,6 +334,8 @@ export async function runTurn(runtime, { request_id, input, expected_revision } 
   } catch {
     fail('provider_failure', 'agent provider failed');
   }
+  const latest = getSession({ repository: state.repository, session_uuid: state.session_uuid });
+  if (latest.revision !== state.base_revision) fail('revision_mismatch', 'generation was superseded by a newer player action');
   const providerResult = normalizeProviderResult(rawResult);
   // ClickUp 08 contract: the runtime STAGES the provider result on the
   // canonical session pending slot. There is exactly one active pending

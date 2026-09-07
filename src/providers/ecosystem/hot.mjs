@@ -110,6 +110,7 @@ import { deriveExternalCommunityProfileVersion } from '../../community/version.m
 // through `profileRepository.findByExternalVersion` (no active
 // concept).
 import { getCommunityProfile } from '../../community/service.mjs';
+import { createRealZhihuHotSource } from './zhihuHotSource.mjs';
 
 /**
  * Categories the orchestrator forwards to the upstream. Anything
@@ -529,6 +530,8 @@ function projectEntry(row, rank) {
     title: typeof row.title === 'string' ? row.title : '',
     url: typeof row.url === 'string' ? row.url : '',
     heat: typeof row.hotness === 'number' ? row.hotness : 0,
+    ...(typeof row.thumbnail_url === 'string' ? { thumbnail_url: row.thumbnail_url } : {}),
+    ...(typeof row.excerpt === 'string' ? { excerpt: row.excerpt } : {}),
     ...(typeof row.category === 'string' && row.category ? { category: row.category } : {}),
     ...(Array.isArray(row.tags) ? { tags: row.tags.slice() } : {}),
   };
@@ -549,11 +552,12 @@ function projectEntry(row, rank) {
  */
 export function createEcosystemHotOrchestrator(opts) {
   const options = opts || {};
-  const source = options.source || {
+  const provider = options.provider ?? (process.env.STORY_OUTSIDE_PROVIDER?.trim() || process.env.ZHIHU_PROVIDER?.trim() || 'mock');
+  const source = options.source || (provider === 'real' ? createRealZhihuHotSource({ accessSecret: options.accessSecret }) : {
     name: 'mock',
     fetchHotList: async (input) => fetchMockHotList(input || {}),
     endpoint: () => '',
-  };
+  });
   const ttlMs = Number.isFinite(options.ttlMs) ? options.ttlMs : TTL_MS;
   const swrMs = Number.isFinite(options.swrMs) ? options.swrMs : SWR_MS;
   const bucketMs = Number.isFinite(options.bucketMs) ? options.bucketMs : BUCKET_MS;
@@ -641,6 +645,8 @@ export function createEcosystemHotOrchestrator(opts) {
       category,
       cached: false,
       fetchedAt: '',
+      unavailable: Boolean(upstreamErr),
+      reason: /^hot_[a-z0-9_]+$/.test(upstreamErr?.code || '') ? upstreamErr.code : 'hot_upstream_unavailable',
     });
   }
 
@@ -666,6 +672,7 @@ export function createEcosystemHotOrchestrator(opts) {
       category: meta.category,
       ...(meta.swrRefreshed ? { swr_refreshed: true } : {}),
       ...(meta.degraded ? { degraded: true } : {}),
+      ...(meta.unavailable ? { unavailable: true, reason: meta.reason } : {}),
     };
   }
 

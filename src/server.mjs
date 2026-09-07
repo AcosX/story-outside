@@ -11,9 +11,12 @@ import http from 'node:http';
 import { randomUUID } from 'node:crypto';
 import { readFile, stat } from 'node:fs/promises';
 import { extname, isAbsolute, join, normalize, relative, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import { canonicalJsonStringify } from './stories/canonicalHash.mjs';
+import { createAIProvider, loadAIConfig, STORY_SYSTEM_PROMPT } from './agent/aiProvider.mjs';
+import { TOOL_DEFINITIONS } from './agent/tools.mjs';
+import { createPreparedStoryProvider } from './agent/storyPreparation.mjs';
 import {
   getStoryProvider,
   ProviderError,
@@ -82,6 +85,7 @@ import {
   attachRelevance,
   createEcosystemHotOrchestrator,
 } from './providers/ecosystem/hot.mjs';
+import { matchHotToStoryCatalog, projectProfileMatchedHot } from './providers/ecosystem/hotStoryMatch.mjs';
 // P1.v1-6 (2026-09-07): the bootstrap response now uses the
 // main-canonical `resolveCommunityProfileVersion` helper (defined
 // below in this module, returns
@@ -842,7 +846,7 @@ async function handleRequest(req, res) {
   // Resolve the data provider once per request; routes below call methods on it.
   let provider;
   try {
-    provider = getStoryProvider();
+    provider = createPreparedStoryProvider(getStoryProvider(), loadAIConfig());
   } catch (err) {
     return jsonResponse(res, 500, {
       error: 'provider_unavailable',
@@ -1914,10 +1918,12 @@ async function handleRequest(req, res) {
       // override from the request body. The bootstrap helper picks
       // server-side defaults for user_ref / model / prompt and pins
       // them into the canonical session; the player never sees them.
+      const aiConfig = loadAIConfig();
       const result = await bootstrapSessionFromWork({
         repository: storyRepo,
         provider,
         session_uuid: sessionUuid,
+        ...(aiConfig ? { identity: { model: aiConfig.model, prompt: STORY_SYSTEM_PROMPT } } : {}),
         work_id: body.work_id,
         role_id: body.role_id,
         // ClickUp 16.3 P1 v1-2: canonical session owner comes from
@@ -2217,15 +2223,14 @@ async function handleRequest(req, res) {
     let runtime;
     try {
       const recovered = recoverSession({ repository: storyRepo, session_uuid: sessionUuid });
+      const aiConfig = loadAIConfig();
+      const pinnedStory = storyRepo.findVersion(recovered.story_version_uuid);
       runtime = createAgentRuntime({
         repository: storyRepo,
         session_uuid: sessionUuid,
-        provider: buildDemoMockAgentProvider(body.input, sessionUuid),
-        system_prompt: { kind: 'system', text: 'demo runtime prompt' },
-        tool_definitions: [
-          { type: 'function', function: { name: 'ask_player_choice', parameters: { type: 'object' } } },
-          { type: 'function', function: { name: 'finish_story', parameters: { type: 'object' } } },
-        ],
+        provider: aiConfig ? createAIProvider({ config: aiConfig, story: pinnedStory.content_payload }) : buildDemoMockAgentProvider(body.input, sessionUuid),
+        system_prompt: { kind: 'system', text: aiConfig ? STORY_SYSTEM_PROMPT : 'demo runtime prompt' },
+        tool_definitions: TOOL_DEFINITIONS,
         expected_story_version_uuid: recovered.story_version_uuid,
         expected_story_version_checksum: recovered.story_version_checksum,
         expected_model: recovered.model,
@@ -2764,7 +2769,13 @@ async function handleRequest(req, res) {
             if (e && 'relevant' in e) delete e.relevant;
           }
         }
-        return jsonResponse(res, 200, { ...PUBLIC_DECORATE(), ...baseResponse });
+        let matchedResponse;
+        try {
+          matchedResponse = matchHotToStoryCatalog(baseResponse, await provider.listStories());
+        } catch {
+          matchedResponse = { ...matchHotToStoryCatalog(baseResponse, []), unavailable: true, reason: 'hot_catalog_unavailable' };
+        }
+        return jsonResponse(res, 200, { ...PUBLIC_DECORATE(), ...matchedResponse });
       }
       // Full identity path: attach relevance. The matcher returns
       // { attached, reason, expected_version, actual_version, response };
@@ -2853,7 +2864,8 @@ async function handleRequest(req, res) {
           ...(result.response || baseResponse),
         });
       }
-      return jsonResponse(res, 200, { ...PUBLIC_DECORATE(), ...result.response });
+      const pinnedStory = storyRepo.listStories().find((story) => story.story_uuid === identity.story_uuid);
+      return jsonResponse(res, 200, { ...PUBLIC_DECORATE(), ...projectProfileMatchedHot(result.response, pinnedStory) });
     } catch (err) {
       const message = String(err && err.message ? err.message : err);
       return jsonResponse(res, 502, {
@@ -3284,9 +3296,7 @@ server.on('clientError', (err, socket) => {
 // Auto-listen when run directly (e.g. `node src/server.mjs`).
 // When imported as a module, expose the server so tests / tools can
 // control the listen lifecycle.
-const isMainModule =
-  import.meta.url === `file://${process.argv[1]}` ||
-  import.meta.url.endsWith(`/${process.argv[1]}`);
+const isMainModule = !!process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href;
 
 if (isMainModule) {
   // Validate the provider config before accepting traffic so a
@@ -3294,6 +3304,7 @@ if (isMainModule) {
   // than only when the first /api/stories request arrives.
   try {
     getStoryProvider();
+    loadAIConfig();
   } catch (err) {
     // eslint-disable-next-line no-console
     console.error(`[story-outside] provider config error: ${String(err && err.message ? err.message : err)}`);
@@ -3301,7 +3312,7 @@ if (isMainModule) {
   }
   server.listen(PORT, HOST, () => {
     // eslint-disable-next-line no-console
-    console.log(`[story-outside] listening on http://${HOST}:${PORT} (demo mode)`);
+    console.log(`[story-outside] listening on http://${HOST}:${PORT} (${currentDemoFlag().mode} mode)`);
   });
 }
 

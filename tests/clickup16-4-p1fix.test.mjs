@@ -411,7 +411,8 @@ async function runAllChecks() {
   const j1 = await r1.json();
   await check('GET /v1/ecosystem/hot: 200 + hot[] when no identity', () => {
     assert.ok(Array.isArray(j1.hot));
-    assert.ok(j1.hot.length > 0);
+    assert.equal(j1.catalog_matched, true);
+    assert.equal(j1.hot.length, 0, 'unrelated mock fixtures must not become home recommendations');
   });
   await check('GET /v1/ecosystem/hot: no `relevant_to_story` when no identity', () => {
     assert.equal(j1.relevant_to_story, undefined);
