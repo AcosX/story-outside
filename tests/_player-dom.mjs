@@ -77,7 +77,7 @@ async function importSocialPanelForHarness() {
   const stripped = patched
     .replace(/export\s*\{[^}]*\}\s*;?\s*$/m, '')
     .replace(/export\s+default\s+\{[^}]*\}\s*;?\s*$/m, '');
-  const fn = new Function(`${stripped}\nreturn { mount, refreshFeed, refreshShareButton, refreshAuthStatus, currentShareTargetUuid, handleCreateSession, maybeOfferCreateSessionButton };`);
+  const fn = new Function(`${stripped}\nreturn { mount, refreshFeed, refreshShareButton, refreshAuthStatus, currentShareTargetUuid };`);
   return fn();
 }
 

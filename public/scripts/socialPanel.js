@@ -23,8 +23,8 @@
 //     body containing ONLY the server-required wire field. There is
 //     NO caller-shaped field in any body the panel sends.
 //   * The `share` and `unshare` buttons call
-//     `POST /v1/ecosystem/sessions/:uuid/{share,unshare}` WITHOUT a
-//     body. The server resolves the canonical owner through
+//     `/v1/ecosystem/sessions/:uuid/{share,unshare}` (HTTP POST)
+//     WITHOUT a body. The server resolves the canonical owner through
 //     `currentUserProvider(req)`; a missing / invalid body is a 400
 //     by design, and the panel does NOT attempt to work around it.
 //   * The `friend-timelines` button calls `GET
@@ -158,18 +158,12 @@ function buildPanel() {
   followBtn.type = 'button';
   followBtn.textContent = '加关注';
   actions.appendChild(followBtn);
-  // ClickUp 16.3 P1 v1-4 fresh-flow: a "创建 session" button shown
-  // when no session exists yet (the panel mounted before
-  // `bootstrapSession` ran). Clicking it calls
-  // `POST /api/sessions` and dispatches `session:changed` so the
-  // share / unshare buttons appear. The button is hidden by
-  // default — `mount()` reveals it when no session is remembered.
-  const createSessionBtn = document.createElement('button');
-  createSessionBtn.id = 'social-panel-create-session-btn';
-  createSessionBtn.type = 'button';
-  createSessionBtn.textContent = '创建 session';
-  createSessionBtn.hidden = true;
-  actions.appendChild(createSessionBtn);
+  // ClickUp 16.3 P1 v1-5: the panel NEVER creates a session. The
+  // panel is a passive UI surface; the player is the single source
+  // of truth for session lifecycle, and only the player can call
+  // `bootstrapSession` (with a real story + role picked by the
+  // user). Without a session the share / unshare buttons stay
+  // hidden and the panel surfaces a "请先选择故事 + 角色" hint.
   const shareBtn = document.createElement('button');
   shareBtn.id = 'social-panel-share-btn';
   shareBtn.type = 'button';
@@ -187,7 +181,7 @@ function buildPanel() {
   refreshBtn.type = 'button';
   refreshBtn.textContent = '刷新关注流';
   actions.appendChild(refreshBtn);
-  for (const btn of [followBtn, createSessionBtn, shareBtn, unshareBtn, refreshBtn]) {
+  for (const btn of [followBtn, shareBtn, unshareBtn, refreshBtn]) {
     Object.assign(btn.style, {
       padding: '4px 10px',
       borderRadius: '6px',
@@ -213,6 +207,17 @@ function buildPanel() {
   shareTargetCode.id = 'social-panel-share-target-uuid';
   shareTargetBox.appendChild(shareTargetCode);
 
+  // ClickUp 16.3 P1 v1-5: when no session is remembered (fresh tab,
+  // last-session wiped, or deep link with no history) the panel
+  // surfaces a hint instead of a create-session button. The panel
+  // does NOT create sessions — only `player.bootstrapSession` does,
+  // after a real story + role is picked through the picker.
+  const shareHint = document.createElement('div');
+  shareHint.id = 'social-panel-share-hint';
+  shareHint.textContent = '请先选择故事 + 角色';
+  Object.assign(shareHint.style, { marginBottom: '8px', fontSize: '12px', opacity: '0.7' });
+  card.appendChild(shareHint);
+
   const feed = document.createElement('div');
   feed.id = 'social-panel-feed';
   Object.assign(feed.style, {
@@ -230,7 +235,6 @@ function buildPanel() {
 
   closeBtn.addEventListener('click', () => { host.style.display = 'none'; });
   followBtn.addEventListener('click', () => { void handleFollow(); });
-  createSessionBtn.addEventListener('click', () => { void handleCreateSession(); });
   shareBtn.addEventListener('click', () => { void handleShare(); });
   unshareBtn.addEventListener('click', () => { void handleUnshare(); });
   refreshBtn.addEventListener('click', () => { void refreshFeed(); });
@@ -322,14 +326,17 @@ async function refreshShareButton() {
   const unshareBtn = document.getElementById('social-panel-unshare-btn');
   const targetBox = document.getElementById('social-panel-share-target');
   const targetCode = document.getElementById('social-panel-share-target-uuid');
+  const hintEl = document.getElementById('social-panel-share-hint');
   if (!uuid) {
     if (shareBtn) shareBtn.hidden = true;
     if (unshareBtn) unshareBtn.hidden = true;
     if (targetBox) targetBox.hidden = true;
+    if (hintEl) hintEl.hidden = false;
     return;
   }
   if (targetCode) targetCode.textContent = uuid;
   if (targetBox) targetBox.hidden = false;
+  if (hintEl) hintEl.hidden = true;
   // The owner check is enforced by the SERVER. The share / unshare
   // buttons are UX hints — the server may still reject the call with
   // 400 if it sees a principal-shaped body, which it will because the
@@ -427,7 +434,11 @@ async function handleUnshare() {
 // `/scripts/sessionContext.js` helper (and by player.js directly)
 // whenever the active session UUID changes, and the handler calls
 // `refreshShareButton()` so the share / unshare buttons appear and
-// point at the new UUID without re-mounting.
+// point at the new UUID without re-mounting. ClickUp 16.3 P1 v1-5:
+// the panel does NOT create sessions itself — `player.bootstrapSession`
+// is the only legitimate entry point. When no session is remembered
+// the panel surfaces "请先选择故事 + 角色" via the hint element and
+// keeps the share / unshare buttons hidden.
 async function mount() {
   const host = buildPanel();
   host.style.display = '';
@@ -439,14 +450,6 @@ async function mount() {
   await refreshAuthStatus();
   await refreshShareButton();
   await refreshFeed();
-  // ClickUp 16.3 P1 v1-4 fresh-flow: when no session is remembered
-  // (first visit, last-session wiped, or deep link with no history)
-  // the panel shows a "创建 session" button instead of share /
-  // unshare. Clicking it boots the public /api/sessions façade,
-  // which writes the helper's storage key and dispatches
-  // `session:changed` — the listener above then refreshes the
-  // share / unshare buttons.
-  await maybeOfferCreateSessionButton();
 }
 
 function attachSessionChangedListener() {
@@ -459,71 +462,7 @@ function attachSessionChangedListener() {
     // The player is the single source of truth for session changes;
     // re-render only what depends on the session UUID.
     void refreshShareButton();
-    void maybeOfferCreateSessionButton();
   });
-}
-
-async function maybeOfferCreateSessionButton() {
-  const createBtn = document.getElementById('social-panel-create-session-btn');
-  if (!createBtn) return;
-  const uuid = await currentShareTargetUuid();
-  if (uuid) {
-    createBtn.hidden = true;
-    return;
-  }
-  createBtn.hidden = false;
-}
-
-async function handleCreateSession() {
-  const createBtn = document.getElementById('social-panel-create-session-btn');
-  if (createBtn) createBtn.disabled = true;
-  setStatus('创建 session 中…');
-  try {
-    const helper = await loadSessionContext();
-    const { status, data } = await fetchJson('/api/sessions', {
-      method: 'POST',
-      body: JSON.stringify({ work_id: 'cafe-rain', role_id: 'stranger' }),
-    });
-    if (status !== 200 || !data || !data.session_uuid) {
-      setStatus(`创建 session 失败 status=${status} ${data && data.error ? data.error : ''}`);
-      if (createBtn) createBtn.disabled = false;
-      return;
-    }
-    // ClickUp 16.3 P1 v1-4: write the helper so the panel's
-    // session:changed listener refreshes immediately, AND so the
-    // player can read the same value on a subsequent reload.
-    if (helper && typeof helper.setCurrentShareTargetUuid === 'function') {
-      helper.setCurrentShareTargetUuid(data.session_uuid, {
-        storyTitle: '',
-        roleLabel: '',
-        source: 'socialPanel.handleCreateSession',
-      });
-    } else {
-      // Fallback path — write the SINGLE storage key directly and
-      // dispatch the event manually.
-      try {
-        if (typeof sessionStorage !== 'undefined') {
-          sessionStorage.setItem('story-outside:last-session', JSON.stringify({
-            sessionUuid: data.session_uuid,
-            storyTitle: '',
-            roleLabel: '',
-          }));
-        }
-      } catch { /* storage disabled — in-memory cache in the helper will still see it */ }
-      // Dispatch the event so listeners refresh even when the helper
-      // never loaded.
-      const target = (typeof window !== 'undefined') ? window : (typeof globalThis !== 'undefined' ? globalThis : null);
-      if (target && typeof target.dispatchEvent === 'function' && typeof target.CustomEvent === 'function') {
-        target.dispatchEvent(new target.CustomEvent('session:changed', { detail: { sessionUuid: data.session_uuid, source: 'socialPanel.handleCreateSession' } }));
-      } else if (typeof CustomEvent !== 'undefined' && target && typeof target.dispatchEvent === 'function') {
-        target.dispatchEvent(new CustomEvent('session:changed', { detail: { sessionUuid: data.session_uuid, source: 'socialPanel.handleCreateSession' } }));
-      }
-    }
-    setStatus('已创建 session');
-  } catch (err) {
-    setStatus(`创建 session 失败 ${err && err.message ? err.message : ''}`);
-    if (createBtn) createBtn.disabled = false;
-  }
 }
 
 function start() {
@@ -542,8 +481,6 @@ export {
   refreshShareButton,
   refreshAuthStatus,
   currentShareTargetUuid,
-  handleCreateSession,
-  maybeOfferCreateSessionButton,
 };
 
-export default { start, mount, handleCreateSession };
+export default { start, mount };
