@@ -476,9 +476,9 @@ async function mount({ sessionUuid, sessionMeta } = {}) {
   }
 // ClickUp 16.4 P1.v1-2 fix (2026-09-07): when the ending page is
   // mounted from a deep-link or session-rehydrate path, republish the
-  // identity so the home-page relevance path keeps working when the
-  // user navigates back. sessionMeta carries the canonical triple
-  // (story_uuid / story_version_uuid / community_profile_version)
+  // canonical triple so the home-page relevance path keeps working
+  // when the user navigates back. sessionMeta carries the canonical
+  // triple (story_uuid / story_version_uuid / community_profile_version)
   // populated by player.js's bootstrapSession response.
   if (sessionMeta && typeof sessionMeta === 'object') {
     publishEndingIdentity(sessionMeta);
@@ -569,10 +569,11 @@ function teardown() {
 export { mount, teardown, STATE as __state__ };
 
 /**
- * ClickUp 16.4 P1.v1-2 fix (2026-09-07): republish the identity triple
- * when the ending page mounts so the home-page relevance path stays
- * active across the navigation `/play.html → /?s=ending → /`. The
- * producer lives in /scripts/identity.js; the API is exposed on
+ * ClickUp 16.4 P1.v1-2 fix (2026-09-07): republish the canonical
+ * triple when the ending page mounts so the home-page relevance path
+ * stays active across the navigation `/play.html → /?s=ending → /`.
+ * The producer is a separate module loaded synchronously before
+ * endingPage.js; the API is exposed on
  * `window.STORY_OUTSIDE_IDENTITY_API` so this module does not need a
  * direct script reference.
  *
