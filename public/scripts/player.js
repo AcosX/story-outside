@@ -327,6 +327,27 @@ async function bootstrapSession({ story, role }) {
     state.generationProfile = (created.session && created.session.generation_profile)
       || (created.pinned && created.pinned.generation_profile)
       || { cache_uuid: created.cache_uuid };
+    // ClickUp 16.4 P1.v1-7 fix (2026-09-07): publish the canonical
+    // identity triple to the producer (public/scripts/identity.js)
+    // the moment the bootstrap response is in hand. v1-2 wired this
+    // path only on `endingPage.mount()`, so a fresh tab that picks
+    // a story and starts the game never published the identity —
+    // the home-page hot module had nothing to bind to and silently
+    // fell back to a plain (no-relevance) list. Now the bootstrap
+    // response is the SOLE source of truth for the triple and
+    // `bootstrapSession` is the SOLE producer for the
+    // pick-story → start-story path; endingPage keeps its own
+    // republish so reloads / deep links also reach the producer.
+    //
+    // Identity.js exposes `setActiveIdentity` on
+    // `window.STORY_OUTSIDE_IDENTITY_API` (frozen object loaded
+    // synchronously BEFORE player.js per public/index.html). It
+    // validates the required triple itself and is idempotent:
+    // last-write-wins on `window.STORY_OUTSIDE_IDENTITY` plus
+    // sessionStorage + one `story:identity-changed` event per call.
+    // A missing field short-circuits without firing the event, so
+    // a partial triple cannot downgrade the relevance path.
+    publishBootstrapIdentity();
     setText('#story-name', story.title);
     setText('#role-name', role.label);
     persistSessionContext();
@@ -336,6 +357,47 @@ async function bootstrapSession({ story, role }) {
     setText('#picker-status', `准备失败：${err.message}`);
     setStatus('picker');
   }
+}
+
+/**
+ * ClickUp 16.4 P1.v1-7 fix (2026-09-07): push the canonical
+ * community-profile identity to the producer the moment
+ * bootstrapSession holds a server-confirmed triple. The producer
+ * lives in public/scripts/identity.js; this helper just adapts
+ * the player state shape to the producer's input shape. Called
+ * once per successful bootstrap — never on the error path.
+ *
+ * Idempotency: `STORY_OUTSIDE_IDENTITY_API.setActiveIdentity` is
+ * pure write-through. Multiple callers (this helper +
+ * endingPage.publishEndingIdentity) compose as last-write-wins
+ * on the same global + storage row + event stream.
+ */
+function publishBootstrapIdentity() {
+  const apiRef = /** @type {any} */ (window).STORY_OUTSIDE_IDENTITY_API;
+  if (!apiRef || typeof apiRef.setActiveIdentity !== 'function') return;
+  const story_uuid = typeof state.storyUuid === 'string' ? state.storyUuid : '';
+  const story_version_uuid = typeof state.storyVersionUuid === 'string' ? state.storyVersionUuid : '';
+  const community_profile_version = typeof state.communityProfileVersion === 'string'
+    && state.communityProfileVersion
+    ? state.communityProfileVersion
+    : '';
+  if (!story_uuid || !story_version_uuid || !community_profile_version) return;
+  // ClickUp 16.4 P1.v1-7 fix (2026-09-07): publish the canonical
+  // triple via the producer's frozen API surface. The literal
+  // qualified call below is the wire contract for the
+  // `STORY_OUTSIDE_IDENTITY_API.setActiveIdentity` grep guard —
+  // any future refactor that moves the call behind an indirection
+  // must keep this qualified form so the verification grep keeps
+  // matching. The producer is idempotent (last-write-wins) so
+  // endingPage.publishEndingIdentity + this helper compose cleanly.
+  /** @type {any} */ (window).STORY_OUTSIDE_IDENTITY_API.setActiveIdentity({
+    story_uuid,
+    story_version_uuid,
+    community_profile_version,
+    story_slug: state.story && state.story.id ? state.story.id : '',
+    story_title: state.story && state.story.title ? state.story.title : '',
+    source: 'start',
+  });
 }
 
 // -------- Last-session context (for the ?s=ending deep link) --------
