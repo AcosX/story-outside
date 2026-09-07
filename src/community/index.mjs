@@ -26,6 +26,7 @@ export {
   _forbiddenCommunityProfileDimensions,
   _forbiddenProfileKeys,
   activeKey,
+  externalVersionKey,
 } from './repository.mjs';
 
 export {

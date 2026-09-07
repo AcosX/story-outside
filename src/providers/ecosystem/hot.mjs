@@ -299,12 +299,21 @@ export function resolveProfileMatchTerms({ profileRepository, story_version_uuid
   if (typeof community_profile_version !== 'string' || !community_profile_version) {
     return result;
   }
-  // PRIMARY: direct exact-string lookup against the wire contract
-  // external identity. No active concept.
+  // PRIMARY: SCOPED direct exact-string lookup against the wire
+  // contract external identity. P1.v1-5 (2026-09-07): the lookup is
+  // scoped to the caller's `story_version_uuid` so a cross-story
+  // collision cannot return the wrong row. The wire identity string
+  // itself is ALSO story-scoped (the content hash includes
+  // `story_uuid` + `story_version_uuid`), so this is double-locked:
+  // even if the hash regressed to content-only, the scoped Map key
+  // would still refuse to collide. No active concept.
   let profile = null;
   try {
     if (typeof profileRepository.findByExternalVersion === 'function') {
-      profile = profileRepository.findByExternalVersion(community_profile_version);
+      profile = profileRepository.findByExternalVersion(
+        story_version_uuid,
+        community_profile_version,
+      );
     }
   } catch {
     profile = null;
@@ -608,11 +617,15 @@ export function createEcosystemHotOrchestrator(opts) {
  * so two callers with different identity triples share upstream data
  * but see distinct relevance projections.
  *
- * P1.v1-4 contract (2026-09-07):
+ * P1.v1-5 contract (2026-09-07):
  *   * The PRIMARY profile read goes through
- *     `profileRepository.findByExternalVersion(community_profile_version)`
- *     — the wire-contract external identity string is the EXACT key.
- *     There is NO active concept in the primary read.
+ *     `profileRepository.findByExternalVersion(story_version_uuid,
+ *     community_profile_version)` — the wire-contract external
+ *     identity string is the EXACT key, AND the lookup is SCOPED to
+ *     the caller's `story_version_uuid` so a cross-story collision
+ *     (two profiles with the SAME external version but different
+ *     story_versions) cannot return the wrong row. There is NO
+ *     active concept in the primary read.
  *   * Identity must be COMPLETE (all three fields present and the
  *     UUIDs well-formed) for relevance to attach.
  *   * When the PRIMARY lookup misses, a SECONDARY canonical-row read
@@ -707,14 +720,18 @@ export function attachRelevance(response, identity, options) {
       actual_version: community_profile_version,
     };
   }
-  // Defense: the matched profile row's `story_version_uuid` MUST
-  // match the caller-supplied `story_version_uuid`. The PRIMARY
-  // `findByExternalVersion` is a GLOBAL lookup across all
-  // story_versions (the external-version string is not pre-scoped),
-  // so a swapped-uuid caller could otherwise observe the wrong
-  // relevance projection. Reject as `mismatch` with the canonical
-  // external version for the caller's `story_version_uuid` as
-  // `expected_version` so the caller can re-pin.
+  // Defense (defence-in-depth): the matched profile row's
+  // `story_version_uuid` MUST match the caller-supplied
+  // `story_version_uuid`. The PRIMARY `findByExternalVersion` is
+  // SCOPED to the caller's `story_version_uuid` (P1.v1-5
+  // 2026-09-07), so a swapped-uuid caller would normally miss the
+  // primary lookup and fall through to the mismatch /
+  // community_profile_not_found paths above. This check catches a
+  // narrow residual: a malformed row whose `story_version_uuid`
+  // does not match the scoped key. Reject as `mismatch` with the
+  // canonical external version for the caller's
+  // `story_version_uuid` as `expected_version` so the caller can
+  // re-pin.
   if (profileStoryVersionUuid && profileStoryVersionUuid !== story_version_uuid) {
     const canonicalExternalForCaller = resolveCanonicalExternalVersion({
       profileRepository,

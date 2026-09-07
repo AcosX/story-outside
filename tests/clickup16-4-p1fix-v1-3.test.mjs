@@ -154,17 +154,43 @@ async function runAllChecks() {
       assert.equal(h.length, 64);
       assert.match(h, /^[0-9a-f]{64}$/);
     });
-    await check('B: computeProfileContentHash is content-only (excludes generator_version / generated_at / uuids)', () => {
-      // Mutate the non-content fields and re-derive — hash MUST stay
-      // identical. The internal ruleset string 'community-profile-rules/1'
-      // does NOT contribute to the content hash.
-      const mutated = JSON.parse(JSON.stringify(cafeRainProfile));
-      mutated.generator_version = 'community-profile-rules/999';
-      mutated.generated_at = '2030-01-01T00:00:00.000Z';
-      mutated.profile_uuid = '11111111-2222-4333-8444-555555555555';
+    await check('B: computeProfileContentHash is content-and-story-scoped (excludes generated_at / profile_uuid / hash)', () => {
+      // P1.v1-5 (2026-09-07) contract update: the content hash NOW
+      // INCLUDES `story_uuid`, `story_version_uuid`, and
+      // `generator_version` so two profiles with identical community
+      // content but different story_versions produce different
+      // external versions (cross-story collision fix). The hash
+      // STILL EXCLUDES `generated_at`, `profile_uuid`, and
+      // `hash.content_hash` itself — those are pure metadata.
+      //
+      // We mutate ONLY the metadata fields and confirm the hash
+      // stays identical. We then mutate `generator_version` and
+      // confirm the hash diverges (P1.v1-5 contract).
+      const metaOnly = JSON.parse(JSON.stringify(cafeRainProfile));
+      metaOnly.generated_at = '2030-01-01T00:00:00.000Z';
+      metaOnly.profile_uuid = '11111111-2222-4333-8444-555555555555';
+      metaOnly.hash = { content_hash: '0'.repeat(64) };
       const beforeHash = computeProfileContentHash(cafeRainProfile);
-      const afterHash = computeProfileContentHash(mutated);
-      assert.equal(afterHash, beforeHash, 'content hash MUST ignore generator_version / generated_at / profile_uuid');
+      const afterMeta = computeProfileContentHash(metaOnly);
+      assert.equal(afterMeta, beforeHash, 'content hash MUST ignore generated_at / profile_uuid / hash');
+
+      const withRulesetBump = JSON.parse(JSON.stringify(cafeRainProfile));
+      withRulesetBump.generator_version = 'community-profile-rules/999';
+      const afterRuleset = computeProfileContentHash(withRulesetBump);
+      assert.notEqual(
+        afterRuleset,
+        beforeHash,
+        'content hash MUST change when generator_version changes (P1.v1-5 includes it)',
+      );
+
+      const withStoryVersionBump = JSON.parse(JSON.stringify(cafeRainProfile));
+      withStoryVersionBump.story_version_uuid = '00000000-0000-4000-8000-000000000bbb';
+      const afterStoryBump = computeProfileContentHash(withStoryVersionBump);
+      assert.notEqual(
+        afterStoryBump,
+        beforeHash,
+        'content hash MUST change when story_version_uuid changes (P1.v1-5 includes it)',
+      );
     });
     await check('B: deriveExternalCommunityProfileVersion returns `${generator_version}@${shortContentHash}`', () => {
       const ev = deriveExternalCommunityProfileVersion(cafeRainProfile);

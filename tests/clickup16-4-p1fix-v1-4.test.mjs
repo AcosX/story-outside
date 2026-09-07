@@ -12,11 +12,13 @@
 //      `@` separator replaces the v1-3-era `-`; the hash suffix is
 //      16 hex chars (~64 bits of entropy) instead of 12.
 //
-//   2. P1.v1-4-2: `communityProfileRepo.findByExternalVersion(externalVersion)`
+//   2. P1.v1-4-2: `communityProfileRepo.findByExternalVersion(story_version_uuid, externalVersion)`
 //      is the PRIMARY read path used by `attachRelevance`. The
-//      lookup is GLOBAL (not story_version-scoped) so it works
-//      against the wire identity string directly. The `active`
-//      concept is NEVER consulted by the primary read.
+//      lookup is SCOPED to `story_version_uuid` (P1.v1-5
+//      2026-09-07 cross-story-collision defence) so it works against
+//      the wire identity string directly while still refusing to
+//      collide across stories. The `active` concept is NEVER
+//      consulted by the primary read.
 //
 //   3. P1.v1-4-3: when `findByExternalVersion` returns null AND no
 //      canonical row exists for the caller's `story_version_uuid`,
@@ -240,18 +242,24 @@ async function runAllChecks() {
     });
     const externalVersionA = deriveExternalCommunityProfileVersion(cafeRainProfile);
     await check('C: findByExternalVersion returns the matching row for a known external version', () => {
-      const found = profileRepo.findByExternalVersion(externalVersionA);
+      const found = profileRepo.findByExternalVersion(cafeRainIds.story_version_uuid, externalVersionA);
       assert.ok(found);
       assert.equal(found.profile_uuid, cafeRainProfile.profile_uuid);
     });
     await check('C: findByExternalVersion returns null for a non-existent external version', () => {
-      const found = profileRepo.findByExternalVersion('community-profile-rules/1-deadbeefdead');
+      const found = profileRepo.findByExternalVersion(
+        cafeRainIds.story_version_uuid,
+        'community-profile-rules/1-deadbeefdead',
+      );
       assert.equal(found, null);
     });
     await check('C: findByExternalVersion returns null for an empty / non-string external version', () => {
-      assert.equal(profileRepo.findByExternalVersion(''), null);
-      assert.equal(profileRepo.findByExternalVersion(null), null);
-      assert.equal(profileRepo.findByExternalVersion(undefined), null);
+      assert.equal(profileRepo.findByExternalVersion(cafeRainIds.story_version_uuid, ''), null);
+      assert.equal(profileRepo.findByExternalVersion(cafeRainIds.story_version_uuid, null), null);
+      assert.equal(profileRepo.findByExternalVersion(cafeRainIds.story_version_uuid, undefined), null);
+      assert.equal(profileRepo.findByExternalVersion('', externalVersionA), null);
+      assert.equal(profileRepo.findByExternalVersion(null, externalVersionA), null);
+      assert.equal(profileRepo.findByExternalVersion(undefined, externalVersionA), null);
     });
 
     // ----- D. attachRelevance uses findByExternalVersion (P1.v1-4-2) ---------
@@ -354,22 +362,24 @@ async function runAllChecks() {
       const prefix = (s) => s.split('@').slice(0, -1).join('@');
       assert.equal(prefix(externalVersionGenA), prefix(externalVersionGenB));
     });
-    await check('E: Generation A is reachable via findByExternalVersion(externalVersionGenA)', () => {
-      const found = profileRepoMulti.findByExternalVersion(externalVersionGenA);
+    await check('E: Generation A is reachable via findByExternalVersion(story_version_uuid, externalVersionGenA)', () => {
+      const found = profileRepoMulti.findByExternalVersion(cafeRainIds.story_version_uuid, externalVersionGenA);
       assert.ok(found);
       assert.equal(found.profile_uuid, profileGenA.profile_uuid);
     });
-    await check('E: Generation B is reachable via findByExternalVersion(externalVersionGenB)', () => {
-      const found = profileRepoMulti.findByExternalVersion(externalVersionGenB);
+    await check('E: Generation B is reachable via findByExternalVersion(story_version_uuid, externalVersionGenB)', () => {
+      const found = profileRepoMulti.findByExternalVersion(cafeRainIds.story_version_uuid, externalVersionGenB);
       assert.ok(found);
       assert.equal(found.profile_uuid, profileGenB.profile_uuid);
     });
     await check('E: active slot moved to Generation B (most recent insert), but Generation A is still findable', () => {
       const active = profileRepoMulti.findActiveByStoryVersion(cafeRainIds.story_version_uuid);
       assert.equal(active.profile_uuid, profileGenB.profile_uuid, 'active slot must hold Generation B (most recent)');
-      // Crucially, findByExternalVersion is GLOBAL — it returns
-      // Generation A even though Generation A is no longer active.
-      const foundA = profileRepoMulti.findByExternalVersion(externalVersionGenA);
+      // Crucially, findByExternalVersion is SCOPED to
+      // story_version_uuid — it returns Generation A even though
+      // Generation A is no longer active, AS LONG AS the caller
+      // passes the same story_version_uuid.
+      const foundA = profileRepoMulti.findByExternalVersion(cafeRainIds.story_version_uuid, externalVersionGenA);
       assert.ok(foundA);
       assert.equal(foundA.profile_uuid, profileGenA.profile_uuid);
     });
