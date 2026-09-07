@@ -121,6 +121,16 @@ function renderHeader(ending, sessionMeta) {
       sessionMeta && sessionMeta.storyTitle ? `${sessionMeta.storyTitle} · ${sessionMeta.roleLabel || ''}` : ''),
     el('span', { class: 'ending-tag ending-tag-ai', id: 'ending-ai-tag', title: '本页 AI 生成的时间线仅供平行体验，不视为原作' },
       'AI 生成平行时间线'),
+    // ClickUp 16.3 P1 v1-2 (主人 2026-09-07 04:21 巡检): the
+    // canonical owner is rendered on the ending page so the player
+    // can see who they played as. In the OAuth-pending build this is
+    // always "待接入用户 (OAuth pending)". The server resolves the
+    // canonical principal via `currentUserProvider(req)` — the
+    // browser never mints a per-session principal id.
+    el('p', { class: 'ending-owner', id: 'ending-owner' },
+      sessionMeta && sessionMeta.ownerDisplayName
+        ? `你 · ${sessionMeta.ownerDisplayName}`
+        : '你 · 待接入用户 (OAuth pending)'),
   );
 }
 
@@ -405,7 +415,7 @@ function updateReplayView() {
 }
 
 // ClickUp 16.2 P1.v2 (2026-09-07): fetch ecosystem discussions with
-// the **server-authoritative identity triple** — we send ONLY
+// the **server-authoritative pointer triple** — we send ONLY
 // story_uuid / story_version_uuid / community_profile_version. The
 // server resolves the canonical StoryCommunityProfile (with its
 // canonical `profile.queries[]`) and runs them through the upstream
@@ -464,7 +474,7 @@ async function mount({ sessionUuid, sessionMeta } = {}) {
   if (!screen) {
     throw new Error('endingPage.mount: #screen-ending not found in DOM');
   }
-  // ClickUp 16.4 P1.v1-2 fix (2026-09-07): when the ending page is
+// ClickUp 16.4 P1.v1-2 fix (2026-09-07): when the ending page is
   // mounted from a deep-link or session-rehydrate path, republish the
   // identity so the home-page relevance path keeps working when the
   // user navigates back. sessionMeta carries the canonical triple
@@ -472,6 +482,18 @@ async function mount({ sessionUuid, sessionMeta } = {}) {
   // populated by player.js's bootstrapSession response.
   if (sessionMeta && typeof sessionMeta === 'object') {
     publishEndingIdentity(sessionMeta);
+  }
+  // ClickUp 16.3 P1 v1-2: fetch the canonical owner from
+  // /api/auth/status so the ending header can render the
+  // OAuth-pending display name. The sessionMeta fallback covers the
+  // case where the bootstrap path already cached the value and
+  // passed it through.
+  let ownerDisplayName = sessionMeta && sessionMeta.ownerDisplayName;
+  if (!ownerDisplayName) {
+    try {
+      const authStatus = await api('/api/auth/status');
+      ownerDisplayName = authStatus && authStatus.owner && authStatus.owner.display_name;
+    } catch { /* fall through to the OAuth-pending default */ }
   }
   // Fetch the three projections in parallel; render whatever we get.
   const projections = sessionUuid
@@ -482,13 +504,18 @@ async function mount({ sessionUuid, sessionMeta } = {}) {
   STATE.replay = projections.replay && !projections.replay.error ? projections.replay : null;
   STATE.replayIndex = 0;
   // ClickUp 16.2 P1.v2 (2026-09-07): also fetch ecosystem
-  // discussions using the server-authoritative identity triple from
+  // discussions using the server-authoritative pointer triple from
   // sessionMeta. Failures are surfaced on STATE.ecosystemError so the
   // render layer can show them; we never throw out of mount().
   const ecosystem = await fetchEcosystemDiscussions(sessionMeta || {});
   STATE.ecosystem = ecosystem && !ecosystem.error ? ecosystem : null;
   STATE.ecosystemError = ecosystem && ecosystem.error ? ecosystem : null;
-  render(screen, sessionMeta || {});
+  // ClickUp 16.3 P1 v1-6 (merge of origin/main ea992690 into
+  // fix/clickup16-3-p1-auth): keep the OAuth-pending owner display
+  // name alongside the new sessionMeta spread. The player reads
+  // `ownerDisplayName` to render the canonical author label even
+  // when the server returns a different `display_name`.
+  render(screen, { ...(sessionMeta || {}), ownerDisplayName });
   STATE.mounted = true;
 }
 
