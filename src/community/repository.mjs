@@ -148,7 +148,7 @@ function rejectForbiddenKeys(value, path) {
  *   profiles: Map<string, StoryCommunityProfile>,                 // keyed by profile_uuid
  *   activeByStoryVersion: Map<string, string>,                    // story_version_uuid|generator_version → profile_uuid
  *   byUuid: Map<string, StoryCommunityProfile>,
- *   insertSeqByStoryVersion: Map<string, number>,                 // story_version_uuid → next insert_seq to assign (starts at 1)
+ *   latestByStoryVersion: Map<string, string>,                    // story_version_uuid → profile_uuid of the most recently inserted row (PRIVATE; not a row field)
  * }}
  */
 function createEmptyState() {
@@ -156,38 +156,26 @@ function createEmptyState() {
     profiles: new Map(),
     activeByStoryVersion: new Map(),
     byUuid: new Map(),
-    // ClickUp 16.2 P1.v1-4 fix (2026-09-07): monotonic insert sequence
-    // counter, scoped to `(story_version_uuid)`. Every NEW row inserted
-    // by `setCommunityProfile` (i.e., one that does NOT collapse on the
-    // existing-row same-content-hash idempotency contract) receives
-    // `insert_seq = max(existing insert_seq for this story_version_uuid) + 1`.
-    // Idempotent re-inserts do NOT bump the counter — the existing row
-    // keeps its `insert_seq`. This is the anchor that makes the
-    // "second new insert wins under same `generated_at`" contract
-    // robust against caller-supplied randomness in
-    // `profile_uuid` (UUID v4) and `generator_version` (free-form
-    // string).
-    insertSeqByStoryVersion: new Map(),
+    // ClickUp 16.2 P1.v1-5 fix (2026-09-07): the monotonic/latest
+    // metadata that drives active-row selection lives in PRIVATE
+    // repository state. The previous v1-4 implementation stamped a
+    // numeric `insert_seq` onto every row and made it part of the
+    // canonical schema (which is owned by ClickUp 16.1 / main), turning
+    // the 13-field strict allowlist into 14 fields. v1-5 reverts
+    // that schema change: this Map is the SINGLE source of truth for
+    // "which row is currently active under this story_version_uuid".
+    //
+    // Semantics:
+    //   * Updated ONLY when `setCommunityProfile` accepts a NEW row
+    //     (one that does NOT collapse on the existing-row same-
+    //     content-hash idempotency contract).
+    //   * Idempotent re-inserts do NOT touch this Map.
+    //   * This Map is NEVER exposed through any public API. Tests
+    //     observe its semantics through `findActiveByStoryVersion` /
+    //     `getCommunityProfile`, not by reading the Map directly.
+    //   * `_resetForTests` clears it.
+    latestByStoryVersion: new Map(),
   };
-}
-
-/**
- * Return the next monotonic `insert_seq` value to assign to a new row
- * bound to `story_version_uuid`. The counter starts at 1 and never
- * decreases. The repository owns the counter; callers never set
- * `insert_seq` themselves (the shape validator rejects a caller-set
- * non-null value as a defensive sanity check, and the repository
- * overwrites any caller-set value on the way into storage).
- *
- * @param {Map<string, number>} counter
- * @param {string} story_version_uuid
- * @returns {number}
- */
-function nextInsertSeq(counter, story_version_uuid) {
-  const prev = counter.get(story_version_uuid);
-  const next = typeof prev === 'number' && Number.isInteger(prev) ? prev + 1 : 1;
-  counter.set(story_version_uuid, next);
-  return next;
 }
 
 /**
@@ -242,110 +230,35 @@ export function createInMemoryCommunityProfileRepository() {
   const repo = {
     findActiveByStoryVersion(story_version_uuid) {
       assertUuid('story_version_uuid', story_version_uuid);
-      // Walk the activeByStoryVersion index; pick the most recently
-      // generated profile when multiple generator versions exist.
+      // ClickUp 16.2 P1.v1-5 fix (2026-09-07 主人巡检 + ChatGPT
+      // 复核): the previous v1-4 implementation walked
+      // `state.profiles` and compared per-row `insert_seq` fields
+      // to pick the active row. v1-5 replaces that surface-level
+      // computation with a single private lookup:
       //
-      // ClickUp 16.2 P1.v1-4 fix (2026-09-07 主人巡检 + ChatGPT 复核):
-      // v1-3 closed the `generator_version` lexicographic tie-break
-      // bug by using `profile_uuid` (UUID v4) as the millisecond-
-      // identical tie-break. ChatGPT independently re-ran
-      // `communityProfile.test` consecutively and found that v1-3
-      // still flakes on the second consecutive run — UUID v4
-      // comparison is a total order, but it is uncorrelated with
-      // insertion order, so two runs that produce different UUID v4
-      // values for "row B" can flip which row wins the
-      // same-millisecond tie-break.
+      //   active_row = state.latestByStoryVersion.get(story_version_uuid)
       //
-      // v1-4 replaces the random-UUID tie-break with a monotonic
-      // INSERT SEQUENCE (`insert_seq`) assigned by the repository at
-      // row-creation time. The contract is:
+      // `latestByStoryVersion` is updated ONLY when
+      // `setCommunityProfile` accepts a NEW row (one that does not
+      // collapse on the existing-row same-content-hash idempotency
+      // contract). Idempotent re-inserts do NOT touch it, so the
+      // active row stays pinned across retries. This makes the
+      // "second new insert wins under same generated_at" contract
+      // robust against:
       //
-      //   1. Active row = the row with the LARGEST `insert_seq`
-      //      among rows bound to this `story_version_uuid`.
-      //      `insert_seq` is assigned by `setCommunityProfile` and
-      //      reflects insertion order (NOT caller-supplied string
-      //      ordering, NOT UUID randomness, NOT clock time).
-      //   2. Ties on `insert_seq` (defensive: should never happen
-      //      because the counter is strictly monotonic) fall back to
-      //      `(generated_at DESC, profile_uuid DESC)`.
-      //   3. Legacy rows inserted before this commit carry
-      //      `insert_seq === null`. They participate in the
-      //      selection through the fallback path: the row with the
-      //      largest `generated_at` (and `profile_uuid` as the final
-      //      tie-break) among the null-seq rows is the active row
-      //      ONLY when no non-null-seq row exists for the same
-      //      story_version_uuid. As soon as ANY new row is inserted
-      //      after the migration, the new row wins. This guarantees
-      //      a strict "second new insert wins under same
-      //      generated_at" contract even when the original seed
-      //      rows all share a millisecond.
-      //   4. The repository's idempotency contract (existing row +
-      //      same content_hash returns the existing row) does NOT
-      //      bump `insert_seq`. Re-calling `findOrCreate` with the
-      //      same payload is a no-op for the counter.
+      //   * caller-supplied randomness in `profile_uuid` (UUID v4),
+      //   * lexicographic ties on `generated_at` (Date#toISOString
+      //     has millisecond resolution),
+      //   * free-form `generator_version` strings.
       //
-      // Implementation note: we walk `state.profiles` (every row ever
-      // written, not just `activeByStoryVersion`) because the
-      // active-row decision must be driven by `insert_seq`, which is
-      // a property of the row itself. `activeByStoryVersion` only
-      // tracks `(story_version_uuid, generator_version)` pairs that
-      // have a current active slot; rows under a
-      // `generator_version` that has since been superseded are still
-      // candidates for the active slot until a newer row (any
-      // `generator_version`) bumps the counter past theirs.
-      let bestProfile = null;
-      for (const row of state.profiles.values()) {
-        if (!row || row.story_version_uuid !== story_version_uuid) continue;
-        const rowSeq = /** @type {any} */ (row).insert_seq;
-        if (bestProfile === null) {
-          bestProfile = row;
-          continue;
-        }
-        const bestSeq = /** @type {any} */ (bestProfile).insert_seq;
-        const rowHasSeq = typeof rowSeq === 'number' && Number.isInteger(rowSeq);
-        const bestHasSeq = typeof bestSeq === 'number' && Number.isInteger(bestSeq);
-        if (rowHasSeq && bestHasSeq) {
-          // Both rows carry a non-null insert_seq: pick the larger.
-          if (rowSeq > bestSeq) {
-            bestProfile = row;
-            continue;
-          }
-          if (rowSeq === bestSeq) {
-            // Defensive tie-break; should not happen under normal
-            // operation since the counter is strictly monotonic.
-            if (row.generated_at > bestProfile.generated_at) {
-              bestProfile = row;
-            } else if (
-              row.generated_at === bestProfile.generated_at
-              && row.profile_uuid > bestProfile.profile_uuid
-            ) {
-              bestProfile = row;
-            }
-          }
-          continue;
-        }
-        if (rowHasSeq && !bestHasSeq) {
-          // New (numbered) row beats a legacy (null-seq) row.
-          bestProfile = row;
-          continue;
-        }
-        if (!rowHasSeq && bestHasSeq) {
-          // Current best is a numbered row; a null-seq row cannot
-          // beat it. Continue.
-          continue;
-        }
-        // Both rows are null-seq legacy rows: fall back to
-        // (generated_at DESC, profile_uuid DESC).
-        if (row.generated_at > bestProfile.generated_at) {
-          bestProfile = row;
-        } else if (
-          row.generated_at === bestProfile.generated_at
-          && row.profile_uuid > bestProfile.profile_uuid
-        ) {
-          bestProfile = row;
-        }
-      }
-      return bestProfile;
+      // The previous v1-4 row-stamped `insert_seq` field is GONE:
+      // monotonic/latest metadata is no longer carried on the row.
+      // The canonical 13-field profile schema is preserved end-to-
+      // end. The Map lives in PRIVATE repository state and is never
+      // exposed through any public API.
+      const latestUuid = state.latestByStoryVersion.get(story_version_uuid);
+      if (!latestUuid) return null;
+      return state.profiles.get(latestUuid) || null;
     },
     findActiveByStoryVersionAndGenerator(story_version_uuid, generator_version) {
       assertUuid('story_version_uuid', story_version_uuid);
@@ -537,45 +450,44 @@ export function createInMemoryCommunityProfileRepository() {
       //    content_hash). When the caller regenerates with the same
       //    content, we MUST NOT create a duplicate active row — we
       //    return the existing one instead. This is the critical
-      //    P1.v1-4 contract: an idempotent hit MUST NOT bump the
-      //    `insert_seq` counter. If it did, the "second new insert
-      //    wins under same generated_at" guarantee would be undone
-      //    by any caller that retries `findOrCreate` against the
-      //    already-active row.
+      //    P1.v1-5 contract: an idempotent hit MUST NOT move the
+      //    `latestByStoryVersion` pointer. If it did, the "second
+      //    new insert wins under same generated_at" guarantee would
+      //    be undone by any caller that retries `findOrCreate`
+      //    against the already-active row.
       const key = activeKey(profile.story_version_uuid, profile.generator_version);
       const existingUuid = state.activeByStoryVersion.get(key);
       if (existingUuid) {
         const existing = state.profiles.get(existingUuid);
         if (existing && existing.hash.content_hash === profile.hash.content_hash) {
-          // Idempotent hit. Return the existing row AS-IS — its
-          // `insert_seq` is preserved, the counter is NOT bumped.
+          // Idempotent hit. Return the existing row AS-IS — the
+          // private latest pointer is preserved, NOT moved.
           return existing;
         }
       }
-      // 4. Insert. ClickUp 16.2 P1.v1-4 (2026-09-07): assign the
-      //    monotonic `insert_seq` based on the largest existing
-      //    value for this `story_version_uuid`, plus one. The
-      //    counter is scoped to the story_version, not to
-      //    (story_version, generator_version), so a row inserted
-      //    under a fresh `generator_version` still bumps the
-      //    counter past any earlier row's value. This guarantees the
-      //    "second new insert wins" contract regardless of how the
-      //    caller partitions the active slot.
-      const insertSeq = nextInsertSeq(
-        state.insertSeqByStoryVersion,
-        profile.story_version_uuid,
-      );
-      // The shape validator permits `insert_seq: null`; here we
-      // authoritatively stamp the row with the counter value, so the
-      // returned row always carries a non-null `insert_seq` for new
-      // insertions.
-      const stored = /** @type {any} */ ({
-        ...profile,
-        insert_seq: insertSeq,
-      });
+      // 4. Insert. ClickUp 16.2 P1.v1-5 (2026-09-07): the row is
+      //    stored AS-IS (no `insert_seq` stamp; the canonical
+      //    13-field schema is preserved). The
+      //    `latestByStoryVersion` private Map is moved to the
+      //    newly-inserted row's `profile_uuid`, so a subsequent
+      //    `findActiveByStoryVersion` returns this row regardless
+      //    of `generated_at` ties or UUID v4 randomness. A row
+      //    inserted under a fresh `generator_version` still moves
+      //    the latest pointer past any earlier row's value
+      //    (regardless of generator_version), because the pointer
+      //    is scoped to `story_version_uuid`, not to
+      //    `(story_version, generator_version)`. This guarantees
+      //    the "second new insert wins" contract no matter how
+      //    the caller partitions the active slot.
+      const stored = /** @type {any} */ ({ ...profile });
       state.profiles.set(stored.profile_uuid, stored);
       state.byUuid.set(stored.profile_uuid, stored);
       state.activeByStoryVersion.set(key, stored.profile_uuid);
+      // Move the private latest pointer to the freshly-inserted
+      // row. Idempotent hits (handled above) DO NOT touch this Map
+      // — that is the entire point of separating it from the row
+      // surface.
+      state.latestByStoryVersion.set(stored.story_version_uuid, stored.profile_uuid);
       return stored;
     },
     stats() {
@@ -586,7 +498,7 @@ export function createInMemoryCommunityProfileRepository() {
       state.profiles = fresh.profiles;
       state.activeByStoryVersion = fresh.activeByStoryVersion;
       state.byUuid = fresh.byUuid;
-      state.insertSeqByStoryVersion = fresh.insertSeqByStoryVersion;
+      state.latestByStoryVersion = fresh.latestByStoryVersion;
     },
   };
   return repo;

@@ -69,18 +69,15 @@ import { canonicalSha256 } from '../stories/canonicalHash.mjs';
  *                                                Several hot-list match keywords.
  * @property {{ content_hash: string }} hash        Content hash of the profile (used to
  *                                                  dedupe identical profiles across regenerations).
- * @property {number | null} insert_seq             ClickUp 16.2 P1.v1-4 (2026-09-07):
- *                                                  monotonic insert sequence assigned by the
- *                                                  repository at row-creation time, scoped to
- *                                                  `(story_version_uuid)`. Active-row selection
- *                                                  prefers the row with the largest `insert_seq`;
- *                                                  a fresh UUID v4 is assigned for every row, so
- *                                                  the ordering reflects insertion order, not
- *                                                  caller-supplied string keys. Legacy rows
- *                                                  pre-dating P1.v1-4 carry `null` and the
- *                                                  repository falls back to
- *                                                  `(generated_at DESC, profile_uuid DESC)`
- *                                                  for those rows.
+ *
+ * ClickUp 16.2 P1.v1-5 fix (2026-09-07): the monotonic/latest
+ * metadata used to pick the active row is NOT a canonical field on
+ * the profile row. It lives in PRIVATE state on the repository
+ * (`latestByStoryVersion: Map<story_version_uuid, profile_uuid>`)
+ * so the canonical 13-field schema is preserved end-to-end (this is
+ * the same 13-field schema ClickUp 16.1 / main ships, plus the v1-5
+ * zero-impact guarantee that no P1 metadata leaks into the row
+ * surface).
  */
 
 /**
@@ -134,13 +131,15 @@ export const PROFILE_TOP_LEVEL_KEYS = Object.freeze([
   'knowledge_queries',
   'hot_keywords',
   'hash',
-  // ClickUp 16.2 P1.v1-4 fix (2026-09-07): monotonic insert sequence
-  // assigned by the repository at row-creation time. Legacy rows
-  // pre-dating this commit carry `insert_seq: null`; the repository
-  // falls back to (generated_at DESC, profile_uuid DESC) for those
-  // rows so existing data is not broken. New rows always carry a
-  // non-null integer ≥ 1.
-  'insert_seq',
+  // ClickUp 16.2 P1.v1-5 fix (2026-09-07): the previous v1-4 attempt
+  // added `insert_seq` here to drive active-row selection. That made
+  // the canonical 13-field schema 14 fields, which is a schema
+  // change to the surface that main / ClickUp 16.1 owns. v1-5
+  // reverts the schema: monotonic/latest metadata is NOT a row
+  // field. It lives in PRIVATE repository state
+  // (`latestByStoryVersion: Map<story_version_uuid, profile_uuid>`)
+  // so this list stays exactly at the 13 fields ClickUp 16.1 /
+  // main ship.
 ]);
 export const PROFILE_TOPIC_KEYS = Object.freeze(['id', 'label', 'summary']);
 export const PROFILE_QUERY_KEYS = Object.freeze(['id', 'query', 'kind']);
@@ -299,20 +298,16 @@ export function assertCommunityProfileShape(profile) {
       + `(allowed: ${JSON.stringify(PROFILE_SOURCES)})`,
     );
   }
-  // ClickUp 16.2 P1.v1-4 (2026-09-07): `insert_seq` is OPTIONAL on the
-  // shape contract. When supplied by a caller, it MUST be either
-  // `null` (legacy / pre-migration row) OR a non-negative integer
-  // (the monotonic insert sequence assigned by the repository).
-  // The repository overwrites any caller-supplied value with its own
-  // monotonic counter at row-creation time, so this field is
-  // authoritative only after `setCommunityProfile` returns.
-  if ('insert_seq' in p && p.insert_seq !== null) {
-    if (typeof p.insert_seq !== 'number' || !Number.isInteger(p.insert_seq) || p.insert_seq < 0) {
-      throw new Error(
-        `communityProfile: insert_seq must be null or a non-negative integer, got ${JSON.stringify(p.insert_seq)}`,
-      );
-    }
-  }
+  // ClickUp 16.2 P1.v1-5 (2026-09-07): the previous v1-4 shape
+  // validator accepted `insert_seq` as a legacy optional field
+  // (`null` for pre-migration rows, non-negative integer for new
+  // rows). v1-5 REMOVES this field from the row entirely so the
+  // canonical 13-field schema is preserved. Monotonic/latest
+  // metadata lives in PRIVATE repository state. Any caller that
+  // smuggles `insert_seq` is rejected by the strict top-level
+  // allowlist above (line `assertRecordAllowlist('$', ...)` runs
+  // first), so the row surface is exactly the 13 keys ClickUp 16.1 /
+  // main ship.
   assertNonEmptyString('locale', p.locale);
   if (!Array.isArray(p.topics)) throw new Error('communityProfile: topics must be an array');
   if (!Array.isArray(p.queries)) throw new Error('communityProfile: queries must be an array');
