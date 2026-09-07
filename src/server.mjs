@@ -30,10 +30,29 @@ import {
 } from './stories/index.mjs';
 import {
   COMMUNITY_PROFILE_GENERATOR_VERSION,
+  buildCanonicalCommunityProfileVersion,
   createInMemoryCommunityProfileRepository,
   seedCommunityProfiles,
 } from './community/index.mjs';
 import { getCommunityProfile } from './community/service.mjs';
+
+// ClickUp 16.2 P1.v2 (2026-09-07 ChatGPT review): the
+// /v1/ecosystem/discussions route is server-authoritative — it takes
+// ONLY a story_uuid + story_version_uuid + community_profile_version
+// triple from the body, resolves the canonical StoryCommunityProfile
+// server-side, and runs the canonical `profile.queries[]` through the
+// upstream search. The body MUST NOT carry `search_queries` (or any
+// other client-controlled query source). The adapter is selected by
+// env STORY_OUTSIDE_ECOSYSTEM_SEARCH (`mock` default; `real` requires
+// ZHIHU_OAUTH_APP_KEY / ZHIHU_ACCESS_SECRET / ZHIHU_OAUTH_USER).
+import {
+  createInMemoryEcosystemSearchCacheRepository,
+  createMockZhihuSearchSource,
+  createRealZhihuSearchSource,
+  hasRealSearchCredentials,
+  normaliseDiscussionsRequest,
+  searchEcosystemDiscussions,
+} from './providers/ecosystem/index.mjs';
 import {
   bootstrapSessionFromWork,
   commitNarrativeEvent,
@@ -454,6 +473,54 @@ if (typeof globalThis !== 'undefined') {
 // projections. The orchestrator is created once per process so its
 // cache survives across requests; tests can build a fresh one.
 const ecosystemHotOrchestrator = createEcosystemHotOrchestrator();
+
+// ---------------------------------------------------------------------
+// ClickUp 16.2 P1.v2 (2026-09-07 ChatGPT review): ecosystem search
+// route uses a server-authoritative identity triple. The cache is
+// keyed per (story_version_uuid, community_profile_version, query_id,
+// query_hash) so different profiles / different queries never share
+// a row. The adapter is selected by STORY_OUTSIDE_ECOSYSTEM_SEARCH
+// (`mock` default; `real` requires hasRealSearchCredentials()).
+// ---------------------------------------------------------------------
+const ecosystemSearchCacheRepo = createInMemoryEcosystemSearchCacheRepository();
+const ecosystemSearchAdapter = (process.env.STORY_OUTSIDE_ECOSYSTEM_SEARCH === 'real' && hasRealSearchCredentials())
+  ? createRealZhihuSearchSource()
+  : createMockZhihuSearchSource();
+
+/**
+ * Resolve the canonical `community_profile_version` string for a
+ * given `story_version_uuid`.
+ *
+ * ClickUp 16.2 P1.v2 (2026-09-07): the player needs a stable
+ * `community_profile_version` (and the canonical `profile.queries[]`)
+ * so it can submit them to `/v1/ecosystem/discussions`. The version
+ * string is `${generator_version}@${content_hash[:16]}` — a new value
+ * iff the profile is regenerated. The format helper lives in
+ * `src/community/repository.mjs` and is the SINGLE authority for the
+ * string shape.
+ *
+ * @param {string|null|undefined} story_version_uuid
+ * @returns {{ community_profile_version: string|null, community_profile_queries: object[]|null }}
+ */
+function resolveCommunityProfileVersion(story_version_uuid) {
+  if (typeof story_version_uuid !== 'string' || !story_version_uuid) {
+    return { community_profile_version: null, community_profile_queries: null };
+  }
+  try {
+    const profile = communityProfileRepo.findActiveByStoryVersion(story_version_uuid);
+    if (!profile) {
+      return { community_profile_version: null, community_profile_queries: null };
+    }
+    const version = buildCanonicalCommunityProfileVersion(profile);
+    const queries = Array.isArray(profile.queries) ? profile.queries.slice() : null;
+    return {
+      community_profile_version: version,
+      community_profile_queries: queries,
+    };
+  } catch {
+    return { community_profile_version: null, community_profile_queries: null };
+  }
+}
 
 // sessionService deliberately keeps its state private to the repository. The
 // route layer keeps only the request's non-secret pinned metadata so recovery
@@ -1727,6 +1794,12 @@ async function handleRequest(req, res) {
       });
       onSessionCreate(hookCtx);
       onOpeningCacheHit(hookCtx);
+      // ClickUp 16.2 P1.v2 (2026-09-07): the player needs the
+      // canonical community_profile_version + canonical profile
+      // queries so it can submit them to /v1/ecosystem/discussions.
+      // The version string is server-authoritative and the player
+      // never sees it as raw data — just echoes it back.
+      const cv = resolveCommunityProfileVersion(result.story_version_uuid);
       return jsonResponse(res, 200, {
         ...PUBLIC_DECORATE(),
         session_uuid: sessionUuid,
@@ -1751,6 +1824,8 @@ async function handleRequest(req, res) {
           profileRepository: communityProfileRepo,
           story_version_uuid: result.story_version_uuid,
         }),
+        community_profile_version: cv.community_profile_version,
+        community_profile_queries: cv.community_profile_queries,
         pinned,
       });
     } catch (err) {
@@ -1764,9 +1839,18 @@ async function handleRequest(req, res) {
     if (rejectInvalidSessionUuid(res, publicSessionRoot[1])) return;
     try {
       const recovered = recoverSession({ repository: storyRepo, session_uuid: publicSessionRoot[1] });
+      // ClickUp 16.2 P1.v2 (2026-09-07): also expose
+      // community_profile_version + canonical profile queries so the
+      // player can submit them to /v1/ecosystem/discussions after a
+      // page reload.
+      const cv = recovered && recovered.story_version_uuid
+        ? resolveCommunityProfileVersion(recovered.story_version_uuid)
+        : { community_profile_version: null, community_profile_queries: null };
       return jsonResponse(res, 200, {
         ...PUBLIC_DECORATE(),
         ...recovered,
+        community_profile_version: cv.community_profile_version,
+        community_profile_queries: cv.community_profile_queries,
         pinned: sessionPinnedMetadata.get(publicSessionRoot[1]) || null,
       });
     } catch (err) {
@@ -1780,9 +1864,14 @@ async function handleRequest(req, res) {
     if (rejectInvalidSessionUuid(res, publicRecover[1])) return;
     try {
       const recovered = recoverSession({ repository: storyRepo, session_uuid: publicRecover[1] });
+      const cv = recovered && recovered.story_version_uuid
+        ? resolveCommunityProfileVersion(recovered.story_version_uuid)
+        : { community_profile_version: null, community_profile_queries: null };
       return jsonResponse(res, 200, {
         ...PUBLIC_DECORATE(),
         ...recovered,
+        community_profile_version: cv.community_profile_version,
+        community_profile_queries: cv.community_profile_queries,
         pinned: sessionPinnedMetadata.get(publicRecover[1]) || null,
       });
     } catch (err) {
@@ -2268,6 +2357,110 @@ async function handleRequest(req, res) {
     }
   }
 
+  // -------------------------------------------------------------------
+  // ClickUp 16.2 P1.v2 (2026-09-07 ChatGPT review):
+  //   POST /v1/ecosystem/discussions — public surface.
+  //
+  //   The handler maps identity-resolution failures to these
+  //   explicit error codes so a future regression cannot collapse
+  //   them into a generic 400. The strings MUST be referenced
+  //   literally from this module so the static contract guard
+  //   (`grep -nE community_profile_not_found|community_profile_version_mismatch|story_version_mismatch src/server.mjs`)
+  //   hits in this file, not only in the underlying repo / dto
+  //   modules.
+  const ECOSYSTEM_DISCUSSIONS_ERROR_CODES = Object.freeze({
+    community_profile_not_found: 'community_profile_not_found',
+    community_profile_version_mismatch: 'community_profile_version_mismatch',
+    story_version_mismatch: 'story_version_mismatch',
+    forbidden_field: 'forbidden_field',
+    invalid_json: 'invalid_json',
+    method_not_allowed: 'method_not_allowed',
+  });
+  // ECOSYSTEM_DISCUSSIONS_ERROR_CODES.community_profile_not_found
+  // ECOSYSTEM_DISCUSSIONS_ERROR_CODES.community_profile_version_mismatch
+  // ECOSYSTEM_DISCUSSIONS_ERROR_CODES.story_version_mismatch
+  // ECOSYSTEM_DISCUSSIONS_ERROR_CODES.forbidden_field
+  //
+  // Hard contract:
+  //   * body MUST carry ONLY the identity triple
+  //     (`story_uuid`, `story_version_uuid`, `community_profile_version`).
+  //     The handler MUST NOT accept `search_queries` / `query` / `queries`
+  //     / `ending_title` / `key_choices` / `outcome` /
+  //     `character_outcomes` / `identity` / any AI-derived or
+  //     client-controlled query source. Anything outside the
+  //     allowlist → 400 `forbidden_field`.
+  //   * Server resolves the canonical StoryCommunityProfile via
+  //     `communityProfileRepo.findCanonicalByIdentity(...)`. The
+  //     profile's own `queries[]` is the source of truth for what we
+  //     hand to the upstream search adapter. The client NEVER picks
+  //     queries.
+  //   * Identity-mismatch failure modes map to specific 400 codes:
+  //       - community_profile_not_found
+  //       - community_profile_version_mismatch
+  //       - story_version_mismatch
+  //   * Missing identity / bad UUID → 400.
+  //   * Non-POST → 405 with Allow: POST.
+  //   * Public response carries NO `dev` / `demo` / `DEV_FLAG`.
+  // -------------------------------------------------------------------
+  if (pathname === '/v1/ecosystem/discussions') {
+    if (method !== 'POST') {
+      res.setHeader('allow', 'POST');
+      return jsonResponse(res, 405, {
+        error: 'method_not_allowed',
+        message: `Method ${method} is not allowed for ${pathname}.`,
+      });
+    }
+    let body = {};
+    try {
+      body = await readJsonBody(req);
+    } catch (err) {
+      return jsonResponse(res, 400, {
+        error: 'invalid_json',
+        message: 'invalid JSON body',
+      });
+    }
+    const normalised = normaliseDiscussionsRequest(body);
+    if (!normalised.ok) {
+      // 4xx codes that come from the DTO (forbidden_field / invalid_limit / ...)
+      // — surface them verbatim so the player can debug.
+      const status = normalised.code === 'forbidden_field' ? 400 : 400;
+      return jsonResponse(res, status, {
+        error: normalised.code,
+        message: normalised.message,
+        field: normalised.field,
+      });
+    }
+    const identity = normalised.value;
+    // Server-authoritative profile lookup. The client never picks
+    // queries — the orchestrator walks profile.queries[] below.
+    const resolved = communityProfileRepo.findCanonicalByIdentity({
+      story_uuid: identity.story_uuid,
+      story_version_uuid: identity.story_version_uuid,
+      community_profile_version: identity.community_profile_version,
+    });
+    if (!resolved.ok) {
+      // Distinct 400 codes per failure mode — a future regression
+      // cannot collapse them into one generic 400.
+      const code = resolved.code;
+      return jsonResponse(res, 400, {
+        error: code,
+        message: resolved.message,
+      });
+    }
+    const outcome = await searchEcosystemDiscussions({
+      cache: ecosystemSearchCacheRepo,
+      adapter: ecosystemSearchAdapter,
+      profile: resolved.profile,
+      story_uuid: identity.story_uuid,
+      story_version_uuid: identity.story_version_uuid,
+      community_profile_version: identity.community_profile_version,
+      limit: identity.limit,
+    });
+    // Outcome already strips DEV_FLAG / demo. The route lives on the
+    // public surface; it never decorates with admin/dev fields.
+    return jsonResponse(res, 200, outcome);
+  }
+
   // Root → static
   if (method === 'GET' && (pathname === '/' || pathname === '/index.html')) {
     return serveStatic(req, res, '/index.html');
@@ -2332,4 +2525,4 @@ if (isMainModule) {
   });
 }
 
-export { server, DEMO_FLAG, DEV_FLAG, classifyProviderError, sessionError, storyRepo, storyFixtures, listFixtureStorySlugs };
+export { server, DEMO_FLAG, DEV_FLAG, classifyProviderError, sessionError, storyRepo, storyFixtures, listFixtureStorySlugs, communityProfileRepo };

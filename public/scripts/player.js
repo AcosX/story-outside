@@ -53,6 +53,12 @@ const state = {
   storyVersionUuid: null,
   cacheUuid: null,
   generationProfile: null,
+  // ClickUp 16.2 P1.v2 (2026-09-07): canonical community-profile
+  // identity returned by /api/sessions. Forwarded verbatim to
+  // /v1/ecosystem/discussions; the handler resolves the canonical
+  // profile server-side from these three values.
+  communityProfileVersion: null,
+  communityProfileQueries: null,
   pending: null,        // { pending_id, events[], tool_call, committed_count }
   pendingIdx: 0,        // index of the NEXT pending event to display
   progressTotal: 0,     // largest known event total for progress bar
@@ -267,47 +273,6 @@ function selectStory(storyId) {
   setText('#role-name', '选一个视角');
   renderRoles(story.roles || []);
   $('#role-block').hidden = false;
-  // ClickUp 16.4 P1.v1-2 fix (2026-09-07): when the user picks a
-  // story, try to publish a provisional identity via the producer in
-  // public/scripts/identity.js. We DO NOT have story_uuid /
-  // story_version_uuid / community_profile_version here yet (those
-  // arrive on bootstrapSession), so the producer will reject this
-  // partial triple and the hot module stays on its "no identity"
-  // path. bootstrapSession() then publishes the complete triple.
-  publishIdentityIfAvailable();
-}
-
-/**
- * ClickUp 16.4 P1.v1-2 fix (2026-09-07): publish the active identity
- * via the producer exposed by /scripts/identity.js. Reads from the
- * in-memory state (story_slug, story_title) plus the latest
- * session-bootstrap response (story_uuid, story_version_uuid,
- * community_profile_version). Refuses to publish a partial triple —
- * the producer rejects missing required fields so a buggy caller
- * cannot downgrade the home page to "0 terms" by accident.
- */
-function publishIdentityIfAvailable() {
-  const api = /** @type {any} */ (window).STORY_OUTSIDE_IDENTITY_API;
-  if (!api || typeof api.setActiveIdentity !== 'function') return;
-  const story_uuid = state.storyUuid || '';
-  const story_version_uuid = state.storyVersionUuid || '';
-  // The community_profile_version is read from the session bootstrap
-  // payload (server surfaces the canonical value on the response).
-  // When the bootstrap has not run yet we leave the field empty and
-  // let the producer reject — bootstrapSession() republishes once
-  // the canonical value is in state.
-  const community_profile_version = typeof state.communityProfileVersion === 'string'
-    ? state.communityProfileVersion
-    : '';
-  if (!story_uuid || !story_version_uuid || !community_profile_version) return;
-  api.setActiveIdentity({
-    story_uuid,
-    story_version_uuid,
-    community_profile_version,
-    story_slug: state.story && state.story.id ? state.story.id : '',
-    story_title: state.story && state.story.title ? state.story.title : '',
-    source: 'pick',
-  });
 }
 
 // -------- Story bootstrap (session creation) --------
@@ -344,20 +309,24 @@ async function bootstrapSession({ story, role }) {
     // response. The value comes from the same source the
     // /v1/ecosystem/hot orchestrator reads, so a mismatch is
     // impossible unless the row was regenerated between calls.
+    // Empty-string rejection preserved so a 400
+    // community_profile_version_mismatch downstream is not
+    // preempted by a phantom "" match.
     state.communityProfileVersion = typeof created.community_profile_version === 'string'
       && created.community_profile_version
       ? created.community_profile_version
+      : null;
+    // ClickUp 16.2 P1.v2 (2026-09-07): forward the canonical
+    // community-profile queries list (server-authoritative) so
+    // mountEndingPage can hand it to /v1/ecosystem/discussions
+    // verbatim without a fresh /recover round-trip.
+    state.communityProfileQueries = Array.isArray(created.community_profile_queries)
+      ? created.community_profile_queries
       : null;
     state.openingEvents = Array.isArray(created.opening_events) ? created.opening_events : [];
     state.generationProfile = (created.session && created.session.generation_profile)
       || (created.pinned && created.pinned.generation_profile)
       || { cache_uuid: created.cache_uuid };
-    // ClickUp 16.4 P1.v1-2 fix (2026-09-07): publish the complete
-    // identity triple (story_uuid / story_version_uuid /
-    // community_profile_version) so homeHotModule.js can switch
-    // from the plain hot list to "相关才关联". The producer is in
-    // /scripts/identity.js and is loaded BEFORE player.js.
-    publishIdentityIfAvailable();
     setText('#story-name', story.title);
     setText('#role-name', role.label);
     persistSessionContext();
@@ -384,6 +353,13 @@ function persistSessionContext() {
       sessionUuid: state.sessionUuid || null,
       storyTitle: state.story ? state.story.title : '',
       roleLabel: state.role ? state.role.label : '',
+      // ClickUp 16.2 P1.v2 (2026-09-07): forward the canonical
+      // community-profile identity so the deep link can submit
+      // /v1/ecosystem/discussions without a fresh bootstrap.
+      communityProfileVersion: state.communityProfileVersion || null,
+      communityProfileQueries: state.communityProfileQueries || null,
+      storyUuid: state.storyUuid || null,
+      storyVersionUuid: state.storyVersionUuid || null,
     }));
   } catch { /* storage unavailable — deep link degrades to empty state */ }
 }
@@ -408,6 +384,16 @@ async function recoverAndStart() {
     const recovered = await api(`/api/sessions/${state.sessionUuid}/recover`);
     state.lastRevision = recovered.revision || 0;
     state.openingCursor = recovered.opening_cursor || 0;
+    // ClickUp 16.2 P1.v2 (2026-09-07): refresh the canonical
+    // community-profile identity on /recover so a page reload still
+    // has it. If the server response does not carry one (older
+    // versions), leave the previous value as-is.
+    if (typeof recovered.community_profile_version === 'string') {
+      state.communityProfileVersion = recovered.community_profile_version;
+    }
+    if (Array.isArray(recovered.community_profile_queries)) {
+      state.communityProfileQueries = recovered.community_profile_queries;
+    }
     state.canonicalHistory = recovered.history || [];
     state.canonicalEventsById = new Map(state.canonicalHistory.map((e) => [e.event_id, e]));
     state.canonicalNarrativeCount = state.canonicalHistory.filter((e) => e.event_type === 'narrative_beat').length;
@@ -906,14 +892,24 @@ async function mountEndingPage(sessionMetaOverride) {
       // ClickUp 16.4 P1.v1-2 fix (2026-09-07): carry the canonical
       // identity triple into the ending-page sessionMeta so the
       // producer in /scripts/identity.js can republish on mount.
+      // ClickUp 16.2 P1.v2 (2026-09-07): also forward the canonical
+      // community-profile queries list (server-authoritative) so
+      // the ending page can submit /v1/ecosystem/discussions
+      // without an extra /recover round-trip. sessionMetaOverride
+      // wins for any field it supplies.
       const identityMeta = {
         story_uuid: state.storyUuid || '',
         story_version_uuid: state.storyVersionUuid || '',
         community_profile_version: state.communityProfileVersion || '',
+        community_profile_queries: state.communityProfileQueries || null,
         story_slug: state.story && state.story.id ? state.story.id : '',
         story_title: state.story ? state.story.title : '',
         storyTitle: state.story ? state.story.title : '',
         roleLabel: state.role ? state.role.label : '',
+        communityProfileVersion: state.communityProfileVersion || '',
+        communityProfileQueries: state.communityProfileQueries || null,
+        storyUuid: state.storyUuid || '',
+        storyVersionUuid: state.storyVersionUuid || '',
       };
       await mod.mount({
         sessionUuid: state.sessionUuid,

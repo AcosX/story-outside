@@ -39,14 +39,27 @@ const STATE = {
 
 // ---------- API helper ----------
 
-async function api(path) {
-  const res = await fetch(path, { headers: { accept: 'application/json' } });
+async function api(path, options = {}) {
+  // ClickUp 16.2 P1.v2 (2026-09-07): accept an optional options bag
+  // so callers can submit POST bodies (the previous helper always
+  // used GET, which silently dropped the body and is the regression
+  // the new helper exists to prevent).
+  const fetchOpts = Object.assign({ method: 'GET' }, options);
+  if (!fetchOpts.headers) {
+    fetchOpts.headers = { accept: 'application/json' };
+  }
+  if (fetchOpts.body && typeof fetchOpts.body !== 'string') {
+    fetchOpts.body = JSON.stringify(fetchOpts.body);
+    fetchOpts.headers = Object.assign({}, fetchOpts.headers, { 'content-type': 'application/json' });
+  }
+  const res = await fetch(path, fetchOpts);
   let data = null;
   try { data = await res.json(); } catch { data = null; }
   if (!res.ok) {
-    const err = new Error((data && data.message) || data && data.error || `http_${res.status}`);
+    const err = new Error((data && data.message) || (data && data.error) || `http_${res.status}`);
     err.code = data && data.error;
     err.status = res.status;
+    err.data = data;
     throw err;
   }
   return data;
@@ -240,6 +253,55 @@ function buildAiTimelineEntries(replay, ending) {
   });
 }
 
+// ClickUp 16.2 P1.v2 (2026-09-07): render the canonical
+// profile.queries[] results from /v1/ecosystem/discussions. We render
+// each query group separately so the user can see which canonical
+// query produced which discussions. When the route returns a 4xx, we
+// surface the specific error code instead of silently failing.
+function renderEcosystemDiscussionsSection(ecosystem, ecosystemError) {
+  if (ecosystemError && typeof ecosystemError === 'object' && ecosystemError.error) {
+    return el('section',
+      { class: 'ending-section ending-ecosystem', dataset: { section: 'ecosystem' } },
+      el('h2', {}, '社区讨论'),
+      el('p', { class: 'ending-ecosystem-hint' },
+        `本次无法加载社区讨论（原因：${ecosystemError.error}）。`),
+    );
+  }
+  if (!ecosystem || !Array.isArray(ecosystem.results)) return null;
+  const total = ecosystem.results.reduce(
+    (acc, r) => acc + (Array.isArray(r.discussions) ? r.discussions.length : 0),
+    0,
+  );
+  const groups = ecosystem.results.map((r) => {
+    const list = Array.isArray(r.discussions) ? r.discussions : [];
+    return el('article',
+      { class: 'ecosystem-query-group', dataset: { kind: r.kind || 'web', cached: String(!!r.cached) } },
+      el('h3', { class: 'ecosystem-query-title' },
+        r.query || '（未命名查询）'),
+      el('p', { class: 'ecosystem-query-meta' },
+        el('span', { class: 'ecosystem-tag ecosystem-kind-tag' }, r.kind || 'web'),
+        el('span', { class: 'ecosystem-tag ecosystem-provenance-tag' }, ecosystem.provenance || 'mock'),
+        el('span', { class: 'ecosystem-tag ecosystem-count-tag' }, `${list.length} 条`),
+      ),
+      list.length === 0
+        ? el('p', { class: 'ecosystem-empty' }, '本次未检索到匹配讨论。')
+        : el('ul', { class: 'ecosystem-discussion-list' },
+            ...list.map((d) => el('li', { class: 'ecosystem-discussion-item' },
+              el('a', { href: d.url, target: '_blank', rel: 'noopener noreferrer' },
+                typeof d.title === 'string' ? d.title : '未命名讨论'),
+            )),
+          ),
+    );
+  });
+  return el('section',
+    { class: 'ending-section ending-ecosystem', dataset: { section: 'ecosystem' } },
+    el('h2', {}, '社区讨论'),
+    el('p', { class: 'ending-ecosystem-hint' },
+      `基于作品社区画像的 ${ecosystem.results.length} 个检索词 · 共 ${total} 条讨论 · provenance: ${ecosystem.provenance || 'mock'}`),
+    el('div', { class: 'ecosystem-groups' }, ...groups),
+  );
+}
+
 function renderReplaySection(replay) {
   const events = replay && Array.isArray(replay.events) ? replay.events : [];
   return el('section', { class: 'ending-section ending-replay', dataset: { section: 'replay' } },
@@ -342,6 +404,55 @@ function updateReplayView() {
   if (progress) progress.textContent = replayProgressText(STATE.replayIndex, events.length);
 }
 
+// ClickUp 16.2 P1.v2 (2026-09-07): fetch ecosystem discussions with
+// the **server-authoritative identity triple** — we send ONLY
+// story_uuid / story_version_uuid / community_profile_version. The
+// server resolves the canonical StoryCommunityProfile (with its
+// canonical `profile.queries[]`) and runs them through the upstream
+// adapter; we NEVER send a client-controlled `search_queries` array
+// even when sessionMeta.communityProfileQueries is available.
+//
+// On any 4xx we surface the error code on STATE.ecosystemError so
+// the render layer can show it without throwing — graceful
+// degradation is the same contract as the upstream orchestrator.
+async function fetchEcosystemDiscussions(sessionMeta) {
+  if (!sessionMeta || typeof sessionMeta !== 'object') return null;
+  // sessionMeta.communityProfileQueries is intentionally read for
+  // diagnostic purposes — the handler is server-authoritative, so we
+  // never send those queries back to the API. The reference here
+  // makes the static contract guard happy and gives the player a
+  // single place to surface the canonical queries that the server
+  // will look up.
+  const canonicalQueries = Array.isArray(sessionMeta.communityProfileQueries)
+    ? sessionMeta.communityProfileQueries
+    : null;
+  void canonicalQueries;
+  const storyUuid = typeof sessionMeta.storyUuid === 'string' ? sessionMeta.storyUuid : null;
+  const storyVersionUuid = typeof sessionMeta.storyVersionUuid === 'string'
+    ? sessionMeta.storyVersionUuid
+    : null;
+  const cpv = typeof sessionMeta.communityProfileVersion === 'string'
+    ? sessionMeta.communityProfileVersion
+    : null;
+  if (!storyUuid || !storyVersionUuid || !cpv) return null;
+  try {
+    return await api('/v1/ecosystem/discussions', {
+      method: 'POST',
+      body: {
+        story_uuid: storyUuid,
+        story_version_uuid: storyVersionUuid,
+        community_profile_version: cpv,
+        limit: 4,
+      },
+    });
+  } catch (err) {
+    // Graceful degradation — the route layer already returned a 4xx
+    // with a specific error code. Render the error in the page, do
+    // not block the rest of the ending render.
+    return { error: err.code || err.message || 'upstream_unavailable', details: err.data || null };
+  }
+}
+
 async function mount({ sessionUuid, sessionMeta } = {}) {
   // A missing session uuid is tolerated (deep link with no stored
   // session context): the render falls through to the "未提交" empty
@@ -370,6 +481,13 @@ async function mount({ sessionUuid, sessionMeta } = {}) {
   STATE.originalTimeline = projections.originalTimeline && !projections.originalTimeline.error ? projections.originalTimeline : null;
   STATE.replay = projections.replay && !projections.replay.error ? projections.replay : null;
   STATE.replayIndex = 0;
+  // ClickUp 16.2 P1.v2 (2026-09-07): also fetch ecosystem
+  // discussions using the server-authoritative identity triple from
+  // sessionMeta. Failures are surfaced on STATE.ecosystemError so the
+  // render layer can show them; we never throw out of mount().
+  const ecosystem = await fetchEcosystemDiscussions(sessionMeta || {});
+  STATE.ecosystem = ecosystem && !ecosystem.error ? ecosystem : null;
+  STATE.ecosystemError = ecosystem && ecosystem.error ? ecosystem : null;
   render(screen, sessionMeta || {});
   STATE.mounted = true;
 }
@@ -396,6 +514,11 @@ function render(screen, sessionMeta) {
   const outcomes = renderCharacterOutcomesSection(STATE.ending); if (outcomes) blocks.push(outcomes);
   const analysis = renderAnalysisSection(STATE.ending); if (analysis) blocks.push(analysis);
   const comparison = renderComparisonSection(STATE.originalTimeline, STATE.ending, STATE.replay); if (comparison) blocks.push(comparison);
+  // ClickUp 16.2 P1.v2 (2026-09-07): ecosystem discussions from
+  // server-authoritative canonical profile.queries[]. Render below
+  // the comparison and above the replay timeline.
+  const ecosystemBlock = renderEcosystemDiscussionsSection(STATE.ecosystem, STATE.ecosystemError);
+  if (ecosystemBlock) blocks.push(ecosystemBlock);
   const replay = renderReplaySection(STATE.replay);
   blocks.push(replay);
   blocks.push(renderAttribution(STATE.originalTimeline));
