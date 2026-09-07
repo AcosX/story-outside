@@ -30,6 +30,9 @@ import {
   assertCommunityProfileShape,
   findCommunityProfileBoundsViolations,
 } from './profile.mjs';
+import {
+  deriveExternalCommunityProfileVersion,
+} from './version.mjs';
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -136,6 +139,7 @@ function rejectForbiddenKeys(value, path) {
  * @property {(story_version_uuid: string) => StoryCommunityProfile | null} findActiveByStoryVersion
  * @property {(story_version_uuid: string, generator_version: string) => StoryCommunityProfile | null} findActiveByStoryVersionAndGenerator
  * @property {(profile_uuid: string) => StoryCommunityProfile | null} findByUuid
+ * @property {(story_version_uuid: string, externalVersion: string) => StoryCommunityProfile | null} findByExternalVersion
  * @property {(input: { story_version_uuid: string }) => StoryCommunityProfile[]} listByStoryVersion
  * @property {(input: StoryCommunityProfile) => StoryCommunityProfile} setCommunityProfile
  * @property {() => { profile_count: number }} stats
@@ -145,9 +149,10 @@ function rejectForbiddenKeys(value, path) {
 /**
  * Build a fresh in-memory state. Pure factory.
  * @returns {{
- *   profiles: Map<string, StoryCommunityProfile>,                 // keyed by profile_uuid
- *   activeByStoryVersion: Map<string, string>,                    // story_version_uuid|generator_version → profile_uuid
+ *   profiles: Map<string, StoryCommunityProfile>,                  // keyed by profile_uuid
+ *   activeByStoryVersion: Map<string, string>,                     // story_version_uuid|generator_version → profile_uuid
  *   byUuid: Map<string, StoryCommunityProfile>,
+ *   byExternalVersion: Map<string, string>,                        // `${story_version_uuid}::${externalVersion}` → profile_uuid (P1.v1-5 SCOPED)
  *   latestByStoryVersion: Map<string, string>,                    // story_version_uuid → profile_uuid of the most recently inserted row (PRIVATE; not a row field)
  * }}
  */
@@ -156,6 +161,7 @@ function createEmptyState() {
     profiles: new Map(),
     activeByStoryVersion: new Map(),
     byUuid: new Map(),
+    byExternalVersion: new Map(),
     // ClickUp 16.2 P1.v1-5 fix (2026-09-07): the monotonic/latest
     // metadata that drives active-row selection lives in PRIVATE
     // repository state. The previous v1-4 implementation stamped a
@@ -218,6 +224,28 @@ export function buildCanonicalCommunityProfileVersion(profile) {
     ? profile.hash.content_hash : '';
   if (!generator || !hash) return null;
   return `${generator}@${hash.slice(0, 16)}`;
+}
+
+/**
+ * P1.v1-5 (2026-09-07): SCOPED index key for the external-version
+ * lookup. The wire-contract external version string is NOT globally
+ * unique — two profiles with the SAME community content but
+ * DIFFERENT `story_version_uuid` can yield the same external version
+ * if anything ever regresses the hash input. Scoping the key by
+ * `story_version_uuid` is defence-in-depth: even if a future
+ * refactor accidentally drops `story_uuid` + `story_version_uuid`
+ * from the hash input, the index still refuses to collide across
+ * story_versions.
+ *
+ * The `::` separator (vs. `|` in `activeKey`) makes the key visually
+ * distinct in test failures so a quick `grep externalVersionKey`
+ * surfaces the v1-5 contract.
+ *
+ * @param {string} story_version_uuid
+ * @param {string} externalVersion
+ */
+export function externalVersionKey(story_version_uuid, externalVersion) {
+  return `${story_version_uuid}::${externalVersion}`;
 }
 
 /**
@@ -417,6 +445,37 @@ export function createInMemoryCommunityProfileRepository() {
       if (typeof profile_uuid !== 'string') return null;
       return state.profiles.get(profile_uuid) || null;
     },
+    findByExternalVersion(story_version_uuid, externalVersion) {
+      // P1.v1-5 (2026-09-07): SCOPED exact-string lookup against the
+      // wire contract external identity. The repository maintains a
+      // lazy-derived index keyed by
+      //     `${story_version_uuid}::${externalVersion}`
+      // so the lookup is ALWAYS scoped to the caller's story_version.
+      // The v1-4 GLOBAL lookup (keyed by `externalVersion` alone)
+      // allowed a cross-story collision: two profiles with the SAME
+      // community content but DIFFERENT `story_version_uuid` produced
+      // the same external version (the content-only hash excluded
+      // `story_uuid` + `story_version_uuid`), and the Map then
+      // collapsed the second insert onto the first one's profile_uuid.
+      // v1-5 closes that hole by (a) including `story_uuid` +
+      // `story_version_uuid` in the content hash so the external
+      // version itself differs across stories, AND (b) scoping the
+      // index key to `story_version_uuid` as a defence-in-depth.
+      //
+      // The caller still passes the external version string it
+      // received on the wire (or computed via the public helper);
+      // the repo returns the matching row verbatim or `null` when
+      // nothing matches.
+      //
+      // Important: the index is only as fresh as `setCommunityProfile`
+      // keeps it. `setCommunityProfile` derives the external version
+      // for every insert. Reads therefore stay O(1).
+      if (typeof story_version_uuid !== 'string' || !story_version_uuid) return null;
+      if (typeof externalVersion !== 'string' || !externalVersion) return null;
+      const uuid = state.byExternalVersion.get(externalVersionKey(story_version_uuid, externalVersion));
+      if (!uuid) return null;
+      return state.profiles.get(uuid) || null;
+    },
     listByStoryVersion(input) {
       if (!input || typeof input !== 'object') {
         throw new Error('communityRepository.listByStoryVersion: input required');
@@ -488,6 +547,31 @@ export function createInMemoryCommunityProfileRepository() {
       // — that is the entire point of separating it from the row
       // surface.
       state.latestByStoryVersion.set(stored.story_version_uuid, stored.profile_uuid);
+      // 5. P1.v1-5 (2026-09-07): maintain the SCOPED external-version
+      //    index so `findByExternalVersion(story_version_uuid,
+      //    externalVersion)` is O(1). The key is
+      //    `${story_version_uuid}::${externalVersion}` so two profiles
+      //    with the same external version but different
+      //    story_versions never collide on the index. We derive the
+      //    external identity via the public helper (which is the
+      //    SINGLE place that knows the wire format). If derivation
+      //    fails for any reason, we still store the row but skip the
+      //    index entry — `findByExternalVersion` will then return
+      //    `null` for this row, which is the same observable
+      //    behaviour as before.
+      try {
+        const externalVersion = deriveExternalCommunityProfileVersion(stored);
+        if (externalVersion) {
+          state.byExternalVersion.set(
+            externalVersionKey(stored.story_version_uuid, externalVersion),
+            stored.profile_uuid,
+          );
+        }
+      } catch {
+        // Intentionally swallowed: shape validator already enforces
+        // `generator_version`, so derivation only fails for an
+        // in-memory invariant break. Keep the row, drop the index.
+      }
       return stored;
     },
     stats() {
@@ -498,6 +582,7 @@ export function createInMemoryCommunityProfileRepository() {
       state.profiles = fresh.profiles;
       state.activeByStoryVersion = fresh.activeByStoryVersion;
       state.byUuid = fresh.byUuid;
+      state.byExternalVersion = fresh.byExternalVersion;
       state.latestByStoryVersion = fresh.latestByStoryVersion;
     },
   };

@@ -27,6 +27,7 @@ export {
   _forbiddenCommunityProfileDimensions,
   _forbiddenProfileKeys,
   activeKey,
+  externalVersionKey,
 } from './repository.mjs';
 
 export {
@@ -40,6 +41,11 @@ export {
   getCommunityProfile,
   setCommunityProfile,
 } from './service.mjs';
+
+export {
+  EXTERNAL_HASH_LENGTH,
+  deriveExternalCommunityProfileVersion,
+} from './version.mjs';
 
 export {
   ensureCommunityProfileForStoryVersion,

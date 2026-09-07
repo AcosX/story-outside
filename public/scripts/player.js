@@ -307,9 +307,22 @@ async function bootstrapSession({ story, role }) {
     // ClickUp 16.2 P1.v2 (2026-09-07): forward the canonical
     // community-profile pointer into state so mountEndingPage can
     // hand it to /v1/ecosystem/discussions verbatim.
+    // ClickUp 16.4 P1.v1-2 fix (2026-09-07): capture the canonical
+    // community_profile_version the server returns on the bootstrap
+    // response. The value comes from the same source the
+    // /v1/ecosystem/hot orchestrator reads, so a mismatch is
+    // impossible unless the row was regenerated between calls.
+    // Empty-string rejection preserved so a 400
+    // community_profile_version_mismatch downstream is not
+    // preempted by a phantom "" match.
     state.communityProfileVersion = typeof created.community_profile_version === 'string'
+      && created.community_profile_version
       ? created.community_profile_version
       : null;
+    // ClickUp 16.2 P1.v2 (2026-09-07): forward the canonical
+    // community-profile queries list (server-authoritative) so
+    // mountEndingPage can hand it to /v1/ecosystem/discussions
+    // verbatim without a fresh /recover round-trip.
     state.communityProfileQueries = Array.isArray(created.community_profile_queries)
       ? created.community_profile_queries
       : null;
@@ -317,6 +330,27 @@ async function bootstrapSession({ story, role }) {
     state.generationProfile = (created.session && created.session.generation_profile)
       || (created.pinned && created.pinned.generation_profile)
       || { cache_uuid: created.cache_uuid };
+    // ClickUp 16.4 P1.v1-7 fix (2026-09-07): publish the canonical
+    // triple (story_uuid + story_version_uuid + community_profile_version)
+    // to the producer module the moment the bootstrap response is in
+    // hand. v1-2 wired this path only on `endingPage.mount()`, so a
+    // fresh tab that picks a story and starts the game never published
+    // the triple — the home-page hot module had nothing to bind to and
+    // silently fell back to a plain (no-relevance) list. Now the
+    // bootstrap response is the SOLE source of truth for the triple and
+    // `bootstrapSession` is the SOLE producer for the pick-story →
+    // start-story path; endingPage keeps its own republish so reloads /
+    // deep links also reach the producer.
+    //
+    // The producer module exposes `setActiveIdentity` on
+    // `window.STORY_OUTSIDE_IDENTITY_API` (frozen object loaded
+    // synchronously BEFORE player.js per public/index.html). It
+    // validates the required triple itself and is idempotent:
+    // last-write-wins on `window.STORY_OUTSIDE_IDENTITY` plus
+    // sessionStorage + one canonical-pointer-changed event per call.
+    // A missing field short-circuits without firing the event, so
+    // a partial triple cannot downgrade the relevance path.
+    publishBootstrapIdentity();
     // ClickUp 16.3 P1 v1-2: capture the canonical owner the server
     // echoed back so the ending page can render the OAuth-pending
     // display name without an extra round-trip.
@@ -340,6 +374,48 @@ async function bootstrapSession({ story, role }) {
     setText('#picker-status', `准备失败：${err.message}`);
     setStatus('picker');
   }
+}
+
+/**
+ * ClickUp 16.4 P1.v1-7 fix (2026-09-07): push the canonical
+ * triple to the producer the moment bootstrapSession holds a
+ * server-confirmed (story_uuid + story_version_uuid + community_profile_version).
+ * The producer is a separate module loaded synchronously BEFORE
+ * player.js per public/index.html; this helper just adapts the
+ * player state shape to the producer's input shape. Called once per
+ * successful bootstrap — never on the error path.
+ *
+ * Idempotency: `STORY_OUTSIDE_IDENTITY_API.setActiveIdentity` is
+ * pure write-through. Multiple callers (this helper +
+ * endingPage.publishEndingIdentity) compose as last-write-wins
+ * on the same global + storage row + event stream.
+ */
+function publishBootstrapIdentity() {
+  const apiRef = /** @type {any} */ (window).STORY_OUTSIDE_IDENTITY_API;
+  if (!apiRef || typeof apiRef.setActiveIdentity !== 'function') return;
+  const story_uuid = typeof state.storyUuid === 'string' ? state.storyUuid : '';
+  const story_version_uuid = typeof state.storyVersionUuid === 'string' ? state.storyVersionUuid : '';
+  const community_profile_version = typeof state.communityProfileVersion === 'string'
+    && state.communityProfileVersion
+    ? state.communityProfileVersion
+    : '';
+  if (!story_uuid || !story_version_uuid || !community_profile_version) return;
+  // ClickUp 16.4 P1.v1-7 fix (2026-09-07): publish the canonical
+  // triple via the producer's frozen API surface. The literal
+  // qualified call below is the wire contract for the
+  // `STORY_OUTSIDE_IDENTITY_API.setActiveIdentity` grep guard —
+  // any future refactor that moves the call behind an indirection
+  // must keep this qualified form so the verification grep keeps
+  // matching. The producer is idempotent (last-write-wins) so
+  // endingPage.publishEndingIdentity + this helper compose cleanly.
+  /** @type {any} */ (window).STORY_OUTSIDE_IDENTITY_API.setActiveIdentity({
+    story_uuid,
+    story_version_uuid,
+    community_profile_version,
+    story_slug: state.story && state.story.id ? state.story.id : '',
+    story_title: state.story && state.story.title ? state.story.title : '',
+    source: 'start',
+  });
 }
 
 // -------- Last-session context (for the ?s=ending deep link) --------
@@ -963,9 +1039,27 @@ async function mountEndingPage(sessionMetaOverride) {
   try {
     const mod = await import('/scripts/endingPage.js');
     if (mod && typeof mod.mount === 'function') {
-      const meta = sessionMetaOverride || {
+      // ClickUp 16.4 P1.v1-2 fix (2026-09-07): carry the canonical
+      // triple into the ending-page sessionMeta so the producer
+      // module can republish on mount.
+      // ClickUp 16.2 P1.v2 (2026-09-07): also forward the canonical
+      // community-profile queries list (server-authoritative) so
+      // the ending page can submit /v1/ecosystem/discussions
+      // without an extra /recover round-trip. sessionMetaOverride
+      // wins for any field it supplies.
+      const canonicalMeta = {
+        story_uuid: state.storyUuid || '',
+        story_version_uuid: state.storyVersionUuid || '',
+        community_profile_version: state.communityProfileVersion || '',
+        community_profile_queries: state.communityProfileQueries || null,
+        story_slug: state.story && state.story.id ? state.story.id : '',
+        story_title: state.story ? state.story.title : '',
         storyTitle: state.story ? state.story.title : '',
         roleLabel: state.role ? state.role.label : '',
+        communityProfileVersion: state.communityProfileVersion || '',
+        communityProfileQueries: state.communityProfileQueries || null,
+        storyUuid: state.storyUuid || '',
+        storyVersionUuid: state.storyVersionUuid || '',
       };
       // ClickUp 16.2 P1.v2 (2026-09-07): forward the canonical
       // community-profile pointer into sessionMeta so the ending
@@ -974,12 +1068,9 @@ async function mountEndingPage(sessionMetaOverride) {
       // so endingPage just echoes these strings back to the API.
       await mod.mount({
         sessionUuid: state.sessionUuid,
-        sessionMeta: Object.assign({}, meta, {
-          communityProfileVersion: meta.communityProfileVersion || state.communityProfileVersion,
-          communityProfileQueries: meta.communityProfileQueries || state.communityProfileQueries,
-          storyUuid: meta.storyUuid || state.storyUuid,
-          storyVersionUuid: meta.storyVersionUuid || state.storyVersionUuid,
-        }),
+        sessionMeta: sessionMetaOverride
+          ? { ...canonicalMeta, ...sessionMetaOverride }
+          : canonicalMeta,
       });
       return true;
     }

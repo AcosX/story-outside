@@ -474,6 +474,15 @@ async function mount({ sessionUuid, sessionMeta } = {}) {
   if (!screen) {
     throw new Error('endingPage.mount: #screen-ending not found in DOM');
   }
+// ClickUp 16.4 P1.v1-2 fix (2026-09-07): when the ending page is
+  // mounted from a deep-link or session-rehydrate path, republish the
+  // canonical triple so the home-page relevance path keeps working
+  // when the user navigates back. sessionMeta carries the canonical
+  // triple (story_uuid / story_version_uuid / community_profile_version)
+  // populated by player.js's bootstrapSession response.
+  if (sessionMeta && typeof sessionMeta === 'object') {
+    publishEndingIdentity(sessionMeta);
+  }
   // ClickUp 16.3 P1 v1-2: fetch the canonical owner from
   // /api/auth/status so the ending header can render the
   // OAuth-pending display name. The sessionMeta fallback covers the
@@ -558,3 +567,36 @@ function teardown() {
 }
 
 export { mount, teardown, STATE as __state__ };
+
+/**
+ * ClickUp 16.4 P1.v1-2 fix (2026-09-07): republish the canonical
+ * triple when the ending page mounts so the home-page relevance path
+ * stays active across the navigation `/play.html → /?s=ending → /`.
+ * The producer is a separate module loaded synchronously before
+ * endingPage.js; the API is exposed on
+ * `window.STORY_OUTSIDE_IDENTITY_API` so this module does not need a
+ * direct script reference.
+ *
+ * @param {object} sessionMeta
+ */
+function publishEndingIdentity(sessionMeta) {
+  const api = /** @type {any} */ (window).STORY_OUTSIDE_IDENTITY_API;
+  if (!api || typeof api.setActiveIdentity !== 'function') return;
+  const story_uuid = typeof sessionMeta.story_uuid === 'string' ? sessionMeta.story_uuid : '';
+  const story_version_uuid = typeof sessionMeta.story_version_uuid === 'string'
+    ? sessionMeta.story_version_uuid
+    : '';
+  const community_profile_version = typeof sessionMeta.community_profile_version === 'string'
+    && sessionMeta.community_profile_version
+    ? sessionMeta.community_profile_version
+    : '';
+  if (!story_uuid || !story_version_uuid || !community_profile_version) return;
+  api.setActiveIdentity({
+    story_uuid,
+    story_version_uuid,
+    community_profile_version,
+    story_slug: typeof sessionMeta.story_slug === 'string' ? sessionMeta.story_slug : '',
+    story_title: typeof sessionMeta.story_title === 'string' ? sessionMeta.story_title : '',
+    source: 'ending',
+  });
+}
