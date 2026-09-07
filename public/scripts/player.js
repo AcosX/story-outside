@@ -369,9 +369,30 @@ function persistSessionContext() {
   // pattern: write through the helper when it is available, otherwise
   // fall back to the direct storage write so the deep-link recovery
   // still works. Both paths write the SAME single key.
+  //
+  // ClickUp 16.3 P1 v1-7 (主人 2026-09-07 10:18 巡检 + ChatGPT 复核):
+  // the meta passed to the helper MUST include the FULL canonical
+  // triple (`storyUuid` / `storyVersionUuid` /
+  // `communityProfileVersion` / `communityProfileQueries`). v1-6
+  // forwarded only `storyTitle` / `roleLabel` / `source`, which
+  // caused the helper to silently strip the canonical triple on
+  // `location.reload()` and the `?s=ending` deep link lost its
+  // canonical triple. The direct-write fallback below was correct,
+  // but the helper is pre-loaded by the player bootstrap, so the
+  // fallback essentially never ran — every reload ate the
+  // canonical triple.
+  //
+  // v1-7 sends the full meta on BOTH paths so the storage payload
+  // is identical regardless of whether the helper or the fallback
+  // wins the race.
   const meta = {
     storyTitle: state.story ? state.story.title : '',
     roleLabel: state.role ? state.role.label : '',
+    storyUuid: state.storyUuid || null,
+    storyVersionUuid: state.storyVersionUuid || null,
+    communityProfileVersion: state.communityProfileVersion || null,
+    communityProfileQueries: Array.isArray(state.communityProfileQueries)
+      ? state.communityProfileQueries.slice() : null,
     source: 'player.bootstrapSession',
   };
   const helper = _sessionContextModule;
@@ -382,22 +403,19 @@ function persistSessionContext() {
     } catch { /* fall through to direct write */ }
   }
   // Direct write — same key as the helper. No secondary key exists.
+  // Keep the payload shape aligned with the helper's v1-7
+  // `normalizeMeta()` so a future fallback-path test or a pre-v1-7
+  // helper still round-trips the same triple.
   try {
     sessionStorage.setItem('story-outside:last-session', JSON.stringify({
       sessionUuid: state.sessionUuid || null,
-      // ClickUp 16.3 P1 v1-6 (merge): prefer meta values when
-      // present (the #22 share-target helper writes meta.storyTitle /
-      // meta.roleLabel explicitly); fall back to state-derived
-      // values from the new session bootstrap. Also forward the
-      // canonical community-profile pointer triple from main so the
-      // deep link can submit /v1/ecosystem/discussions without a
-      // fresh bootstrap.
-      storyTitle: (meta && meta.storyTitle) || (state.story ? state.story.title : ''),
-      roleLabel: (meta && meta.roleLabel) || (state.role ? state.role.label : ''),
-      communityProfileVersion: state.communityProfileVersion || null,
-      communityProfileQueries: state.communityProfileQueries || null,
-      storyUuid: state.storyUuid || null,
-      storyVersionUuid: state.storyVersionUuid || null,
+      storyTitle: meta.storyTitle || (state.story ? state.story.title : ''),
+      roleLabel: meta.roleLabel || (state.role ? state.role.label : ''),
+      storyUuid: meta.storyUuid,
+      storyVersionUuid: meta.storyVersionUuid,
+      communityProfileVersion: meta.communityProfileVersion,
+      communityProfileQueries: meta.communityProfileQueries,
+      source: meta.source,
     }));
   } catch { /* storage unavailable — deep link degrades to empty state */ }
   // We still want listeners to observe the change even when the
@@ -1383,9 +1401,20 @@ async function bootstrap() {
     if (new URLSearchParams(window.location.search).get('s') === 'ending') {
       const ctx = readSessionContext();
       if (ctx) state.sessionUuid = ctx.sessionUuid;
+      // ClickUp 16.3 P1 v1-7 (主人 2026-09-07 10:18 巡检 + ChatGPT
+      // 复核): forward the FULL canonical meta from the last-session
+      // payload so the ending page can submit
+      // /v1/ecosystem/discussions with the same triple the player
+      // bootstrap received from /api/sessions. v1-6 only forwarded
+      // `storyTitle` / `roleLabel`, so the deep link lost the
+      // canonical triple on every reload.
       deepLinkedToEnding = await mountEndingPage(ctx ? {
         storyTitle: ctx.storyTitle || '',
         roleLabel: ctx.roleLabel || '',
+        storyUuid: typeof ctx.storyUuid === 'string' ? ctx.storyUuid : null,
+        storyVersionUuid: typeof ctx.storyVersionUuid === 'string' ? ctx.storyVersionUuid : null,
+        communityProfileVersion: typeof ctx.communityProfileVersion === 'string' ? ctx.communityProfileVersion : null,
+        communityProfileQueries: Array.isArray(ctx.communityProfileQueries) ? ctx.communityProfileQueries : null,
       } : undefined);
       if (deepLinkedToEnding) {
         state.finished = true;
