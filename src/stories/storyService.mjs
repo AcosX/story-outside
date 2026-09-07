@@ -277,7 +277,7 @@ export async function importStoryAndEnsureCache({
   // /api/sessions bootstrap response can echo it to the browser.
   // The external form is `<generator_version>-<content_hash_short>`
   // (see deriveExternalCommunityProfileVersion in
-  // src/community/profile.mjs) so two preserved rows with the same
+  // src/community/version.mjs) so two preserved rows with the same
   // raw rule version but different content hashes yield two
   // different external versions — that is what lets the route layer
   // resolve old-session regressions that pinned a prior external
@@ -289,7 +289,7 @@ export async function importStoryAndEnsureCache({
   if (profileRepository) {
     try {
       const { getCommunityProfile: _getProfile } = await import('../community/service.mjs');
-      const { deriveExternalCommunityProfileVersion: _deriveExternal } = await import('../community/profile.mjs');
+      const { deriveExternalCommunityProfileVersion: _deriveExternal } = await import('../community/version.mjs');
       const profile = _getProfile({
         profileRepository,
         story_version_uuid: imported.story_version_uuid,

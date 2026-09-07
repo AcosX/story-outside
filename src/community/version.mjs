@@ -72,27 +72,23 @@ export const EXTERNAL_HASH_LENGTH = 16;
  * @returns {string|null}
  */
 export function deriveExternalCommunityProfileVersion(profile) {
-  // ClickUp 16.5 P1.v1-4 — match HEAD's profile.mjs THROW semantics
-  // so PR #25 tests (`assert.throws(() => derive(null))`) pass.
-  // The valid-input output is byte-identical to main's
-  // `buildCanonicalCommunityProfileVersion` (both produce
-  // `${generator_version}@${hash.content_hash.slice(0, 16)}`), so
-  // callers see the same wire format. Bad inputs throw (caller
-  // MUST handle via try/catch — repository.mjs's setCommunityProfile
-  // and ecosystem/hot.mjs already wrap with try/catch).
   if (!profile || typeof profile !== 'object') {
-    throw new Error('communityProfile.deriveExternalCommunityProfileVersion: profile required');
+    return null;
   }
-  if (typeof profile.generator_version !== 'string' || !profile.generator_version) {
-    throw new Error(
-      'communityProfile.deriveExternalCommunityProfileVersion: generator_version required',
-    );
+  // Read directly from the row (per P1.v1-6). Pass-through to the
+  // canonical helper so the format / length / null-handling stay
+  // owned by one module (`repository.mjs`).
+  const canonical = buildCanonicalCommunityProfileVersion(profile);
+  if (canonical) return canonical;
+  // Defensive fallback: if the canonical helper returned `null`
+  // (e.g. a partially-shaped row missing `hash.content_hash`),
+  // surface the bare `generator_version` so the route layer can
+  // still emit SOMETHING rather than crashing. This matches the
+  // v1-5 fallback `typeof profile.generator_version === 'string'
+  // && profile.generator_version ? profile.generator_version : ''`
+  // semantically.
+  if (typeof profile.generator_version === 'string' && profile.generator_version) {
+    return profile.generator_version;
   }
-  const hash = profile.hash;
-  if (!hash || typeof hash !== 'object' || typeof hash.content_hash !== 'string' || !hash.content_hash) {
-    throw new Error(
-      'communityProfile.deriveExternalCommunityProfileVersion: hash.content_hash required',
-    );
-  }
-  return `${profile.generator_version}@${hash.content_hash.slice(0, 16)}`;
+  return null;
 }

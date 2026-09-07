@@ -32,10 +32,10 @@ import {
   COMMUNITY_PROFILE_GENERATOR_VERSION,
   buildCanonicalCommunityProfileVersion,
   createInMemoryCommunityProfileRepository,
-  deriveExternalCommunityProfileVersion,
   findCanonicalByIdentity,
   seedCommunityProfiles,
 } from './community/index.mjs';
+import { deriveExternalCommunityProfileVersion } from './community/version.mjs';
 
 // ClickUp 16.2 P1.v2 (2026-09-07 ChatGPT review): the
 // /v1/ecosystem/discussions route is server-authoritative — it takes
@@ -90,8 +90,9 @@ import {
 // pass-through to the SAME canonical formatter
 // (`buildCanonicalCommunityProfileVersion`), so any future caller in
 // this module can import either side and get a byte-identical
-// result. We no longer import `deriveExternalCommunityProfileVersion`
-// here because the route + bootstrap paths read `community_profile_*`
+// result. We import `deriveExternalCommunityProfileVersion` here
+// directly from `./community/version.mjs` (the single source of
+// truth) so the route + bootstrap paths can read `community_profile_*`
 // via `resolveCommunityProfileVersion`, which already wraps the
 // canonical formatter.
 import {

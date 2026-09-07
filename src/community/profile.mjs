@@ -23,7 +23,8 @@
 // shape `<generator_version>-<content_hash_short>` (first 8 hex chars
 // of the profile's `hash.content_hash`). The internal schema keeps
 // `generator_version` as the raw rule-version string; the external
-// derivation lives next to it (`deriveExternalCommunityProfileVersion`)
+// derivation lives in `src/community/version.mjs`
+// (`deriveExternalCommunityProfileVersion`)
 // and is the ONLY string the route layer / browser treats as the
 // canonical identity. Same generator_version + different content →
 // two different external versions → two preserved rows that an
@@ -414,57 +415,6 @@ export function findCommunityProfileBoundsViolations(profile) {
     );
   }
   return violations;
-}
-
-/**
- * ClickUp 16.5 P1.v1-3 — derive the external `community_profile_version`
- * from a profile (or any object carrying `generator_version` +
- * `hash.content_hash`). The shape is the canonical
- * `<generator_version>-<content_hash_short>` where `content_hash_short`
- * is the first 8 hex chars of the `hash.content_hash`. This external
- * derivation is what the handler / browser carries in
- * `community_profile_version`; the raw `generator_version` stays in
- * the schema for diagnostic / upgrade purposes and MUST NOT be used
- * directly by the route layer.
- *
- * Two profiles with the same `generator_version` but a different
- * `hash.content_hash` (e.g. a content-curated fixture edit) yield two
- * DIFFERENT external versions, so an old-session regression that
- * pinned the old external version still resolves to its original row.
- *
- * Pure function. Throws when the inputs are malformed.
- *
- * @param {{
- *   generator_version: string,
- *   hash: { content_hash: string },
- * }} profile
- * @returns {string} `<generator_version>@<content_hash_prefix>`
- *                  where `content_hash_prefix` is the first 16 hex
- *                  chars of `profile.hash.content_hash`.
- */
-export function deriveExternalCommunityProfileVersion(profile) {
-  if (!profile || typeof profile !== 'object') {
-    throw new Error('communityProfile.deriveExternalCommunityProfileVersion: profile required');
-  }
-  if (typeof profile.generator_version !== 'string' || !profile.generator_version) {
-    throw new Error(
-      'communityProfile.deriveExternalCommunityProfileVersion: generator_version required',
-    );
-  }
-  const hash = profile.hash;
-  if (!hash || typeof hash !== 'object' || typeof hash.content_hash !== 'string' || !hash.content_hash) {
-    throw new Error(
-      'communityProfile.deriveExternalCommunityProfileVersion: hash.content_hash required',
-    );
-  }
-  // P1.v1-4 — `@` is the hard delimiter; 16 hex chars is the
-  // content_hash prefix. Together they form the canonical external
-  // version used by the route layer, the orchestrator, and every
-  // regression test. The format is symmetric with
-  // `parseExternalCommunityProfileVersion` so the orchestrator can
-  // round-trip a string back into (generator_version, hash_prefix)
-  // without touching the repo.
-  return `${profile.generator_version}@${hash.content_hash.slice(0, 16)}`;
 }
 
 /**

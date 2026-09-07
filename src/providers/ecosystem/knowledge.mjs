@@ -80,7 +80,8 @@ import {
 // `src/community/profile.mjs`; this file does NOT carry its own
 // private derivation, so any format change MUST land in community/
 // and be picked up here automatically.
-import { deriveExternalCommunityProfileVersion, parseExternalCommunityProfileVersion } from '../../community/profile.mjs';
+import { deriveExternalCommunityProfileVersion } from '../../community/version.mjs';
+import { parseExternalCommunityProfileVersion } from '../../community/profile.mjs';
 
 /**
  * Public response shape.

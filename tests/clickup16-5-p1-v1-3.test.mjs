@@ -253,12 +253,20 @@ test('deriveExternalCommunityProfileVersion: <generator_version>@<content_hash_p
   assert.notEqual(externalA, externalB);
 });
 
-test('deriveExternalCommunityProfileVersion: rejects missing inputs', () => {
-  assert.throws(() => deriveExternalCommunityProfileVersion(null));
-  assert.throws(() => deriveExternalCommunityProfileVersion({}));
-  assert.throws(() => deriveExternalCommunityProfileVersion({ generator_version: 'g' }));
-  assert.throws(
-    () => deriveExternalCommunityProfileVersion({ generator_version: 'g', hash: {} }),
+test('deriveExternalCommunityProfileVersion: soft-null on missing inputs (main-canonical v1-6)', () => {
+  // ChatGPT review 5130773278: PR #25's throw-on-bad-input
+  // semantics are not the canonical contract. The single source of
+  // truth is src/community/version.mjs (main's verified soft-null
+  // delegate), which returns null for any unprocessable input so
+  // partially-shaped rows still get a usable identity fallback
+  // (e.g. bare generator_version when hash is missing).
+  assert.equal(deriveExternalCommunityProfileVersion(null), null);
+  assert.equal(deriveExternalCommunityProfileVersion(undefined), null);
+  assert.equal(deriveExternalCommunityProfileVersion({}), null);
+  assert.equal(deriveExternalCommunityProfileVersion({ generator_version: 'g' }), 'g');
+  assert.equal(
+    deriveExternalCommunityProfileVersion({ generator_version: 'g', hash: {} }),
+    'g',
   );
 });
 
