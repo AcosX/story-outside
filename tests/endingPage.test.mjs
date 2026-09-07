@@ -215,6 +215,69 @@ async function appendEndingScreen(dom) {
       check('endingPage module exposes teardown', typeof globalThis.__ENDING_PAGE__.teardown === 'function');
     }
 
+    // ----- 1b) Knowledge wire contract: browser sends identity only -----
+    {
+      delete globalThis.__ENDING_PAGE__;
+      installEndingPageGlobals();
+      const dom = createPlayerDom({ baseUrl });
+      await appendEndingScreen(dom);
+      await globalThis.__ENDING_PAGE_LOAD__();
+
+      const bootstrap = await postJson(baseUrl, '/api/sessions', {
+        work_id: 'cafe-rain',
+        role_id: 'stranger',
+      });
+      check('knowledge wire setup: public bootstrap 200', bootstrap.status === 200);
+      check('knowledge wire setup: bootstrap has canonical profile version',
+        typeof bootstrap.body?.community_profile_version === 'string'
+        && bootstrap.body.community_profile_version.length > 0);
+
+      const harnessFetch = globalThis.fetch;
+      let knowledgeCall = null;
+      globalThis.fetch = async (url, options = {}) => {
+        const response = await harnessFetch(url, options);
+        if (String(url).includes('/v1/ecosystem/knowledge')) {
+          let requestBody = null;
+          try { requestBody = JSON.parse(String(options.body || '{}')); } catch { requestBody = null; }
+          knowledgeCall = { status: response.status, requestBody };
+        }
+        return response;
+      };
+      try {
+        await globalThis.__ENDING_PAGE__.mount({
+          sessionUuid: bootstrap.body.session_uuid,
+          sessionMeta: {
+            storyTitle: '雨夜咖啡馆',
+            roleLabel: '陌生人',
+            story_uuid: bootstrap.body.story_uuid,
+            story_version_uuid: bootstrap.body.story_version_uuid,
+            community_profile_version: bootstrap.body.community_profile_version,
+            // Deliberately inject a fake browser-side list. The wire
+            // contract must ignore it and let the server load the
+            // trusted StoryCommunityProfile.knowledge_queries[] row.
+            knowledge_queries: [{ id: 'browser-forgery', query: '不应发送', kind: 'web' }],
+          },
+        });
+      } finally {
+        globalThis.fetch = harnessFetch;
+      }
+
+      check('knowledge wire: endingPage actually calls public knowledge API', knowledgeCall !== null);
+      check('knowledge wire: server accepts endingPage request with 200', knowledgeCall?.status === 200,
+        `status=${knowledgeCall?.status}`);
+      const wireBody = knowledgeCall?.requestBody || {};
+      check('knowledge wire: request contains story_uuid', wireBody.story_uuid === bootstrap.body.story_uuid);
+      check('knowledge wire: request contains story_version_uuid',
+        wireBody.story_version_uuid === bootstrap.body.story_version_uuid);
+      check('knowledge wire: request contains canonical community_profile_version',
+        wireBody.community_profile_version === bootstrap.body.community_profile_version);
+      check('knowledge wire: request does NOT send knowledge_queries',
+        !Object.prototype.hasOwnProperty.call(wireBody, 'knowledge_queries'));
+      check('knowledge wire: request keys are identity triple + limit only',
+        JSON.stringify(Object.keys(wireBody).sort())
+          === JSON.stringify(['community_profile_version', 'limit', 'story_uuid', 'story_version_uuid']));
+    }
+
     // ----- 2) Mount renders the ending page after finish_story commit -----
     {
       // Tear down the previous harness globals before recreating.

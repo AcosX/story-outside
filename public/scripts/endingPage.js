@@ -88,14 +88,12 @@ async function fetchProjections(sessionUuid) {
 // here MUST NOT block the ending page. Returns either a normalised
 // payload, or { degraded: true } when the public surface failed.
 //
-// P1.2 fix (2026-09-07, PR #25): the body ONLY carries the canonical
-// `knowledge_queries[]` from the StoryCommunityProfile. The previous
-// implementation sent free-form `query_id` / `topic_label` so the AI
-// could pick its own subject — that let the surface stay degraded
-// forever (`missing_identifiers`) because the handler treats any
-// free-form topic as out-of-policy. We pass through the canonical
-// list verbatim so the orchestrator always has the three identifiers
-// it needs + a stable, curated topic set.
+// P1.v2 authority contract: the browser sends ONLY the canonical
+// profile pointer triple plus an optional limit. The server resolves the
+// pinned StoryCommunityProfile row and reads knowledge_queries[] from
+// that trusted row. This keeps query text server-authoritative and
+// prevents the browser from accidentally (or maliciously) overriding
+// the subject list.
 async function fetchRelatedKnowledge(sessionMeta) {
   if (!sessionMeta || typeof sessionMeta !== 'object') {
     return { degraded: true, reason: 'no_session_meta', knowledge: [] };
@@ -108,22 +106,6 @@ async function fetchRelatedKnowledge(sessionMeta) {
     // knowledge extension. The Knowledge surface is provisional.
     return { degraded: true, reason: 'missing_identifiers', knowledge: [] };
   }
-  // The browser is contractually a courier: it forwards the canonical
-  // knowledge_queries[] that /api/sessions already echoed. When the
-  // list is missing the handler returns 400 — we surface that as a
-  // degraded state with a stable reason so the UI can render the
-  // "知识延伸暂未启用" hint instead of pretending the topic was
-  // hand-picked.
-  const knowledge_queries = Array.isArray(sessionMeta.knowledge_queries)
-    ? sessionMeta.knowledge_queries.filter((q) => q
-      && typeof q === 'object'
-      && typeof q.query === 'string'
-      && q.query.length > 0
-      && typeof q.kind === 'string')
-    : [];
-  if (knowledge_queries.length === 0) {
-    return { degraded: true, reason: 'no_knowledge_queries', knowledge: [] };
-  }
   try {
     const res = await fetch('/v1/ecosystem/knowledge', {
       method: 'POST',
@@ -132,7 +114,6 @@ async function fetchRelatedKnowledge(sessionMeta) {
         story_uuid,
         story_version_uuid,
         community_profile_version,
-        knowledge_queries,
         limit: 4,
       }),
     });
@@ -146,7 +127,7 @@ async function fetchRelatedKnowledge(sessionMeta) {
       provisional: data.provisional === true,
       disclaimer: data.disclaimer || null,
       knowledge: Array.isArray(data.knowledge) ? data.knowledge : [],
-      knowledge_queries: Array.isArray(data.knowledge_queries) ? data.knowledge_queries : knowledge_queries,
+      knowledge_queries: Array.isArray(data.knowledge_queries) ? data.knowledge_queries : [],
       results: Array.isArray(data.results) ? data.results : [],
     };
   } catch (err) {
