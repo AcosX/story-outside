@@ -54,7 +54,7 @@ const state = {
   cacheUuid: null,
   generationProfile: null,
   // ClickUp 16.2 P1.v2 (2026-09-07): canonical community-profile
-  // identity returned by /api/sessions. Forwarded verbatim to
+  // pointer returned by /api/sessions. Forwarded verbatim to
   // /v1/ecosystem/discussions; the handler resolves the canonical
   // profile server-side from these three values.
   communityProfileVersion: null,
@@ -305,7 +305,7 @@ async function bootstrapSession({ story, role }) {
     state.storyUuid = created.story_uuid || null;
     state.storyVersionUuid = created.story_version_uuid || null;
     // ClickUp 16.2 P1.v2 (2026-09-07): forward the canonical
-    // community-profile identity into state so mountEndingPage can
+    // community-profile pointer into state so mountEndingPage can
     // hand it to /v1/ecosystem/discussions verbatim.
     state.communityProfileVersion = typeof created.community_profile_version === 'string'
       ? created.community_profile_version
@@ -389,7 +389,7 @@ function persistSessionContext() {
       // present (the #22 share-target helper writes meta.storyTitle /
       // meta.roleLabel explicitly); fall back to state-derived
       // values from the new session bootstrap. Also forward the
-      // canonical community-profile identity triple from main so the
+      // canonical community-profile pointer triple from main so the
       // deep link can submit /v1/ecosystem/discussions without a
       // fresh bootstrap.
       storyTitle: (meta && meta.storyTitle) || (state.story ? state.story.title : ''),
@@ -441,7 +441,7 @@ async function recoverAndStart() {
     state.lastRevision = recovered.revision || 0;
     state.openingCursor = recovered.opening_cursor || 0;
     // ClickUp 16.2 P1.v2 (2026-09-07): refresh the canonical
-    // community-profile identity on /recover so a page reload still
+    // community-profile pointer on /recover so a page reload still
     // has it. If the server response does not carry one (older
     // versions), leave the previous value as-is.
     if (typeof recovered.community_profile_version === 'string') {
@@ -950,7 +950,7 @@ async function mountEndingPage(sessionMetaOverride) {
         roleLabel: state.role ? state.role.label : '',
       };
       // ClickUp 16.2 P1.v2 (2026-09-07): forward the canonical
-      // community-profile identity into sessionMeta so the ending
+      // community-profile pointer into sessionMeta so the ending
       // page can submit /v1/ecosystem/discussions without an extra
       // /recover round-trip. The handler is server-authoritative,
       // so endingPage just echoes these strings back to the API.

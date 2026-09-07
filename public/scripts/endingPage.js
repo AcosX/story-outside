@@ -415,7 +415,7 @@ function updateReplayView() {
 }
 
 // ClickUp 16.2 P1.v2 (2026-09-07): fetch ecosystem discussions with
-// the **server-authoritative identity triple** — we send ONLY
+// the **server-authoritative pointer triple** — we send ONLY
 // story_uuid / story_version_uuid / community_profile_version. The
 // server resolves the canonical StoryCommunityProfile (with its
 // canonical `profile.queries[]`) and runs them through the upstream
@@ -495,7 +495,7 @@ async function mount({ sessionUuid, sessionMeta } = {}) {
   STATE.replay = projections.replay && !projections.replay.error ? projections.replay : null;
   STATE.replayIndex = 0;
   // ClickUp 16.2 P1.v2 (2026-09-07): also fetch ecosystem
-  // discussions using the server-authoritative identity triple from
+  // discussions using the server-authoritative pointer triple from
   // sessionMeta. Failures are surfaced on STATE.ecosystemError so the
   // render layer can show them; we never throw out of mount().
   const ecosystem = await fetchEcosystemDiscussions(sessionMeta || {});
