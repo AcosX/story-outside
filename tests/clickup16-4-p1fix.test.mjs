@@ -497,11 +497,39 @@ async function runAllChecks() {
     assert.match(serverSrc, /relevant_to_story/);
   });
   await check('src/server.mjs: route uses PUBLIC_DECORATE (no DEV_FLAG leak)', () => {
-    // The /v1/ecosystem/hot handler must spread PUBLIC_DECORATE.
-    const routeBlock = serverSrc.match(/pathname === '\/v1\/ecosystem\/hot'[\s\S]+?Root → static/);
-    assert.ok(routeBlock);
+    // The /v1/ecosystem/hot handler must spread PUBLIC_DECORATE and
+    // must NOT leak DEV_FLAG. P1.v1-6 (2026-09-07): bound the slice
+    // to just the hot route handler (via brace-depth matching from
+    // the `pathname === '/v1/ecosystem/hot'` anchor), because main
+    // merged in /v1/ecosystem/discussions between the hot route and
+    // the original end-anchor `Root → static`, and that
+    // discussions-route comment block legitimately mentions
+    // `DEV_FLAG` to assert it is NOT leaked.
+    const startMatch = serverSrc.match(/pathname === '\/v1\/ecosystem\/hot'/);
+    assert.ok(startMatch, 'hot route block start anchor not found');
+    const startIdx = startMatch.index;
+    // Walk brace depth to find the matching close of the
+    // `if (method === 'GET' && pathname === '/v1/ecosystem/hot') { ... }`.
+    let depth = 0;
+    let endIdx = -1;
+    for (let i = startIdx; i < serverSrc.length; i += 1) {
+      const ch = serverSrc[i];
+      if (ch === '{') depth += 1;
+      else if (ch === '}') {
+        depth -= 1;
+        if (depth === 0) {
+          endIdx = i + 1;
+          break;
+        }
+      }
+    }
+    assert.ok(endIdx > startIdx, 'hot route block end not located');
+    const routeBlock = [serverSrc.slice(startIdx, endIdx)];
     assert.match(routeBlock[0], /PUBLIC_DECORATE\(\)/);
-    assert.ok(!/DEV_FLAG/.test(routeBlock[0]));
+    assert.ok(
+      !/DEV_FLAG/.test(routeBlock[0]),
+      'hot route must not reference DEV_FLAG in code',
+    );
   });
 
   // ----- I. hot.mjs uses the profile fields ---------------------------------------

@@ -94,13 +94,16 @@ import {
   filterMockHotByCategory,
   KNOWN_CATEGORIES as MOCK_KNOWN_CATEGORIES,
 } from './mockZhihuHotSource.mjs';
-// P1.v1-4 (2026-09-07): import the SINGLE community-layer helper that
+// P1.v1-6 (2026-09-07): import the SINGLE community-layer helper that
 // knows the wire format. We do NOT re-implement the format locally —
-// the helper is the source of truth. `computeProfileContentHash` is
-// exported by the same module so test suites that need to probe the
-// hash (e.g. for invariant checks) can also pull it from the same
-// community-layer entry point.
-import { deriveExternalCommunityProfileVersion, computeProfileContentHash } from '../../community/version.mjs';
+// the helper is the source of truth. The previous v1-5 surface
+// (`computeProfileContentHash`) was deleted: the canonical content
+// hash now lives on the profile row (`profile.hash.content_hash`,
+// stamped by `buildCommunityProfileFromSeed` and exposed via
+// `buildCanonicalCommunityProfileVersion` in
+// `src/community/repository.mjs`). The helper here is a thin
+// pass-through that reads `profile.hash.content_hash` AS-IS.
+import { deriveExternalCommunityProfileVersion } from '../../community/version.mjs';
 // P1.v1-4 (2026-09-07): the canonical-row read is now a SECONDARY
 // fallback used only to surface a useful `expected_version` when the
 // direct external-version lookup misses. The PRIMARY read goes
@@ -327,11 +330,14 @@ export function resolveProfileMatchTerms({ profileRepository, story_version_uuid
   } catch {
     result.externalVersion = null;
   }
-  try {
-    result.contentHash = computeProfileContentHash(profile);
-  } catch {
-    result.contentHash = null;
-  }
+  // P1.v1-6 (2026-09-07): the canonical content hash now lives on
+  // the profile row (`profile.hash.content_hash`) and is read AS-IS.
+  // The hot orchestrator no longer recomputes it; route-layer
+  // diagnostics that need the hash must read it from the profile
+  // directly.
+  result.contentHash = (profile && profile.hash && typeof profile.hash.content_hash === 'string')
+    ? profile.hash.content_hash
+    : null;
   if (Array.isArray(profile.hot_keywords)) {
     for (const k of profile.hot_keywords) {
       if (k && typeof k.keyword === 'string' && k.keyword) {

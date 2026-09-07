@@ -1,44 +1,45 @@
 // src/community/version.mjs — community-layer PUBLIC helper for the
 // EXTERNAL `community_profile_version` string used on the wire
-// contract (ClickUp 16.4 P1.v1-5, 2026-09-07).
+// contract (ClickUp 16.4 P1.v1-6, 2026-09-07).
 //
-// Hard contract:
+// Hard contract (P1.v1-6):
 //   * This module is the SINGLE place that knows the external-version
 //     wire format. Other modules (hot.mjs, server.mjs, tests) MUST
 //     import `deriveExternalCommunityProfileVersion` from here, NOT
 //     re-implement the format locally.
-//   * The internal `generator_version` field on the profile row is
-//     preserved (v1 schema, 13 top-level keys). Only the EXTERNAL
-//     identity string used on the HTTP boundary is content-aware.
 //   * The wire format is:
-//         `${generator_version}@${content_hash.slice(0, EXTERNAL_HASH_LENGTH)}`
+//         `${generator_version}@${profile.hash.content_hash.slice(0, EXTERNAL_HASH_LENGTH)}`
 //     where EXTERNAL_HASH_LENGTH = 16 hex chars (~64 bits of entropy).
 //     The `@` separator distinguishes the external identity from the
 //     internal `generator_version` string AND prevents accidental
 //     confusion with v1-3-era records that used `-` + 12 hex chars.
-//   * The hash is computed via `computeProfileContentHash`, which is
-//     content-only AND story-scoped. As of P1.v1-5 (2026-09-07) the
-//     hash input INCLUDES `story_uuid` + `story_version_uuid` so
-//     two profiles with IDENTICAL community content but bound to
-//     DIFFERENT story_versions produce DIFFERENT external versions.
-//     The hash STILL EXCLUDES `generator_version`, `generated_at`,
-//     `profile_uuid`, `hash`, `story_version_checksum` — those are
-//     metadata, not content.
-//   * Two profiles with the SAME `generator_version` but DIFFERENT
-//     content (regenerated hot_keywords / topics) yield DIFFERENT
-//     external versions, so a stale caller is rejected with 400
-//     `community_profile_version_mismatch` instead of silently
-//     observing stale relevance projections.
-//   * Two profiles bound to DIFFERENT story_versions with the SAME
-//     community content ALSO yield DIFFERENT external versions,
-//     preventing the cross-story collision that v1-4's content-only
-//     hash allowed (a swapped-uuid caller could otherwise observe a
-//     match against a row bound to a different story_version).
+//   * The helper reads `profile.hash.content_hash` AS-IS. It does NOT
+//     recompute the hash; the canonical hash is owned by
+//     `src/community/profile.mjs` (buildCommunityProfileFromSeed stamps
+//     it during fixture/seeding) and re-exposed by
+//     `buildCanonicalCommunityProfileVersion` from
+//     `src/community/repository.mjs`. The previous v1-5 implementation
+//     re-hashed content via the in-module content-hash function
+//     (since deleted), which ChatGPT
+//     review (2026-09-07 09:19) flagged as a second source of truth:
+//     the seeded cafe-rain row then yielded
+//     `1.0.0@e2faabf0b55c9794` instead of the main-canonical
+//     `1.0.0@f134b0e086e021ce`. v1-6 deletes the rehash and routes the
+//     helper through the canonical hash that main ships.
+//   * Same `story_version_uuid` + same `generator_version` + same
+//     canonical content_hash → same external version (idempotent).
+//   * Different `generator_version` (ruleset bump) → different external
+//     version (existing v1-2 mismatch path keeps firing).
+//   * Different `story_version_uuid` (story version bump) → the
+//     canonical hash already incorporates the new `story_uuid` /
+//     `story_version_uuid` / `story_version_checksum`, so the
+//     external version naturally diverges (P1.v1-5 cross-story
+//     collision fix is preserved end-to-end).
 //
 // This module does NOT read env vars that look like credentials and
 // does NOT call any external API.
 
-import { canonicalSha256 } from '../stories/canonicalHash.mjs';
+import { buildCanonicalCommunityProfileVersion } from './repository.mjs';
 
 /**
  * Length of the short content-hash suffix used in the EXTERNAL
@@ -50,86 +51,44 @@ import { canonicalSha256 } from '../stories/canonicalHash.mjs';
 export const EXTERNAL_HASH_LENGTH = 16;
 
 /**
- * Compute a deterministic, content-and-story-scoped SHA-256 over the
- * user-editable fields of a community profile. The hash intentionally
- * EXCLUDES `generator_version`, `generated_at`, `profile_uuid`,
- * `hash`, `story_version_checksum` — those are metadata, not content.
- *
- * P1.v1-5 (2026-09-07): the hash now INCLUDES `story_uuid` and
- * `story_version_uuid`. Two regenerations of the SAME community
- * content (same topics / queries / knowledge queries / hot_keywords)
- * bound to the SAME story_version still yield the same hash even if
- * the import path minted a fresh profile_uuid or bumped the
- * timestamp. But two profiles with the SAME community content bound
- * to DIFFERENT story_versions now yield DIFFERENT hashes — this is
- * the "did the story_version actually change" check that prevents the
- * cross-story collision v1-4 allowed. The hot-relevance matcher uses
- * the resulting external version as the wire identity string; if
- * two rows (different `story_version_uuid`) shared an external
- * version, a swapped-uuid caller could observe the wrong relevance
- * projection. Including `story_uuid` + `story_version_uuid` in the
- * hash closes that hole without changing the wire format.
- *
- * @param {object} profile
- * @returns {string}  64-char hex SHA-256.
- */
-export function computeProfileContentHash(profile) {
-  if (!profile || typeof profile !== 'object') {
-    throw new Error('communityVersion.computeProfileContentHash: profile required');
-  }
-  const payload = {
-    story_uuid: typeof profile.story_uuid === 'string' ? profile.story_uuid : '',
-    story_version_uuid: typeof profile.story_version_uuid === 'string' ? profile.story_version_uuid : '',
-    generator_version: typeof profile.generator_version === 'string' ? profile.generator_version : '',
-    topics: Array.isArray(profile.topics) ? profile.topics : [],
-    queries: Array.isArray(profile.queries) ? profile.queries : [],
-    knowledge_queries: Array.isArray(profile.knowledge_queries) ? profile.knowledge_queries : [],
-    hot_keywords: Array.isArray(profile.hot_keywords) ? profile.hot_keywords : [],
-    themes: Array.isArray(profile.themes) ? profile.themes : [],
-  };
-  return canonicalSha256(payload);
-}
-
-/**
  * Derive the EXTERNAL `community_profile_version` string used on
  * the wire contract from a canonical profile row.
  *
- * Wire format (P1.v1-5, 2026-09-07):
- *
- *     `${generator_version}@${content_hash.slice(0, 16)}`
- *
- * Same `story_version_uuid` + same `generator_version` + same content
- *   → same external version (deterministic, idempotent across
- *   regenerations of the same row).
- * Same `story_version_uuid` + same `generator_version` + different
- *   content → different external version (two-generation regression
- *   catches the mismatch).
- * Same `generator_version` + same content but DIFFERENT
- *   `story_version_uuid` → DIFFERENT external version (P1.v1-5
- *   cross-story collision fix; v1-4's content-only hash would have
- *   returned the same external version here, which the
- *   `byExternalVersion` Map then collapsed into a single row).
- * Different `generator_version` (ruleset bump) → different external
- *   version (existing v1-2 mismatch path keeps firing).
- *
- * The internal `generator_version` field on the profile row is
- * preserved as-is (v1 schema, 13 top-level keys, NOT renamed). Only
- * the EXTERNAL identity string is content-aware AND story-scoped.
+ * This is a thin pass-through to main's canonical helper
+ * (`buildCanonicalCommunityProfileVersion`) so the v1-5 external API
+ * keeps working without a rehash. The helper:
+ *   * requires `profile.hash.content_hash` to be present (the row
+ *     must have been minted through `buildCommunityProfileFromSeed`
+ *     or `buildStubCommunityProfile`, both of which stamp the hash);
+ *   * returns `${generator_version}@${hash.content_hash.slice(0, 16)}`;
+ *   * returns `null` when the canonical hash is missing (the
+ *     repository helper's contract) — callers MUST handle the
+ *     `null` case explicitly (the previous v1-5 implementation
+ *     threw a generic `Error`; v1-6 keeps the soft-fail so a
+ *     partially-shaped row still gets a usable identity fallback
+ *     inside the hot orchestrator).
  *
  * @param {object} profile
- * @returns {string}
+ * @returns {string|null}
  */
 export function deriveExternalCommunityProfileVersion(profile) {
   if (!profile || typeof profile !== 'object') {
-    throw new Error('communityVersion.deriveExternalCommunityProfileVersion: profile required');
+    return null;
   }
-  const generatorVersion = typeof profile.generator_version === 'string' && profile.generator_version
-    ? profile.generator_version
-    : '';
-  if (!generatorVersion) {
-    throw new Error('communityVersion.deriveExternalCommunityProfileVersion: profile.generator_version required');
+  // Read directly from the row (per P1.v1-6). Pass-through to the
+  // canonical helper so the format / length / null-handling stay
+  // owned by one module (`repository.mjs`).
+  const canonical = buildCanonicalCommunityProfileVersion(profile);
+  if (canonical) return canonical;
+  // Defensive fallback: if the canonical helper returned `null`
+  // (e.g. a partially-shaped row missing `hash.content_hash`),
+  // surface the bare `generator_version` so the route layer can
+  // still emit SOMETHING rather than crashing. This matches the
+  // v1-5 fallback `typeof profile.generator_version === 'string'
+  // && profile.generator_version ? profile.generator_version : ''`
+  // semantically.
+  if (typeof profile.generator_version === 'string' && profile.generator_version) {
+    return profile.generator_version;
   }
-  const contentHash = computeProfileContentHash(profile);
-  const shortHash = contentHash.slice(0, EXTERNAL_HASH_LENGTH);
-  return `${generatorVersion}@${shortHash}`;
+  return null;
 }

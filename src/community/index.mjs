@@ -44,7 +44,6 @@ export {
 
 export {
   EXTERNAL_HASH_LENGTH,
-  computeProfileContentHash,
   deriveExternalCommunityProfileVersion,
 } from './version.mjs';
 

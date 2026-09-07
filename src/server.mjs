@@ -34,7 +34,6 @@ import {
   createInMemoryCommunityProfileRepository,
   seedCommunityProfiles,
 } from './community/index.mjs';
-import { getCommunityProfile } from './community/service.mjs';
 
 // ClickUp 16.2 P1.v2 (2026-09-07 ChatGPT review): the
 // /v1/ecosystem/discussions route is server-authoritative — it takes
@@ -79,10 +78,18 @@ import {
   attachRelevance,
   createEcosystemHotOrchestrator,
 } from './providers/ecosystem/hot.mjs';
-// P1.v1-4 (2026-09-07): the EXTERNAL `community_profile_version`
-// derivation now lives in the community layer. Import from there so
-// there is exactly one source of truth for the wire format.
-import { deriveExternalCommunityProfileVersion } from './community/version.mjs';
+// P1.v1-6 (2026-09-07): the bootstrap response now uses the
+// main-canonical `resolveCommunityProfileVersion` helper (defined
+// below in this module, returns
+// `{ community_profile_version, community_profile_queries }`). The
+// community-layer `deriveExternalCommunityProfileVersion` is a thin
+// pass-through to the SAME canonical formatter
+// (`buildCanonicalCommunityProfileVersion`), so any future caller in
+// this module can import either side and get a byte-identical
+// result. We no longer import `deriveExternalCommunityProfileVersion`
+// here because the route + bootstrap paths read `community_profile_*`
+// via `resolveCommunityProfileVersion`, which already wraps the
+// canonical formatter.
 import {
   createStoriesHookContext,
   onSessionCreate,
@@ -1643,58 +1650,14 @@ async function handleRequest(req, res) {
   // ---------------------------------------------------------------------
   const PUBLIC_DECORATE = () => ({ demo: currentDemoFlag() });
 
-  /**
-   * ClickUp 16.4 P1.v1-2 + P1.v1-3 + P1.v1-4 fix (2026-09-07): look up the
-   * canonical community_profile_version for a story_version_uuid by
-   * reading the same community-profile repo the /v1/ecosystem/hot
-   * orchestrator reads. When the row is missing we fall back to the
-   * process-wide `COMMUNITY_PROFILE_GENERATOR_VERSION.rules_version`
-   * (the v1 schema string `'community-profile-rules/1'`) so the
-   * bootstrap response always carries a valid triple for the browser.
-   *
-   * P1.v1-3 makes the returned string CONTENT-AWARE: the value is the
-   * EXTERNAL identity derived via `deriveExternalCommunityProfileVersion`.
-   *
-   * P1.v1-4 (2026-09-07): the wire format is now
-   *     `${generator_version}@${content_hash.slice(0, 16)}`
-   * (the `@` separator replaces the v1-3-era `-` to distinguish the
-   * external identity from the internal `generator_version` string,
-   * and the hash suffix is 16 hex chars). The helper lives in the
-   * community layer (`src/community/version.mjs`) and is the SINGLE
-   * source of truth. The internal `generator_version` field on the
-   * profile row is preserved as the ruleset version; only the
-   * external identity string used on the wire contract (and echoed
-   * on the bootstrap response) gains the content-hash suffix. Two
-   * regenerations of the same ruleset with different content
-   * therefore surface distinct external versions and stale callers
-   * are rejected with 400 mismatch instead of silently observing
-   * stale relevance projections.
-   *
-   * @param {object} input
-   * @param {object} input.profileRepository
-   * @param {string} input.story_version_uuid
-   * @returns {string}
-   */
-  function resolveCanonicalCommunityProfileVersion({ profileRepository, story_version_uuid }) {
-    const fallback = COMMUNITY_PROFILE_GENERATOR_VERSION.rules_version;
-    if (!profileRepository || typeof story_version_uuid !== 'string' || !story_version_uuid) {
-      return fallback;
-    }
-    let profile;
-    try {
-      profile = getCommunityProfile({ profileRepository, story_version_uuid });
-    } catch {
-      profile = null;
-    }
-    if (!profile) return fallback;
-    try {
-      return deriveExternalCommunityProfileVersion(profile);
-    } catch {
-      return typeof profile.generator_version === 'string' && profile.generator_version
-        ? profile.generator_version
-        : fallback;
-    }
-  }
+  // P1.v1-6 (2026-09-07): the HEAD v1-5 implementation
+  // `resolveCanonicalCommunityProfileVersion` was deleted in favour
+  // of the main-canonical `resolveCommunityProfileVersion` (line
+  // 505). The main helper reads `profile.hash.content_hash` directly
+  // from the row stamped by `buildCommunityProfileFromSeed` and
+  // exposes the canonical `community_profile_queries` alongside.
+  // Bootstrap responses now reuse this helper so the wire identity
+  // and the bootstrap identity are byte-identical.
 
   // POST /api/sessions — atomic session bootstrap from a story + role.
   if (method === 'POST' && pathname === '/api/sessions') {
@@ -1813,17 +1776,16 @@ async function handleRequest(req, res) {
         opening_cursor: result.session.opening_cursor,
         cache_reused: result.cache_reused,
         version_reused: result.version_reused,
-        // ClickUp 16.4 P1.v1-2 fix (2026-09-07): surface the canonical
-        // community_profile_version on the bootstrap response so the
-        // browser can publish the identity triple WITHOUT a second
-        // round-trip. The value comes from the same source the
-        // /v1/ecosystem/hot orchestrator reads (the canonical profile
-        // row's generator_version), so a mismatch is impossible unless
-        // the row was regenerated between calls.
-        community_profile_version: resolveCanonicalCommunityProfileVersion({
-          profileRepository: communityProfileRepo,
-          story_version_uuid: result.story_version_uuid,
-        }),
+        // ClickUp 16.4 P1.v1-6 fix (2026-09-07): surface the canonical
+        // community_profile_version + the canonical profile queries
+        // on the bootstrap response so the browser can publish the
+        // identity triple WITHOUT a second round-trip. The version
+        // string is computed via the SAME community-layer helper
+        // (`deriveExternalCommunityProfileVersion`, which is a thin
+        // pass-through to `buildCanonicalCommunityProfileVersion`)
+        // that the /v1/ecosystem/hot orchestrator reads, so a
+        // mismatch between the bootstrap response and the orchestrator
+        // is impossible unless the row was regenerated between calls.
         community_profile_version: cv.community_profile_version,
         community_profile_queries: cv.community_profile_queries,
         pinned,
