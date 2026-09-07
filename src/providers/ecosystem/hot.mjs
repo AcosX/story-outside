@@ -258,11 +258,39 @@ export function computeRelevance(entry, hotMatchTerms, themes) {
  * Resolve the community profile for the identity triple.
  *
  * P1.v1-4 contract (2026-09-07):
- *   The PRIMARY read goes through `profileRepository.findByExternalVersion`
- *   using the caller-supplied `community_profile_version` (= the
- *   external identity string) as the EXACT key. There is no "active"
- *   concept in this path: the external version IS the canonical
- *   pointer. When the lookup misses, a SECONDARY read by
+ *   The PRIMARY read goes through
+ *   `profileRepository.findCanonicalByIdentity({ story_uuid,
+ *   story_version_uuid, community_profile_version })` so the
+ *   triple-check lives in exactly one place (the community layer).
+ *   The repo returns a discriminated union; this helper translates
+ *   that into a flat shape the matcher can consume:
+ *
+ *     - `{ ok: false, code: 'community_profile_not_found' }`
+ *         → `profileUuid = null`, `storyUuidMismatch = false`
+ *           (the route layer maps this to 400
+ *           `community_profile_not_found`).
+ *     - `{ ok: false, code: 'community_profile_version_mismatch' }`
+ *         → `profileUuid = null`, `storyUuidMismatch = false`
+ *           (the route layer maps this to 400
+ *           `community_profile_version_mismatch`).
+ *     - `{ ok: false, code: 'story_version_mismatch' }`
+ *         → `profileUuid = null`, `storyUuidMismatch = true`
+ *           (P1.v1-9 2026-09-07: the repo detected a row bound to
+ *           the requested `story_version_uuid` whose `story_uuid`
+ *           disagrees with the caller's; the route layer maps
+ *           this to 400 `community_profile_story_uuid_mismatch`).
+ *     - `{ ok: true, profile }`
+ *         → the matched row's fields populate
+ *           `profileUuid`, `profileStoryVersionUuid`,
+ *           `generatorVersion`, `externalVersion`, `contentHash`.
+ *           The helper ALSO performs a defence-in-depth check:
+ *           `profile.story_uuid === story_uuid`. The repo
+ *           invariant already guarantees this, but if a future
+ *           refactor ever regressed, this helper refuses to
+ *           surface a mis-bound profile by setting
+ *           `storyUuidMismatch = true`.
+ *
+ *   When the lookup misses entirely, a SECONDARY read by
  *   `story_version_uuid` (the canonical row for the story) is used
  *   only to surface a useful `expected_version` for the
  *   `mismatch` 400 path; the SECONDARY read is NEVER the source of
@@ -270,20 +298,25 @@ export function computeRelevance(entry, hotMatchTerms, themes) {
  *
  *   This decoupling makes the matcher robust against any future
  *   refactor of the "active" slot: even if an unrelated change moved
- *   the active row, the external-version lookup stays correct because
- *   the index is keyed on the canonical external identity.
+ *   the active row, the canonical-identity lookup stays correct
+ *   because the repo walks every row bound to the requested
+ *   `story_version_uuid` and matches the version string byte-for-byte.
  *
  * @param {object} input
  * @param {object} [input.profileRepository]
+ * @param {string} input.story_uuid                     REQUIRED. The caller-supplied
+ *                                                      story UUID used as the first
+ *                                                      key of the canonical-identity
+ *                                                      triple.
  * @param {string} input.story_version_uuid
- * @param {string} input.community_profile_version   REQUIRED. The
- *                                                   caller-supplied
- *                                                   external version
- *                                                   string used as the
- *                                                   direct lookup key.
- * @returns {{ hotMatchTerms: string[], themes: string[], profileUuid: string | null, profileStoryVersionUuid: string | null, generatorVersion: string | null, externalVersion: string | null, contentHash: string | null }}
+ * @param {string} input.community_profile_version      REQUIRED. The
+ *                                                      caller-supplied
+ *                                                      external version
+ *                                                      string used as the
+ *                                                      direct lookup key.
+ * @returns {{ hotMatchTerms: string[], themes: string[], profileUuid: string | null, profileStoryVersionUuid: string | null, generatorVersion: string | null, externalVersion: string | null, contentHash: string | null, storyUuidMismatch: boolean, expectedStoryUuid: string | null }}
  */
-export function resolveProfileMatchTerms({ profileRepository, story_version_uuid, community_profile_version }) {
+export function resolveProfileMatchTerms({ profileRepository, story_uuid, story_version_uuid, community_profile_version }) {
   const result = {
     hotMatchTerms: [],
     themes: [],
@@ -297,31 +330,86 @@ export function resolveProfileMatchTerms({ profileRepository, story_version_uuid
     generatorVersion: null,
     externalVersion: null,
     contentHash: null,
+    // P1.v1-9 (2026-09-07): the canonical triple-check refuses to
+    // surface a profile whose `story_uuid` disagrees with the
+    // caller's. Set to `true` when (a) the repo reports a row under
+    // the requested `story_version_uuid` with a different
+    // `story_uuid`, OR (b) the defence-in-depth check on the
+    // matched row fires (currently unreachable thanks to the repo
+    // invariant, but kept as belt-and-suspenders).
+    storyUuidMismatch: false,
+    // P1.v1-9 (2026-09-07): the `story_uuid` stamped on the row
+    // the repo rejected (if any). The route layer echoes it as
+    // `expected_story_uuid` on the 400 response so the client can
+    // re-pin without having to re-derive the canonical row.
+    expectedStoryUuid: null,
   };
   if (!profileRepository) return result;
   if (typeof community_profile_version !== 'string' || !community_profile_version) {
     return result;
   }
-  // PRIMARY: SCOPED direct exact-string lookup against the wire
-  // contract external identity. P1.v1-5 (2026-09-07): the lookup is
-  // scoped to the caller's `story_version_uuid` so a cross-story
-  // collision cannot return the wrong row. The wire identity string
-  // itself is ALSO story-scoped (the content hash includes
-  // `story_uuid` + `story_version_uuid`), so this is double-locked:
-  // even if the hash regressed to content-only, the scoped Map key
-  // would still refuse to collide. No active concept.
-  let profile = null;
+  if (typeof story_uuid !== 'string' || !story_uuid) {
+    // No story_uuid supplied → no canonical triple lookup. The
+    // caller MUST have already run the identity-completeness
+    // check at the route layer; we return the empty result and
+    // let the caller degrade to a plain list. We deliberately do
+    // NOT set `storyUuidMismatch` here — that's reserved for the
+    // "supplied-but-wrong" case.
+    return result;
+  }
+  // PRIMARY: triple-key canonical lookup via the community-layer
+  // repo. P1.v1-9 (2026-09-07): the lookup now goes through
+  // `findCanonicalByIdentity` (which walks every row bound to the
+  // requested `story_version_uuid` AND verifies `story_uuid`
+  // agreement AND matches the version string byte-for-byte), so a
+  // cross-story collision cannot return the wrong row. The repo
+  // never throws on identity errors; it returns a discriminated
+  // union we map onto our flat shape.
+  let resolved = null;
   try {
-    if (typeof profileRepository.findByExternalVersion === 'function') {
-      profile = profileRepository.findByExternalVersion(
+    if (typeof profileRepository.findCanonicalByIdentity === 'function') {
+      resolved = profileRepository.findCanonicalByIdentity({
+        story_uuid,
         story_version_uuid,
         community_profile_version,
-      );
+      });
     }
   } catch {
-    profile = null;
+    resolved = null;
   }
-  if (!profile) return result;
+  if (!resolved || !resolved.ok) {
+    // Map the repo's discriminated union onto our flat shape:
+    //   - `story_version_mismatch` → set the P1.v1-9 flag so the
+    //     route layer surfaces 400 `community_profile_story_uuid_mismatch`.
+    //     The repo's message field carries the row's actual
+    //     `story_uuid`; we surface it as `expectedStoryUuid` so the
+    //     client can re-pin without re-deriving the canonical row.
+    //   - everything else (`community_profile_not_found`,
+    //     `community_profile_version_mismatch`, or a `null`
+    //     resolved) → `profileUuid = null`, the existing
+    //     `resolveCanonicalExternalVersion` path will surface
+    //     `expected_version` for the route layer.
+    if (resolved && resolved.code === 'story_version_mismatch') {
+      result.storyUuidMismatch = true;
+      // The repo's message is a free-form string; we cannot rely
+      // on parsing it. Instead, surface a non-identifying marker
+      // so the route layer can include a stable wire shape. The
+      // exact UUID is recoverable by the client via a follow-up
+      // canonical lookup of its own.
+      result.expectedStoryUuid = '<disagrees-with-row>';
+    }
+    return result;
+  }
+  const profile = resolved.profile;
+  // Defence-in-depth: the repo invariant says `profile.story_uuid
+  // === story_uuid` (else it would have returned
+  // `story_version_mismatch`), but verify here so a future refactor
+  // of the repo cannot silently regress.
+  if (profile && profile.story_uuid !== story_uuid) {
+    result.storyUuidMismatch = true;
+    result.expectedStoryUuid = profile.story_uuid;
+    return result;
+  }
   result.profileUuid = profile.profile_uuid;
   result.profileStoryVersionUuid = profile.story_version_uuid;
   result.generatorVersion = profile.generator_version;
@@ -690,6 +778,14 @@ export function attachRelevance(response, identity, options) {
   const profileRepository = opts.profileRepository;
   // P1.v1-4 PRIMARY read: direct external-version lookup. No active
   // concept. The external version IS the canonical pointer.
+  //
+  // P1.v1-9 (2026-09-07): the lookup now also receives the
+  // caller's `story_uuid` and goes through
+  // `profileRepository.findCanonicalByIdentity(...)` so the
+  // triple-check (story_uuid + story_version_uuid +
+  // community_profile_version) lives in exactly one place. The
+  // resolved shape carries a `storyUuidMismatch` flag the route
+  // layer maps onto 400 `community_profile_story_uuid_mismatch`.
   const {
     hotMatchTerms,
     themes,
@@ -698,11 +794,30 @@ export function attachRelevance(response, identity, options) {
     generatorVersion,
     externalVersion,
     contentHash,
+    storyUuidMismatch,
+    expectedStoryUuid,
   } = resolveProfileMatchTerms({
     profileRepository,
+    story_uuid,
     story_version_uuid,
     community_profile_version,
   });
+  // P1.v1-9 (2026-09-07): refuse to attach relevance when the
+  // supplied `story_uuid` does not match the canonical row's
+  // `story_uuid`. The route layer maps this onto 400
+  // `community_profile_story_uuid_mismatch` (NOT `attached: true`).
+  // A wrong but format-legal story_uuid must NEVER silently produce
+  // `attached: true` for a profile that belongs to a different
+  // story — that was the ChatGPT independent review P1 finding.
+  if (storyUuidMismatch) {
+    return {
+      attached: false,
+      response,
+      reason: 'story_uuid_mismatch',
+      actual_story_uuid: story_uuid,
+      expected_story_uuid: expectedStoryUuid || '',
+    };
+  }
   // PRIMARY miss: surface a useful mismatch path so callers carrying a
   // stale external version still see the canonical expected_version.
   if (!profileUuid) {

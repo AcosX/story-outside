@@ -2423,6 +2423,26 @@ async function handleRequest(req, res) {
         profileRepository: communityProfileRepo,
       });
       if (!result.attached) {
+        if (result.reason === 'story_uuid_mismatch') {
+          // P1.v1-9 (2026-09-07): the supplied `story_uuid` does
+          // not match the canonical profile row's `story_uuid`.
+          // Return 400 `community_profile_story_uuid_mismatch`
+          // (NOT a plain list with `attached: true`). The wire
+          // response echoes `actual_story_uuid` (the caller's
+          // value) and `expected_story_uuid` (the row's value, or
+          // a stable non-identifying marker when the repo refused
+          // to disclose it) so the client can re-pin without a
+          // second round-trip.
+          return jsonResponse(res, 400, {
+            error: 'community_profile_story_uuid_mismatch',
+            message: 'The supplied story_uuid does not match the canonical profile row bound to the supplied story_version_uuid.',
+            ...PUBLIC_DECORATE(),
+            actual_story_uuid: result.actual_story_uuid || '',
+            expected_story_uuid: result.expected_story_uuid || '',
+            story_version_uuid: identity.story_version_uuid,
+            actual_community_profile_version: identity.community_profile_version,
+          });
+        }
         if (result.reason === 'mismatch') {
           return jsonResponse(res, 400, {
             error: 'community_profile_version_mismatch',

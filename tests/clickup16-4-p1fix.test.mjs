@@ -454,6 +454,272 @@ async function runAllChecks() {
     assert.ok(j3.demo);
   });
 
+  // ----- E'. P1.v1-9 (2026-09-07) — story_uuid triple-check -----------------------
+  // ChatGPT independent review of PR #23 (#5127997067) flagged that
+  // the hot-relevance path resolved profiles by
+  // `story_version_uuid + community_profile_version` only; a wrong
+  // but format-legal `story_uuid` would still produce
+  // `attached: true` for a profile that belonged to a different
+  // story. P1.v1-9 closes that hole by switching the lookup to
+  // `profileRepository.findCanonicalByIdentity(...)` (the triple-
+  // check lives in exactly one place — the community layer) and
+  // surfacing a new `reason: 'story_uuid_mismatch'` that the route
+  // layer maps onto 400 `community_profile_story_uuid_mismatch`.
+  //
+  // E'.1: wrong-but-format-legal story_uuid against a known profile
+  // row → 400 `community_profile_story_uuid_mismatch` (NOT 200
+  // attached=true). Use a UUID-shaped string that is NOT the row's
+  // own story_uuid; the repo's `findCanonicalByIdentity` walks every
+  // row bound to the requested `story_version_uuid`, finds a row
+  // whose `story_uuid` disagrees, and bails with
+  // `story_version_mismatch`; the route layer translates that into
+  // the new wire code.
+  const wrongStoryUuid = '99999999-9999-4999-8999-111111111111';
+  const r4 = await fetch(`${baseUrl}/v1/ecosystem/hot?story_uuid=${wrongStoryUuid}&story_version_uuid=${cafeRainIds.story_version_uuid}&community_profile_version=${encodeURIComponent(communityProfileVersion)}`);
+  assert.equal(r4.status, 400);
+  const j4 = await r4.json();
+  await check('GET /v1/ecosystem/hot: wrong story_uuid (format-legal, disagrees with row) → 400 community_profile_story_uuid_mismatch', () => {
+    assert.equal(j4.error, 'community_profile_story_uuid_mismatch');
+  });
+  await check('GET /v1/ecosystem/hot: wrong-story_uuid response MUST NOT carry DEV_FLAG', () => {
+    assert.equal(j4.dev, undefined);
+  });
+  await check('GET /v1/ecosystem/hot: wrong-story_uuid response MUST carry PUBLIC_DECORATE', () => {
+    assert.ok(j4.demo);
+  });
+  await check('GET /v1/ecosystem/hot: wrong-story_uuid response echoes actual_story_uuid', () => {
+    assert.equal(j4.actual_story_uuid, wrongStoryUuid);
+  });
+  await check('GET /v1/ecosystem/hot: wrong-story_uuid response echoes story_version_uuid', () => {
+    assert.equal(j4.story_version_uuid, cafeRainIds.story_version_uuid);
+  });
+  await check('GET /v1/ecosystem/hot: wrong-story_uuid response MUST NOT carry relevant_to_story', () => {
+    // Defence-in-depth: a 400 mismatch MUST NOT also carry
+    // `relevant_to_story` — otherwise the home page would silently
+    // render badges for a profile that does not belong to this
+    // story. The route layer returns the raw JSON object on the
+    // 400 path, so `relevant_to_story` is not part of the wire
+    // shape at all here.
+    assert.equal(j4.relevant_to_story, undefined);
+  });
+
+  // E'.2: matching story_uuid against the same profile row → 200
+  // attached=true. This is the existing happy-path assertion (it
+  // was already covered by E2 above), restated under the P1.v1-9
+  // triple-check contract so a future regression that breaks the
+  // triple-check is caught by the SAME test that verifies the
+  // mismatch path.
+  const r5 = await fetch(`${baseUrl}/v1/ecosystem/hot?story_uuid=${cafeRainIds.story_uuid}&story_version_uuid=${cafeRainIds.story_version_uuid}&community_profile_version=${encodeURIComponent(communityProfileVersion)}`);
+  assert.equal(r5.status, 200);
+  const j5 = await r5.json();
+  await check('GET /v1/ecosystem/hot: matching story_uuid → 200 with relevant_to_story (P1.v1-9 happy path)', () => {
+    assert.ok(j5.relevant_to_story);
+    assert.equal(j5.relevant_to_story.story_uuid, cafeRainIds.story_uuid);
+    assert.ok(j5.relevant_to_story.score > 0);
+  });
+
+  // E'.3: missing story_uuid → existing behaviour UNCHANGED
+  // (200 + plain list with no `relevant_to_story`, no `relevant`).
+  // P1.v1-9 MUST NOT regress this path: the route layer's
+  // identity-completeness check fires before the triple-check,
+  // so a missing field still degrades to a plain list. The
+  // task description's "现有 400 `missing_story_uuid`" was a
+  // placeholder for "the existing behaviour, unchanged"; the
+  // existing behaviour is plain-list-200, NOT a new 400.
+  const r6 = await fetch(`${baseUrl}/v1/ecosystem/hot?story_version_uuid=${cafeRainIds.story_version_uuid}&community_profile_version=${encodeURIComponent(communityProfileVersion)}`);
+  assert.equal(r6.status, 200);
+  const j6 = await r6.json();
+  await check('GET /v1/ecosystem/hot: missing story_uuid → 200 plain list (existing behaviour unchanged, P1.v1-9)', () => {
+    assert.equal(j6.relevant_to_story, undefined);
+    for (const e of j6.hot) assert.equal(e.relevant, undefined);
+  });
+
+  // E'.4: PURE-FUNCTION attachRelevance — wrong story_uuid →
+  // reason: 'story_uuid_mismatch', attached: false. This
+  // covers the matcher in isolation (without going through HTTP)
+  // so a future refactor of the route layer cannot silently
+  // re-map the new reason onto a 200.
+  const wrongAttach = attachRelevance(
+    JSON.parse(JSON.stringify(baseResp)),
+    {
+      story_uuid: wrongStoryUuid,
+      story_version_uuid: cafeRainIds.story_version_uuid,
+      community_profile_version: communityProfileVersion,
+    },
+    { profileRepository: profileRepo },
+  );
+  await check('attachRelevance: wrong story_uuid → attached: false, reason: story_uuid_mismatch', () => {
+    assert.equal(wrongAttach.attached, false);
+    assert.equal(wrongAttach.reason, 'story_uuid_mismatch');
+    assert.equal(wrongAttach.actual_story_uuid, wrongStoryUuid);
+    // The route layer translates `expected_story_uuid` onto the
+    // 400 response; the matcher may surface either the row's
+    // actual `story_uuid` or a stable non-identifying marker.
+    assert.ok(typeof wrongAttach.expected_story_uuid === 'string');
+  });
+
+  // E'.5: historical profile — SAME `story_version_uuid` +
+  // SAME `generator_version` + DIFFERENT `content_hash` (two
+  // generations coexisting). Both generations MUST resolve
+  // correctly when the caller's `story_uuid` matches, AND
+  // MUST refuse with `community_profile_story_uuid_mismatch`
+  // when the caller's `story_uuid` is wrong. This is the
+  // P1.v1-9 regression for the historical-fixture case:
+  // a pinned session from a previous regeneration must still
+  // be able to re-resolve its old row, AND a wrong-story_uuid
+  // caller must NOT be able to silently ride the pinned
+  // external version onto someone else's profile row.
+  const seedA = getCommunityFixtureSeed('cafe-rain');
+  const seedB = {
+    ...seedA,
+    // Mutate one of the hot_keywords so the content hash differs
+    // while the rest of the structure stays coherent with the
+    // cafe-rain fixture. The seed object is frozen, so spread
+    // into a fresh object and override the keywords field.
+    hot_keywords: [
+      ...seedA.hot_keywords,
+      { keyword: '雨夜咖啡馆 续篇', rationale: '第二世代 fixture：新增一个与原作标题相关的热搜关键词以驱动 content_hash 变化。' },
+    ],
+  };
+  const historicalRepo = createInMemoryCommunityProfileRepository();
+  // First generation (hash A): seed with seedA. The probe
+  // comparison sees no existing active row, so a new row is
+  // created and `setCommunityProfile` returns it.
+  const historicalA = ensureCommunityProfile({
+    repository: storyRepo,
+    profileRepository: historicalRepo,
+    story_version_uuid: cafeRainIds.story_version_uuid,
+    story: { id: 'cafe-rain', title: '雨夜咖啡馆', hook: '凌晨的咖啡馆只剩你和她。' },
+    options: { source: 'mock-fixture', seed: seedA },
+  });
+  // Second generation (hash B): different content_hash, SAME
+  // `story_version_uuid`, SAME `generator_version`. The repo
+  // keeps the old row AND inserts a new row; the active
+  // pointer moves to B, but `findCanonicalByIdentity` still
+  // resolves A from its pinned external version.
+  const historicalB = ensureCommunityProfile({
+    repository: storyRepo,
+    profileRepository: historicalRepo,
+    story_version_uuid: cafeRainIds.story_version_uuid,
+    story: { id: 'cafe-rain', title: '雨夜咖啡馆', hook: '凌晨的咖啡馆只剩你和她。' },
+    options: { source: 'mock-fixture', seed: seedB },
+  });
+  await check('historical profile: same generator_version + different content_hash → two distinct rows', () => {
+    assert.notEqual(historicalA.hash.content_hash, historicalB.hash.content_hash);
+    assert.equal(historicalA.story_version_uuid, historicalB.story_version_uuid);
+    assert.equal(historicalA.generator_version, historicalB.generator_version);
+    assert.notEqual(historicalA.profile_uuid, historicalB.profile_uuid);
+  });
+  const historicalAVersion = deriveExternalCommunityProfileVersion(historicalA);
+  const historicalBVersion = deriveExternalCommunityProfileVersion(historicalB);
+  await check('historical profile: distinct external versions for the two generations', () => {
+    assert.notEqual(historicalAVersion, historicalBVersion);
+  });
+
+  // Historical A: correct story_uuid → attached: true.
+  const historicalAResult = attachRelevance(
+    JSON.parse(JSON.stringify(baseResp)),
+    {
+      story_uuid: cafeRainIds.story_uuid,
+      story_version_uuid: cafeRainIds.story_version_uuid,
+      community_profile_version: historicalAVersion,
+    },
+    { profileRepository: historicalRepo },
+  );
+  await check('historical profile: pinned A + correct story_uuid → attached: true', () => {
+    assert.equal(historicalAResult.attached, true);
+    assert.ok(historicalAResult.response.relevant_to_story);
+  });
+  // Historical A: WRONG story_uuid → reason: story_uuid_mismatch.
+  const historicalAWrong = attachRelevance(
+    JSON.parse(JSON.stringify(baseResp)),
+    {
+      story_uuid: wrongStoryUuid,
+      story_version_uuid: cafeRainIds.story_version_uuid,
+      community_profile_version: historicalAVersion,
+    },
+    { profileRepository: historicalRepo },
+  );
+  await check('historical profile: pinned A + wrong story_uuid → reason: story_uuid_mismatch', () => {
+    assert.equal(historicalAWrong.attached, false);
+    assert.equal(historicalAWrong.reason, 'story_uuid_mismatch');
+  });
+
+  // Historical B: correct story_uuid → attached: true.
+  const historicalBResult = attachRelevance(
+    JSON.parse(JSON.stringify(baseResp)),
+    {
+      story_uuid: cafeRainIds.story_uuid,
+      story_version_uuid: cafeRainIds.story_version_uuid,
+      community_profile_version: historicalBVersion,
+    },
+    { profileRepository: historicalRepo },
+  );
+  await check('historical profile: pinned B + correct story_uuid → attached: true', () => {
+    assert.equal(historicalBResult.attached, true);
+    assert.ok(historicalBResult.response.relevant_to_story);
+  });
+  // Historical B: WRONG story_uuid → reason: story_uuid_mismatch.
+  const historicalBWrong = attachRelevance(
+    JSON.parse(JSON.stringify(baseResp)),
+    {
+      story_uuid: wrongStoryUuid,
+      story_version_uuid: cafeRainIds.story_version_uuid,
+      community_profile_version: historicalBVersion,
+    },
+    { profileRepository: historicalRepo },
+  );
+  await check('historical profile: pinned B + wrong story_uuid → reason: story_uuid_mismatch', () => {
+    assert.equal(historicalBWrong.attached, false);
+    assert.equal(historicalBWrong.reason, 'story_uuid_mismatch');
+  });
+
+  // E'.6: hot.mjs now routes the lookup through
+  // `findCanonicalByIdentity` (the triple-check lives in
+  // exactly one place — the community layer). Source-level
+  // grep guard so a future refactor that re-introduces the
+  // v1-8 `findByExternalVersion` lookup is caught.
+  const hotSrcV19 = readFileSync(resolve(ROOT, 'src/providers/ecosystem/hot.mjs'), 'utf-8');
+  await check('src/providers/ecosystem/hot.mjs: PRIMARY lookup goes through findCanonicalByIdentity (P1.v1-9)', () => {
+    assert.match(hotSrcV19, /findCanonicalByIdentity/);
+  });
+  await check('src/providers/ecosystem/hot.mjs: still surfaces the v1-5 fallback `expected_version` resolver', () => {
+    // The SECONDARY `resolveCanonicalExternalVersion` read is
+    // kept for the mismatch path (when the PRIMARY lookup
+    // misses entirely, but a canonical row exists for the
+    // caller's `story_version_uuid`). P1.v1-9 MUST NOT regress
+    // that fallback.
+    assert.match(hotSrcV19, /resolveCanonicalExternalVersion/);
+  });
+
+  // E'.7: server.mjs maps the new reason to the new wire code.
+  const serverSrcV19 = readFileSync(resolve(ROOT, 'src/server.mjs'), 'utf-8');
+  await check('src/server.mjs: hot route maps story_uuid_mismatch → community_profile_story_uuid_mismatch (P1.v1-9)', () => {
+    // Slice the hot route handler block (same brace-depth walk
+    // as the existing H check) and assert the new mapping
+    // appears inside it.
+    const startMatch = serverSrcV19.match(/pathname === '\/v1\/ecosystem\/hot'/);
+    assert.ok(startMatch, 'hot route block start anchor not found');
+    const startIdx = startMatch.index;
+    let depth = 0;
+    let endIdx = -1;
+    for (let i = startIdx; i < serverSrcV19.length; i += 1) {
+      const ch = serverSrcV19[i];
+      if (ch === '{') depth += 1;
+      else if (ch === '}') {
+        depth -= 1;
+        if (depth === 0) {
+          endIdx = i + 1;
+          break;
+        }
+      }
+    }
+    assert.ok(endIdx > startIdx, 'hot route block end not located');
+    const routeBlock = serverSrcV19.slice(startIdx, endIdx);
+    assert.match(routeBlock, /community_profile_story_uuid_mismatch/);
+    assert.match(routeBlock, /story_uuid_mismatch/);
+  });
+
   // ----- F. static contract: grep -rE "/api/(admin|dev)/" public/ is zero -------
   let staticContractViolation = 0;
   try {
