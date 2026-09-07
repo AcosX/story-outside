@@ -35,6 +35,24 @@
 // external-version lookup either returns the matching row or returns
 // `null` so the route layer can report `community_profile_not_found`.
 //
+// ClickUp 16.5 P1.v1-5 fix (2026-09-07 owner review, ChatGPT 复核):
+// `Map.set(existing key)` does NOT change the key's iteration
+// position — so the v1-4 "last insertion wins" walk over
+// `activeByStoryVersion.entries()` was still deterministically
+// WRONG when an older `generator_version` was re-inserted AFTER a
+// newer one (the older row's `activeByStoryVersion` key stayed in
+// its original slot and the walk returned the newer row's uuid
+// first, regardless of insertion order). The store now keeps an
+// EXPLICIT `latestByStoryVersion: Map<story_version_uuid,
+// profile_uuid>` pointer that is updated ONLY on fresh inserts
+// (idempotent re-inserts of the same row do NOT move the pointer
+// backwards, so a re-insert of an older row CANNOT regress the
+// active row). `findActiveByStoryVersion` is now a direct
+// `latestByStoryVersion.get(story_version_uuid)` — no Map iteration
+// at all. The `insert_seq` / ordering metadata is purely
+// repository-private; the canonical 13-field profile schema in
+// profile.mjs is unchanged.
+//
 // The module does not read env vars that look like credentials and
 // does not call any external API.
 
@@ -180,6 +198,7 @@ function rejectForbiddenKeys(value, path) {
  * @returns {{
  *   profiles: Map<string, StoryCommunityProfile>,                 // keyed by profile_uuid
  *   activeByStoryVersion: Map<string, string>,                    // story_version_uuid|generator_version → profile_uuid
+ *   latestByStoryVersion: Map<string, string>,                    // ClickUp 16.5 P1.v1-5 — explicit latest pointer, story_version_uuid → profile_uuid (NO Map iteration)
  *   byUuid: Map<string, StoryCommunityProfile>,
  * }}
  */
@@ -187,6 +206,7 @@ function createEmptyState() {
   return {
     profiles: new Map(),
     activeByStoryVersion: new Map(),
+    latestByStoryVersion: new Map(),
     byUuid: new Map(),
   };
 }
@@ -214,31 +234,23 @@ export function createInMemoryCommunityProfileRepository() {
   const repo = {
     findActiveByStoryVersion(story_version_uuid) {
       assertUuid('story_version_uuid', story_version_uuid);
-      // P1.v1-4 (2026-09-07 owner review) — walk the
-      // activeByStoryVersion index and pick the row whose
-      // (story_version_uuid, generator_version) scope was inserted
-      // LAST. JavaScript Map iteration is insertion-ordered so the
-      // last insertion wins — this fixes the pre-existing v1-3
-      // timing flake in `communityProfile.test.mjs` where two
-      // back-to-back inserts (v1 from `seedCommunityProfiles`, v2
-      // from `ensureCommunityProfile`) shared the same ISO
-      // millisecond and the lexicographic tie-break on
-      // `generator_version` flipped the result (e.g. when the
-      // seeded v1 carries a `@`-bearing identifier like
-      // `community-profile@community-profile-rules/1`, the `@`
-      // (0x40) sorts ABOVE `-` (0x2D) so v1 wins over v2's
-      // `community-profile-rules/2` even though v2 was inserted
-      // later). Insertion order is monotonic for a single process
-      // and is the only deterministic answer.
-      let bestProfile = null;
-      for (const [key, profileUuid] of state.activeByStoryVersion.entries()) {
-        const [sv] = key.split('|');
-        if (sv !== story_version_uuid) continue;
-        const row = state.profiles.get(profileUuid);
-        if (!row) continue;
-        bestProfile = row;
-      }
-      return bestProfile;
+      // P1.v1-5 (2026-09-07 owner review, ChatGPT 复核) — direct
+      // lookup against the explicit `latestByStoryVersion` pointer.
+      // We previously walked `activeByStoryVersion.entries()` and
+      // trusted Map insertion order, but `Map.set(existing key)`
+      // does NOT move the key — so when an older `generator_version`
+      // was re-inserted AFTER a newer one (e.g. the g1/A → g2/B →
+      // g1/C ordering), the older key stayed in its original slot
+      // and the walk deterministically returned the wrong (older)
+      // row. The new contract: `latestByStoryVersion` is updated
+      // EXCLUSIVELY by `setCommunityProfile` on a fresh insert
+      // (idempotent re-inserts of an existing
+      // `(sv, generator_version, content_hash)` triple are a no-op
+      // and never move the pointer), and this lookup is a single
+      // `Map.get()` — no iteration, no ordering ambiguity.
+      const uuid = state.latestByStoryVersion.get(story_version_uuid);
+      if (!uuid) return null;
+      return state.profiles.get(uuid) || null;
     },
     findActiveByStoryVersionAndGenerator(story_version_uuid, generator_version) {
       assertUuid('story_version_uuid', story_version_uuid);
@@ -347,25 +359,22 @@ export function createInMemoryCommunityProfileRepository() {
       // 2. No external community_profile_version supplied → fall back
       //    to the most recent active row for this story_version (the
       //    service-layer behaviour mirrors `getCommunityProfile`).
-      // P1.v1-4 — same insertion-order fix as `findActiveByStoryVersion`
-      // so the two paths agree. Without this, the v1-3
-      // `communityProfile.test` 8th-run flake could resurface here
-      // when two back-to-back inserts share a millisecond timestamp
-      // and the lexicographic `@` vs `-` tie-break flips the result.
-      // We walk `activeByStoryVersion` (which is insertion-ordered)
-      // and pick the LAST entry whose scope key matches the
-      // story_version; this is exactly the deterministic answer
-      // that the service layer wants.
-      let best = null;
-      for (const [key, profileUuid] of state.activeByStoryVersion.entries()) {
-        const [sv] = key.split('|');
-        if (sv !== targetVersion) continue;
-        const row = state.profiles.get(profileUuid);
-        if (!row) continue;
-        if (targetStory && row.story_uuid !== targetStory) continue;
-        best = row;
-      }
-      return best;
+      // P1.v1-5 — mirror the explicit-pointer semantics of
+      //    `findActiveByStoryVersion` so the two paths agree on the
+      //    same row. We read `latestByStoryVersion.get(targetVersion)`
+      //    directly — no iteration, no `activeByStoryVersion` walk.
+      //    If the caller supplied a `story_uuid`, we additionally
+      //    guard that the resolved row's `story_uuid` matches (a
+      //    stale pointer from a different story_version_uuid sharing
+      //    the same row by accident would be filtered here; in
+      //    practice this is unreachable because the pointer is keyed
+      //    by `story_version_uuid`).
+      const latestUuid = state.latestByStoryVersion.get(targetVersion);
+      if (!latestUuid) return null;
+      const latestRow = state.profiles.get(latestUuid);
+      if (!latestRow) return null;
+      if (targetStory && latestRow.story_uuid !== targetStory) return null;
+      return latestRow;
     },
     listByStoryVersion(input) {
       if (!input || typeof input !== 'object') {
@@ -399,7 +408,12 @@ export function createInMemoryCommunityProfileRepository() {
       // 3. Idempotency on (story_version_uuid, generator_version,
       //    content_hash). When the caller regenerates with the same
       //    content, we MUST NOT create a duplicate active row — we
-      //    return the existing one instead.
+      //    return the existing one instead. Critically (P1.v1-5,
+      //    2026-09-07 ChatGPT 复核): an idempotent hit MUST NOT move
+      //    the `latestByStoryVersion` pointer — the active row stays
+      //    on whatever the latest FRESH insert was. This prevents a
+      //    stale re-insert of an older row from regressing the active
+      //    pointer back to itself.
       const key = activeKey(profile.story_version_uuid, profile.generator_version);
       const existingUuid = state.activeByStoryVersion.get(key);
       if (existingUuid) {
@@ -412,6 +426,16 @@ export function createInMemoryCommunityProfileRepository() {
       state.profiles.set(profile.profile_uuid, profile);
       state.byUuid.set(profile.profile_uuid, profile);
       state.activeByStoryVersion.set(key, profile.profile_uuid);
+      // 5. ClickUp 16.5 P1.v1-5 — update the explicit
+      //    `latestByStoryVersion` pointer ONLY on a fresh insert
+      //    (the idempotency hit above short-circuited, so we are by
+      //    construction inserting a NEW row here, possibly with a
+      //    DIFFERENT `generator_version` than the previous latest).
+      //    This pointer is what `findActiveByStoryVersion` reads; it
+      //    is NEVER touched by Map iteration, NEVER touched by
+      //    `for...of` over `activeByStoryVersion`, and NEVER moved
+      //    backwards by an idempotent re-insert of an older row.
+      state.latestByStoryVersion.set(profile.story_version_uuid, profile.profile_uuid);
       return profile;
     },
     stats() {
@@ -421,6 +445,7 @@ export function createInMemoryCommunityProfileRepository() {
       const fresh = createEmptyState();
       state.profiles = fresh.profiles;
       state.activeByStoryVersion = fresh.activeByStoryVersion;
+      state.latestByStoryVersion = fresh.latestByStoryVersion;
       state.byUuid = fresh.byUuid;
     },
   };
