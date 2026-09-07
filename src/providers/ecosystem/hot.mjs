@@ -809,6 +809,11 @@ export function attachRelevance(response, identity, options) {
   // A wrong but format-legal story_uuid must NEVER silently produce
   // `attached: true` for a profile that belongs to a different
   // story — that was the ChatGPT independent review P1 finding.
+  //
+  // Cross-check contract: `story_uuid === profile.story_uuid`. If
+  // the helper above set `storyUuidMismatch`, the caller's
+  // `story_uuid` disagrees with the canonical row's
+  // `profile.story_uuid` and we refuse here.
   if (storyUuidMismatch) {
     return {
       attached: false,
