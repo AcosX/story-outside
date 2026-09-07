@@ -69,6 +69,15 @@ import { canonicalSha256 } from '../stories/canonicalHash.mjs';
  *                                                Several hot-list match keywords.
  * @property {{ content_hash: string }} hash        Content hash of the profile (used to
  *                                                  dedupe identical profiles across regenerations).
+ *
+ * ClickUp 16.2 P1.v1-5 fix (2026-09-07): the monotonic/latest
+ * metadata used to pick the active row is NOT a canonical field on
+ * the profile row. It lives in PRIVATE state on the repository
+ * (`latestByStoryVersion: Map<story_version_uuid, profile_uuid>`)
+ * so the canonical 13-field schema is preserved end-to-end (this is
+ * the same 13-field schema ClickUp 16.1 / main ships, plus the v1-5
+ * zero-impact guarantee that no P1 metadata leaks into the row
+ * surface).
  */
 
 /**
@@ -122,6 +131,15 @@ export const PROFILE_TOP_LEVEL_KEYS = Object.freeze([
   'knowledge_queries',
   'hot_keywords',
   'hash',
+  // ClickUp 16.2 P1.v1-5 fix (2026-09-07): the previous v1-4 attempt
+  // added `insert_seq` here to drive active-row selection. That made
+  // the canonical 13-field schema 14 fields, which is a schema
+  // change to the surface that main / ClickUp 16.1 owns. v1-5
+  // reverts the schema: monotonic/latest metadata is NOT a row
+  // field. It lives in PRIVATE repository state
+  // (`latestByStoryVersion: Map<story_version_uuid, profile_uuid>`)
+  // so this list stays exactly at the 13 fields ClickUp 16.1 /
+  // main ship.
 ]);
 export const PROFILE_TOPIC_KEYS = Object.freeze(['id', 'label', 'summary']);
 export const PROFILE_QUERY_KEYS = Object.freeze(['id', 'query', 'kind']);
@@ -280,6 +298,16 @@ export function assertCommunityProfileShape(profile) {
       + `(allowed: ${JSON.stringify(PROFILE_SOURCES)})`,
     );
   }
+  // ClickUp 16.2 P1.v1-5 (2026-09-07): the previous v1-4 shape
+  // validator accepted `insert_seq` as a legacy optional field
+  // (`null` for pre-migration rows, non-negative integer for new
+  // rows). v1-5 REMOVES this field from the row entirely so the
+  // canonical 13-field schema is preserved. Monotonic/latest
+  // metadata lives in PRIVATE repository state. Any caller that
+  // smuggles `insert_seq` is rejected by the strict top-level
+  // allowlist above (line `assertRecordAllowlist('$', ...)` runs
+  // first), so the row surface is exactly the 13 keys ClickUp 16.1 /
+  // main ship.
   assertNonEmptyString('locale', p.locale);
   if (!Array.isArray(p.topics)) throw new Error('communityProfile: topics must be an array');
   if (!Array.isArray(p.queries)) throw new Error('communityProfile: queries must be an array');

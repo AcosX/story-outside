@@ -28,6 +28,7 @@ import {
   getCommunityFixtureSeed,
   buildStubCommunityProfile,
   buildCommunityProfileFromSeed,
+  buildCanonicalCommunityProfileVersion,
   listCommunityFixtureSlugs,
   seedCommunityProfiles,
   setCommunityProfile,
@@ -266,7 +267,11 @@ async function runChecks() {
       story_version_uuid: FIXTURE_UUIDS['cafe-rain'].story_version_uuid,
     });
     assert.ok(profile);
-    // Top-level keys.
+    // Top-level keys. ClickUp 16.2 P1.v1-5 (2026-09-07): the
+    // previous v1-4 surface stamped `insert_seq` onto every row
+    // (turning the canonical 13-field schema into 14 fields). v1-5
+    // reverts the schema. `insert_seq` is NOT a row field; the
+    // allowed set is exactly the 13 fields ClickUp 16.1 / main ship.
     const allowed = new Set([
       'profile_uuid', 'story_uuid', 'story_version_uuid',
       'story_version_checksum', 'generator_version', 'generated_at',
@@ -450,6 +455,521 @@ async function runChecks() {
     // Same content_hash → same active row (no duplicate insert).
     assert.equal(storedA.profile_uuid, storedB.profile_uuid);
     assert.equal(profileRepo.stats().profile_count, 1);
+  });
+
+  // ----- ClickUp 16.2 P1.v1-3 / P1.v1-4 --------------------------
+  //
+  // Regression guards for the active-row deterministic-order fix.
+  // P1.v1-2 closed the immutable-lookup bug (findCanonicalByIdentity
+  // walks every row by story_version_uuid and matches the version
+  // string byte-for-byte). P1.v1-3 closed a related active-row
+  // tie-break bug: when two distinct rows under the same
+  // story_version_uuid share the SAME `generated_at` millisecond
+  // (Date#toISOString only has ms resolution), the choice of
+  // "active" row MUST be deterministic AND MUST NOT depend on the
+  // caller-supplied `generator_version` string. v1-3 used
+  // `profile_uuid` (lexicographic UUID v4 comparison) as the
+  // tie-break. ChatGPT independently re-ran `communityProfile.test`
+  // consecutively and found that v1-3 still flakes on the second
+  // consecutive run because UUID v4 comparison is a total order
+  // UNCORRELATED with insertion order.
+  //
+  // P1.v1-5 replaces the row-stamped `insert_seq` of v1-4 with a
+  // PRIVATE repository state (`latestByStoryVersion:
+  // Map<story_version_uuid, profile_uuid>`) that is updated on
+  // every NEW insert and only on new inserts (idempotent retries
+  // do not move it). The active row for a `story_version_uuid`
+  // is the `profile_uuid` recorded in the latest pointer. The
+  // canonical 13-field profile schema is preserved end-to-end;
+  // no `insert_seq` lives on the row surface. This makes the
+  // contract:
+  //   "The second new insert under the same story_version wins
+  //    the active slot, regardless of `generated_at` collisions
+  //    or caller-supplied randomness in `profile_uuid` /
+  //    `generator_version`."
+  // Stable, repeatable, independent of caller-supplied strings.
+
+  function _buildRowWithFixedTimestamp({
+    story_uuid,
+    story_version_uuid,
+    story_version_checksum,
+    generator_version,
+    generated_at,
+    content_marker,
+  }) {
+    const profile = buildCommunityProfileFromSeed({
+      story_uuid,
+      story_version_uuid,
+      story_version_checksum,
+      generator_version,
+      source: 'mock-fixture',
+      topics: [
+        { label: `topic-${content_marker}-A`, summary: `summary-${content_marker}-A` },
+        { label: `topic-${content_marker}-B`, summary: `summary-${content_marker}-B` },
+        { label: `topic-${content_marker}-C`, summary: `summary-${content_marker}-C` },
+      ],
+      queries: [
+        { query: `query-${content_marker}-A`, kind: 'web' },
+        { query: `query-${content_marker}-B`, kind: 'web' },
+        { query: `query-${content_marker}-C`, kind: 'mixed' },
+      ],
+      knowledge_queries: [
+        { query: `knowledge-${content_marker}-A`, kind: 'knowledge' },
+        { query: `knowledge-${content_marker}-B`, kind: 'knowledge' },
+      ],
+      hot_keywords: [
+        { keyword: `hot-${content_marker}-A`, rationale: `rationale-${content_marker}-A` },
+        { keyword: `hot-${content_marker}-B`, rationale: `rationale-${content_marker}-B` },
+      ],
+    });
+    // Pin generated_at to a caller-controlled millisecond so we can
+    // exercise the same-timestamp path deterministically.
+    profile.generated_at = generated_at;
+    return profile;
+  }
+
+  // Pull the canonical story_version_checksum off the seed-built
+  // profile so the P1.v1-3 fixtures match the same
+  // (story_uuid, story_version_uuid, story_version_checksum) triple
+  // the rest of the test suite uses.
+  function _seedChecksum(profileRepo, story_version_uuid) {
+    const seeded = getCommunityProfile({ profileRepository: profileRepo, story_version_uuid });
+    assert.ok(seeded, 'seed profile must exist');
+    return seeded.story_version_checksum;
+  }
+
+  await check('same-timestamp rows under one story_version resolve to a deterministic active row (P1.v1-3 / v1-5)', () => {
+    // Two rows under the SAME story_version_uuid, produced in the
+    // SAME millisecond, with DIFFERENT generator_version strings.
+    //
+    // v1-3 fixed the case where the active-row decision depended on
+    // lexicographic comparison of caller-supplied `generator_version`.
+    // v1-4 closes the residual flake ChatGPT caught on the SECOND
+    // consecutive run: v1-3 used `profile_uuid` (random UUID v4) as
+    // the tie-break, which is a total order but UNCORRELATED with
+    // insertion order — two runs can produce different UUID v4
+    // values for "row B" and flip the winner.
+    //
+    // v1-4 contract: active row = the row with the LARGEST
+    // `insert_seq` within the `story_version_uuid`. The counter is
+    // monotonic in insertion order, so under the same `generated_at`
+    // millisecond, the SECOND-INSERTED row always wins — regardless
+    // of UUID v4 randomness or `generator_version` content. This
+    // test pins the v1-4 contract on top of the v1-3 fixture.
+    const { repository } = createSeededRepository();
+    const profileRepo = createInMemoryCommunityProfileRepository();
+    seedCommunityProfiles(repository, profileRepo);
+    const { story_uuid, story_version_uuid } = FIXTURE_UUIDS['cafe-rain'];
+    const story_version_checksum = _seedChecksum(profileRepo, story_version_uuid);
+
+    const fixed_ts = '2026-09-07T01:02:03.456Z';
+    const row_a = _buildRowWithFixedTimestamp({
+      story_uuid,
+      story_version_uuid,
+      story_version_checksum,
+      generator_version: 'community-profile@community-profile-rules/a',
+      generated_at: fixed_ts,
+      content_marker: 'A',
+    });
+    const row_b = _buildRowWithFixedTimestamp({
+      story_uuid,
+      story_version_uuid,
+      story_version_checksum,
+      generator_version: 'community-profile@community-profile-rules/b',
+      generated_at: fixed_ts,
+      content_marker: 'B',
+    });
+    const stored_a = setCommunityProfile({ profileRepository: profileRepo, profile: row_a });
+    const stored_b = setCommunityProfile({ profileRepository: profileRepo, profile: row_b });
+    assert.notEqual(stored_a.profile_uuid, stored_b.profile_uuid);
+    assert.equal(stored_a.generated_at, fixed_ts);
+    assert.equal(stored_b.generated_at, fixed_ts);
+
+    // P1.v1-5 invariant: the SECOND new insert always wins under the
+    // same `generated_at`. The repository moves its PRIVATE
+    // `latestByStoryVersion` pointer on every NEW insert (and only
+    // on new inserts; idempotent hits do NOT move the pointer), so
+    // the second call's row is the active row regardless of
+    // `generated_at` ties, UUID v4 randomness, or
+    // `generator_version` content.
+    //
+    // v1-5 deliberately does NOT carry `insert_seq` on the row:
+    // canonical schema must stay at 13 fields. We assert the
+    // absence of `insert_seq` here to lock the schema invariant.
+    assert.equal(
+      Object.prototype.hasOwnProperty.call(stored_a, 'insert_seq'), false,
+      'row A must NOT carry `insert_seq` on its surface (canonical 13-field schema)',
+    );
+    assert.equal(
+      Object.prototype.hasOwnProperty.call(stored_b, 'insert_seq'), false,
+      'row B must NOT carry `insert_seq` on its surface (canonical 13-field schema)',
+    );
+    // The shape validator must reject a caller that smuggles an
+    // `insert_seq` field into a payload — strict 13-field allowlist.
+    assert.throws(
+      () => setCommunityProfile({
+        profileRepository: profileRepo,
+        profile: { ...row_a, insert_seq: 1 },
+      }),
+      /unknown key/,
+      'smuggling `insert_seq` into the payload MUST be rejected by the strict top-level allowlist',
+    );
+
+    // Run the active-row selection many times; the answer MUST be
+    // identical every call (deterministic) and MUST NOT depend on
+    // UUID v4 randomness or generator_version lexicographic order.
+    // The expected winner is row B by the v1-4 contract.
+    const expected_uuid = stored_b.profile_uuid;
+    const active1 = getCommunityProfile({ profileRepository: profileRepo, story_version_uuid });
+    const active2 = getCommunityProfile({ profileRepository: profileRepo, story_version_uuid });
+    const active3 = getCommunityProfile({ profileRepository: profileRepo, story_version_uuid });
+    assert.equal(active1.profile_uuid, expected_uuid);
+    assert.equal(active2.profile_uuid, expected_uuid);
+    assert.equal(active3.profile_uuid, expected_uuid);
+
+    // listByStoryVersion must return at least the seed row + our two
+    // same-timestamp fixtures, all sharing the same story_version_uuid.
+    const all = profileRepo.listByStoryVersion({ story_version_uuid });
+    assert.ok(all.length >= 3,
+      `expected at least 3 rows for the cafe-rain story_version, got ${all.length}`);
+    const fixtureUuids = new Set([stored_a.profile_uuid, stored_b.profile_uuid]);
+    for (const row of all) {
+      assert.ok(
+        row.story_version_uuid === story_version_uuid,
+        'every listed row must share the same story_version_uuid',
+      );
+    }
+    // Both fixture rows must be present in the listing (idempotency
+    // does not collapse them: different generator_version strings,
+    // different content_hash).
+    let fixtureRowsSeen = 0;
+    for (const row of all) {
+      if (fixtureUuids.has(row.profile_uuid)) fixtureRowsSeen += 1;
+    }
+    assert.equal(fixtureRowsSeen, 2, 'both fixture rows must appear in listByStoryVersion');
+  });
+
+  await check('different-timestamp rows pick the newer generated_at as active (P1.v1-3)', () => {
+    const { repository } = createSeededRepository();
+    const profileRepo = createInMemoryCommunityProfileRepository();
+    seedCommunityProfiles(repository, profileRepo);
+    const { story_uuid, story_version_uuid } = FIXTURE_UUIDS['cafe-rain'];
+    const story_version_checksum = _seedChecksum(profileRepo, story_version_uuid);
+
+    // Older row first, then newer row.
+    const old_ts = '2026-09-07T01:00:00.000Z';
+    const new_ts = '2026-09-07T02:00:00.000Z';
+    const old_row = _buildRowWithFixedTimestamp({
+      story_uuid,
+      story_version_uuid,
+      story_version_checksum,
+      generator_version: 'community-profile@community-profile-rules/old',
+      generated_at: old_ts,
+      content_marker: 'old',
+    });
+    const new_row = _buildRowWithFixedTimestamp({
+      story_uuid,
+      story_version_uuid,
+      story_version_checksum,
+      generator_version: 'community-profile@community-profile-rules/new',
+      generated_at: new_ts,
+      content_marker: 'new',
+    });
+    setCommunityProfile({ profileRepository: profileRepo, profile: old_row });
+    setCommunityProfile({ profileRepository: profileRepo, profile: new_row });
+    const active = getCommunityProfile({ profileRepository: profileRepo, story_version_uuid });
+    assert.ok(active, 'active row must resolve');
+    assert.equal(active.profile_uuid, new_row.profile_uuid,
+      'active row must be the one with the newer generated_at, regardless of insertion order');
+    assert.equal(active.generated_at, new_ts);
+  });
+
+  await check('community_profile_version exact lookup hits the requested row even when an older active row exists (P1.v1-3)', () => {
+    // Regression for the immutable-lookup contract from P1.v1-2:
+    // even when `findActiveByStoryVersion` would resolve to the
+    // newest row, a client that pins a `community_profile_version`
+    // string built from an OLDER row must still get THAT older row
+    // back. This pairs with the active-row fix above to make sure
+    // the two mechanisms do not interfere.
+    const { repository } = createSeededRepository();
+    const profileRepo = createInMemoryCommunityProfileRepository();
+    seedCommunityProfiles(repository, profileRepo);
+    const { story_uuid, story_version_uuid } = FIXTURE_UUIDS['cafe-rain'];
+    const story_version_checksum = _seedChecksum(profileRepo, story_version_uuid);
+
+    const old_ts = '2026-09-07T01:00:00.000Z';
+    const new_ts = '2026-09-07T02:00:00.000Z';
+    const old_row = _buildRowWithFixedTimestamp({
+      story_uuid,
+      story_version_uuid,
+      story_version_checksum,
+      generator_version: 'community-profile@community-profile-rules/old',
+      generated_at: old_ts,
+      content_marker: 'exact-old',
+    });
+    const new_row = _buildRowWithFixedTimestamp({
+      story_uuid,
+      story_version_uuid,
+      story_version_checksum,
+      generator_version: 'community-profile@community-profile-rules/new',
+      generated_at: new_ts,
+      content_marker: 'exact-new',
+    });
+    setCommunityProfile({ profileRepository: profileRepo, profile: old_row });
+    setCommunityProfile({ profileRepository: profileRepo, profile: new_row });
+
+    // Active is the newer row.
+    const active = getCommunityProfile({ profileRepository: profileRepo, story_version_uuid });
+    assert.equal(active.profile_uuid, new_row.profile_uuid);
+
+    // Exact cpv lookup against the OLD row's version string MUST
+    // return the OLD row, not the active row.
+    const old_cpv = buildCanonicalCommunityProfileVersion(old_row);
+    assert.ok(old_cpv);
+    const exact = profileRepo.findCanonicalByIdentity({
+      story_uuid,
+      story_version_uuid,
+      community_profile_version: old_cpv,
+    });
+    assert.equal(exact.ok, true);
+    assert.equal(exact.profile.profile_uuid, old_row.profile_uuid);
+    assert.equal(exact.profile.generated_at, old_ts);
+  });
+
+  // ----- ClickUp 16.2 P1.v1-4 specific fixtures ---------------------
+
+  // helper: build a fresh profile whose only difference from a
+  // fixture row is the `generator_version` string + the content
+  // marker (so the `content_hash` differs but the millisecond is
+  // shared). Used by the same-timestamp "second new insert wins"
+  // fixture.
+  function _buildInsertSeqFixtureRow({
+    story_uuid,
+    story_version_uuid,
+    story_version_checksum,
+    generator_version,
+    generated_at,
+    content_marker,
+  }) {
+    return _buildRowWithFixedTimestamp({
+      story_uuid,
+      story_version_uuid,
+      story_version_checksum,
+      generator_version,
+      generated_at,
+      content_marker,
+    });
+  }
+
+  await check('same-timestamp: SECOND new insert wins under identical generated_at (P1.v1-5)', () => {
+    // P1.v1-5 core regression: when two distinct rows share the SAME
+    // millisecond `generated_at`, the row inserted SECOND must win
+    // the active slot, regardless of:
+    //   - the lexicographic order of `profile_uuid` (UUID v4 randomness)
+    //   - the content of `generator_version`
+    //   - the millisecond resolution of `generated_at`
+    //
+    // v1-5 contract: the repository's PRIVATE
+    // `latestByStoryVersion: Map<story_version_uuid, profile_uuid>`
+    // is moved on every NEW insert (and ONLY on new inserts;
+    // idempotent re-inserts do not move it). The canonical
+    // `profile_uuid` of the most-recently-inserted row for the
+    // `story_version_uuid` is the active row. The map is private
+    // (no public API exposes it); we observe the contract through
+    // `findActiveByStoryVersion` / `getCommunityProfile`.
+    //
+    // v1-5 explicitly REMOVES `insert_seq` from the row surface so
+    // the canonical 13-field schema is preserved. This test asserts
+    // the row carries NO `insert_seq` field.
+    //
+    // Fixture: same story_uuid + story_version_uuid + checksum +
+    // generated_at; different generator_version so the two rows
+    // occupy different `activeByStoryVersion` slots and are NOT
+    // collapsed by the existing same-content-hash idempotency path.
+    const { repository } = createSeededRepository();
+    const profileRepo = createInMemoryCommunityProfileRepository();
+    seedCommunityProfiles(repository, profileRepo);
+    const { story_uuid, story_version_uuid } = FIXTURE_UUIDS['cafe-rain'];
+    const story_version_checksum = _seedChecksum(profileRepo, story_version_uuid);
+
+    const fixed_ts = '2026-09-07T00:00:00.000Z';
+    const row_a = _buildInsertSeqFixtureRow({
+      story_uuid,
+      story_version_uuid,
+      story_version_checksum,
+      generator_version: 'community-profile@community-profile-rules/v1-5-a',
+      generated_at: fixed_ts,
+      content_marker: 'v1-5-A',
+    });
+    const row_b = _buildInsertSeqFixtureRow({
+      story_uuid,
+      story_version_uuid,
+      story_version_checksum,
+      generator_version: 'community-profile@community-profile-rules/v1-5-b',
+      generated_at: fixed_ts,
+      content_marker: 'v1-5-B',
+    });
+
+    // Insert row A FIRST. Assert it is the active row at this point.
+    const stored_a = setCommunityProfile({ profileRepository: profileRepo, profile: row_a });
+    const active_after_a = getCommunityProfile({ profileRepository: profileRepo, story_version_uuid });
+    assert.equal(active_after_a.profile_uuid, stored_a.profile_uuid,
+      'after inserting row A, row A must be the active row');
+    // v1-5 schema invariant: NO `insert_seq` on the row surface.
+    assert.equal(Object.prototype.hasOwnProperty.call(stored_a, 'insert_seq'), false,
+      'row A must NOT carry `insert_seq` (canonical 13-field schema)');
+    assert.equal(Object.keys(stored_a).length, 13,
+      `row A must carry exactly the 13 canonical fields; got ${Object.keys(stored_a).length}`);
+
+    // Insert row B with the SAME `generated_at` millisecond.
+    // Assert row B is now the active row, even though the
+    // millisecond is shared.
+    const stored_b = setCommunityProfile({ profileRepository: profileRepo, profile: row_b });
+    assert.equal(stored_b.generated_at, stored_a.generated_at,
+      'row B and row A must share the same generated_at millisecond for this fixture to exercise the bug');
+    assert.equal(Object.prototype.hasOwnProperty.call(stored_b, 'insert_seq'), false,
+      'row B must NOT carry `insert_seq` (canonical 13-field schema)');
+    assert.equal(Object.keys(stored_b).length, 13,
+      `row B must carry exactly the 13 canonical fields; got ${Object.keys(stored_b).length}`);
+
+    const active_after_b = getCommunityProfile({ profileRepository: profileRepo, story_version_uuid });
+    assert.equal(active_after_b.profile_uuid, stored_b.profile_uuid,
+      'after inserting row B (same timestamp), row B must be the active row \u2014 second new insert wins (P1.v1-5)');
+    assert.notEqual(active_after_b.profile_uuid, stored_a.profile_uuid,
+      'row A must NOT remain the active row after row B is inserted');
+  });
+
+  await check('idempotent findOrCreate against the existing active row does NOT move the active pointer (P1.v1-5)', () => {
+    // P1.v1-5 invariant: when a caller re-invokes
+    // `setCommunityProfile` with a payload that the idempotency
+    // contract recognises as identical to the existing active row
+    // (same content_hash), the repository MUST return the existing
+    // row AS-IS and MUST NOT move the PRIVATE
+    // `latestByStoryVersion` pointer. If the pointer were moved on
+    // every retry, the "second-new-insert-wins" guarantee would be
+    // undone by any caller that retries `findOrCreate` against the
+    // already-active row.
+    //
+    // v1-5 schema invariant: rows carry NO `insert_seq` field. We
+    // assert the active-pointer semantics by reading the active row
+    // through the public `findActiveByStoryVersion` API.
+    const profileRepo = createInMemoryCommunityProfileRepository();
+    const { story_uuid, story_version_uuid } = FIXTURE_UUIDS['cafe-rain'];
+    const story_version_checksum =
+      '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef';
+    const fixed_ts = '2026-09-07T00:00:00.000Z';
+    const row_a = _buildInsertSeqFixtureRow({
+      story_uuid,
+      story_version_uuid,
+      story_version_checksum,
+      generator_version: 'community-profile@community-profile-rules/idemp',
+      generated_at: fixed_ts,
+      content_marker: 'idemp-A',
+    });
+    const stored_first = setCommunityProfile({ profileRepository: profileRepo, profile: row_a });
+    assert.equal(Object.prototype.hasOwnProperty.call(stored_first, 'insert_seq'), false,
+      'stored_first must NOT carry `insert_seq` (canonical 13-field schema)');
+    const active_after_first = profileRepo.findActiveByStoryVersion(story_version_uuid);
+    assert.ok(active_after_first, 'active row must resolve after first insert');
+    const active_uuid_after_first = active_after_first.profile_uuid;
+    assert.equal(active_uuid_after_first, stored_first.profile_uuid,
+      'after first insert, the active row must be stored_first');
+
+    // Idempotent retry with the SAME payload. The repository
+    // recognises this as an idempotency hit (same
+    // story_version_uuid + generator_version + content_hash) and
+    // returns the existing row without moving the latest pointer.
+    const stored_second = setCommunityProfile({ profileRepository: profileRepo, profile: row_a });
+    assert.equal(stored_second.profile_uuid, stored_first.profile_uuid,
+      'idempotent hit must return the SAME profile_uuid');
+    assert.equal(Object.prototype.hasOwnProperty.call(stored_second, 'insert_seq'), false,
+      'stored_second must NOT carry `insert_seq` (canonical 13-field schema)');
+
+    // Critical: the active pointer MUST still point at stored_first
+    // after the idempotent retry. The second invocation was a
+    // no-op for active selection.
+    const active_after_retry = profileRepo.findActiveByStoryVersion(story_version_uuid);
+    assert.equal(active_after_retry.profile_uuid, active_uuid_after_first,
+      'idempotent hit MUST NOT move the active pointer; it must remain on stored_first');
+    assert.equal(active_after_retry.profile_uuid, stored_first.profile_uuid,
+      'active row must still be stored_first after the idempotent retry');
+
+    // Now insert a fresh row under a DIFFERENT generator_version so
+    // it does NOT collapse on the existing active row's idempotency
+    // path. The new row's `profile_uuid` MUST become the active
+    // row (the private latest pointer moves).
+    const row_b = _buildInsertSeqFixtureRow({
+      story_uuid,
+      story_version_uuid,
+      story_version_checksum,
+      generator_version: 'community-profile@community-profile-rules/idemp-next',
+      generated_at: fixed_ts,
+      content_marker: 'idemp-B',
+    });
+    const stored_third = setCommunityProfile({ profileRepository: profileRepo, profile: row_b });
+    assert.equal(Object.prototype.hasOwnProperty.call(stored_third, 'insert_seq'), false,
+      'stored_third must NOT carry `insert_seq` (canonical 13-field schema)');
+    const active_after_third = profileRepo.findActiveByStoryVersion(story_version_uuid);
+    assert.equal(active_after_third.profile_uuid, stored_third.profile_uuid,
+      'fresh insert MUST move the active pointer to stored_third; idempotent retry MUST NOT have moved it');
+    assert.notEqual(active_after_third.profile_uuid, stored_first.profile_uuid,
+      'stored_first must NOT remain the active row after a fresh insert under a different generator_version');
+  });
+
+  await check('repeat-run stability: same-timestamp active row is identical across 5 consecutive iterations (P1.v1-5)', () => {
+    // ChatGPT independently re-ran `communityProfile.test`
+    // consecutively and found that v1-3 still flakes on the second
+    // consecutive run. v1-4 must NOT flake.
+    //
+    // The harness runs the same fixture in a fresh profileRepo 5
+    // times in the SAME process and asserts the active row's
+    // `generator_version` content marker is identical every time.
+    // UUID v4 is freshly minted per row in each iteration, so a
+    // UUID-based tie-break would produce DIFFERENT active rows on
+    // different iterations. `insert_seq` does not depend on UUID
+    // randomness and must produce the SAME insertion order every
+    // iteration, so the active row's content marker is stable.
+    const iterationCount = 5;
+    const activeGeneratorVersions = [];
+    for (let iter = 0; iter < iterationCount; iter += 1) {
+      const { repository } = createSeededRepository();
+      const profileRepo = createInMemoryCommunityProfileRepository();
+      seedCommunityProfiles(repository, profileRepo);
+      const { story_uuid, story_version_uuid } = FIXTURE_UUIDS['cafe-rain'];
+      const story_version_checksum = _seedChecksum(profileRepo, story_version_uuid);
+      const fixed_ts = '2026-09-07T03:00:00.000Z';
+      const row_a = _buildInsertSeqFixtureRow({
+        story_uuid,
+        story_version_uuid,
+        story_version_checksum,
+        generator_version: `community-profile@community-profile-rules/stab-${iter}-a`,
+        generated_at: fixed_ts,
+        content_marker: `v1-4-stab-A-${iter}`,
+      });
+      const row_b = _buildInsertSeqFixtureRow({
+        story_uuid,
+        story_version_uuid,
+        story_version_checksum,
+        generator_version: `community-profile@community-profile-rules/stab-${iter}-b`,
+        generated_at: fixed_ts,
+        content_marker: `v1-4-stab-B-${iter}`,
+      });
+      setCommunityProfile({ profileRepository: profileRepo, profile: row_a });
+      setCommunityProfile({ profileRepository: profileRepo, profile: row_b });
+      const active = getCommunityProfile({ profileRepository: profileRepo, story_version_uuid });
+      assert.ok(active, 'active row must resolve');
+      // The active row must always be the second-inserted row by
+      // content marker (suffix `-b`).
+      assert.ok(active.generator_version.endsWith(`-${iter}-b`),
+        `iteration ${iter}: active row must be the second-inserted row; got generator_version='${active.generator_version}'`);
+      activeGeneratorVersions.push(active.generator_version);
+    }
+    // Every iteration's active row must end with `-b`. This is the
+    // deterministic, repeatable contract.
+    for (let i = 0; i < activeGeneratorVersions.length; i += 1) {
+      assert.ok(activeGeneratorVersions[i].endsWith(`-${i}-b`),
+        `iteration ${i} active row must end with -${i}-b; got ${activeGeneratorVersions[i]}`);
+    }
   });
 
   await check('ensureCommunityProfile throws on unknown story_version', () => {

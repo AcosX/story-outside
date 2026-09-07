@@ -22,6 +22,7 @@ export {
 } from './profile.mjs';
 
 export {
+  buildCanonicalCommunityProfileVersion,
   createInMemoryCommunityProfileRepository,
   _forbiddenCommunityProfileDimensions,
   _forbiddenProfileKeys,
