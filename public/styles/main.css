@@ -458,6 +458,7 @@ input::placeholder {
   gap: 33px 25px;
 }
 .book-card {
+  display: block;
   border: 0;
   background: none;
   padding: 0;
@@ -510,6 +511,11 @@ input::placeholder {
   color: #50658d;
 }
 .book-category {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  line-height: 19px;
   font-size: 9px;
   letter-spacing: 0.4px;
   color: #8090ab;
@@ -530,6 +536,7 @@ input::placeholder {
   margin: 0 0 9px;
 }
 .book-description {
+  min-height: 3.6em;
   display: -webkit-box;
   -webkit-line-clamp: 2;
   -webkit-box-orient: vertical;

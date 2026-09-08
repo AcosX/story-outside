@@ -43,6 +43,7 @@ const EMPTY_LABEL = '此刻还没有与书架相关的热议。';
 const LOADING_LABEL = '载入中…';
 const IDENTITY_EVENT = 'story:identity-changed';
 const IDENTITY_GLOBAL_KEY = 'STORY_OUTSIDE_IDENTITY';
+let latestRequest = 0;
 
 function getRoot() {
   return document.getElementById(ROOT_ID);
@@ -97,6 +98,7 @@ function readActiveIdentity() {
 function setState(root, state) {
   if (!root) return;
   root.setAttribute('data-state', state);
+  root.hidden = state !== 'plain' && state !== 'identity';
 }
 
 function setStatus(text) {
@@ -244,12 +246,16 @@ async function loadInitial() {
   clearList();
   const identity = readActiveIdentity();
   const hasIdentity = Boolean(identity);
+  const request = ++latestRequest;
   try {
     const payload = await fetchHotList(hasIdentity, identity || undefined);
-    const hot = payload && Array.isArray(payload.hot) ? payload.hot : [];
+    if (request !== latestRequest) return;
+    const hot = (payload && Array.isArray(payload.hot) ? payload.hot : [])
+      .filter(entry => entry && typeof entry === 'object');
     renderList(hot, hasIdentity);
-    setState(root, hasIdentity ? 'identity' : 'plain');
+    setState(root, hot.length ? (hasIdentity ? 'identity' : 'plain') : 'empty');
   } catch (err) {
+    if (request !== latestRequest) return;
     // ClickUp 16.4 graceful degradation: a 5xx / network error must
     // NEVER break the home page. Render an empty list and a soft hint
     // so the user can still pick a story and play.
@@ -266,30 +272,7 @@ async function loadInitial() {
  * the plain list to the "相关才关联" list without a full page reload.
  */
 function attachIdentityListener() {
-  document.addEventListener(IDENTITY_EVENT, async (event) => {
-    const detail = event && /** @type {any} */ (event).detail;
-    // detail === null → identity cleared; fall through to a plain
-    // list with the soft hint.
-    const identity = readActiveIdentity();
-    const root = getRoot();
-    if (!root) return;
-    if (!identity) {
-      await loadInitial();
-      return;
-    }
-    setState(root, 'loading');
-    setStatus(LOADING_LABEL);
-    try {
-      const payload = await fetchHotList(true, identity);
-      const hot = payload && Array.isArray(payload.hot) ? payload.hot : [];
-      renderList(hot, true);
-      setState(root, 'identity');
-    } catch {
-      setState(root, 'error');
-      renderEmpty();
-    }
-    void detail;
-  });
+  document.addEventListener(IDENTITY_EVENT, () => { void loadInitial(); });
 }
 
 function init() {
