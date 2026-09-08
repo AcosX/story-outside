@@ -73,12 +73,19 @@ export function createInMemoryEcosystemSearchCacheRepository(opts = {}) {
     return store.get(key) || null;
   }
 
-  function put(key, value, now = Date.now()) {
+  function put(key, value, now = Date.now(), metadata = {}) {
     store.set(key, {
       value: Array.isArray(value) ? value.slice() : [],
       fetchedAt: now,
       expiresAt: now + ttlMs,
       swrExpiresAt: now + swrMs,
+      storyUuid: typeof metadata.story_uuid === 'string' ? metadata.story_uuid : null,
+      storyVersionUuid: typeof metadata.story_version_uuid === 'string' ? metadata.story_version_uuid : null,
+      communityProfileVersion: typeof metadata.community_profile_version === 'string'
+        ? metadata.community_profile_version
+        : null,
+      queryId: typeof metadata.query_id === 'string' ? metadata.query_id : null,
+      query: typeof metadata.query === 'string' ? metadata.query : null,
     });
   }
 
@@ -123,6 +130,41 @@ export function createInMemoryEcosystemSearchCacheRepository(opts = {}) {
     return inflight.size;
   }
 
+  function _exportSnapshot() {
+    return [...store.entries()].map(([key, row]) => ({
+      cache_key: key,
+      value: Array.isArray(row.value) ? row.value.slice() : [],
+      fetched_at_ms: row.fetchedAt,
+      expires_at_ms: row.expiresAt,
+      swr_expires_at_ms: row.swrExpiresAt,
+      story_uuid: row.storyUuid,
+      story_version_uuid: row.storyVersionUuid,
+      community_profile_version: row.communityProfileVersion,
+      query_id: row.queryId,
+      query_text: row.query,
+    }));
+  }
+
+  function _hydrateSnapshot(rows) {
+    if (!Array.isArray(rows)) throw new Error('ecosystemSearchCache: rows snapshot required');
+    store.clear();
+    inflight.clear();
+    for (const row of rows) {
+      if (!row || typeof row.cache_key !== 'string') continue;
+      store.set(row.cache_key, {
+        value: Array.isArray(row.value) ? row.value.slice() : [],
+        fetchedAt: Number(row.fetched_at_ms),
+        expiresAt: Number(row.expires_at_ms),
+        swrExpiresAt: Number(row.swr_expires_at_ms),
+        storyUuid: row.story_uuid || null,
+        storyVersionUuid: row.story_version_uuid || null,
+        communityProfileVersion: row.community_profile_version || null,
+        queryId: row.query_id || null,
+        query: row.query_text || null,
+      });
+    }
+  }
+
   return Object.freeze({
     name: 'in-memory-ecosystem-search-cache',
     ttlMs,
@@ -139,6 +181,8 @@ export function createInMemoryEcosystemSearchCacheRepository(opts = {}) {
     _size,
     _clear,
     _inflightSize,
+    _exportSnapshot,
+    _hydrateSnapshot,
   });
 }
 
@@ -274,7 +318,13 @@ async function fetchOneQuery(args) {
     });
     const list = Array.isArray(result && result.discussions) ? result.discussions : [];
     const cleanList = list.filter((d) => isDiscussionShape(d));
-    cache.put(key, cleanList, Date.now());
+    cache.put(key, cleanList, Date.now(), {
+      story_uuid,
+      story_version_uuid,
+      community_profile_version,
+      query_id: sq.id,
+      query: sq.query,
+    });
     const source = result && result.source ? result.source : 'mock';
     // 'cache' is reserved for the per-query cache hit; live or mock
     // provenance reflects the actual source.
@@ -322,7 +372,13 @@ function scheduleBackgroundRefresh(input) {
       });
       const list = Array.isArray(result && result.discussions) ? result.discussions : [];
       const cleanList = list.filter((d) => isDiscussionShape(d));
-      input.cache.put(key, cleanList, Date.now());
+      input.cache.put(key, cleanList, Date.now(), {
+        story_uuid: input.story_uuid,
+        story_version_uuid: input.story_version_uuid,
+        community_profile_version: input.community_profile_version,
+        query_id: input.sq.id,
+        query: input.sq.query,
+      });
     } catch {
       // Swallow background failures — the SWR row stays valid.
     } finally {

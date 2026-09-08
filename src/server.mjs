@@ -39,6 +39,8 @@ import {
   seedCommunityProfiles,
 } from './community/index.mjs';
 import { deriveExternalCommunityProfileVersion } from './community/version.mjs';
+import { closeDatabase, connectDatabase, databaseStatus } from './db/mariadb.mjs';
+import { createMariaDbRepositories } from './db/mariaPersistence.mjs';
 
 // ClickUp 16.2 P1.v2 (2026-09-07 ChatGPT review): the
 // /v1/ecosystem/discussions route is server-authoritative — it takes
@@ -137,6 +139,8 @@ const ROOT = resolve(__dirname, '..');
 const PUBLIC_DIR = resolve(ROOT, 'public');
 const PORT = Number(process.env.PORT || 4173);
 const HOST = process.env.HOST || '127.0.0.1';
+let databasePersistence = null;
+let databaseBootstrapError = null;
 
 /**
  * Build a deterministic, story-aware mock provider that satisfies the
@@ -264,10 +268,10 @@ const DEMO_FLAG = Object.freeze({
 // wire so a client can tell at a glance whether a response came from
 // the real adapter or from the deterministic in-process demo.
 const MOCK_ONLY_ROUTES = Object.freeze([
-  // Phase 4 admin tooling that operates on the seeded in-memory fixtures
-  // (not on the live upstream). With STORY_OUTSIDE_PROVIDER=real these
-  // endpoints become dev-only and refuse to write — they exist solely
-  // so an operator can inspect the local mock catalog.
+  // Phase 4 admin tooling operates on the seeded/local projection (not on
+  // the live upstream). With STORY_OUTSIDE_PROVIDER=real these endpoints
+  // remain dev-only and refuse upstream writes; when MariaDB is configured,
+  // accepted projection mutations are still flushed to the database.
   '/api/admin/stories',
   '/api/admin/stories/:slug/import',
   '/api/admin/opening-cache/rebuild',
@@ -364,12 +368,37 @@ const MIME = {
 
 function jsonResponse(res, status, payload) {
   const body = JSON.stringify(payload);
-  res.writeHead(status, {
-    'content-type': 'application/json; charset=utf-8',
-    'content-length': Buffer.byteLength(body),
-    'cache-control': 'no-store',
-  });
-  res.end(body);
+  const write = (writeStatus = status, writePayload = payload) => {
+    const serialized = JSON.stringify(writePayload);
+    res.writeHead(writeStatus, {
+      'content-type': 'application/json; charset=utf-8',
+      'content-length': Buffer.byteLength(serialized),
+      'cache-control': 'no-store',
+    });
+    res.end(serialized);
+  };
+  if (!databasePersistence) {
+    write();
+    return;
+  }
+  return databasePersistence.flush().then(
+    () => write(),
+    (error) => {
+      // Do not acknowledge a business mutation when its transaction failed.
+      // Keep the database error out of the public response body.
+      // eslint-disable-next-line no-console
+      console.error('[story-outside] MariaDB persistence failure:', String(error && error.message ? error.message : error));
+      if (!res.headersSent) {
+        write(503, {
+          error: 'database_unavailable',
+          message: 'The service could not persist the request.',
+          demo: currentDemoFlag(),
+        });
+      } else {
+        try { res.end(); } catch { /* response already failed */ }
+      }
+    },
+  );
 }
 
 function sendText(res, status, text, contentType = 'text/plain; charset=utf-8') {
@@ -470,11 +499,12 @@ function classifyProviderError(err) {
   return { status: 500, code: 'provider_error' };
 }
 
-// Stories application layer. Seeded once per process from the mock catalog so
-// admin/dev tooling can rebuild caches against a known set of UUIDs without
-// having to POST a separate import for every story. The repository lives in
-// memory only; see docs/data-model.md for the MariaDB mapping.
-const { repository: storyRepo, fixtures: storyFixtures } = createSeededRepository();
+// Stories application layer. The in-memory projection is seeded from the
+// bundled catalog, then replaced with its MariaDB-hydrated projection when a
+// database is configured. The service layer keeps its synchronous contract;
+// the persistence adapter flushes before JSON responses.
+const { repository: seededStoryRepository, fixtures: storyFixtures } = createSeededRepository();
+let storyRepo = seededStoryRepository;
 
 // ClickUp 16.1 server.mjs wiring (2026-09-06): a single in-memory
 // community-profile repository is seeded once per process from the
@@ -490,7 +520,31 @@ const { repository: storyRepo, fixtures: storyFixtures } = createSeededRepositor
 // `seedCommunityProfiles` below, and the hook inside
 // `importStoryAndEnsureCache` falls back to `mock-generated` for any
 // story_version the seed loop did not cover.
-const communityProfileRepo = createInMemoryCommunityProfileRepository();
+let communityProfileRepo = createInMemoryCommunityProfileRepository();
+let followingRepo = createInMemoryFollowingRepository();
+let followingService;
+let ecosystemSearchCacheRepo = createInMemoryEcosystemSearchCacheRepository();
+
+try {
+  const pool = await connectDatabase();
+  if (pool) {
+    const persisted = await createMariaDbRepositories({
+      pool,
+      storyRepository: storyRepo,
+      communityProfileRepository: communityProfileRepo,
+      followingRepository: followingRepo,
+      ecosystemSearchCacheRepository: ecosystemSearchCacheRepo,
+    });
+    databasePersistence = persisted;
+    storyRepo = persisted.storyRepository;
+    communityProfileRepo = persisted.communityProfileRepository;
+    followingRepo = persisted.followingRepository;
+    ecosystemSearchCacheRepo = persisted.ecosystemSearchCacheRepository;
+  }
+} catch (error) {
+  databaseBootstrapError = error;
+}
+
 seedCommunityProfiles(storyRepo, communityProfileRepo);
 // Test hook (NO production consumers): the regression suite reads
 // the live repo so it can install / override rows for the
@@ -516,8 +570,7 @@ const ecosystemHotOrchestrator = createEcosystemHotOrchestrator();
 // canonical owner persisted by sessionService.createSession against
 // the cookie-derived caller identity. There is no header-based auth
 // path; every ecosystem route reads `req.cookies.story_outside_session`.
-const followingRepo = createInMemoryFollowingRepository();
-const followingService = createFollowingService({ repository: followingRepo });
+followingService = createFollowingService({ repository: followingRepo });
 
 // ClickUp 16.3 — the public surface decorator is hoisted near the
 // ecosystem helpers so the cookie / share / follow code below can
@@ -604,7 +657,6 @@ function sendFollowingError(res, err) {
 // a row. The adapter is selected by STORY_OUTSIDE_ECOSYSTEM_SEARCH
 // (`mock` default; `real` requires hasRealSearchCredentials()).
 // ---------------------------------------------------------------------
-const ecosystemSearchCacheRepo = createInMemoryEcosystemSearchCacheRepository();
 const ecosystemSearchAdapter = (process.env.STORY_OUTSIDE_ECOSYSTEM_SEARCH === 'real' && hasRealSearchCredentials())
   ? createRealZhihuSearchSource()
   : createMockZhihuSearchSource();
@@ -677,19 +729,65 @@ const communityProfileService = Object.freeze({
 });
 
 // sessionService deliberately keeps its state private to the repository. The
-// route layer keeps only the request's non-secret pinned metadata so recovery
-// can return the same metadata without reaching into service internals.
-//
-// The store is bounded so a long-running server cannot accumulate state
-// for every UUID it has ever observed. Eviction is LRU-based; an evicted
-// session_uuid simply has no pinned metadata on the next /recover call
-// (pinned=null). The canonical session data lives in the repository, not
-// here — eviction here never loses durable information.
+// route layer keeps a bounded response cache for the non-secret pinned
+// metadata; after a restart or an LRU eviction the same view is rebuilt from
+// the durable session projection instead of being treated as missing.
 const sessionPinnedMetadata = new BoundedMap({ max: 1024, name: 'sessionPinnedMetadata' });
 // Per-session turn-level request idempotency map. Keyed by session_uuid,
 // then by request_id. The map intentionally lives outside the repository
 // because the runtime does not own it (the repository is process-shared
 // with other tests/routes); the route layer is the only producer.
+
+const PINNED_GENERATION_PROFILE_KEYS = [
+  'cache_uuid',
+  'story_uuid',
+  'story_version_uuid',
+  'generation_hash',
+  'identifier',
+  'rules_version',
+  'locale',
+  'variant',
+];
+
+function pinnedGenerationProfile(profile) {
+  const result = {};
+  if (!profile || typeof profile !== 'object') return result;
+  for (const key of PINNED_GENERATION_PROFILE_KEYS) {
+    if (profile[key] !== undefined) result[key] = profile[key];
+  }
+  return result;
+}
+
+function publicPinnedMetadata(metadata) {
+  if (!metadata || typeof metadata !== 'object') return null;
+  return {
+    role_id: metadata.role_id,
+    generation_profile: pinnedGenerationProfile(metadata.generation_profile),
+  };
+}
+
+function durablePinnedMetadata(session) {
+  if (!session || typeof session !== 'object') return null;
+  return {
+    user_ref: session.user_ref,
+    role_id: session.role_id,
+    model: session.model,
+    prompt: session.prompt,
+    generation_profile: pinnedGenerationProfile(session.generation_profile),
+  };
+}
+
+function pinnedMetadataForSession(session_uuid, { publicSurface = false } = {}) {
+  const cached = sessionPinnedMetadata.get(session_uuid);
+  if (cached) return publicSurface ? publicPinnedMetadata(cached) : cached;
+  try {
+    const recovered = recoverSession({ repository: storyRepo, session_uuid });
+    const rebuilt = durablePinnedMetadata(recovered);
+    return publicSurface ? publicPinnedMetadata(rebuilt) : rebuilt;
+  } catch {
+    return null;
+  }
+}
 
 const SESSION_UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -839,6 +937,7 @@ async function handleRequest(req, res) {
       uptimeSeconds: Math.round(process.uptime()),
       nodeVersion: process.version,
       provider: providerName,
+      database: databaseStatus(),
       demo: currentDemoFlag(),
     });
   }
@@ -924,14 +1023,14 @@ async function handleRequest(req, res) {
   // Phase 4 routes — story import, version, opening cache, session snapshot.
   //
   // All Phase 4 routes are demo/dev-only and live under /api/admin/* so a
-  // future reverse proxy can block them with one ACL. They carry the DEV_FLAG
-  // banner on every response, are un-authenticated by design, and intentionally
-  // do not write to MariaDB.
+  // reverse proxy can block them with one ACL. They carry the DEV_FLAG
+  // banner on every response, are un-authenticated by design, and use the
+  // same MariaDB flush boundary as the public business routes.
   // -----------------------------------------------------------------------
 
   // GET /api/admin/stories — list every story currently in the in-memory
-  // repository (seeded fixtures ∪ stories imported via the real provider
-  // since process start). Includes their story_uuid / story_version_uuid
+  // repository projection (seeded fixtures ∪ stories imported via the real
+  // provider). Includes their story_uuid / story_version_uuid
   // list so admins can copy identifiers and bootstrap a session against
   // any imported story, not just the seeded mock catalogue.
   if (method === 'GET' && pathname === '/api/admin/stories') {
@@ -1277,7 +1376,7 @@ async function handleRequest(req, res) {
         demo: currentDemoFlag(),
         dev: DEV_FLAG,
         ...recovered,
-        pinned: sessionPinnedMetadata.get(sessionMatch[1]) || null,
+        pinned: pinnedMetadataForSession(sessionMatch[1]),
       });
     } catch (err) {
       return sessionErrorResponse(res, err);
@@ -1349,8 +1448,9 @@ async function handleRequest(req, res) {
   // GET /api/dev/sessions/:uuid/recover — explicit read-only recovery.
   // Surfaces canonical history + revision + cursor + opening_cursor +
   // active pending snapshot. Never calls the provider, never replays,
-  // never mutates state. Same-process only: the repository is
-  // in-memory, so a fresh process does not know this session.
+  // never mutates state. With MariaDB configured the repository projection
+  // was hydrated before this route became available; without it the route
+  // remains process-local.
   const recoverMatch = pathname.match(/^\/api\/dev\/sessions\/([^/]+)\/recover$/);
   if (method === 'GET' && recoverMatch) {
     if (rejectInvalidSessionUuid(res, recoverMatch[1])) return;
@@ -1359,7 +1459,7 @@ async function handleRequest(req, res) {
       return jsonResponse(res, 200, {
         demo: currentDemoFlag(), dev: DEV_FLAG,
         ...recovered,
-        pinned: sessionPinnedMetadata.get(recoverMatch[1]) || null,
+        pinned: pinnedMetadataForSession(recoverMatch[1]),
       });
     } catch (err) {
       return sessionErrorResponse(res, err);
@@ -1391,7 +1491,8 @@ async function handleRequest(req, res) {
   // ClickUp 11 ending-page read-only routes. These three endpoints are
   // pure projections over (session_events + story_version + opening_cache)
   // and never mutate the repository. They are safe to call after a page
-  // reload (in the same process) and return a deterministic shape the
+  // reload and, with MariaDB configured, after a process restart; they return
+  // a deterministic shape the
   // ending page can rebuild the full result from.
   //
   //  GET /api/dev/sessions/:uuid/ending             — derived ending
@@ -1749,9 +1850,9 @@ async function handleRequest(req, res) {
     try {
       pinnedSession = recoverSession({ repository: storyRepo, session_uuid });
     } catch {
-      // The session may exist in metrics but not in the in-memory
-      // repository (e.g. process restart between the metric write and
-      // the request). Fall through with pinnedSession=null so the
+      // The session may exist in metrics but not in the hydrated
+      // repository projection (for example when metrics are from a prior
+      // process and MariaDB is disabled). Fall through with pinnedSession=null so the
       // metrics view still renders.
       pinnedSession = null;
     }
@@ -2032,7 +2133,7 @@ async function handleRequest(req, res) {
         ...recovered,
         community_profile_version: cv.community_profile_version,
         community_profile_queries: cv.community_profile_queries,
-        pinned: sessionPinnedMetadata.get(publicSessionRoot[1]) || null,
+        pinned: pinnedMetadataForSession(publicSessionRoot[1], { publicSurface: true }),
       });
     } catch (err) {
       return sessionErrorResponse(res, err);
@@ -2053,7 +2154,7 @@ async function handleRequest(req, res) {
         ...recovered,
         community_profile_version: cv.community_profile_version,
         community_profile_queries: cv.community_profile_queries,
-        pinned: sessionPinnedMetadata.get(publicRecover[1]) || null,
+        pinned: pinnedMetadataForSession(publicRecover[1], { publicSurface: true }),
       });
     } catch (err) {
       return sessionErrorResponse(res, err);
@@ -2429,7 +2530,7 @@ async function handleRequest(req, res) {
   // SERVER-AUTHORITATIVE. The handler accepts ONLY the three identity
   // fields (story_uuid, story_version_uuid, community_profile_version)
   // and resolves the canonical StoryCommunityProfile from the
-  // in-memory repo via `findCanonicalByIdentity`. The
+  // hydrated community-profile repository via `findCanonicalByIdentity`. The
   // `profile.knowledge_queries[]` list is read from THAT row —
   // caller-supplied knowledge_queries / topic_id / topic_label /
   // topic / theme / subject / query / identity are NEVER accepted.
@@ -3303,17 +3404,37 @@ if (isMainModule) {
   // misconfigured STORY_OUTSIDE_PROVIDER fails loudly at startup rather
   // than only when the first /api/stories request arrives.
   try {
-    getStoryProvider();
-    loadAIConfig();
+    try {
+      getStoryProvider();
+      loadAIConfig();
+    } catch (err) {
+      // Keep the established startup error channel for provider/AI config
+      // failures; callers and wire-regression checks rely on this prefix.
+      // eslint-disable-next-line no-console
+      console.error(`[story-outside] provider config error: ${String(err && err.message ? err.message : err)}`);
+      await closeDatabase().catch(() => {});
+      process.exit(1);
+    }
+    await connectDatabase();
+    if (databaseBootstrapError) throw databaseBootstrapError;
+    if (databasePersistence) await databasePersistence.flush();
   } catch (err) {
     // eslint-disable-next-line no-console
-    console.error(`[story-outside] provider config error: ${String(err && err.message ? err.message : err)}`);
+    console.error(`[story-outside] bootstrap error: ${String(err && err.message ? err.message : err)}`);
+    await closeDatabase().catch(() => {});
     process.exit(1);
   }
   server.listen(PORT, HOST, () => {
     // eslint-disable-next-line no-console
     console.log(`[story-outside] listening on http://${HOST}:${PORT} (${currentDemoFlag().mode} mode)`);
   });
+
+  const shutdown = async () => {
+    server.close();
+    await closeDatabase();
+  };
+  process.once('SIGINT', shutdown);
+  process.once('SIGTERM', shutdown);
 }
 
 export { server, DEMO_FLAG, DEV_FLAG, classifyProviderError, sessionError, storyRepo, storyFixtures, listFixtureStorySlugs, communityProfileRepo };

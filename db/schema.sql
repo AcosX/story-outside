@@ -2,8 +2,7 @@
 --
 -- This file is the deployment entrypoint. It creates the database and then
 -- applies the same final DDL as db/migrations/0001_initial_story_outside.sql
--- followed by db/migrations/0002_opening_cache_generation_profile.sql and
--- db/migrations/0003_session_playback.sql.
+-- through db/migrations/0007_session_event_request_scope.sql.
 -- The contract test tests/schema-contract.test.mjs keeps this body in sync
 -- with the migration set.
 
@@ -164,6 +163,7 @@ CREATE TABLE IF NOT EXISTS game_sessions (
   model VARCHAR(128) NOT NULL,
   prompt TEXT NOT NULL,
   generation_profile JSON NOT NULL,
+  user_uuid CHAR(36) NULL,
   role_label VARCHAR(80) NULL,
   status ENUM('active', 'paused', 'ended', 'abandoned') NOT NULL DEFAULT 'active',
   opening_cache_id BIGINT UNSIGNED NULL,
@@ -189,6 +189,7 @@ CREATE TABLE IF NOT EXISTS game_sessions (
   last_compact_attempt_at DATETIME(6) NULL,
   last_compact_status ENUM('idle', 'compacted', 'skipped', 'failed') NOT NULL DEFAULT 'idle',
   last_compact_error VARCHAR(500) NULL,
+  runtime_payload JSON NULL,
   created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
   updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
   PRIMARY KEY (id),
@@ -215,6 +216,7 @@ CREATE TABLE IF NOT EXISTS game_sessions (
   CONSTRAINT chk_game_sessions_role CHECK (CHAR_LENGTH(role_id) > 0),
   CONSTRAINT chk_game_sessions_model CHECK (CHAR_LENGTH(model) > 0),
   CONSTRAINT chk_game_sessions_generation_profile CHECK (JSON_VALID(generation_profile)),
+  CONSTRAINT chk_game_sessions_runtime_payload CHECK (runtime_payload IS NULL OR JSON_VALID(runtime_payload)),
   CONSTRAINT chk_game_sessions_opening_cursor CHECK (opening_cursor >= 0),
   CONSTRAINT chk_game_sessions_revision CHECK (session_revision >= 0),
   CONSTRAINT chk_game_sessions_meta CHECK (meta_payload IS NULL OR JSON_VALID(meta_payload)),
@@ -263,7 +265,7 @@ CREATE TABLE IF NOT EXISTS session_events (
   PRIMARY KEY (id),
   UNIQUE KEY uq_session_events_event_id (event_id),
   UNIQUE KEY uq_session_events_seq (session_id, event_seq),
-  UNIQUE KEY uq_session_events_client_request (client_request_id),
+  UNIQUE KEY uq_session_events_client_request (session_id, client_request_id),
   UNIQUE KEY uq_session_events_source_sequence (session_id, source, source_sequence),
   KEY idx_session_events_session_created (session_id, created_at),
   KEY idx_session_events_type_occurred (event_type, occurred_at),
@@ -494,6 +496,90 @@ CREATE TABLE IF NOT EXISTS model_context_windows (
   CONSTRAINT chk_model_context_windows_reserved CHECK (reserved_completion_tokens >= 0)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
+-- Story-version-scoped community profiles. The full canonical profile is
+-- retained as JSON so historical profile versions remain resolvable by the
+-- external community_profile_version identity.
+CREATE TABLE IF NOT EXISTS story_community_profiles (
+  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  profile_uuid CHAR(36) NOT NULL,
+  story_id BIGINT UNSIGNED NOT NULL,
+  story_version_id BIGINT UNSIGNED NOT NULL,
+  generator_version VARCHAR(255) NOT NULL,
+  content_hash CHAR(64) NOT NULL,
+  profile_payload JSON NOT NULL,
+  source VARCHAR(32) NOT NULL,
+  generated_at DATETIME(6) NOT NULL,
+  created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+  updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+  PRIMARY KEY (id),
+  UNIQUE KEY uq_story_community_profiles_uuid (profile_uuid),
+  UNIQUE KEY uq_story_community_profiles_generation (story_version_id, generator_version, content_hash),
+  KEY idx_story_community_profiles_story_version (story_version_id, generated_at),
+  CONSTRAINT fk_story_community_profiles_story FOREIGN KEY (story_id) REFERENCES stories(id)
+    ON DELETE RESTRICT ON UPDATE RESTRICT,
+  CONSTRAINT fk_story_community_profiles_version FOREIGN KEY (story_version_id) REFERENCES story_versions(id)
+    ON DELETE RESTRICT ON UPDATE RESTRICT,
+  CONSTRAINT fk_story_community_profiles_story_version_pair FOREIGN KEY (story_id, story_version_id)
+    REFERENCES story_versions(story_id, id) ON DELETE RESTRICT ON UPDATE RESTRICT,
+  CONSTRAINT chk_story_community_profiles_payload CHECK (JSON_VALID(profile_payload)),
+  CONSTRAINT chk_story_community_profiles_hash CHECK (CHAR_LENGTH(content_hash) = 64)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- Ecosystem graph state. UUIDs are opaque application identities; the
+-- account/auth provider remains outside this schema.
+CREATE TABLE IF NOT EXISTS ecosystem_follow_edges (
+  follower_uuid CHAR(36) NOT NULL,
+  target_user_uuid CHAR(36) NOT NULL,
+  created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+  PRIMARY KEY (follower_uuid, target_user_uuid),
+  KEY idx_ecosystem_follow_edges_target (target_user_uuid, created_at),
+  CONSTRAINT chk_ecosystem_follow_edges_no_self CHECK (follower_uuid <> target_user_uuid)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS ecosystem_block_edges (
+  owner_uuid CHAR(36) NOT NULL,
+  target_user_uuid CHAR(36) NOT NULL,
+  created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+  PRIMARY KEY (owner_uuid, target_user_uuid),
+  KEY idx_ecosystem_block_edges_target (target_user_uuid, created_at),
+  CONSTRAINT chk_ecosystem_block_edges_no_self CHECK (owner_uuid <> target_user_uuid)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS ecosystem_shared_sessions (
+  session_uuid CHAR(36) NOT NULL,
+  owner_user_uuid CHAR(36) NOT NULL,
+  title VARCHAR(200) NULL,
+  story_uuid CHAR(36) NULL,
+  story_version_uuid CHAR(36) NULL,
+  created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+  updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+  PRIMARY KEY (session_uuid),
+  KEY idx_ecosystem_shared_sessions_owner (owner_user_uuid, updated_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- Persistent pair-key cache for ecosystem search. Epoch milliseconds are
+-- used because the runtime cache already uses Date.now() and the TTL/SWR
+-- contract is independent of the database server timezone.
+CREATE TABLE IF NOT EXISTS ecosystem_search_cache (
+  cache_key VARCHAR(512) NOT NULL,
+  story_uuid CHAR(36) NOT NULL,
+  story_version_uuid CHAR(36) NOT NULL,
+  community_profile_version VARCHAR(255) NOT NULL,
+  query_id VARCHAR(128) NOT NULL,
+  query_text VARCHAR(500) NOT NULL,
+  value JSON NOT NULL,
+  fetched_at_ms BIGINT UNSIGNED NOT NULL,
+  expires_at_ms BIGINT UNSIGNED NOT NULL,
+  swr_expires_at_ms BIGINT UNSIGNED NOT NULL,
+  created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+  updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+  PRIMARY KEY (cache_key),
+  KEY idx_ecosystem_search_cache_identity (story_version_uuid, community_profile_version, query_id),
+  KEY idx_ecosystem_search_cache_expiry (swr_expires_at_ms),
+  CONSTRAINT chk_ecosystem_search_cache_value CHECK (JSON_VALID(value)),
+  CONSTRAINT chk_ecosystem_search_cache_expiry CHECK (expires_at_ms <= swr_expires_at_ms)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
 -- Seed default context windows so the table mirrors the application
 -- fallback even before any operator override.
 INSERT IGNORE INTO model_context_windows (model, context_window, safety_ratio, reserved_completion_tokens, notes, is_active)
@@ -572,4 +658,6 @@ VALUES ('0001_initial_story_outside', NULL),
        ('0002_opening_cache_generation_profile', NULL),
        ('0003_session_playback', NULL),
        ('0004_pending_batch_lifecycle', NULL),
-       ('0005_compact_and_context', NULL);
+       ('0005_compact_and_context', NULL),
+       ('0006_business_persistence', NULL),
+       ('0007_session_event_request_scope', NULL);

@@ -148,9 +148,9 @@ export async function timeProvider(ctx, fn) {
 }
 
 /**
- * Wrap a database (or repository) call. Even though the repository is
- * in-memory today, recording under `db` future-proofs the slow-point
- * triage column against the real backend.
+ * Wrap a database (or repository) call. MariaDB flushes and the synchronous
+ * projection both report under `db` so slow-point triage remains comparable
+ * when the configured backend changes.
  */
 export async function timeDb(ctx, fn) {
   const stopwatch = new Stopwatch();

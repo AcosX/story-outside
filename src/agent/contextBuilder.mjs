@@ -2,15 +2,14 @@
 // runtime hands to the provider, including the long-context compact
 // decision (ClickUp 10).
 //
-// DEPENDENCY NOTE — in-memory vs SQL boundary:
-// This module is pure: it reads the in-memory session snapshot returned by
-// sessionService and produces a context payload object. It never mutates
-// session_events, never asks the provider, and never opens DB connections.
-// When the MariaDB DAO is wired (not in this PR), the same module can be
-// fed the SQL-backed session + history list and its output will be
-// identical. The compact *write* path lives in sessionService.mjs (see
-// recordCompact / rebuildCompactFromHistory) and is intentionally a
-// separate concern from this read+assemble path.
+// DEPENDENCY NOTE — projection vs SQL boundary:
+// This module is pure: it reads the synchronous session projection returned
+// by sessionService and produces a context payload object. It never mutates
+// session_events, asks the provider, or opens DB connections. In MariaDB
+// mode the projection has already been hydrated by the server adapter, so
+// the output is identical after a restart. The compact *write* path lives in
+// sessionService.mjs (see recordCompact / rebuildCompactFromHistory) and is
+// intentionally separate from this read+assemble path.
 //
 // MariaDB contract: session_events rows are append-only and never deleted
 // by compact. The compact summary lives on game_sessions.context_compact

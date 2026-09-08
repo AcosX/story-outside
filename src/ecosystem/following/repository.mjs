@@ -241,5 +241,30 @@ export function createInMemoryFollowingRepository() {
         shares: sharedSessions.size,
       });
     },
+    _exportSnapshot() {
+      return {
+        follows: [...follows.values()].map((row) => ({ ...row })),
+        blocks: [...blocks.values()].map((row) => ({ ...row })),
+        sharedSessions: [...sharedSessions.values()].map((row) => ({ ...row })),
+      };
+    },
+    _hydrateSnapshot(snapshot) {
+      if (!snapshot || typeof snapshot !== 'object') throw new Error('followingRepository: snapshot required');
+      follows.clear();
+      blocks.clear();
+      sharedSessions.clear();
+      for (const row of Array.isArray(snapshot.follows) ? snapshot.follows : []) {
+        if (!row || typeof row.follower_uuid !== 'string' || typeof row.target_user_uuid !== 'string') continue;
+        follows.set(followKey(row.follower_uuid, row.target_user_uuid), Object.freeze({ ...row }));
+      }
+      for (const row of Array.isArray(snapshot.blocks) ? snapshot.blocks : []) {
+        if (!row || typeof row.owner_uuid !== 'string' || typeof row.target_user_uuid !== 'string') continue;
+        blocks.set(`${row.owner_uuid}\u0000${row.target_user_uuid}`, Object.freeze({ ...row }));
+      }
+      for (const row of Array.isArray(snapshot.sharedSessions) ? snapshot.sharedSessions : []) {
+        if (!row || typeof row.session_uuid !== 'string') continue;
+        sharedSessions.set(row.session_uuid, Object.freeze({ ...row }));
+      }
+    },
   };
 }

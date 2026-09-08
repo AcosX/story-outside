@@ -131,7 +131,9 @@ const MAX_NARRATIVE_ITEMS = 4;
 // of a stale cached result.
 const MAX_TRACKED_REQUESTS_PER_SESSION = 1000;
 
-// Canonical session store bound. PR #7 only capped three auxiliary Maps
+// In-memory demo session store bound. Persistent repositories retain the
+// complete projection until the adapter supports lazy loading from SQL.
+// PR #7 only capped three auxiliary Maps
 // (sessionPinnedMetadata, turnRequests-by-session, sessionMetrics); the
 // canonical session store itself could still grow without limit. This
 // demo-grade bound evicts the LEAST RECENTLY TOUCHED session when the
@@ -140,20 +142,16 @@ const MAX_TRACKED_REQUESTS_PER_SESSION = 1000;
 // recordCompact) call `touchSession(...)` to refresh the LRU position;
 // `createSession` also touches after insertion. The eviction drops
 // history / pending / requestIds / turnRequests for the evicted session
-// AND drops its entries from the cross-session uniqueness index so
+// AND drops its entries from the cross-session request tracking index so
 // future replays are not silently prevented. Anonymous /api/dev traffic
 // can therefore grow the canonical store up to this bound and no
 // further; documented as a demo bound in docs/observability.md.
 const MAX_CANONICAL_SESSIONS = 2000;
 
-// Bounded sliding window per process (PR #7 follow-up, ChatGPT 2026-09-05
-// re-review, Blocker 3). The MariaDB schema keeps a GLOBALLY UNIQUE
-// constraint on `client_request_id` (uq_session_events_client_request),
-// which would survive across all processes and across process lifetime.
-// The in-memory demo cannot keep an equivalent index forever — it is
-// bounded by MAX_TRACKED_CLIENT_REQUEST_IDS so the demo memory budget
-// stays predictable. The trade-off, made explicit here so a future
-// operator cannot silently rely on the wrong guarantee:
+// Bounded request tracking window per process. SQL idempotency is scoped
+// by (session_id, client_request_id), matching the service's per-session
+// replay contract. This auxiliary index limits the number of distinct ids
+// tracked by the process; it does not enforce cross-session uniqueness:
 //
 //   * SAME-session replay with the same id and the same payload
 //     continues to return the prior result (per-session idempotency,
@@ -161,11 +159,7 @@ const MAX_CANONICAL_SESSIONS = 2000;
 //   * SAME-session replay with the same id and a DIFFERENT payload
 //     still fails closed (per-session fingerprint check).
 //   * CROSS-session reuse of an id that is still in the window is now
-//     ACCEPTED — the demo treats `clientRequestIndex` as a bounded
-//     sliding window, NOT as a mirror of the SQL UNIQUE index. A future
-//     session may legally re-commit under an id that an evicted session
-//     previously held. The production DAO replaces this index with the
-//     SQL UNIQUE constraint, which DOES reject cross-session reuse.
+//     ACCEPTED in both the in-memory service and the SQL schema.
 //
 // When the cap is reached a NEW (previously unseen) id is refused with
 // a stable 'too_many_client_request_ids' code so operators can see the
@@ -173,6 +167,7 @@ const MAX_CANONICAL_SESSIONS = 2000;
 // oldest entries as before because their semantic is 'replay window',
 // not 'uniqueness index'.
 const MAX_TRACKED_CLIENT_REQUEST_IDS = 50000;
+const persistentSessionStates = new WeakSet();
 function repositoryState(repository) {
   if (!repository || typeof repository !== 'object') {
     throw new Error('sessionService: repository required');
@@ -191,6 +186,12 @@ function repositoryState(repository) {
 // Public (read-only) access for cross-module helpers. Callers MUST NOT
 // mutate the returned object.
 export { repositoryState };
+
+// Register by shared state so a repository and its persistence proxy have
+// identical retention behavior. The marker is internal and not serialized.
+export function registerPersistentSessionRepository(repository) {
+  persistentSessionStates.add(repositoryState(repository));
+}
 
 /**
  * Wire the repository's pinned-cache resolver to the canonical session
@@ -327,15 +328,14 @@ function rememberRequest(session, id, entry) {
 }
 
 /**
- * Enforce the bounded cross-session uniqueness window on canonical
+ * Enforce the bounded cross-session tracking window on canonical
  * events. Called from append() — the only writer of canonical events.
  *
  * Contract (PR #7 follow-up, ChatGPT 2026-09-05 re-review, Blocker 3):
  *   * A cross-session reuse of an id that is ALREADY in the window IS
  *     ALLOWED. The index is a bounded sliding window per process, not a
- *     mirror of the SQL UNIQUE constraint — once an owning session is
- *     evicted (or its id otherwise drops out of the window), any
- *     session may reuse the id. Same-session idempotency is enforced
+ *     SQL uniqueness check. Any session may reuse the id, including
+ *     while another session still owns it. Same-session idempotency is enforced
  *     earlier by `session.requestIds` (with a different fingerprint
  *     failure mode); this function only deals with the cross-session
  *     case.
@@ -490,7 +490,7 @@ function append(state, session, canonical, clientRequestId = null) {
  * Next source_sequence for a (session, source) pair. Per-source counters
  * are 0-based, contiguous, and monotonic — they never reset between
  * batches. The counter is seeded from canonical history on first use so
- * a session object rebuilt from persisted history (future DAO) derives
+ * a session object rebuilt from persisted history (MariaDB hydrate) derives
  * the same next value without extra state.
  */
 function nextSourceSequence(session, source) {
@@ -654,19 +654,126 @@ export function createSession({ repository, session_uuid, story_uuid, story_vers
     last_compact_error: null,
     compact_history: [], // append-only list of compact_attempt records (audit)
   };
-  // Evict the least-recently-touched session if the canonical store is
-  // full. Eviction drops ALL per-session state including history and
-  // pending batch, AND the session's entries in the cross-session
-  // uniqueness index (see registerCanonicalRequestId / the eviction
-  // helper below). createSession is the only insertion point for the
-  // canonical store, so bounding here keeps the entire demo memory
-  // budget predictable (this is the H1 follow-up to PR #7).
-  if (state.sessions.size >= MAX_CANONICAL_SESSIONS) {
+  // Only demo repositories may evict. Persistent reads currently depend
+  // on the complete hydrated projection; eviction would make a durable
+  // session appear missing until restart.
+  if (!persistentSessionStates.has(state) && state.sessions.size >= MAX_CANONICAL_SESSIONS) {
     evictOldestSession(state);
   }
   state.sessions.set(session_uuid, session);
   session.lastTouchedAt = nowIso();
   return publicSession(session);
+}
+
+function mapEntries(map) {
+  return map instanceof Map ? [...map.entries()].map(([key, value]) => [key, clone(value)]) : [];
+}
+
+/**
+ * Serialize the session state that is not represented by the normalized
+ * story/session tables. `session_events` remains the canonical history; the
+ * runtime payload carries the idempotency windows, pending envelope, owner,
+ * finish envelope, and compact audit needed for an exact process restart.
+ */
+export function exportSessionPersistenceSnapshot(repository) {
+  const state = repositoryState(repository);
+  return [...state.sessions.values()].map((session) => ({
+    session_uuid: session.session_uuid,
+    story_uuid: session.story_uuid,
+    story_version_uuid: session.story_version_uuid,
+    story_version_checksum: session.story_version_checksum,
+    cache_uuid: session.cache_uuid,
+    opening_cache_status: session.opening_cache_status,
+    generation_profile: clone(session.generation_profile),
+    user_ref: session.user_ref,
+    user_uuid: session.user_uuid || null,
+    role_id: session.role_id,
+    model: session.model,
+    prompt: session.prompt,
+    state: session.state,
+    cursor: session.cursor,
+    opening_cursor: session.opening_cursor,
+    revision: session.revision,
+    history: clone(session.history),
+    runtime_payload: {
+      pending: clone(session.pending),
+      requestIds: mapEntries(session.requestIds),
+      turnRequests: mapEntries(session.turnRequests),
+      sourceSeq: mapEntries(session.sourceSeq),
+      finish_envelope: clone(session.finish_envelope),
+      compact_history: clone(session.compact_history),
+      lastTouchedAt: session.lastTouchedAt || null,
+    },
+    compact: publicCompact(session),
+  }));
+}
+
+/**
+ * Rehydrate one session from the MariaDB projection. This deliberately lives
+ * beside createSession so the restored object has exactly the same shape and
+ * Map-backed idempotency semantics as a newly created session.
+ */
+export function hydrateSessionPersistence({ repository, row, history = [], runtime_payload = {}, pending = null }) {
+  if (!repository || !row || typeof row !== 'object') {
+    throw new Error('hydrateSessionPersistence: repository and row required');
+  }
+  assertUuid('session_uuid', row.session_uuid);
+  assertUuid('story_uuid', row.story_uuid);
+  assertUuid('story_version_uuid', row.story_version_uuid);
+  assertUuid('cache_uuid', row.cache_uuid);
+  const state = repositoryState(repository);
+  if (state.sessions.has(row.session_uuid)) return state.sessions.get(row.session_uuid);
+  const runtime = runtime_payload && typeof runtime_payload === 'object' ? runtime_payload : {};
+  const compact = row.compact && typeof row.compact === 'object' ? row.compact : {};
+  const restoredHistory = Array.isArray(history) ? clone(history) : [];
+  const restoredPending = runtime.pending && typeof runtime.pending === 'object'
+    ? clone(runtime.pending)
+    : (pending && typeof pending === 'object' ? clone(pending) : null);
+  const session = {
+    session_uuid: row.session_uuid,
+    story_uuid: row.story_uuid,
+    story_version_uuid: row.story_version_uuid,
+    story_version_checksum: row.story_version_checksum || null,
+    cache_uuid: row.cache_uuid,
+    opening_cache_status: row.opening_cache_status || 'valid',
+    generation_profile: clone(row.generation_profile || {}),
+    user_ref: row.user_ref,
+    user_uuid: row.user_uuid || runtime.user_uuid || null,
+    role_id: row.role_id,
+    model: row.model,
+    prompt: row.prompt,
+    state: runtime.state || row.state || (row.status === 'ended' ? 'finished' : 'opening'),
+    cursor: Number.isInteger(runtime.cursor) ? runtime.cursor : restoredHistory.length,
+    opening_cursor: Number.isInteger(runtime.opening_cursor) ? runtime.opening_cursor : Number(row.opening_cursor || 0),
+    revision: Number.isInteger(runtime.revision) ? runtime.revision : Number(row.session_revision || restoredHistory.length),
+    history: restoredHistory,
+    pending: restoredPending,
+    requestIds: new Map(Array.isArray(runtime.requestIds) ? clone(runtime.requestIds) : []),
+    turnRequests: new Map(Array.isArray(runtime.turnRequests) ? clone(runtime.turnRequests) : []),
+    sourceSeq: new Map(Array.isArray(runtime.sourceSeq) ? clone(runtime.sourceSeq) : []),
+    finish_envelope: clone(runtime.finish_envelope || null),
+    context_compact_text: row.context_compact_text ?? compact.context_compact_text ?? null,
+    context_compact_payload: clone(row.context_compact_payload ?? compact.context_compact_payload ?? null),
+    compacted_through_seq: row.compacted_through_seq == null ? (compact.compacted_through_seq ?? null) : Number(row.compacted_through_seq),
+    compacted_event_count: row.compacted_event_count == null ? (compact.compacted_event_count ?? null) : Number(row.compacted_event_count),
+    token_estimate: row.token_estimate == null ? (compact.token_estimate ?? null) : Number(row.token_estimate),
+    context_window: row.context_window == null ? (compact.context_window ?? null) : Number(row.context_window),
+    context_safety_ratio: row.context_safety_ratio == null ? (compact.context_safety_ratio ?? null) : Number(row.context_safety_ratio),
+    reserved_completion_tokens: row.reserved_completion_tokens == null ? (compact.reserved_completion_tokens ?? null) : Number(row.reserved_completion_tokens),
+    context_schema_version: row.context_schema_version == null ? (compact.context_schema_version ?? null) : Number(row.context_schema_version),
+    prompt_version: row.prompt_version == null ? (compact.prompt_version ?? null) : Number(row.prompt_version),
+    last_compact_at: row.last_compact_at || compact.last_compact_at || null,
+    last_compact_attempt_at: row.last_compact_attempt_at || compact.last_compact_attempt_at || null,
+    last_compact_status: row.last_compact_status || compact.last_compact_status || 'idle',
+    last_compact_error: row.last_compact_error || compact.last_compact_error || null,
+    compact_history: Array.isArray(runtime.compact_history) ? clone(runtime.compact_history) : [],
+    lastTouchedAt: runtime.lastTouchedAt || row.updated_at || nowIso(),
+  };
+  state.sessions.set(session.session_uuid, session);
+  for (const event of session.history) {
+    if (event && event.client_request_id) state.clientRequestIndex.set(event.client_request_id, session.session_uuid);
+  }
+  return session;
 }
 
 /**
@@ -1344,15 +1451,13 @@ export function listSessionEvents({ repository, session_uuid }) {
  * canonical history, and the active pending snapshot (if any). Never calls
  * the provider, never replays, never mutates state.
  *
- * ClickUp 08 P1.6 persistence boundary: the application-layer in-memory
- * repository (src/stories/repository.mjs) does NOT persist sessions
- * across process restarts, so `recoverSession` is only safe to call from
- * the SAME process that originally staged the session. It is NOT
- * cross-process recovery. A future MariaDB-backed DAO will replace the
- * in-memory map with the `game_sessions` table; until that DAO lands,
- * callers MUST NOT claim that the SQL migrations provide runtime
- * persistence — the migrations only pin the schema the future DAO will
- * write through. Tests and docs must not describe this as cross-process.
+ * ClickUp 08 P1.6 persistence boundary: this service keeps a synchronous
+ * in-memory projection and is intentionally unaware of the database. When
+ * the server is configured with MariaDB, `src/db/mariaPersistence.mjs`
+ * hydrates this projection before traffic and flushes it transactionally
+ * before JSON responses, so the same `recoverSession` contract also works
+ * across process restarts. Without a configured database, the projection is
+ * process-local by design.
  */
 export function recoverSession({ repository, session_uuid }) {
   if (!repository) throw new Error('recoverSession: repository required');

@@ -725,6 +725,23 @@ export function createInMemoryCommunityProfileRepository() {
       state.byExternalVersion = fresh.byExternalVersion;
       state.latestByStoryVersion = fresh.latestByStoryVersion;
     },
+    _exportSnapshot() {
+      return [...state.profiles.values()].map((profile) => JSON.parse(JSON.stringify(profile)));
+    },
+    _hydrateSnapshot(profiles) {
+      if (!Array.isArray(profiles)) throw new Error('communityRepository: profiles snapshot required');
+      state.profiles = new Map();
+      state.activeByStoryVersion = new Map();
+      state.latestByStoryVersion = new Map();
+      state.byUuid = new Map();
+      state.byExternalVersion = new Map();
+      const ordered = profiles.slice().sort((a, b) => {
+        const left = typeof a?.generated_at === 'string' ? a.generated_at : '';
+        const right = typeof b?.generated_at === 'string' ? b.generated_at : '';
+        return left < right ? -1 : left > right ? 1 : 0;
+      });
+      for (const profile of ordered) repo.setCommunityProfile(profile);
+    },
   };
   return repo;
 }
