@@ -83,7 +83,6 @@ function showScreen(name) {
   document.body.dataset.view = name;
   $('#nav-stories')?.classList.toggle('active', name !== 'mine');
   $('#nav-mine')?.classList.toggle('active', name === 'mine');
-  if (name !== 'player' && $('#header-role-select')) $('#header-role-select').hidden = true;
   $$('.screen').forEach((s) => {
     const isActive = s.dataset.screen === name;
     s.classList.toggle('active', isActive);
@@ -442,7 +441,7 @@ async function resumeSavedReading(saved) {
   state.toolCallTimer = null;
   showScreen('player');
   Object.assign(state, saved, { finished: Boolean(saved.finished), pending:null, pendingIdx:0, queuedToolCall:null, inputInFlight:false, progressTotal:0 });
-  setText('#story-name', state.story.title); setText('#role-name', state.role?.label || '故事之外'); persistSessionContext(); syncHeaderRoles(); setStatus('loading');
+  setText('#story-name', state.story.title); setText('#role-name', state.role?.label || '故事之外'); persistSessionContext(); setStatus('loading');
   try {
     const endingCommitted = await hasCommittedEnding(saved.sessionUuid);
     if (navigationToken !== state.navigationToken || state.sessionUuid !== saved.sessionUuid) return;
@@ -477,12 +476,6 @@ function renderMine(requestedPage = 1) {
   $('#reading-next')?.addEventListener('click', () => renderMine(page + 1));
   icons();
 }
-function syncHeaderRoles() {
-  const select = $('#header-role-select'); if (!select) return;
-  select.innerHTML = (state.story?.roles || []).map(r => `<option value="${escapeHtml(r.id)}" ${r.id === state.role?.id ? 'selected' : ''}>${escapeHtml(r.label)}</option>`).join('');
-  select.hidden = state.story?.default_role_id != null || !(state.story?.roles?.length > 1) || document.body.dataset.view !== 'player';
-}
-
 // -------- Story bootstrap (session creation) --------
 
 async function bootstrapSession({ story, role }) {
@@ -615,7 +608,6 @@ async function bootstrapSession({ story, role }) {
     dispatchLocalSessionChanged(state.sessionUuid || null, 'player.bootstrapSession');
     rememberReading();
     showScreen('player');
-    syncHeaderRoles();
     await recoverAndStart();
   } catch (err) {
     if (requestToken !== state.bootstrapRequestToken || bootstrapToken !== (state.navigationToken || 0)) return null;
@@ -1821,7 +1813,6 @@ function bindEvents() {
     if (e.detail?.storyId) void selectStory(e.detail.storyId);
   });
   $('#start-story-btn')?.addEventListener('click', () => { if (state.story && state.role) void bootstrapSession({story:state.story, role:state.role}); });
-  $('#header-role-select')?.addEventListener('change', (e) => { const role = state.story?.roles.find(r => r.id === e.target.value); if (role && role.id !== state.role?.id) { void bootstrapSession({story:state.story, role}); } });
   $('#player-input').addEventListener('focus', () => { if (state.status === 'playing') togglePause(); });
   $('#story-log').addEventListener('click', e => { if (e.target?.closest('button, a')) return; void advanceStory(); });
   $('#share-btn').addEventListener('click', () => { void share(); });

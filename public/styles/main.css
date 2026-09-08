@@ -230,14 +230,6 @@ body[data-view="picker"] #share-btn,
 body[data-view="mine"] #share-btn {
   display: none;
 }
-#header-role-select {
-  border: 1px solid var(--line);
-  border-radius: 7px;
-  padding: 9px 30px 9px 12px;
-  color: var(--blue);
-  background: white;
-  font-size: 12px;
-}
 .picker-shell,
 .mine-shell {
   max-width: 1300px;
@@ -1257,13 +1249,7 @@ body[data-view="player"] .story-name {
     overflow: hidden;
     text-overflow: ellipsis;
   }
-  #header-role-select {
-    max-width: 125px;
-    font-size: 10px;
-    padding: 7px;
-  }
-  body[data-view="player"] .topbar-label,
-  .topbar:has(#header-role-select:not([hidden])) .topbar-label {
+  body[data-view="player"] .topbar-label {
     display: none;
   }
 }

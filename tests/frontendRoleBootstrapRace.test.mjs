@@ -30,7 +30,6 @@ const persistSessionContext = () => {};
 const dispatchLocalSessionChanged = () => {};
 const rememberReading = () => remembered.push({ role: state.role.id, sessionUuid: state.sessionUuid });
 const showScreen = () => {};
-const syncHeaderRoles = () => {};
 const recoverAndStart = async () => {};
 ${bootstrapSource}
 return { bootstrapSession };
