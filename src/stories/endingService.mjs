@@ -18,13 +18,13 @@
 //                            status=staged are excluded).
 //
 // Strict invariants (fail closed):
-//   - repository is required (in-memory per-process)
+//   - repository is required (the MariaDB adapter hydrates this projection)
 //   - session_uuid is a UUID
 //   - finish_story commit has happened for buildEnding; otherwise throws
 //     ending_not_committed so the HTTP layer can return 404.
 //
 // The service is intentionally pure: it does NOT mutate state, does NOT
-// touch the in-memory pending batch, and does NOT replay the provider.
+// touch the pending batch, and does NOT replay the provider.
 // Every projection can be rebuilt deterministically from
 // session_events + story_version + opening_cache.
 
@@ -374,9 +374,8 @@ export function buildReplay({ repository, session_uuid }) {
   const session = sessionFor(repository, session_uuid);
   const history = Array.isArray(session.history) ? session.history.slice() : [];
   // Defensive: filter any pre-canonical rows (should never be present
-  // in the in-memory history, but the contract requires explicit
-  // rejection of `pending` / `discarded` types so a future DAO-backed
-  // repository is held to the same shape).
+  // in the hydrated history, but the contract requires explicit rejection
+  // of `pending` / `discarded` types for every repository implementation).
   const filtered = history.filter((ev) => ev && !REPLAY_EXCLUDED_TYPES.has(ev.event_type));
   // Order by event_seq ascending (defensive: history is append-only so
   // it is already in order, but the contract requires this guarantee).

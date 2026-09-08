@@ -155,8 +155,8 @@ MVP 不实现：
 
 ## 8. 真实边界与 DEPENDENCY NOTE
 
-* 仓库仍是**进程内 in-memory repository**（08 / 09 / 10 / 11 一致）；跨进程 recover 不可恢复；MariaDB 仍未接线（schema 是未来的 DAO contract）。
-* `/ending` 的 `category` 与 `first_deviation` 是纯派生字段，不持久化——重启即丢失。
+* service 层仍使用同步 in-memory projection；配置 MariaDB 时由 `src/db/mariaPersistence.mjs` hydrate/flush，canonical history、finish_story envelope、pending 和 compact 状态都可跨进程恢复。未配置数据库时才是单进程 fallback。
+* `/ending` 的 `category` 与 `first_deviation` 是纯派生字段，不单独落列；它们每次从已恢复的 story/version/cache 与 canonical history 重算，不因重启丢失。`finish_story` envelope 保存在 session runtime payload 中。
 * `first_deviation` 当前的算法只识别"开场之后第一个 `narrative_beat`"，未做句子级语义对比。
 * `original-timeline` 的 `key_facts` 数量取决于开场缓存的前 3 条事件；如果开场缓存为空（例如空作品），只展示作品级元数据 + 选择边界（值仍包含"原作在第 0 句进入首次选择"）。
 * `replay` 严格按 `session_events.event_seq` 升序；任何未通过 `commitNarrativeEvent` / `commitOpeningEvent` / `interruptWithPlayerInput` 路径写入的行都不会出现在回放里。

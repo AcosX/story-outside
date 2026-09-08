@@ -20,7 +20,9 @@
 //     may still read and cache the same public opening.
 //
 // This module is the seam between the provider layer and the application
-// state. It does not write to MariaDB and does not load any secrets.
+// state. It keeps the synchronous repository contract; the server's MariaDB
+// projection adapter observes repository mutations and performs the SQL
+// transaction, while this module never loads secrets.
 
 import { canonicalStoryContent, canonicalStoryHash } from './canonicalHash.mjs';
 import { deriveOpeningCacheKey } from './cacheKey.mjs';
@@ -524,10 +526,10 @@ const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{
  * opening cache stays valid for every other session; this marker only stops
  * THIS session from continuing to import/advance the public opening.
  *
- * The in-memory repository has no persistent game_sessions table, so it
- * returns an explicit session-local consumed marker with the snapshot's
- * cache uuid for observability. A MariaDB DAO can persist the same marker
- * to game_sessions.first_choice_at.
+ * The synchronous repository returns an explicit session-local consumed
+ * marker with the snapshot's cache uuid for observability. In MariaDB mode
+ * the persistence adapter mirrors the marker to
+ * game_sessions.first_choice_at; the service does not issue SQL directly.
  *
  * @param {object} input
  * @param {StoryRepository} input.repository

@@ -8,7 +8,7 @@
 > * **turn 结果面**: runtime 返回单个 tool envelope（`result.tool_call` / `tool_envelope` / `tool_result.payload`），不再有 `result.tool_calls[]` 数组；恢复快照的 pending 字段是 `recoverRuntime().staged`。
 > * **cursor 语义**: `cursor === revision === history.length`，所有 commit（含 player_input）双增；开场播放位置独立在 `opening_cursor`（仅 opening commit 推进）。
 > * **source_sequence**: per-(session, source) 0-based 连续计数器——runtime 批次跨批连续，第一条 player_input 从 0 开始。
-> * **pending 生命周期**: 存在未消费 pending 时 `stageNarrativeBatch` fail-closed；多次 agent turn 之间测试需先 commit 或 `discardPendingTail`。
+> * **pending 生命周期**: 存在未消费 pending 时 `stageNarrativeBatch` fail-closed；多次 agent turn 之间测试需先 commit 或 `discardPendingTail`。配置 MariaDB 的 HTTP flush 还会把 active narrative/tool item 保持为 `pending`，提交后分别写成 `committed` / `discarded`。
 
 ## 1. 测试套件清单
 
@@ -113,7 +113,7 @@ importStory
 
 `failureScenarios.test.mjs` 的 #13 / #14 已从"negative assertion（未合并）"改成"positive assertion（已合并）"：
 
-* **#13 (compact + 服务重启)**: 断言 4 个 compact 函数存在于 sessionService、`src/stories/index.mjs` 的 re-export 面完整（sessionService 10 个导出 + pendingLifecycle 门面 6 个导出）；recordCompact 不触碰 canonical history；用新 repository 模拟"重启后进程"，`rebuildCompactFromHistory` 仅凭 canonical history 重建出与重启前等价的快照（同 through_seq / event_count / payload / token_estimate）。进程内边界声明见 §6 —— 内存 repository 不跨真实进程存活。
+* **#13 (compact + 服务重启)**: 断言 4 个 compact 函数存在于 sessionService、`src/stories/index.mjs` 的 re-export 面完整（sessionService 10 个导出 + pendingLifecycle 门面 6 个导出）；recordCompact 不触碰 canonical history；用新 repository 模拟"重启后进程"，`rebuildCompactFromHistory` 仅凭 canonical history 重建出与重启前等价的快照（同 through_seq / event_count / payload / token_estimate）。内存 repository 的单元边界见 §6；配置 MariaDB 的真实 HTTP 重启验证见 §6.1。
 * **#14 (compact + 模型失败)**: `recordCompactFailure` 写入 session-local 失败标记（`last_compact_status='failed'`），不推进 `compacted_through_seq`、不清空既有快照、不失效共享 opening cache；更高 `through_seq` 的 retry 照常成功并清除失败状态。
 
 ## 5. CI 跑法（不依赖真实 API）
@@ -151,14 +151,35 @@ git diff --check
 
 > 套件明确不假装生产。所有断言仅在以下两个边界内可证:
 >
-> * **进程内 in-memory repository**: 仍是当前 main 上的实现；MariaDB DAO 是未来的事，触发器 / 唯一键 / canonical append-only 由 `docs/data-model.md` + `tests/schema-contract.test.mjs` 守门。
+> * **进程内 in-memory repository**: `npm test` 的大多数 service/unit 套件使用无数据库的同步 projection，专门验证应用层语义；这不是跨进程持久化证明。
+> * **MariaDB runtime adapter**: 配置 `STORY_OUTSIDE_DATABASE_URL` 后，`src/db/mariaPersistence.mjs` 在启动时 hydrate，并在 JSON 响应前事务 flush。真实数据库启动、迁移、跨进程 recovery 和 pending item 状态需要按 §6.1 验证。
 > * **固定故事 cafe-rain**: 任何 slug 漂移 / 字段漂移会立刻把本套件变红。
 
 不要把以下当作可生产契约:
 
-* `repository` 的内存状态在进程退出时丢失 — 真实生产是 MariaDB。
+* 未配置数据库时，`repository` 的内存 projection 在进程退出时丢失；配置 MariaDB 的运行模式从 SQL hydrate，跨进程 recovery 由真实 adapter 验证。
 * `createMockAgentProvider` 的 canned responses — 真实生产是任意 LLM provider。
 * `STORY_OUTSIDE_PROVIDER=mock` 是默认；`ZHIHU_PROVIDER` 是向后兼容的别名（`STORY_OUTSIDE_PROVIDER` 优先）。`real` 已实现。
+
+### 6.1 MariaDB 真实集成清单
+
+自动回归使用单独创建的空测试库，测试不会删除库，运行后由调用者清理测试库和测试用户：
+
+```bash
+STORY_OUTSIDE_TEST_DATABASE_URL='mariadb://test_user:password@127.0.0.1:3307/disposable_test_db' npm run test:db
+```
+
+该测试覆盖旧 schema 升级、迁移重跑、跨会话相同请求 ID、相同 pending 内容的批次隔离、重载和事件冲突回滚。未显式配置测试连接时跳过；非空库会拒绝执行。普通 `npm test` 包含无数据库的事务队列恢复、事件幂等和批次身份回归。
+
+使用本地 scratch MariaDB 或专用测试库，不对生产库执行迁移：
+
+```bash
+export STORY_OUTSIDE_DATABASE_URL='mariadb://user:password@127.0.0.1:3306/story_outside'
+npm run db:migrate
+STORY_OUTSIDE_PROVIDER=mock PORT=4175 npm start
+```
+
+确认 `GET /api/health` 返回 `database.status=ready`，然后从 HTTP 创建 session、生成带 `finish_story` 的 batch，分别检查：active batch 的 narrative/tool item 都是 `pending`；提交最后一个 narrative 后 batch 是 `succeeded`、narrative 是 `committed`、tool 是 `discarded`。停止并重新启动服务后，`/api/sessions/:uuid/recover` 的 history/revision/pending 与数据库一致；`pinned` 元数据由 durable session projection 重建。
 
 ## 7. 添加新测试的规则
 

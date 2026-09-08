@@ -1,5 +1,9 @@
 import { spawnSync } from 'node:child_process';
 const tests = [
+  "tests/mariadbConfig.test.mjs",
+  "tests/mariaPersistenceQueue.test.mjs",
+  "tests/mariaPersistenceIdentity.test.mjs",
+  "tests/mariaPersistenceRetention.test.mjs",
   "tests/health.test.mjs",
   "tests/providers.test.mjs",
   "tests/http.test.mjs",

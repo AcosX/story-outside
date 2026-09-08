@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Scratch MariaDB verification for Story Outside 08 remaining P1 (issues 7 & 8).
-# - 0001→0004 applied, each migration repeated 3x to prove idempotency
-# - repeat 0004 after full chain
+# Scratch MariaDB verification for the Story Outside business schema.
+# - 0001→0007 applied, each migration repeated 3x to prove idempotency
+# - repeat 0007 after full chain
 # - fresh schema.sql applies standalone: the CREATE DATABASE / USE statements
 #   inside schema.sql are rewritten to a uniquely-named scratch DB, so a
 #   pre-existing story_outside database on this machine is NEVER touched or
@@ -36,8 +36,8 @@ S2="(SELECT id FROM game_sessions WHERE session_uuid='00000000-0000-4000-8000-00
 
 mariadb --no-defaults -e "CREATE DATABASE \`$DB\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
 
-# --- 0001 -> 0004, each migration applied 3 times (idempotency) ---
-for m in 0001_initial_story_outside 0002_opening_cache_generation_profile 0003_session_playback 0004_pending_batch_lifecycle; do
+# --- 0001 -> 0007, each migration applied 3 times (idempotency) ---
+for m in 0001_initial_story_outside 0002_opening_cache_generation_profile 0003_session_playback 0004_pending_batch_lifecycle 0005_compact_and_context 0006_business_persistence 0007_session_event_request_scope; do
   for i in 1 2 3; do
     if ! mariadb --no-defaults "$DB" < "db/migrations/$m.sql" 2>"$ERR_LOG"; then
       fail "migration $m pass $i failed: $(cat "$ERR_LOG")"
@@ -45,13 +45,13 @@ for m in 0001_initial_story_outside 0002_opening_cache_generation_profile 0003_s
   done
 done
 
-# --- repeat 0004 once more explicitly ---
-mariadb --no-defaults "$DB" < db/migrations/0004_pending_batch_lifecycle.sql 2>"$ERR_LOG" || fail "repeat 0004 failed: $(cat "$ERR_LOG")"
+# --- repeat 0007 once more explicitly ---
+mariadb --no-defaults "$DB" < db/migrations/0007_session_event_request_scope.sql 2>"$ERR_LOG" || fail "repeat 0007 failed: $(cat "$ERR_LOG")"
 
-# Ledger must record exactly 4 migrations.
+# Ledger must record exactly 7 migrations.
 LEDGER=$(mariadb --no-defaults -N -e "SELECT COUNT(*) FROM \`$DB\`.schema_migrations;")
-[ "$LEDGER" = "4" ] || fail "schema_migrations count=$LEDGER (want 4)"
-say "ok   ledger: 4 migrations recorded after 3x apply + repeat"
+[ "$LEDGER" = "7" ] || fail "schema_migrations count=$LEDGER (want 7)"
+say "ok   ledger: 7 migrations recorded after 3x apply + repeat"
 
 # --- fresh schema.sql standalone ---
 # schema.sql hardcodes CREATE DATABASE story_outside + USE story_outside.
@@ -62,10 +62,10 @@ sed -e "s/CREATE DATABASE IF NOT EXISTS story_outside/CREATE DATABASE IF NOT EXI
     db/schema.sql > "$SCHEMA_SQL"
 mariadb --no-defaults < "$SCHEMA_SQL" 2>"$ERR_LOG" || fail "schema.sql apply failed: $(cat "$ERR_LOG")"
 SCHEMA_TABLES=$(mariadb --no-defaults -N -e "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='$SCHEMA_DB';")
-[ "$SCHEMA_TABLES" = "12" ] || fail "schema.sql table count=$SCHEMA_TABLES (want 12)"
+[ "$SCHEMA_TABLES" = "17" ] || fail "schema.sql table count=$SCHEMA_TABLES (want 17)"
 SCHEMA_LEDGER=$(mariadb --no-defaults -N -e "SELECT COUNT(*) FROM \`$SCHEMA_DB\`.schema_migrations;")
-[ "$SCHEMA_LEDGER" = "5" ] || fail "schema.sql ledger count=$SCHEMA_LEDGER (want 5)"
-say "ok   fresh schema.sql standalone (12 tables, 5 migrations)"
+[ "$SCHEMA_LEDGER" = "7" ] || fail "schema.sql ledger count=$SCHEMA_LEDGER (want 7)"
+say "ok   fresh schema.sql standalone (17 tables, 7 migrations)"
 mariadb --no-defaults -e "DROP DATABASE \`$SCHEMA_DB\`;"
 
 # --- fixture seed (two sessions, one canonical event each) ---

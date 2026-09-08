@@ -130,6 +130,10 @@ function nowIso() {
   return new Date().toISOString();
 }
 
+function clone(value) {
+  return value === undefined ? undefined : JSON.parse(JSON.stringify(value));
+}
+
 function assertUuid(label, value) {
   if (typeof value !== 'string' || !UUID_PATTERN.test(value)) {
     throw new Error(`repository: ${label} must be a UUID`);
@@ -739,6 +743,65 @@ export function createInMemoryStoryRepository() {
       state.openingCachesByScope = fresh.openingCachesByScope;
       state.sessionFirstChoices = fresh.sessionFirstChoices;
       state._pinnedCacheResolver = fresh._pinnedCacheResolver;
+    },
+    /**
+     * Persistence adapter seam. The application still uses the synchronous
+     * repository contract, while the MariaDB adapter snapshots and hydrates
+     * the exact same row shapes at process boundaries.
+     */
+    _exportSnapshot() {
+      return {
+        stories: [...state.stories.values()].map((row) => clone(row)),
+        versions: [...state.versions.values()].map((row) => clone(row)),
+        openingCaches: [...state.openingCaches.values()].map((row) => clone(row)),
+        sessionFirstChoices: [...state.sessionFirstChoices.values()].map((row) => clone(row)),
+      };
+    },
+    _hydrateSnapshot(snapshot) {
+      if (!snapshot || typeof snapshot !== 'object') throw new Error('repository: snapshot required');
+      const pinnedResolver = state._pinnedCacheResolver;
+      state.stories = new Map();
+      state.versions = new Map();
+      state.versionsByChecksum = new Map();
+      state.versionsByStory = new Map();
+      state.versionsNoByStory = new Map();
+      state.openingCaches = new Map();
+      state.openingCachesByScope = new Map();
+      state.sessionFirstChoices = new Map();
+      state._pinnedCacheResolver = pinnedResolver;
+
+      for (const row of Array.isArray(snapshot.stories) ? snapshot.stories : []) {
+        if (!row || typeof row.story_uuid !== 'string') continue;
+        state.stories.set(row.story_uuid, clone(row));
+      }
+      for (const row of Array.isArray(snapshot.versions) ? snapshot.versions : []) {
+        if (!row || typeof row.version_uuid !== 'string') continue;
+        const version = clone(row);
+        state.versions.set(version.version_uuid, version);
+        state.versionsByChecksum.set(version.checksum, version.version_uuid);
+        const versions = state.versionsByStory.get(version.story_uuid) || new Set();
+        versions.add(version.version_uuid);
+        state.versionsByStory.set(version.story_uuid, versions);
+        state.versionsNoByStory.set(
+          version.story_uuid,
+          Math.max(state.versionsNoByStory.get(version.story_uuid) || 0, Number(version.version_no) || 0),
+        );
+      }
+      for (const row of Array.isArray(snapshot.openingCaches) ? snapshot.openingCaches : []) {
+        if (!row || typeof row.cache_uuid !== 'string') continue;
+        const cache = clone(row);
+        state.openingCaches.set(cache.cache_uuid, cache);
+        if (cache.status === 'valid' || cache.status === 'failed') {
+          state.openingCachesByScope.set(
+            makeOpeningScopeKey(cache.story_uuid, cache.story_version_uuid, cache.opening_key, cache.generation_hash),
+            cache.cache_uuid,
+          );
+        }
+      }
+      for (const row of Array.isArray(snapshot.sessionFirstChoices) ? snapshot.sessionFirstChoices : []) {
+        if (!row || typeof row.session_uuid !== 'string') continue;
+        state.sessionFirstChoices.set(row.session_uuid, clone(row));
+      }
     },
   };
 

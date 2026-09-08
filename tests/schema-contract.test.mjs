@@ -2,7 +2,8 @@
 // Validates db/migrations/0001_initial_story_outside.sql,
 // db/migrations/0002_opening_cache_generation_profile.sql,
 // db/migrations/0003_session_playback.sql, db/migrations/0004_pending_batch_lifecycle.sql,
-// db/migrations/0005_compact_and_context.sql, db/schema.sql, and
+// db/migrations/0005_compact_and_context.sql, db/migrations/0006_business_persistence.sql,
+// db/schema.sql, and
 // docs/data-model.md without needing database credentials or a running server.
 // The point of this suite is to keep the migration set and the canonical
 // schema.sql entrypoint in lockstep — column drift, a missing CHECK, or a
@@ -18,6 +19,8 @@ const MIGRATION_0002_PATH = join(ROOT, "db/migrations/0002_opening_cache_generat
 const MIGRATION_0003_PATH = join(ROOT, "db/migrations/0003_session_playback.sql");
 const MIGRATION_0004_PATH = join(ROOT, "db/migrations/0004_pending_batch_lifecycle.sql");
 const MIGRATION_0005_PATH = join(ROOT, "db/migrations/0005_compact_and_context.sql");
+const MIGRATION_0006_PATH = join(ROOT, "db/migrations/0006_business_persistence.sql");
+const MIGRATION_0007_PATH = join(ROOT, "db/migrations/0007_session_event_request_scope.sql");
 const SCHEMA_PATH = join(ROOT, "db/schema.sql");
 const DOCS_PATH = join(ROOT, "docs/data-model.md");
 
@@ -34,6 +37,11 @@ const REQUIRED_TABLES = [
   "session_checkpoints",
   "compact_compacted_events",
   "model_context_windows",
+  "story_community_profiles",
+  "ecosystem_follow_edges",
+  "ecosystem_block_edges",
+  "ecosystem_shared_sessions",
+  "ecosystem_search_cache",
 ];
 
 const REQUIRED_COLUMNS = {
@@ -84,6 +92,7 @@ const REQUIRED_COLUMNS = {
     "model VARCHAR(128) NOT NULL",
     "prompt TEXT NOT NULL",
     "generation_profile JSON NOT NULL",
+    "user_uuid CHAR(36) NULL",
     "status ENUM('active', 'paused', 'ended', 'abandoned') NOT NULL DEFAULT 'active'",
     "opening_cache_id BIGINT UNSIGNED NULL",
     "first_choice_at DATETIME(6) NULL",
@@ -103,6 +112,7 @@ const REQUIRED_COLUMNS = {
     "context_schema_version INT UNSIGNED NOT NULL DEFAULT 1",
     "prompt_version INT UNSIGNED NOT NULL DEFAULT 1",
     "last_compact_status ENUM('idle', 'compacted', 'skipped', 'failed') NOT NULL DEFAULT 'idle'",
+    "runtime_payload JSON NULL",
   ],
   session_events: [
     "event_id CHAR(36) NOT NULL",
@@ -171,6 +181,45 @@ const REQUIRED_COLUMNS = {
     "reserved_completion_tokens INT UNSIGNED NOT NULL DEFAULT 1024",
     "is_active TINYINT(1) NOT NULL DEFAULT 1",
   ],
+  story_community_profiles: [
+    "profile_uuid CHAR(36) NOT NULL",
+    "story_id BIGINT UNSIGNED NOT NULL",
+    "story_version_id BIGINT UNSIGNED NOT NULL",
+    "generator_version VARCHAR(255) NOT NULL",
+    "content_hash CHAR(64) NOT NULL",
+    "profile_payload JSON NOT NULL",
+    "source VARCHAR(32) NOT NULL",
+    "generated_at DATETIME(6) NOT NULL",
+  ],
+  ecosystem_follow_edges: [
+    "follower_uuid CHAR(36) NOT NULL",
+    "target_user_uuid CHAR(36) NOT NULL",
+    "created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)",
+  ],
+  ecosystem_block_edges: [
+    "owner_uuid CHAR(36) NOT NULL",
+    "target_user_uuid CHAR(36) NOT NULL",
+    "created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)",
+  ],
+  ecosystem_shared_sessions: [
+    "session_uuid CHAR(36) NOT NULL",
+    "owner_user_uuid CHAR(36) NOT NULL",
+    "title VARCHAR(200) NULL",
+    "story_uuid CHAR(36) NULL",
+    "story_version_uuid CHAR(36) NULL",
+  ],
+  ecosystem_search_cache: [
+    "cache_key VARCHAR(512) NOT NULL",
+    "story_uuid CHAR(36) NOT NULL",
+    "story_version_uuid CHAR(36) NOT NULL",
+    "community_profile_version VARCHAR(255) NOT NULL",
+    "query_id VARCHAR(128) NOT NULL",
+    "query_text VARCHAR(500) NOT NULL",
+    "value JSON NOT NULL",
+    "fetched_at_ms BIGINT UNSIGNED NOT NULL",
+    "expires_at_ms BIGINT UNSIGNED NOT NULL",
+    "swr_expires_at_ms BIGINT UNSIGNED NOT NULL",
+  ],
   schema_migrations: [
     "migration_name VARCHAR(255) NOT NULL",
     "applied_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)",
@@ -226,6 +275,12 @@ const REQUIRED_INDEXES = [
   "idx_session_checkpoints_dirty",
   "idx_compact_compacted_events_session_status",
   "idx_endings_story_version_public",
+  "idx_story_community_profiles_story_version",
+  "idx_ecosystem_follow_edges_target",
+  "idx_ecosystem_block_edges_target",
+  "idx_ecosystem_shared_sessions_owner",
+  "idx_ecosystem_search_cache_identity",
+  "idx_ecosystem_search_cache_expiry",
 ];
 
 const REQUIRED_FKS = [
@@ -356,6 +411,21 @@ const REQUIRED_0005_FRAGMENTS = [
   "0005_compact_and_context",
 ];
 
+const REQUIRED_0006_FRAGMENTS = [
+  "ALTER TABLE game_sessions",
+  "ADD COLUMN IF NOT EXISTS user_uuid CHAR(36) NULL AFTER generation_profile",
+  "ADD COLUMN IF NOT EXISTS runtime_payload JSON NULL AFTER last_compact_error",
+  "CREATE TABLE IF NOT EXISTS story_community_profiles",
+  "CREATE TABLE IF NOT EXISTS ecosystem_follow_edges",
+  "CREATE TABLE IF NOT EXISTS ecosystem_block_edges",
+  "CREATE TABLE IF NOT EXISTS ecosystem_shared_sessions",
+  "CREATE TABLE IF NOT EXISTS ecosystem_search_cache",
+  "chk_story_community_profiles_payload",
+  "chk_ecosystem_search_cache_expiry",
+  "INSERT IGNORE INTO schema_migrations (migration_name, applied_by)",
+  "0006_business_persistence",
+];
+
 // The exact CHECK expressions both schema.sql AND 0005 must carry, verbatim
 // (this is the drift the 0005 review caught: the migration previously skipped
 // these five CHECKs while schema.sql had them).
@@ -381,6 +451,8 @@ const JSON_TABLES = [
   "pending_batch_items",
   "session_checkpoints",
   "compact_compacted_events",
+  "story_community_profiles",
+  "ecosystem_search_cache",
 ];
 
 const POSTGRES_ONLY_PATTERNS = [
@@ -451,6 +523,8 @@ let migration0002 = "";
 let migration0003 = "";
 let migration0004 = "";
 let migration0005 = "";
+let migration0006 = "";
+let migration0007 = "";
 let schema = "";
 let docs = "";
 
@@ -460,6 +534,8 @@ try {
   migration0003 = await readFile(MIGRATION_0003_PATH, "utf8");
   migration0004 = await readFile(MIGRATION_0004_PATH, "utf8");
   migration0005 = await readFile(MIGRATION_0005_PATH, "utf8");
+  migration0006 = await readFile(MIGRATION_0006_PATH, "utf8");
+  migration0007 = await readFile(MIGRATION_0007_PATH, "utf8");
   schema = await readFile(SCHEMA_PATH, "utf8");
   docs = await readFile(DOCS_PATH, "utf8");
 } catch (err) {
@@ -474,6 +550,10 @@ check("0002 migration file is non-empty", migration0002.trim().length > 0);
 check("0003 migration file is non-empty", migration0003.trim().length > 0);
 check("0004 migration file is non-empty", migration0004.trim().length > 0);
 check("0005 migration file is non-empty", migration0005.trim().length > 0);
+check("0006 migration file is non-empty", migration0006.trim().length > 0);
+check("0007 upgrades request ID uniqueness to session scope", migration0007.includes("(session_id, client_request_id)") && migration0007.includes("DROP INDEX IF EXISTS uq_session_events_client_request"));
+check("schema request ID uniqueness is session scoped", schema.includes("UNIQUE KEY uq_session_events_client_request (session_id, client_request_id)"));
+check("schema records 0007", schema.includes("'0007_session_event_request_scope', NULL"));
 check("schema file is non-empty", schema.trim().length > 0);
 check("data-model doc is non-empty", docs.trim().length > 0);
 
@@ -588,6 +668,35 @@ check(
   "0005 records its migration ledger entry",
   migration0005.includes("INSERT IGNORE INTO schema_migrations (migration_name, applied_by)")
 );
+
+check(
+  "0006 contains business persistence fragments",
+  REQUIRED_0006_FRAGMENTS.every((fragment) => migration0006.includes(fragment))
+);
+check(
+  "0006 records its migration ledger entry",
+  migration0006.includes("INSERT IGNORE INTO schema_migrations (migration_name, applied_by)")
+);
+for (const table of [
+  "story_community_profiles",
+  "ecosystem_follow_edges",
+  "ecosystem_block_edges",
+  "ecosystem_shared_sessions",
+  "ecosystem_search_cache",
+]) {
+  const schemaBlock = tableBlock(schema, table);
+  const migrationBlock = tableBlock(migration0006, table);
+  check(`0006 defines table ${table}`, migrationBlock.length > 0);
+  check(
+    `0006 ${table} matches schema.sql exactly (comments/whitespace aside)`,
+    migrationBlock.length > 0 && schemaBlock.length > 0 &&
+      normalizedSql(migrationBlock) === normalizedSql(schemaBlock)
+  );
+}
+check(
+  "schema records the 0006 migration ledger entry",
+  schema.includes("'0006_business_persistence', NULL")
+);
 for (const expression of REQUIRED_GAME_SESSIONS_COMPACT_CHECK_EXPRESSIONS) {
   check(`schema game_sessions constraint ${expression.split(" ")[0]}`, schema.includes(expression));
   check(
@@ -666,7 +775,12 @@ for (const [label, sql] of [
   } else if (label === "0001" || label === "schema") {
     for (const table of JSON_TABLES) {
       // Tables created by later migrations are not part of 0001.
-      if (label === "0001" && (table === "pending_batch_items" || table === "compact_compacted_events")) continue;
+      if (label === "0001" && [
+        "pending_batch_items",
+        "compact_compacted_events",
+        "story_community_profiles",
+        "ecosystem_search_cache",
+      ].includes(table)) continue;
       check(
         `${label} JSON_VALID guard for ${table}`,
         tableBlock(sql, table).includes("JSON_VALID")
@@ -762,6 +876,8 @@ for (const [label, sql] of [
   ["0003", migration0003],
   ["0004", migration0004],
   ["0005", migration0005],
+  ["0006", migration0006],
+  ["0007", migration0007],
   ["schema", schema],
 ]) {
   for (const pattern of POSTGRES_ONLY_PATTERNS) {
@@ -776,6 +892,8 @@ for (const [label, sql] of [
   ["0003", migration0003],
   ["0004", migration0004],
   ["0005", migration0005],
+  ["0006", migration0006],
+  ["0007", migration0007],
   ["schema", schema],
 ]) {
   for (const pattern of SECRET_PATTERNS) {
@@ -793,6 +911,8 @@ for (const fragment of [
   "db/migrations/0003_session_playback.sql",
   "db/migrations/0004_pending_batch_lifecycle.sql",
   "db/migrations/0005_compact_and_context.sql",
+  "db/migrations/0006_business_persistence.sql",
+  "db/migrations/0007_session_event_request_scope.sql",
   "db/schema.sql",
   "node tests/schema-contract.test.mjs",
   "append-only",

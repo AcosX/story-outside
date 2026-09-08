@@ -147,7 +147,7 @@ The slow-point triage table maps a symptom to a category:
 | `agent`    | Server-side: LLM generation wall clock.       |
 | `commit`   | Server-side: opening event / tool commit.     |
 | `provider` | Network: outbound HTTP to the upstream.       |
-| `db`       | Storage: in-memory repo today; MariaDB tomorrow. |
+| `db`       | Storage: MariaDB projection flush / query latency; in-memory fallback when DB is disabled. |
 | `frontend` | Client-side: browser playback wall clock.     |
 
 The first four categories are measured server-side via the four

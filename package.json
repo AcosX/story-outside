@@ -10,9 +10,12 @@
   "scripts": {
     "start": "node src/server.mjs",
     "dev": "node src/server.mjs",
+    "db:migrate": "node scripts/migrate.mjs",
+    "test:db": "node tests/mariaPersistence.integration.test.mjs",
     "test": "node scripts/test.mjs",
     "check": "node scripts/check.mjs"
   },
-  "dependencies": {},
-  "devDependencies": {}
+  "dependencies": {
+    "mysql2": "^3.24.3"
+  }
 }
