@@ -353,6 +353,28 @@ function renderComparisonSection(originalTimeline, ending, replay) {
       ),
     ),
   );
+  const sourceList = $('#comparison-source-list', wrap);
+  const aiList = $('#comparison-ai-list', wrap);
+  const toggle = el('button', { class: 'btn timeline-toggle', type: 'button', 'aria-expanded': 'false', 'aria-controls': 'comparison-ai-list' }, '展开完整剧情');
+  aiList.classList.add('timeline-collapsed');
+  aiList.parentNode.appendChild(toggle);
+  const fit = () => {
+    const height = Math.max(160, sourceList.getBoundingClientRect().height);
+    aiList.style.setProperty('--timeline-preview-height', `${height}px`);
+    toggle.hidden = aiList.scrollHeight <= height;
+  };
+  toggle.addEventListener('click', () => {
+    const expanded = toggle.getAttribute('aria-expanded') !== 'true';
+    toggle.setAttribute('aria-expanded', String(expanded));
+    aiList.classList.toggle('timeline-collapsed', !expanded);
+    toggle.textContent = expanded ? '收起剧情' : '展开完整剧情';
+  });
+  if (typeof ResizeObserver !== 'undefined') {
+    const observer = new ResizeObserver(fit);
+    observer.observe(sourceList);
+    STATE.comparisonObserver?.disconnect();
+    STATE.comparisonObserver = observer;
+  }
   return wrap;
 }
 
@@ -392,7 +414,7 @@ function renderEcosystemDiscussionsSection(ecosystem, ecosystemError) {
       { class: 'ending-section ending-ecosystem', dataset: { section: 'ecosystem' } },
       el('h2', {}, '社区讨论'),
       el('p', { class: 'ending-ecosystem-hint' },
-        `本次无法加载社区讨论（原因：${ecosystemError.error}）。`),
+        '社区讨论暂时无法加载，请稍后再试。'),
     );
   }
   if (!ecosystem || !Array.isArray(ecosystem.results)) return null;
@@ -407,8 +429,7 @@ function renderEcosystemDiscussionsSection(ecosystem, ecosystemError) {
       el('h3', { class: 'ecosystem-query-title' },
         r.query || '（未命名查询）'),
       el('p', { class: 'ecosystem-query-meta' },
-        el('span', { class: 'ecosystem-tag ecosystem-kind-tag' }, r.kind || 'web'),
-        el('span', { class: 'ecosystem-tag ecosystem-provenance-tag' }, ecosystem.provenance || 'mock'),
+        el('span', { class: 'ecosystem-tag ecosystem-provenance-tag' }, ecosystem.provenance === 'mock' ? '示例内容' : '知乎讨论'),
         el('span', { class: 'ecosystem-tag ecosystem-count-tag' }, `${list.length} 条`),
       ),
       list.length === 0
@@ -425,7 +446,7 @@ function renderEcosystemDiscussionsSection(ecosystem, ecosystemError) {
     { class: 'ending-section ending-ecosystem', dataset: { section: 'ecosystem' } },
     el('h2', {}, '社区讨论'),
     el('p', { class: 'ending-ecosystem-hint' },
-      `基于作品社区画像的 ${ecosystem.results.length} 个检索词 · 共 ${total} 条讨论 · provenance: ${ecosystem.provenance || 'mock'}`),
+      `故事之外，还有这些值得聊聊的话题 · ${total} 条讨论`),
     el('div', { class: 'ecosystem-groups' }, ...groups),
   );
 }
@@ -738,6 +759,7 @@ async function mount({ sessionUuid, sessionMeta } = {}) {
 }
 
 function render(screen, sessionMeta) {
+  STATE.comparisonObserver?.disconnect();
   clear(screen);
   if (!STATE.ending) {
     // Surface a friendly "未提交" hint when finish_story has not
@@ -771,6 +793,13 @@ function render(screen, sessionMeta) {
   blocks.push(renderRelatedKnowledgeSection(STATE.relatedKnowledge || { degraded: true, knowledge: [] }));
   const replay = renderReplaySection(STATE.replay, sessionMeta);
   blocks.push(replay);
+  const actions = el('nav', { class: 'ending-actions', 'aria-label': '接下来' });
+  for (const [label, event, primary] of [['再来一次', 'story:restart', true], ['返回主页', 'story:home', false]]) {
+    const button = el('button', { type: 'button', class: primary ? 'btn btn-primary' : 'btn' }, label);
+    button.addEventListener('click', () => window.dispatchEvent(new CustomEvent(event)));
+    actions.appendChild(button);
+  }
+  blocks.push(actions);
   blocks.push(renderAttribution(STATE.originalTimeline));
   for (const block of blocks) screen.appendChild(block);
   attachReplayHandlers();
@@ -778,6 +807,7 @@ function render(screen, sessionMeta) {
 }
 
 function teardown() {
+  STATE.comparisonObserver?.disconnect();
   const screen = $('#screen-ending');
   if (screen) clear(screen);
   STATE.mounted = false;

@@ -1338,3 +1338,37 @@ body > #social-panel-host {
   object-fit: cover;
   border-radius: 2px;
 }
+
+/* Quiet reading status and a compact, editorial ending. */
+.autosave-status { margin-left: auto; color: #527b70; font-size: 12px; order: 2; }
+.player-head { gap: 12px; flex-wrap: wrap; }
+.comparison-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: start; }
+.comparison-col { min-width: 0; overflow-wrap: anywhere; }
+.comparison-list.timeline-collapsed { max-height: var(--timeline-preview-height, 240px); overflow: hidden; }
+.timeline-toggle { align-self: stretch; margin-top: 8px; color: var(--accent); }
+.ending-actions { display: flex; justify-content: center; flex-wrap: wrap; gap: 12px; padding: 20px 0 8px; }
+.ending-actions .btn { min-width: 144px; justify-content: center; }
+.ending-ecosystem h2, .ending-related-knowledge h2 { font-family: inherit; font-size: 18px; letter-spacing: 0; color: var(--fg); }
+.ending-section .ending-ecosystem-hint, .ending-section .related-knowledge-intro { font-size: 13px; color: var(--fg-soft); line-height: 1.8; }
+.ecosystem-groups, .related-knowledge-list { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; padding: 0; margin: 6px 0 0; list-style: none; }
+.ecosystem-query-group, .related-knowledge-item { min-width: 0; padding: 20px; background: var(--surface-2); border: 1px solid var(--line); border-radius: 12px; overflow-wrap: anywhere; }
+.ecosystem-query-title { font-size: 15px; line-height: 1.6; margin: 0 0 10px; color: var(--fg); }
+.ending-section .ecosystem-query-meta { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 12px; }
+.ecosystem-tag { color: var(--fg-soft); font-size: 11px; background: white; border: 1px solid var(--line); border-radius: 6px; padding: 2px 7px; }
+.ecosystem-discussion-list { list-style: none; padding: 0; margin: 0; }
+.ecosystem-discussion-item + .ecosystem-discussion-item { border-top: 1px solid var(--line); margin-top: 10px; padding-top: 10px; }
+.ecosystem-discussion-item a, .related-knowledge-link { color: #375fa4; text-decoration: none; font-size: 14px; line-height: 1.8; }
+.ecosystem-discussion-item a:hover, .related-knowledge-link:hover { text-decoration: underline; text-underline-offset: 4px; }
+.related-knowledge-link { font-weight: 600; }
+.ending-section .related-knowledge-summary { font-size: 13px; line-height: 1.8; margin-top: 10px; color: var(--fg-soft); }
+.ending-section .related-knowledge-topics, .ending-section .related-knowledge-source { font-size: 11px; color: var(--fg-soft); margin-top: 10px; }
+.ending-section .related-knowledge-banner, .ending-section .related-knowledge-disabled, .ending-section .related-knowledge-empty, .ending-section .ecosystem-empty { font-size: 13px; color: var(--fg-soft); padding: 12px 14px; background: var(--surface-2); border-radius: 8px; }
+.ending-section.ending-attribution { border: 0; background: transparent; padding: 8px 16px 24px; text-align: center; gap: 6px; }
+.ending-attribution .attribution-row { font-size: 11px; line-height: 1.9; color: var(--fg-soft); }
+.attribution-source { font-family: inherit; }
+.attribution-ai strong { font-weight: 400; color: inherit; }
+#ending-attribution-ai { color: #8d7046; }
+@media (max-width: 720px) {
+  .comparison-grid, .ecosystem-groups, .related-knowledge-list { grid-template-columns: minmax(0, 1fr); }
+  .ending-actions .btn { flex: 1; min-width: 0; }
+}
