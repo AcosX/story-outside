@@ -2,7 +2,7 @@
 --
 -- This file is the deployment entrypoint. It creates the database and then
 -- applies the same final DDL as db/migrations/0001_initial_story_outside.sql
--- through db/migrations/0007_session_event_request_scope.sql.
+-- through db/migrations/0008_client_request_id_width.sql.
 -- The contract test tests/schema-contract.test.mjs keeps this body in sync
 -- with the migration set.
 
@@ -258,7 +258,7 @@ CREATE TABLE IF NOT EXISTS session_events (
   source VARCHAR(64) NOT NULL,
   source_sequence BIGINT UNSIGNED NOT NULL,
   payload JSON NOT NULL,
-  client_request_id CHAR(36) NULL,
+  client_request_id VARCHAR(255) NULL,
   hash CHAR(64) NOT NULL,
   occurred_at DATETIME(6) NOT NULL,
   created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
@@ -660,4 +660,5 @@ VALUES ('0001_initial_story_outside', NULL),
        ('0004_pending_batch_lifecycle', NULL),
        ('0005_compact_and_context', NULL),
        ('0006_business_persistence', NULL),
-       ('0007_session_event_request_scope', NULL);
+       ('0007_session_event_request_scope', NULL),
+       ('0008_client_request_id_width', NULL);

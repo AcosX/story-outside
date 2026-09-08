@@ -86,7 +86,7 @@ export async function connectDatabase(env = process.env) {
     );
     const [migrations] = await candidate.query(
       'SELECT migration_name FROM schema_migrations WHERE migration_name = ?',
-      ['0007_session_event_request_scope'],
+      ['0008_client_request_id_width'],
     );
     if (migrations.length !== 1) {
       const error = new Error('MariaDB schema requires npm run db:migrate');

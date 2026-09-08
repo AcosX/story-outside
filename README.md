@@ -103,7 +103,7 @@ npm run check
 | `HOST` | `127.0.0.1` | 监听地址（OAuth 不能用 `localhost` 回调） |
 | `STORY_OUTSIDE_PROVIDER` | `mock` | 数据 provider。`mock` = 内存版示例故事；`real` = 对接 `api.zhihu.com/km-indep-home/hackathon/v2/story/*`（`zhihu_hackathon_2026_p2` 期间不需要鉴权；不发送 `Authorization` / `X-OAuth-Token`；超时/429/5xx 走 typed ProviderError，不循环重试）。同时支持别名 `ZHIHU_PROVIDER`（向后兼容早期环境变量）；同时设置时 `STORY_OUTSIDE_PROVIDER` 优先。 |
 | `STORY_OUTSIDE_ZHIHU_TIMEOUT_MS` | `5000` | `real` provider 的 fetch 超时（毫秒）。 |
-| `STORY_OUTSIDE_DATABASE_URL` | 未设置 | MariaDB 连接串，例如 `mariadb://user:password@127.0.0.1:3306/story_outside`。设置后启动必须连接成功且已应用 `0007_session_event_request_scope`。 |
+| `STORY_OUTSIDE_DATABASE_URL` | 未设置 | MariaDB 连接串，例如 `mariadb://user:password@127.0.0.1:3306/story_outside`。设置后启动必须连接成功且已应用 `0008_client_request_id_width`。 |
 | `STORY_OUTSIDE_DATABASE_POOL_SIZE` | `10` | MariaDB 连接池上限。 |
 | `STORY_OUTSIDE_DATABASE_CONNECT_TIMEOUT_MS` | `5000` | MariaDB 建连超时（毫秒）。 |
 | `STORY_OUTSIDE_DATABASE_SSL` | `false` | 设为 `true` 时启用 TLS。 |
