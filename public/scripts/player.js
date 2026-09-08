@@ -234,6 +234,20 @@ function waitForRetry(response, attempt) {
 }
 
 async function api(path, options = {}) {
+  const savesProgress = options.method === 'POST' && /\/(opening-events|narrative-events|interrupt)$/.test(path);
+  const sessionUuid = state.sessionUuid;
+  if (savesProgress) setText('#autosave-status', '正在保存…');
+  try {
+    const result = await requestApi(path, options);
+    if (savesProgress && state.sessionUuid === sessionUuid) rememberReading();
+    return result;
+  } catch (error) {
+    if (savesProgress && state.sessionUuid === sessionUuid) setText('#autosave-status', '保存未完成，请重试');
+    throw error;
+  }
+}
+
+async function requestApi(path, options = {}) {
   const requestSession = path.match(/^\/api\/sessions\/([^/]+)\//)?.[1];
   const method = String(options.method || 'GET').toUpperCase();
   // POST is retry-safe only when the server can deduplicate the same
@@ -364,7 +378,10 @@ function renderStoryDetail(story) {
 }
 function rememberReading() {
   const saved = { story: state.story, role: state.role, sessionUuid: state.sessionUuid, storyUuid: state.storyUuid, storyVersionUuid: state.storyVersionUuid, cacheUuid: state.cacheUuid, generationProfile: state.generationProfile, openingEvents: state.openingEvents, communityProfileVersion: state.communityProfileVersion, communityProfileUuid: state.communityProfileUuid, communityProfileQueries: state.communityProfileQueries, knowledgeQueries: state.knowledgeQueries, finished: state.finished || state.status === 'finished' };
-  try { localStorage.setItem('story-outside:reading', JSON.stringify(saved)); } catch {}
+  try {
+    localStorage.setItem('story-outside:reading', JSON.stringify(saved));
+    setText('#autosave-status', '已自动保存');
+  } catch { setText('#autosave-status', '进度已提交，本机续读记录未保存'); }
 }
 function readReading() { try { return JSON.parse(localStorage.getItem('story-outside:reading') || 'null'); } catch { return null; } }
 function isEndingNotCommittedError(error) {
@@ -1740,6 +1757,12 @@ function bindEvents() {
   if (eventsBound) return;
   eventsBound = true;
   $('#back-btn').addEventListener('click', backToPicker);
+  window.addEventListener?.('story:restart', () => {
+    const storyId = state.story?.id || readReading()?.story?.id;
+    backToPicker();
+    if (storyId) void selectStory(storyId);
+  });
+  window.addEventListener?.('story:home', backToPicker);
   $('#nav-stories')?.addEventListener('click', backToPicker);
   $('#nav-mine')?.addEventListener('click', () => { state.navigationToken = (state.navigationToken || 0) + 1; if (state.status === 'playing') togglePause(); showScreen('mine'); setText('#story-name', '我的'); setText('#role-name', '故事之外'); renderMine(); });
   $('#story-search')?.addEventListener('input', renderStories);
