@@ -64,6 +64,12 @@ async function run() {
 
   const events = cache.content_payload.events;
   const shown = (event) => ({ ...event, displayed: true });
+  assert.throws(() => commitOpeningEvent({
+    repository, session_uuid: SESSION, cache_uuid: cache.cache_uuid,
+    event: shown(events[0]), client_request_id: 'x'.repeat(256), expected_revision: 0,
+  }), /client_request_id must be at most 255 characters/);
+  assert.equal(listSessionEvents({ repository, session_uuid: SESSION }).length, 0);
+  assert.equal(getSession({ repository, session_uuid: SESSION }).revision, 0);
   const first = commitOpeningEvent({
     repository, session_uuid: SESSION, cache_uuid: cache.cache_uuid,
     event: shown(events[0]), client_request_id: 'open-1', expected_revision: 0,
