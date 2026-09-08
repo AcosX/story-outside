@@ -48,6 +48,10 @@
           <div class="story-name" id="story-name">发现故事</div>
           <div class="role-name" id="role-name">故事之外</div>
         </div>
+        <div class="player-status" role="status" aria-live="polite">
+          <span class="status-dot" aria-hidden="true"></span>
+          <span id="status-label">载入中</span>
+        </div>
         <select
           id="header-role-select"
           aria-label="切换角色并开始新故事"
@@ -56,6 +60,9 @@
         ><button class="icon-btn" id="share-btn" aria-label="分享">
           <i data-lucide="share-2"></i></button
         ><span class="topbar-label">YOUR NEXT CHAPTER</span>
+        <span class="status-bar" aria-hidden="true">
+          <span id="status-bar-fill" class="status-bar-fill"></span>
+        </span>
       </header>
       <main id="player-main" class="player-main" tabindex="-1">
         <section
@@ -163,16 +170,6 @@
           hidden
         >
           <div class="player-shell">
-            <header class="player-head">
-              <span id="autosave-status" class="autosave-status" role="status" aria-live="polite"></span>
-              <div class="player-status">
-                <span class="status-dot"></span
-                ><span id="status-label">载入中</span
-                ><span class="status-bar"
-                  ><span id="status-bar-fill" class="status-bar-fill"></span
-                ></span>
-              </div>
-            </header>
             <ol
               class="story-log"
               id="story-log"
@@ -199,8 +196,9 @@
                   aria-label="暂停自动播放"
                 >
                   <i data-lucide="play"></i
-                  ><span id="pause-btn-label">暂停</span></button
-                ><button
+                  ><span id="pause-btn-label">暂停</span></button>
+                <span id="autosave-status" class="autosave-status" role="status" aria-live="polite"></span>
+                <button
                   class="btn playback-btn"
                   id="skip-btn"
                   aria-label="立即展示下一句"

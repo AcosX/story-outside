@@ -195,6 +195,7 @@ svg {
 }
 .topbar-meta {
   flex: 1;
+  min-width: 0;
 }
 .story-name {
   font-size: 14px;
@@ -685,11 +686,10 @@ input::placeholder {
   flex-direction: column;
   padding: 0 35px;
 }
-.player-head {
-  padding: 22px 0 14px;
-}
 .player-status {
-  display: flex;
+  display: none;
+  flex-shrink: 0;
+  white-space: nowrap;
   align-items: center;
   gap: 8px;
   font-size: 10px;
@@ -702,11 +702,23 @@ input::placeholder {
   border-radius: 50%;
 }
 .status-bar {
+  display: none;
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: -1px;
   height: 2px;
-  width: 62px;
   background: #edf1f9;
-  margin-left: auto;
 }
+body[data-view="player"] .player-status { display: flex; margin-right: auto; }
+body[data-view="player"] .status-bar { display: block; }
+body[data-view="player"] .topbar-meta { flex: 0 1 auto; }
+body[data-view="player"] .story-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.topbar > .icon-btn { flex-shrink: 0; }
 .status-bar-fill {
   display: block;
   height: 100%;
@@ -763,6 +775,7 @@ input::placeholder {
 }
 .player-controls {
   display: flex;
+  flex-wrap: wrap;
   gap: 7px;
   align-items: center;
   padding: 8px 2px 12px;
@@ -1208,9 +1221,6 @@ input::placeholder {
   .line {
     font-size: 13px;
   }
-  .player-head {
-    padding-top: 15px;
-  }
   .player-input {
     padding: 9px 10px 9px 14px;
     border-radius: 13px;
@@ -1252,6 +1262,7 @@ input::placeholder {
     font-size: 10px;
     padding: 7px;
   }
+  body[data-view="player"] .topbar-label,
   .topbar:has(#header-role-select:not([hidden])) .topbar-label {
     display: none;
   }
@@ -1347,8 +1358,8 @@ body > #social-panel-host {
 }
 
 /* Quiet reading status and a compact, editorial ending. */
-.autosave-status { margin-left: auto; color: #527b70; font-size: 12px; order: 2; }
-.player-head { gap: 12px; flex-wrap: wrap; }
+.autosave-status { color: #527b70; font-size: 10px; overflow-wrap: anywhere; }
+.autosave-status:empty { display: none; }
 .comparison-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: start; }
 .comparison-col { min-width: 0; overflow-wrap: anywhere; }
 .comparison-list.timeline-collapsed { max-height: var(--timeline-preview-height, 240px); overflow: hidden; }
