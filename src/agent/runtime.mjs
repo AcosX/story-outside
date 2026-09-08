@@ -1,3 +1,4 @@
+import { progressMetadata } from '../stories/plotProgress.mjs';
 import { canonicalJsonStringify } from '../stories/canonicalHash.mjs';
 import { getSession, getSessionCompact, recordCompact, recordCompactFailure, listSessionEvents, lookupTurnRequest, registerTurnRequest, stageNarrativeBatch } from '../stories/sessionService.mjs';
 import { buildSessionContext, selectCompactWindow } from './contextBuilder.mjs';
@@ -120,7 +121,7 @@ function normalizeProviderResult(result) {
       const text = typeof item.text === 'string' ? item.text : (typeof item.content === 'string' ? item.content : null);
       if (role !== undefined && role !== 'assistant') fail('invalid_tool_call', `items[${index}].role must be 'assistant' or omitted`);
       if (text === null || !text.trim()) fail('invalid_tool_call', `items[${index}].text must be a non-empty string`);
-      const out = { role: 'assistant', text };
+      const out = { role: 'assistant', text, ...progressMetadata(item) };
       if (item.type !== undefined) {
         // A tool may never hide inside the narrative items: type must be a
         // narrative beat kind, never 'tool_call' or anything else.
@@ -167,7 +168,7 @@ function normalizeProviderResult(result) {
   }
   const normalisedItems = result.messages.map((msg, index) => {
     if (msg.role !== 'assistant' || typeof msg.content !== 'string' || !msg.content.trim()) fail('invalid_tool_call', `messages[${index}] must be an assistant message with non-empty string content`);
-    const out = { role: 'assistant', text: msg.content };
+    const out = { role: 'assistant', text: msg.content, ...progressMetadata(msg) };
     if (msg.type !== undefined) {
       if (!['narration', 'dialogue', 'action', 'beat'].includes(msg.type)) {
         fail('invalid_tool_call', `messages[${index}].type must be a narrative beat type`);
@@ -417,6 +418,7 @@ async function runTurnOnce(runtime, { request_id, input, expected_revision } = {
       items: providerResult.items.map((it) => ({
         type: it.type || 'narration',
         text: it.text,
+        ...progressMetadata(it),
         ...(it.speaker !== undefined ? { speaker: it.speaker } : {}),
       })),
       tool_call: providerResult.tool_call ? {
@@ -457,6 +459,7 @@ async function runTurnOnce(runtime, { request_id, input, expected_revision } = {
     items: providerResult.items.map((it) => ({
       type: it.type || 'narration',
       text: it.text,
+      ...progressMetadata(it),
       ...(it.speaker !== undefined ? { speaker: it.speaker } : {}),
     })),
     pending_id: staged.pending_id,

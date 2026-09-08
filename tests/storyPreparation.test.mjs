@@ -11,7 +11,7 @@ try {
   let calls=0;
   const source={id:'one',title:'原作',hook:'原作简介',roles:[{id:'author',label:'作者',mood:''}],beats:[{index:0,text:'完整原作'.repeat(1000)}]};
   const config={apiKey:'test',baseURL:'https://example.invalid/v1',model:'test',timeoutMs:1000,cacheDir};
-  const fetchImpl=async()=>{calls++;return {ok:true,json:async()=>({choices:[{message:{content:JSON.stringify({roles:[{id:'self',label:'我',mood:'旅人'}],first_person_role_id:'self',opening_events:[{type:'narration',text:'雨落在窗前。'}]})}}]})};};
+  const fetchImpl=async()=>{calls++;return {ok:true,json:async()=>({choices:[{message:{content:JSON.stringify({roles:[{id:'self',label:'我',mood:'旅人'}],first_person_role_id:'self',opening_events:[{type:'narration',text:'雨落在窗前。',story_progress:0.08}]})}}]})};};
   const provider={name:'real',getStory:async()=>source};
   const prepared=createPreparedStoryProvider(provider,config,{fetchImpl});
   const [a,b]=await Promise.all([prepared.getStory('one'),prepared.getStory('one')]);
@@ -26,6 +26,7 @@ try {
   const opening=generateOpeningCache({story_uuid:'11111111-1111-4111-8111-111111111111',story_version_uuid:'22222222-2222-4222-8222-222222222222',opening_key:'default',profile:defaultGenerationProfile(),story:canonical});
   assert.equal(opening.event_count,1);
   assert.equal(opening.events[0].text,'雨落在窗前。');
+  assert.equal(opening.events[0].story_progress,0.08);
   assert.equal(opening.boundary,'truncated_before_first_choice');
   console.log('Story preparation: roles, single-flight/disk cache, canonical full source, opening hash and first-choice boundary passed');
 }finally{await rm(cacheDir,{recursive:true,force:true});}

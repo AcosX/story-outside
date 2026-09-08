@@ -1,3 +1,4 @@
+import { progressMetadata } from './plotProgress.mjs';
 // src/stories/canonicalHash.mjs — deterministic canonicalisation + hashing.
 //
 // ClickUp 04 contract:
@@ -153,6 +154,7 @@ export function canonicalStoryContent(detail) {
     const beat = {
       index: typeof b.index === 'number' ? b.index : i,
       text: String(b.text ?? ''),
+      ...progressMetadata(b),
     };
     if (typeof b.type === 'string' && b.type) beat.type = b.type;
     if (typeof b.speaker === 'string' && b.speaker) beat.speaker = b.speaker;

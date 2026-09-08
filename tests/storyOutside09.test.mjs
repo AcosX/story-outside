@@ -406,7 +406,7 @@ check('recover after two interrupts: history grew by 2', rec4.data?.history?.len
   // somewhere between 0% and 100% (not the all-1.0 historical bug).
   await new Promise((r) => setTimeout(r, 2500));
   const progressEarly = await player.call('progressAudit');
-  check('progress bar reflects committed vs total', progressEarly.totalLines > 0 && progressEarly.fraction !== null && progressEarly.fraction <= 1);
+  check('progress bar renders a bounded plot estimate', progressEarly.totalLines > 0 && progressEarly.fraction !== null && progressEarly.fraction <= 1);
   // The bar must NOT be a constant 100% from the very first event.
   check('progress bar not pinned at 100% during play', progressEarly.fraction !== null && progressEarly.fraction < 1);
 

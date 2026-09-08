@@ -53,6 +53,7 @@ const tests = [
   "tests/clickup16-5-p1-v1-5.test.mjs",
   "tests/clickup16-5-p1-v1-6-unify.test.mjs",
   "tests/aiProvider.test.mjs",
+  "tests/plotProgress.test.mjs",
   "tests/sessionCompactRuntime.test.mjs",
   "tests/storyPreparation.test.mjs",
   "tests/zhihuHotSource.test.mjs",
