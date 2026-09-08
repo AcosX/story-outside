@@ -13,12 +13,14 @@ const provider=createAIProvider({config,story,fetchImpl:async(url,opts)=>{
   const content={items:[{type:'narration',text:'门开了。'}],tool_call:{name:'ask_player_choice',arguments:{question:'进入吗？',options:[{id:'a',label:'进入'},{id:'b',label:'等待'}]}}};
   return {ok:true,json:async()=>({choices:[{message:{content:JSON.stringify(content)},finish_reason:'stop'}]})};
 }});
-const result=await provider.complete({pinned:{role_id:'me'},canonical_history:Array.from({length:20},(_,i)=>({event_seq:i,text:'事件'})),context:{compact_text:'保留玩家选择和人物事实',recent_events:Array.from({length:16},(_,i)=>({event_seq:i+4,text:'事件'}))},input:{text:'看看'}});
+const result=await provider.complete({pinned:{role_id:'me'},canonical_history:Array.from({length:20},(_,i)=>({event_seq:i,event_type:'narrative_beat',payload:i===0?{story_progress:0.23}:{},text:'事件'})),context:{compact_text:'保留玩家选择和人物事实',recent_events:Array.from({length:16},(_,i)=>({event_seq:i+4,text:'事件'}))},input:{text:'看看'}});
 assert.equal(calls.length,1);
 const sent=JSON.parse(calls[0].body.messages[1].content);
 assert.deepEqual(sent.original_story,story);
 assert.equal(sent.committed_history.length,16);
 assert.equal(sent.committed_summary,'保留玩家选择和人物事实');
+assert.equal(sent.current_story_progress,0.23, 'latest estimate survives compacted-away event');
+assert.match(calls[0].body.messages[0].content, /story_progress/);
 assert.ok(result.tool_call.tool_call_id);
 assert.ok(!JSON.stringify(calls).includes(config.apiKey));
 for(const stub of [async()=>({ok:false,status:401}),async()=>({ok:true,json:async()=>({choices:[{message:{content:'not json'}}]})})]) {

@@ -1,3 +1,4 @@
+import { progressMetadata } from './plotProgress.mjs';
 // src/stories/sessionService.mjs — canonical session store.
 //
 // ClickUp 05 / 08 / 09 contract (unified):
@@ -439,7 +440,7 @@ function normalizeCacheEvent(event, pinned, cache_uuid, session_uuid) {
   }
   const payload = event.payload && typeof event.payload === 'object'
     ? event.payload
-    : { type: eventType, ...(event.text === undefined ? {} : { text: event.text }), ...(event.speaker === undefined ? {} : { speaker: event.speaker }) };
+    : { type: eventType, ...progressMetadata(event), ...(event.text === undefined ? {} : { text: event.text }), ...(event.speaker === undefined ? {} : { speaker: event.speaker }) };
   if (!pinned || pinned.sequence !== event.sequence || pinned.type !== eventType) {
     throw new Error('commitOpeningEvent: event does not belong to pinned cache');
   }
@@ -962,6 +963,7 @@ export function stageNarrativeBatch({ repository, session_uuid, items, tool_call
       type: eventType,
       sequence: index,
       text: event.text,
+      ...progressMetadata(event),
       ...(event.speaker !== undefined ? { speaker: event.speaker } : {}),
     };
   });
@@ -996,6 +998,7 @@ export function stageNarrativeBatch({ repository, session_uuid, items, tool_call
           type: event.type,
           sequence: event.sequence,
           text: event.text,
+          ...progressMetadata(event),
           ...(event.speaker !== undefined ? { speaker: event.speaker } : {}),
         })),
         tool_call: active.tool_call || null,

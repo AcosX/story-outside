@@ -61,7 +61,6 @@ const state = {
   communityProfileQueries: null,
   pending: null,        // { pending_id, events[], tool_call, committed_count }
   pendingIdx: 0,        // index of the NEXT pending event to display
-  progressTotal: 0,     // largest known event total for progress bar
   finished: false,      // terminal tool_call has been rendered
   // Tool call envelope whose deferred render has not happened yet. It
   // lives in state (not only in the timer closure) so a pause inside
@@ -98,7 +97,7 @@ function setStatus(next) {
   state.status = next;
   setText('#status-label', STATUS_LABEL[next] || next);
   // When the session reaches a terminal state (finished), the progress
-  // bar should snap to 100% regardless of the in-flight denominator
+  // bar should snap to 100% regardless of the last plot estimate
   // (the player has reached the end; there is no more work to do).
   if (next === 'finished') {
     setProgress(1);
@@ -139,55 +138,16 @@ function setProgress(fraction) {
 }
 
 function computeProgress() {
-  // Numerator: canonical-history events (committed) — this is the
-  // "completed" portion that genuinely advances. Includes opening
-  // events, narrative beats, AND player_input interrupts because the
-  // player also "completed" those.
-  // Denominator: opening_lines + sum of staged (and already-seen)
-  // batch sizes + a budget for player_input interrupts. We never
-  // let the denominator equal the committed count, so mid-playback
-  // the bar is always < 1.0 unless every staged event has been
-  // committed. The denominator only grows monotonically as new
-  // batches come in or new interrupts are made.
-  const openingLines = state.openingEvents ? state.openingEvents.length : 0;
+  // Only displayed, committed narrative carries a plot-position estimate.
+  // Missing estimates retain the last known position, including after reload.
   const history = state.canonicalHistory || [];
-  const committed = history.length;
-  const playerInputsSeen = history.filter((e) => e && e.event_type === 'player_input').length;
-  // A batch is "known" once we have either staged it (state.pending
-  // exists) or it is reflected in canonical history.
-  // state.progressTotal is bumped each time we stage a batch; it
-  // persists across commits so the bar can keep moving forward.
-  const knownTotal = Math.max(state.progressTotal || 0, openingLines);
-  // The first batch the player can see might still be only partially
-  // staged, so add the in-flight batch's total to the denominator.
-  const inFlight = (state.pending && state.pending.events) ? state.pending.events.length : 0;
-  // The base denominator is opening + cumulative batch sizes. We
-  // never let it go below (committed - playerInputsSeen) so that an
-  // interrupt-heavy session still has the bar at or near 1.0 at
-  // finished. But mid-playback the gap between committed and
-  // total comes from the unseen portion of in-flight batches.
-  let total = Math.max(knownTotal, openingLines + inFlight, 1);
-  // If interrupts pushed committed past total, treat total as at
-  // least committed (but never more than the implied work). The
-  // player_input events are "free" additions from the player's
-  // perspective — they don't add to the staged work, so we don't
-  // count them in the denominator.
-  const narrativeCommitted = committed - playerInputsSeen;
-  if (narrativeCommitted > total) total = narrativeCommitted;
-  // Defensive: if for any reason total still tracks committed, force a
-  // minimum gap so the bar cannot be pinned to 1.0 mid-play.
-  const safeTotal = total > committed ? total : committed + 1;
-  return committed / safeTotal;
-}
-
-function growProgressTotal(stagedSize) {
-  // Called whenever a new batch is staged. The denominator grows so
-  // the bar can keep moving forward as commits land.
-  const openingLines = state.openingEvents ? state.openingEvents.length : 0;
-  const candidate = openingLines + stagedSize;
-  if (!state.progressTotal || candidate > state.progressTotal) {
-    state.progressTotal = candidate;
+  for (let i = history.length - 1; i >= 0; i -= 1) {
+    const event = history[i];
+    if (!['story_opening', 'narrative_beat'].includes(event?.event_type)) continue;
+    const value = event.payload?.story_progress;
+    if (typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= 1) return value;
   }
+  return 0;
 }
 
 function showToast(message, ms = 2400) {
@@ -440,7 +400,7 @@ async function resumeSavedReading(saved) {
   if (state.toolCallTimer) clearTimeout(state.toolCallTimer);
   state.toolCallTimer = null;
   showScreen('player');
-  Object.assign(state, saved, { finished: Boolean(saved.finished), pending:null, pendingIdx:0, queuedToolCall:null, inputInFlight:false, progressTotal:0 });
+  Object.assign(state, saved, { finished: Boolean(saved.finished), pending:null, pendingIdx:0, queuedToolCall:null, inputInFlight:false });
   setText('#story-name', state.story.title); setText('#role-name', state.role?.label || '故事之外'); persistSessionContext(); setStatus('loading');
   try {
     const endingCommitted = await hasCommittedEnding(saved.sessionUuid);
@@ -494,7 +454,7 @@ async function bootstrapSession({ story, role }) {
   state.startNextBatchInFlight = null;
   clearAutoplayTimer();
   if (state.toolCallTimer) clearTimeout(state.toolCallTimer);
-  state.finished = false; state.pending = null; state.pendingIdx = 0; state.queuedToolCall = null; state.progressTotal = 0; state.lastPlayerRequestId = 1; state.nextBatchInput = undefined;
+  state.finished = false; state.pending = null; state.pendingIdx = 0; state.queuedToolCall = null; state.lastPlayerRequestId = 1; state.nextBatchInput = undefined;
   setStatus('loading');
   $('#start-story-btn').disabled = true;
   setText('#detail-status', '正在为你写下开场…');
@@ -830,7 +790,6 @@ async function recoverAndStart() {
         committed_count: recovered.pending.committed_count || 0,
       };
       state.pendingIdx = state.pending.committed_count;
-      growProgressTotal(state.pending.events.length);
       for (let i = state.pendingIdx; i < state.pending.events.length; i += 1) {
         const el = renderPendingPlaceholder(state.pending.events[i], state.canonicalHistory.length + i);
         registerPendingNode(`pending:${state.pending.pending_id}:${i}`, el);
@@ -1279,9 +1238,6 @@ async function performstartNextBatch() {
       committed_count: turn.pending_committed_count || 0,
     };
     state.pendingIdx = state.pending.committed_count;
-    // Grow the progress denominator to include this new batch so the
-    // bar can advance as commits land.
-    growProgressTotal(state.pending.events.length);
     setText('#player-help', '');
     // Render the new pending lines as placeholders; track each node
     // by (pending_id, sequence) so commitNextPendingItem can clear
