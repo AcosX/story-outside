@@ -1,3 +1,4 @@
+import { progressMetadata } from './plotProgress.mjs';
 // src/stories/openingGenerator.mjs — produces a story-level public opening
 // cache from a pinned story_version. This is the work that happens once per
 // (story, story_version, generation_profile) and is shared across all
@@ -166,7 +167,7 @@ export function generateOpeningCache(input) {
         ? structured.speaker
         : undefined;
     if (type === 'action') {
-      events.push({ type: 'action', sequence: events.length, text });
+      events.push({ type: 'action', sequence: events.length, text, ...progressMetadata(structured) });
       continue;
     }
     const speaker =
@@ -177,7 +178,7 @@ export function generateOpeningCache(input) {
     const ev = speaker
       ? { type: 'dialogue', sequence: events.length, text, speaker }
       : { type: 'narration', sequence: events.length, text };
-    events.push(ev);
+    events.push({ ...ev, ...progressMetadata(structured) });
   }
   if (events.length === 0) {
     boundary = 'empty_story';
