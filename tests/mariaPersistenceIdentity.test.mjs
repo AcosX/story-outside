@@ -11,7 +11,7 @@ const event = {
   source: 'player',
   source_sequence: 0,
   payload: { text: 'hello', metadata: { b: 2, a: 1 } },
-  client_request_id: '20000000-0000-4000-8000-000000000001',
+  client_request_id: 'opening-20000000-0000-4000-8000-000000000001-0',
   hash: 'a'.repeat(64),
   occurred_at: '2026-09-08T01:00:00.000Z',
 };
@@ -77,10 +77,13 @@ assert.notEqual(first, pendingRequestFingerprint('session-b', 'batch-a', request
 assert.notEqual(first, pendingRequestFingerprint('session-a', 'batch-b', request));
 
 // Both fresh schema and existing installations use the same uniqueness scope.
-for (const path of ['../db/schema.sql', '../db/migrations/0007_session_event_request_scope.sql']) {
-  const sql = await readFile(new URL(path, import.meta.url), 'utf8');
-  assert.match(sql, /UNIQUE KEY uq_session_events_client_request \(session_id, client_request_id\)/);
-  assert.match(sql, /'0007_session_event_request_scope'/);
-}
+const schemaSql = await readFile(new URL('../db/schema.sql', import.meta.url), 'utf8');
+const scopeMigration = await readFile(new URL('../db/migrations/0007_session_event_request_scope.sql', import.meta.url), 'utf8');
+const widthMigration = await readFile(new URL('../db/migrations/0008_client_request_id_width.sql', import.meta.url), 'utf8');
+assert.match(schemaSql, /UNIQUE KEY uq_session_events_client_request \(session_id, client_request_id\)/);
+assert.match(scopeMigration, /UNIQUE KEY uq_session_events_client_request \(session_id, client_request_id\)/);
+assert.match(schemaSql, /client_request_id VARCHAR\(255\) NULL/);
+assert.match(widthMigration, /MODIFY COLUMN client_request_id VARCHAR\(255\) NULL/);
+assert.match(widthMigration, /'0008_client_request_id_width'/);
 
 console.log('MariaDB event and pending identity regression tests passed');

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Scratch MariaDB verification for the Story Outside business schema.
-# - 0001→0007 applied, each migration repeated 3x to prove idempotency
-# - repeat 0007 after full chain
+# - 0001→0008 applied, each migration repeated 3x to prove idempotency
+# - repeat 0008 after full chain
 # - fresh schema.sql applies standalone: the CREATE DATABASE / USE statements
 #   inside schema.sql are rewritten to a uniquely-named scratch DB, so a
 #   pre-existing story_outside database on this machine is NEVER touched or
@@ -36,8 +36,8 @@ S2="(SELECT id FROM game_sessions WHERE session_uuid='00000000-0000-4000-8000-00
 
 mariadb --no-defaults -e "CREATE DATABASE \`$DB\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
 
-# --- 0001 -> 0007, each migration applied 3 times (idempotency) ---
-for m in 0001_initial_story_outside 0002_opening_cache_generation_profile 0003_session_playback 0004_pending_batch_lifecycle 0005_compact_and_context 0006_business_persistence 0007_session_event_request_scope; do
+# --- 0001 -> 0008, each migration applied 3 times (idempotency) ---
+for m in 0001_initial_story_outside 0002_opening_cache_generation_profile 0003_session_playback 0004_pending_batch_lifecycle 0005_compact_and_context 0006_business_persistence 0007_session_event_request_scope 0008_client_request_id_width; do
   for i in 1 2 3; do
     if ! mariadb --no-defaults "$DB" < "db/migrations/$m.sql" 2>"$ERR_LOG"; then
       fail "migration $m pass $i failed: $(cat "$ERR_LOG")"
@@ -45,13 +45,13 @@ for m in 0001_initial_story_outside 0002_opening_cache_generation_profile 0003_s
   done
 done
 
-# --- repeat 0007 once more explicitly ---
-mariadb --no-defaults "$DB" < db/migrations/0007_session_event_request_scope.sql 2>"$ERR_LOG" || fail "repeat 0007 failed: $(cat "$ERR_LOG")"
+# --- repeat 0008 once more explicitly ---
+mariadb --no-defaults "$DB" < db/migrations/0008_client_request_id_width.sql 2>"$ERR_LOG" || fail "repeat 0008 failed: $(cat "$ERR_LOG")"
 
-# Ledger must record exactly 7 migrations.
+# Ledger must record exactly 8 migrations.
 LEDGER=$(mariadb --no-defaults -N -e "SELECT COUNT(*) FROM \`$DB\`.schema_migrations;")
-[ "$LEDGER" = "7" ] || fail "schema_migrations count=$LEDGER (want 7)"
-say "ok   ledger: 7 migrations recorded after 3x apply + repeat"
+[ "$LEDGER" = "8" ] || fail "schema_migrations count=$LEDGER (want 8)"
+say "ok   ledger: 8 migrations recorded after 3x apply + repeat"
 
 # --- fresh schema.sql standalone ---
 # schema.sql hardcodes CREATE DATABASE story_outside + USE story_outside.
@@ -64,8 +64,8 @@ mariadb --no-defaults < "$SCHEMA_SQL" 2>"$ERR_LOG" || fail "schema.sql apply fai
 SCHEMA_TABLES=$(mariadb --no-defaults -N -e "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='$SCHEMA_DB';")
 [ "$SCHEMA_TABLES" = "17" ] || fail "schema.sql table count=$SCHEMA_TABLES (want 17)"
 SCHEMA_LEDGER=$(mariadb --no-defaults -N -e "SELECT COUNT(*) FROM \`$SCHEMA_DB\`.schema_migrations;")
-[ "$SCHEMA_LEDGER" = "7" ] || fail "schema.sql ledger count=$SCHEMA_LEDGER (want 7)"
-say "ok   fresh schema.sql standalone (17 tables, 7 migrations)"
+[ "$SCHEMA_LEDGER" = "8" ] || fail "schema.sql ledger count=$SCHEMA_LEDGER (want 8)"
+say "ok   fresh schema.sql standalone (17 tables, 8 migrations)"
 mariadb --no-defaults -e "DROP DATABASE \`$SCHEMA_DB\`;"
 
 # --- fixture seed (two sessions, one canonical event each) ---
@@ -81,6 +81,17 @@ INSERT INTO session_events (event_id, session_id, event_seq, prev_event_seq, eve
   VALUES ('00000000-0000-4000-8000-000000000005', (SELECT id FROM game_sessions WHERE session_uuid='00000000-0000-4000-8000-000000000003'), 1, NULL, 'player_input', 'user', 'player', 0, JSON_OBJECT('text','x'), REPEAT('b',64), UTC_TIMESTAMP(6)),
          ('00000000-0000-4000-8000-000000000006', (SELECT id FROM game_sessions WHERE session_uuid='00000000-0000-4000-8000-000000000004'), 1, NULL, 'player_input', 'user', 'player', 0, JSON_OBJECT('text','y'), REPEAT('c',64), UTC_TIMESTAMP(6));
 SQL
+
+# Request ids are opaque keys, not UUID-only. The public opening flow uses
+# values longer than 36 characters; 0008 must persist them without truncation.
+LONG_REQUEST_ID='opening-00000000-0000-4000-8000-000000000003-0'
+mariadb --no-defaults "$DB" -e "
+INSERT INTO session_events (event_id, session_id, event_seq, prev_event_seq, event_type, origin, source, source_sequence, payload, client_request_id, hash, occurred_at)
+VALUES ('00000000-0000-4000-8000-00000000000e', $S1, 2, 1, 'story_opening', 'system', 'opening_cache', 1, JSON_OBJECT('text','long id'), '$LONG_REQUEST_ID', REPEAT('d',64), UTC_TIMESTAMP(6));" 2>/dev/null \
+  && say "ok   probe: opaque client_request_id longer than 36 chars accepted" || fail "long client_request_id rejected"
+
+WIDTH_OK=$(mariadb --no-defaults -N -e "SELECT COUNT(*) FROM information_schema.columns WHERE table_schema='$DB' AND table_name='session_events' AND column_name='client_request_id' AND data_type='varchar' AND character_maximum_length=255;")
+[ "$WIDTH_OK" = "1" ] && say "ok   probe: client_request_id VARCHAR(255)" || fail "client_request_id width mismatch"
 
 # Probe 1: source='' must be rejected by chk_pending_batches_source
 OUT=$(mariadb --no-defaults "$DB" -e "

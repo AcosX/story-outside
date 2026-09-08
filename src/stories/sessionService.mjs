@@ -284,9 +284,14 @@ function validateRevision(session, expected_revision) {
   }
 }
 
+const MAX_CLIENT_REQUEST_ID_LENGTH = 255;
+
 function requestId(value) {
   if (value === undefined || value === null) return null;
   requiredString('client_request_id', value);
+  if (value.length > MAX_CLIENT_REQUEST_ID_LENGTH) {
+    throw new Error(`sessionService: client_request_id must be at most ${MAX_CLIENT_REQUEST_ID_LENGTH} characters`);
+  }
   return value;
 }
 

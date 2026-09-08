@@ -3,6 +3,7 @@
 // db/migrations/0002_opening_cache_generation_profile.sql,
 // db/migrations/0003_session_playback.sql, db/migrations/0004_pending_batch_lifecycle.sql,
 // db/migrations/0005_compact_and_context.sql, db/migrations/0006_business_persistence.sql,
+// db/migrations/0007_session_event_request_scope.sql, db/migrations/0008_client_request_id_width.sql,
 // db/schema.sql, and
 // docs/data-model.md without needing database credentials or a running server.
 // The point of this suite is to keep the migration set and the canonical
@@ -21,6 +22,7 @@ const MIGRATION_0004_PATH = join(ROOT, "db/migrations/0004_pending_batch_lifecyc
 const MIGRATION_0005_PATH = join(ROOT, "db/migrations/0005_compact_and_context.sql");
 const MIGRATION_0006_PATH = join(ROOT, "db/migrations/0006_business_persistence.sql");
 const MIGRATION_0007_PATH = join(ROOT, "db/migrations/0007_session_event_request_scope.sql");
+const MIGRATION_0008_PATH = join(ROOT, "db/migrations/0008_client_request_id_width.sql");
 const SCHEMA_PATH = join(ROOT, "db/schema.sql");
 const DOCS_PATH = join(ROOT, "docs/data-model.md");
 
@@ -125,7 +127,7 @@ const REQUIRED_COLUMNS = {
     "source VARCHAR(64) NOT NULL",
     "source_sequence BIGINT UNSIGNED NOT NULL",
     "payload JSON NOT NULL",
-    "client_request_id CHAR(36) NULL",
+    "client_request_id VARCHAR(255) NULL",
     "hash CHAR(64) NOT NULL",
     "occurred_at DATETIME(6) NOT NULL",
   ],
@@ -525,6 +527,7 @@ let migration0004 = "";
 let migration0005 = "";
 let migration0006 = "";
 let migration0007 = "";
+let migration0008 = "";
 let schema = "";
 let docs = "";
 
@@ -536,6 +539,7 @@ try {
   migration0005 = await readFile(MIGRATION_0005_PATH, "utf8");
   migration0006 = await readFile(MIGRATION_0006_PATH, "utf8");
   migration0007 = await readFile(MIGRATION_0007_PATH, "utf8");
+  migration0008 = await readFile(MIGRATION_0008_PATH, "utf8");
   schema = await readFile(SCHEMA_PATH, "utf8");
   docs = await readFile(DOCS_PATH, "utf8");
 } catch (err) {
@@ -552,8 +556,10 @@ check("0004 migration file is non-empty", migration0004.trim().length > 0);
 check("0005 migration file is non-empty", migration0005.trim().length > 0);
 check("0006 migration file is non-empty", migration0006.trim().length > 0);
 check("0007 upgrades request ID uniqueness to session scope", migration0007.includes("(session_id, client_request_id)") && migration0007.includes("DROP INDEX IF EXISTS uq_session_events_client_request"));
+check("0008 widens opaque request IDs", migration0008.includes("MODIFY COLUMN client_request_id VARCHAR(255) NULL") && migration0008.includes("0008_client_request_id_width"));
 check("schema request ID uniqueness is session scoped", schema.includes("UNIQUE KEY uq_session_events_client_request (session_id, client_request_id)"));
 check("schema records 0007", schema.includes("'0007_session_event_request_scope', NULL"));
+check("schema records 0008", schema.includes("'0008_client_request_id_width', NULL"));
 check("schema file is non-empty", schema.trim().length > 0);
 check("data-model doc is non-empty", docs.trim().length > 0);
 
@@ -878,6 +884,7 @@ for (const [label, sql] of [
   ["0005", migration0005],
   ["0006", migration0006],
   ["0007", migration0007],
+  ["0008", migration0008],
   ["schema", schema],
 ]) {
   for (const pattern of POSTGRES_ONLY_PATTERNS) {
@@ -894,6 +901,7 @@ for (const [label, sql] of [
   ["0005", migration0005],
   ["0006", migration0006],
   ["0007", migration0007],
+  ["0008", migration0008],
   ["schema", schema],
 ]) {
   for (const pattern of SECRET_PATTERNS) {
@@ -913,6 +921,7 @@ for (const fragment of [
   "db/migrations/0005_compact_and_context.sql",
   "db/migrations/0006_business_persistence.sql",
   "db/migrations/0007_session_event_request_scope.sql",
+  "db/migrations/0008_client_request_id_width.sql",
   "db/schema.sql",
   "node tests/schema-contract.test.mjs",
   "append-only",
