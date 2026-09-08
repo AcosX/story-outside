@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { createAIProvider, loadAIConfig } from '../src/agent/aiProvider.mjs';
+import { AIProviderError, createAICompletion, createAIProvider, loadAIConfig } from '../src/agent/aiProvider.mjs';
 const config = {apiKey:'private-test-secret',baseURL:'https://example.invalid/v1',model:'test-model',timeoutMs:1000,contextChars:1000};
 assert.equal(loadAIConfig({STORY_OUTSIDE_AI_PROVIDER:'mock'}),null);
 assert.throws(()=>loadAIConfig({STORY_OUTSIDE_AI_PROVIDER:'invalid'}));
@@ -22,6 +22,92 @@ for(const stub of [async()=>({ok:false,status:401}),async()=>({ok:true,json:asyn
   await assert.rejects(createAIProvider({config,story:{},fetchImpl:stub}).complete({canonical_history:[],input:{},pinned:{}}));
 }
 console.log('AI provider: config, full original, compact, validated choice, upstream failure and malformed JSON passed');
+
+const retryConfig = { ...config, maxRetries: 2, retryBaseDelayMs: 0, retryMaxDelayMs: 0 };
+const completionPayload = { choices: [{ message: { content: JSON.stringify({ items: [{ text: '重试成功。' }] }) }, finish_reason: 'stop' }] };
+
+// Transient upstream responses and transport failures are retried twice at
+// most; the request body and model remain unchanged across attempts.
+{
+  let calls = 0;
+  const completion = createAICompletion({
+    config: retryConfig,
+    fetchImpl: async (_url, options) => {
+      calls += 1;
+      assert.equal(JSON.parse(options.body).model, config.model);
+      if (calls < 3) return { ok: false, status: 503, headers: { get: () => null } };
+      return { ok: true, json: async () => completionPayload };
+    },
+  });
+  const result = await completion([{ role: 'user', content: 'test' }], 100);
+  assert.deepEqual(result, { items: [{ text: '重试成功。' }] });
+  assert.equal(calls, 3);
+}
+
+{
+  let calls = 0;
+  const completion = createAICompletion({
+    config: retryConfig,
+    fetchImpl: async () => {
+      calls += 1;
+      if (calls === 1) throw new TypeError('socket closed');
+      return { ok: true, json: async () => completionPayload };
+    },
+  });
+  await completion([{ role: 'user', content: 'test' }], 100);
+  assert.equal(calls, 2);
+}
+
+{
+  let calls = 0;
+  const completion = createAICompletion({
+    config: retryConfig,
+    fetchImpl: async () => {
+      calls += 1;
+      return { ok: false, status: 401, headers: { get: () => null } };
+    },
+  });
+  await assert.rejects(
+    () => completion([{ role: 'user', content: 'test' }], 100),
+    (error) => error instanceof AIProviderError
+      && error.status === 401 && error.retryable === false,
+  );
+  assert.equal(calls, 1);
+}
+
+{
+  let calls = 0;
+  const completion = createAICompletion({
+    config: retryConfig,
+    fetchImpl: async () => {
+      calls += 1;
+      return { ok: true, json: async () => ({ choices: [{ message: { content: 'not-json' } }] }) };
+    },
+  });
+  await assert.rejects(
+    () => completion([{ role: 'user', content: 'test' }], 100),
+    (error) => error instanceof AIProviderError && error.retryable === false,
+  );
+  assert.equal(calls, 1);
+}
+
+{
+  let calls = 0;
+  const completion = createAICompletion({
+    config: retryConfig,
+    fetchImpl: async () => {
+      calls += 1;
+      return { ok: false, status: 503, headers: { get: () => '0' } };
+    },
+  });
+  await assert.rejects(
+    () => completion([{ role: 'user', content: 'test' }], 100),
+    (error) => error instanceof AIProviderError
+      && error.status === 503 && error.retryable === true,
+  );
+  assert.equal(calls, 3);
+}
+console.log('AI provider: transient retries, transport retry, and deterministic failures passed');
 
 // Persisted compact reuses committed-prefix summaries across provider instances.
 const { mkdtemp, rm } = await import('node:fs/promises');

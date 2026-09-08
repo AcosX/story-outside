@@ -472,6 +472,49 @@ async function appendEndingScreen(dom) {
       check('player flow reached awaiting-choice', (globalThis.__PLAYER_STATE__ || {}).status === 'awaiting-choice');
       check('choices share the story scroll container', document.querySelector('#player-choices').parentNode === document.querySelector('#story-log'));
       check('choice labels use alphabetic order', document.querySelector('#player-choices .choice-btn')?.innerHTML.includes('>A</span>'));
+      check('choice labels do not render punctuation in the visual marker', !document.querySelector('#player-choices .choice-btn')?.innerHTML.includes('>A.</span>'));
+      check('choice input removes an upstream duplicate prefix',
+        globalThis.__PLAYER_INTERNALS__.formatOptionText({ displayLabel: 'A', label: 'A: A. 陪思思玩过家家' })
+          === 'A. 陪思思玩过家家');
+      // Browser API retries are bounded by request semantics: GETs and
+      // idempotent POSTs retry transient responses, while an ordinary POST
+      // is sent once because the server cannot deduplicate it safely.
+      const playerFetch = globalThis.fetch;
+      try {
+        let getCalls = 0;
+        globalThis.fetch = async () => {
+          getCalls += 1;
+          return getCalls === 1
+            ? { ok: false, status: 503, headers: { get: () => null }, json: async () => ({ error: 'upstream' }) }
+            : { ok: true, status: 200, headers: { get: () => null }, json: async () => ({ ok: true }) };
+        };
+        const getResult = await globalThis.__PLAYER_INTERNALS__.api('/retry-get');
+        check('player retries transient GET', getResult?.ok === true && getCalls === 2);
+
+        let ordinaryPostCalls = 0;
+        globalThis.fetch = async () => {
+          ordinaryPostCalls += 1;
+          return { ok: false, status: 503, headers: { get: () => null }, json: async () => ({ error: 'upstream' }) };
+        };
+        await assert_.rejects(
+          () => globalThis.__PLAYER_INTERNALS__.api('/ordinary-post', { method: 'POST', body: '{}' }),
+        );
+        check('player does not retry POST without stable id', ordinaryPostCalls === 1);
+
+        let stablePostCalls = 0;
+        globalThis.fetch = async () => {
+          stablePostCalls += 1;
+          return stablePostCalls === 1
+            ? { ok: false, status: 502, headers: { get: () => null }, json: async () => ({ error: 'provider_failure', retryable: true }) }
+            : { ok: true, status: 200, headers: { get: () => null }, json: async () => ({ ok: true }) };
+        };
+        const postResult = await globalThis.__PLAYER_INTERNALS__.api('/stable-post', {
+          method: 'POST', body: JSON.stringify({ request_id: 'stable-test' }),
+        });
+        check('player retries POST with stable id', postResult?.ok === true && stablePostCalls === 2);
+      } finally {
+        globalThis.fetch = playerFetch;
+      }
       // Type the finish input and submit TWICE: the second submit must
       // be swallowed by the in-flight guard instead of replaying the
       // same client_request_id.
@@ -490,6 +533,9 @@ async function appendEndingScreen(dom) {
       check('player hook reaches endingPage.mount (real lazy import)', endingScreen && endingScreen.children.length > 0);
       check('ending screen shows title after player finish', !!document.body.querySelector('#screen-ending #ending-title'));
       check('ending screen takes over from the player screen', document.body.querySelector('#screen-player').hidden === true);
+      check('ending replay renders the Chinese speaker label',
+        document.querySelector('#screen-ending .replay-speaker')?.textContent === '旧友',
+        `speaker=${document.querySelector('#screen-ending .replay-speaker')?.textContent}`);
       // Server-side: exactly ONE player_input landed despite the double
       // submit (the guard prevented a duplicate client_request_id).
       const finishedUuid = globalThis.__PLAYER_STATE__.sessionUuid;
@@ -497,6 +543,17 @@ async function appendEndingScreen(dom) {
       const playerInputs = (rec.body.history || []).filter((e) => e.event_type === 'player_input');
       check('double submit produced exactly one player_input', playerInputs.length === 1);
       check('finish session has committed ending projection', (await getJson(baseUrl, `/api/dev/sessions/${finishedUuid}/ending`)).status === 200);
+
+      // ----- 10b) My page routes a finished reading to the ending page ----
+      const remembered = JSON.parse(globalThis.localStorage.getItem('story-outside:reading') || 'null');
+      check('finished reading stores terminal state', remembered?.finished === true);
+      document.querySelector('#nav-mine')?.dispatch('click');
+      check('My page labels finished reading as view ending', document.querySelector('#recent-session')?.innerHTML.includes('查看结局'));
+      await globalThis.__PLAYER_INTERNALS__.resumeSavedReading(remembered);
+      check('My page resume of finished reading reaches ending status', globalThis.__PLAYER_STATE__.status === 'finished');
+      const resumedEndingScreen = document.querySelector('#screen-ending');
+      check('My page resume of finished reading shows ending page', resumedEndingScreen?.hidden === false,
+        `hidden=${resumedEndingScreen?.hidden} children=${resumedEndingScreen?.children?.length} active=${resumedEndingScreen?.classList?.contains('active')}`);
 
       // ----- 11) Reload recovery: finished session lands on the ending page -----
       // A fresh player (simulated reload) with the finished session uuid
