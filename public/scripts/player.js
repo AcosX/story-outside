@@ -331,7 +331,8 @@ async function bootstrapSession({ story, role }) {
   //   story_version_uuid, generation_profile, pinned.
   // The server chooses the model / prompt / generation_profile defaults
   // — the browser does not know about them, by design.
-  if (state.bootstrapInFlight) return;
+  const requestToken = (state.bootstrapRequestToken || 0) + 1;
+  state.bootstrapRequestToken = requestToken;
   state.bootstrapInFlight = true;
   state.generationEpoch = (state.generationEpoch || 0) + 1;
   state.startNextBatchInFlight = null;
@@ -352,10 +353,17 @@ async function bootstrapSession({ story, role }) {
         role_id: role.id,
       }),
     });
-    if (bootstrapToken !== (state.navigationToken || 0)) return;
+    if (requestToken !== state.bootstrapRequestToken || bootstrapToken !== (state.navigationToken || 0)) return;
     if (!created || !created.session_uuid || !created.cache_uuid) {
       throw new Error('bad_session_bootstrap');
     }
+    if (created.pinned?.role_id && created.pinned.role_id !== role.id) {
+      throw new Error('session_role_mismatch');
+    }
+    // The requested role becomes canonical only together with the matching
+    // server session. This keeps the header, persisted recovery data and the
+    // model's pinned role on the same selection.
+    state.role = role;
     state.sessionUuid = created.session_uuid;
     state.cacheUuid = created.cache_uuid;
     state.storyUuid = created.story_uuid || null;
@@ -447,13 +455,19 @@ async function bootstrapSession({ story, role }) {
     syncHeaderRoles();
     await recoverAndStart();
   } catch (err) {
+    if (requestToken !== state.bootstrapRequestToken || bootstrapToken !== (state.navigationToken || 0)) return null;
     if (err?.code === 'stale_session') return null;
     setText('#picker-status', `准备失败：${err.message}`);
     setText('#detail-status', `准备失败：${err.message}`);
     setStatus('picker');
     showScreen('detail');
     setText('#role-name', '故事详情');
-  } finally { state.bootstrapInFlight = false; $('#start-story-btn').disabled = !state.role; }
+  } finally {
+    if (requestToken === state.bootstrapRequestToken) {
+      state.bootstrapInFlight = false;
+      $('#start-story-btn').disabled = !state.role;
+    }
+  }
 }
 
 /**
@@ -1604,7 +1618,7 @@ function bindEvents() {
     if (e.detail?.storyId) void selectStory(e.detail.storyId);
   });
   $('#start-story-btn')?.addEventListener('click', () => { if (state.story && state.role) void bootstrapSession({story:state.story, role:state.role}); });
-  $('#header-role-select')?.addEventListener('change', (e) => { const role = state.story?.roles.find(r => r.id === e.target.value); if (role && role.id !== state.role?.id) { state.role = role; void bootstrapSession({story:state.story, role}); } });
+  $('#header-role-select')?.addEventListener('change', (e) => { const role = state.story?.roles.find(r => r.id === e.target.value); if (role && role.id !== state.role?.id) { void bootstrapSession({story:state.story, role}); } });
   $('#player-input').addEventListener('focus', () => { if (state.status === 'playing') togglePause(); });
   $('#story-log').addEventListener('click', e => { if (e.target?.closest('button, a')) return; void advanceStory(); });
   $('#share-btn').addEventListener('click', () => { void share(); });

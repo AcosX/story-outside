@@ -53,7 +53,8 @@ const tests = [
   "tests/zhihuHotSource.test.mjs",
   "tests/hotStoryMatch.test.mjs",
   "tests/endingComparison.test.mjs",
-  "tests/frontendGenerationRace.test.mjs"
+  "tests/frontendGenerationRace.test.mjs",
+  "tests/frontendRoleBootstrapRace.test.mjs"
 ];
 for (const file of tests) {
   const result = spawnSync(process.execPath, [file], { stdio: 'inherit', env: { ...process.env, STORY_OUTSIDE_AI_PROVIDER: 'mock' } });
