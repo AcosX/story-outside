@@ -376,14 +376,49 @@ async function selectStory(storyId) {
 function renderStoryDetail(story) {
   $('#story-detail').innerHTML = `<div class="detail-hero">${storyCover(story, 'detail-cover')}<div class="detail-meta"><p class="eyebrow">${escapeHtml(storyCategories(story).join(' / ') || 'BEYOND THE STORY')}</p><h1>${escapeHtml(story.title)}</h1><div class="detail-byline">${story.author_avatar ? `<img class="author-avatar" src="${escapeHtml(story.author_avatar)}" alt="" referrerpolicy="no-referrer">` : ''}${story.author ? `<span>${escapeHtml(story.author)}</span>` : ''}${story.word_count ? `<span>${Number(story.word_count).toLocaleString()} 字</span>` : ''}</div><p class="detail-description">${escapeHtml(story.description || story.summary || story.hook || '')}</p></div></div>`;
 }
+const READING_HISTORY_PREFIX = 'story-outside:reading-session:';
+const READING_PAGE_SIZE = 9;
+
 function rememberReading() {
-  const saved = { story: state.story, role: state.role, sessionUuid: state.sessionUuid, storyUuid: state.storyUuid, storyVersionUuid: state.storyVersionUuid, cacheUuid: state.cacheUuid, generationProfile: state.generationProfile, openingEvents: state.openingEvents, communityProfileVersion: state.communityProfileVersion, communityProfileUuid: state.communityProfileUuid, communityProfileQueries: state.communityProfileQueries, knowledgeQueries: state.knowledgeQueries, finished: state.finished || state.status === 'finished' };
+  if (!state.story || !state.sessionUuid) return;
+  const saved = { story: state.story, role: state.role, sessionUuid: state.sessionUuid, storyUuid: state.storyUuid, storyVersionUuid: state.storyVersionUuid, cacheUuid: state.cacheUuid, generationProfile: state.generationProfile, openingEvents: state.openingEvents, communityProfileVersion: state.communityProfileVersion, communityProfileUuid: state.communityProfileUuid, communityProfileQueries: state.communityProfileQueries, knowledgeQueries: state.knowledgeQueries, finished: state.finished || state.status === 'finished', updatedAt: Date.now() };
   try {
+    migrateReading();
+    localStorage.setItem(READING_HISTORY_PREFIX + saved.sessionUuid, JSON.stringify(saved));
     localStorage.setItem('story-outside:reading', JSON.stringify(saved));
     setText('#autosave-status', '已自动保存');
   } catch { setText('#autosave-status', '进度已提交，本机续读记录未保存'); }
 }
 function readReading() { try { return JSON.parse(localStorage.getItem('story-outside:reading') || 'null'); } catch { return null; } }
+// Keep one storage entry per session so independent tabs do not overwrite a shared list.
+function migrateReading() {
+  const legacy = readReading();
+  if (legacy?.story && legacy.sessionUuid && !localStorage.getItem(READING_HISTORY_PREFIX + legacy.sessionUuid)) {
+    localStorage.setItem(READING_HISTORY_PREFIX + legacy.sessionUuid, JSON.stringify(legacy));
+  }
+}
+function readReadingHistory() {
+  const records = new Map();
+  const legacy = readReading();
+  if (legacy?.story && legacy.sessionUuid) records.set(legacy.sessionUuid, legacy);
+  try {
+    migrateReading();
+    for (let i = 0; i < localStorage.length; i += 1) {
+      const key = localStorage.key(i);
+      if (!key?.startsWith(READING_HISTORY_PREFIX)) continue;
+      try {
+        const saved = JSON.parse(localStorage.getItem(key));
+        if (saved?.story && saved.sessionUuid && key === READING_HISTORY_PREFIX + saved.sessionUuid) records.set(saved.sessionUuid, saved);
+      } catch { /* A damaged entry must not hide the rest of the bookshelf. */ }
+    }
+  } catch { /* Storage may be unavailable; retain the legacy record if readable. */ }
+  return [...records.values()].sort((a, b) => (Number(b.updatedAt) || 0) - (Number(a.updatedAt) || 0) || a.sessionUuid.localeCompare(b.sessionUuid));
+}
+function readingHistoryPage(records, requestedPage = 1) {
+  const pages = Math.max(1, Math.ceil(records.length / READING_PAGE_SIZE));
+  const page = Math.max(1, Math.min(pages, Math.trunc(Number(requestedPage)) || 1));
+  return { page, pages, records: records.slice((page - 1) * READING_PAGE_SIZE, page * READING_PAGE_SIZE) };
+}
 function isEndingNotCommittedError(error) {
   return error?.code === 'ending_not_committed'
     || (error?.status === 404 && error?.data?.error === 'ending_not_committed');
@@ -399,11 +434,18 @@ async function hasCommittedEnding(sessionUuid) {
 }
 async function resumeSavedReading(saved) {
   if (!saved?.story || !saved.sessionUuid) return;
+  const navigationToken = state.navigationToken = (state.navigationToken || 0) + 1;
+  state.generationEpoch = (state.generationEpoch || 0) + 1;
+  state.startNextBatchInFlight = null;
   clearAutoplayTimer();
+  if (state.toolCallTimer) clearTimeout(state.toolCallTimer);
+  state.toolCallTimer = null;
+  showScreen('player');
   Object.assign(state, saved, { finished: Boolean(saved.finished), pending:null, pendingIdx:0, queuedToolCall:null, inputInFlight:false, progressTotal:0 });
   setText('#story-name', state.story.title); setText('#role-name', state.role?.label || '故事之外'); persistSessionContext(); syncHeaderRoles(); setStatus('loading');
   try {
-    const endingCommitted = await hasCommittedEnding(state.sessionUuid);
+    const endingCommitted = await hasCommittedEnding(saved.sessionUuid);
+    if (navigationToken !== state.navigationToken || state.sessionUuid !== saved.sessionUuid) return;
     if (endingCommitted) {
       state.finished = true;
       rememberReading();
@@ -416,15 +458,24 @@ async function resumeSavedReading(saved) {
     showScreen('player');
     await recoverAndStart();
   } catch (err) {
+    if (navigationToken !== state.navigationToken || state.sessionUuid !== saved.sessionUuid) return;
     showToast(`读取会话失败：${err.message}`);
     setStatus('error');
   }
 }
-function renderMine() {
-  const saved = readReading(); const host = $('#recent-session');
-  const actionLabel = saved?.finished ? '查看结局' : '继续故事';
-  host.innerHTML = saved?.story ? `<div class="recent-card">${storyCover(saved.story)}<div class="recent-info"><h3>${escapeHtml(saved.story.title)}</h3><p>以 ${escapeHtml(saved.role?.label || '你的')} 的视角</p></div><button class="btn btn-primary" id="resume-session-btn">${actionLabel} <i data-lucide="arrow-right"></i></button></div>` : '<p class="empty-state">你的书架还很安静。去选一个喜欢的故事吧。</p>';
-  $('#resume-session-btn')?.addEventListener('click', () => { void resumeSavedReading(saved); }); icons();
+function renderMine(requestedPage = 1) {
+  const all = readReadingHistory();
+  const { page, pages, records } = readingHistoryPage(all, requestedPage);
+  const host = $('#recent-session');
+  host.innerHTML = all.length ? `<p class="history-count">共 ${all.length} 段故事</p><div class="reading-grid">${records.map((saved, index) => {
+    const date = new Date(Number(saved.updatedAt));
+    const dateLabel = saved.updatedAt && Number.isFinite(date.getTime()) ? date.toLocaleString('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : '';
+    return `<article class="reading-card">${storyCover(saved.story)}<h3>${escapeHtml(saved.story.title)}</h3><p>以 ${escapeHtml(saved.role?.label || '你')} 的视角</p><p class="reading-status">${saved.finished ? '已完结' : '阅读中'}${dateLabel ? ` · ${escapeHtml(dateLabel)}` : ''}</p><button class="btn btn-primary" data-reading-index="${index}">${saved.finished ? '查看结局' : '继续故事'} <i data-lucide="arrow-right"></i></button></article>`;
+  }).join('')}</div>${pages > 1 ? `<nav class="reading-pagination" aria-label="故事历史分页"><button class="btn" id="reading-prev" ${page === 1 ? 'disabled' : ''}>上一页</button><span aria-live="polite">第 ${page} / ${pages} 页</span><button class="btn" id="reading-next" ${page === pages ? 'disabled' : ''}>下一页</button></nav>` : ''}` : '<p class="empty-state">你的书架还很安静。去选一个喜欢的故事吧。</p>';
+  $$('[data-reading-index]', host).forEach(button => button.addEventListener('click', () => { void resumeSavedReading(records[Number(button.dataset.readingIndex)]); }));
+  $('#reading-prev')?.addEventListener('click', () => renderMine(page - 1));
+  $('#reading-next')?.addEventListener('click', () => renderMine(page + 1));
+  icons();
 }
 function syncHeaderRoles() {
   const select = $('#header-role-select'); if (!select) return;
