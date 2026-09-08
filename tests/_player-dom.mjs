@@ -469,7 +469,7 @@ export function createPlayerDom({ baseUrl, viewport = null, stepDelayMs = null, 
     const storiesBlock = new Element('section'); pickerShell.appendChild(storiesBlock); storiesBlock.classList.add('picker-block');
     const storiesLabel = new Element('h2'); storiesBlock.appendChild(storiesLabel); storiesLabel.id = 'picker-stories-label'; storiesLabel.classList.add('picker-label');
     const storyList = new Element('ul'); storiesBlock.appendChild(storyList); storyList.id = 'story-list'; storyList.attrs['aria-busy'] = 'true';
-    for (const [tag, id] of [['input','story-search'],['div','category-filters'],['div','story-detail'],['button','start-story-btn'],['p','detail-status'],['select','header-role-select'],['section','community-section']]) {
+    for (const [tag, id] of [['input','story-search'],['div','category-filters'],['div','story-detail'],['button','start-story-btn'],['p','detail-status'],['section','community-section']]) {
       const el = new Element(tag); pickerShell.appendChild(el); el.id = id;
     }
     const detailScreen = new Element('section'); main.appendChild(detailScreen); detailScreen.id = 'screen-detail'; detailScreen.classList.add('screen'); detailScreen.dataset.screen = 'detail'; detailScreen.hidden = true;

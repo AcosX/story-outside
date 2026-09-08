@@ -346,7 +346,7 @@ function buildPlayerDom() {
   const pickerScreen = new Element('section'); main.appendChild(pickerScreen); pickerScreen.id = 'screen-picker'; pickerScreen.dataset.screen = 'picker'; pickerScreen.classList.add('screen', 'active');
   const pickerTitle = new Element('h1'); pickerScreen.appendChild(pickerTitle); pickerTitle.id = 'picker-title';
   const storiesList = new Element('ul'); pickerScreen.appendChild(storiesList); storiesList.id = 'story-list';
-  for (const [tag, id] of [['input','story-search'],['div','category-filters'],['div','story-detail'],['button','start-story-btn'],['p','detail-status'],['select','header-role-select']]) { const el = new Element(tag); pickerScreen.appendChild(el); el.id = id; }
+  for (const [tag, id] of [['input','story-search'],['div','category-filters'],['div','story-detail'],['button','start-story-btn'],['p','detail-status']]) { const el = new Element(tag); pickerScreen.appendChild(el); el.id = id; }
   const detailScreen = new Element('section'); main.appendChild(detailScreen); detailScreen.id = 'screen-detail'; detailScreen.dataset.screen = 'detail'; detailScreen.classList.add('screen');
   const rolesList = new Element('ul'); pickerScreen.appendChild(rolesList); rolesList.id = 'role-list';
   const pickerStatus = new Element('p'); pickerScreen.appendChild(pickerStatus); pickerStatus.id = 'picker-status';

@@ -34,7 +34,6 @@ const clearAutoplayTimer = () => {};
 const showScreen = () => {};
 const setText = () => {};
 const persistSessionContext = () => {};
-const syncHeaderRoles = () => {};
 const setStatus = () => {};
 const rememberReading = () => {};
 const showToast = () => {};
