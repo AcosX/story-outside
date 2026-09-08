@@ -12,6 +12,7 @@ import {
   buildCompactSummary,
   renderCompactSummary,
   assembleContext,
+  buildSessionContext,
   __testing,
 } from '../src/agent/contextBuilder.mjs';
 
@@ -428,4 +429,36 @@ test('projectForCompact: returns a projection of the event', () => {
   const projected = projectForCompact(event);
   assert.ok(projected);
   assert.ok(typeof projected === 'object');
+});
+
+
+test('runtime context includes all uncovered events and rejects cursor-only summaries', () => {
+  const history = Array.from({ length: 24 }, (_, i) => makeEvent({ event_seq: i + 1, event_type: 'narrative_beat', text: '事实' }));
+  assert.deepEqual(buildSessionContext(history, null).recent_events, history);
+  assert.deepEqual(buildSessionContext(history, { compacted_through_seq: 12 }).recent_events, history);
+  const compact = { context_compact_text: '旧摘要', compacted_through_seq: 3 };
+  assert.deepEqual(buildSessionContext(history, compact).recent_events, history.slice(3));
+  const pending = { event_seq: 25, event_type: 'narrative_beat', status: 'pending' };
+  assert.deepEqual(buildSessionContext([...history, pending], compact).recent_events, history.slice(3));
+});
+
+test('assembleContext measures full uncovered history and preserves protected gaps', () => {
+  const history = Array.from({ length: 24 }, (_, i) => makeEvent({ event_seq: i + 1, event_type: i === 3 ? 'ask_player_choice' : 'narrative_beat', text: '事实' }));
+  let measured;
+  const estimator = { estimate: draft => { measured = draft; return draft.recent_events.length; }, contextWindow: () => 100, compactThreshold: () => 20 };
+  const result = assembleContext({ canonicalHistory: history, estimator, kept_recent: 2 });
+  assert.equal(result.decision, 'compact', 'full history crosses threshold although tail alone does not');
+  assert.equal(result.compact_through_seq, 3);
+  assert.deepEqual(result.recent_events, history.slice(3));
+  assert.deepEqual(measured.recent_events, history.slice(3));
+  const under = assembleContext({ canonicalHistory: history, estimator: { ...estimator, compactThreshold: () => 100 } });
+  assert.deepEqual(under.recent_events, history);
+});
+
+test('semantic compaction can fold older player inputs but never pending or unresolved choices', () => {
+  const history = Array.from({ length: 24 }, (_, i) => makeEvent({ event_seq: i + 1, event_type: 'player_input', text: '选择' }));
+  const window = selectCompactWindow(history, { kept_recent: 16, fold_player_inputs: true });
+  assert.deepEqual(window.selected, history.slice(0, 8));
+  history[3].event_type = 'ask_player_choice';
+  assert.deepEqual(selectCompactWindow(history, { kept_recent: 16, fold_player_inputs: true }).selected, history.slice(0, 3));
 });

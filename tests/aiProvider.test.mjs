@@ -3,16 +3,19 @@ import { AIProviderError, createAICompletion, createAIProvider, loadAIConfig } f
 const config = {apiKey:'private-test-secret',baseURL:'https://example.invalid/v1',model:'test-model',timeoutMs:1000,contextChars:1000};
 assert.equal(loadAIConfig({STORY_OUTSIDE_AI_PROVIDER:'mock'}),null);
 assert.throws(()=>loadAIConfig({STORY_OUTSIDE_AI_PROVIDER:'invalid'}));
+const env = { STORY_OUTSIDE_AI_PROVIDER: 'real', STORY_OUTSIDE_AI_API_KEY: 'test', STORY_OUTSIDE_AI_BASE_URL: 'https://example.invalid/v1', STORY_OUTSIDE_AI_MODEL: 'test', STORY_OUTSIDE_AI_SECRET_FILE: '/nonexistent/compact-test-secret' };
+assert.equal(loadAIConfig({ ...env, STORY_OUTSIDE_AI_CONTEXT_TOKENS: '128000' }).contextWindow, 128000);
+assert.throws(() => loadAIConfig({ ...env, STORY_OUTSIDE_AI_CONTEXT_TOKENS: '3500' }), /token context window/);
 const story={content:'完整原作'.repeat(500)};
 const calls=[];
 const provider=createAIProvider({config,story,fetchImpl:async(url,opts)=>{
   calls.push({url,body:JSON.parse(opts.body)});
-  const content=calls.length===1?{summary:'保留玩家选择和人物事实'}:{items:[{type:'narration',text:'门开了。'}],tool_call:{name:'ask_player_choice',arguments:{question:'进入吗？',options:[{id:'a',label:'进入'},{id:'b',label:'等待'}]}}};
+  const content={items:[{type:'narration',text:'门开了。'}],tool_call:{name:'ask_player_choice',arguments:{question:'进入吗？',options:[{id:'a',label:'进入'},{id:'b',label:'等待'}]}}};
   return {ok:true,json:async()=>({choices:[{message:{content:JSON.stringify(content)},finish_reason:'stop'}]})};
 }});
-const result=await provider.complete({pinned:{role_id:'me'},canonical_history:Array.from({length:20},(_,i)=>({event_seq:i,text:'事件'})),input:{text:'看看'}});
-assert.equal(calls.length,2);
-const sent=JSON.parse(calls[1].body.messages[1].content);
+const result=await provider.complete({pinned:{role_id:'me'},canonical_history:Array.from({length:20},(_,i)=>({event_seq:i,text:'事件'})),context:{compact_text:'保留玩家选择和人物事实',recent_events:Array.from({length:16},(_,i)=>({event_seq:i+4,text:'事件'}))},input:{text:'看看'}});
+assert.equal(calls.length,1);
+const sent=JSON.parse(calls[0].body.messages[1].content);
 assert.deepEqual(sent.original_story,story);
 assert.equal(sent.committed_history.length,16);
 assert.equal(sent.committed_summary,'保留玩家选择和人物事实');
@@ -109,23 +112,22 @@ const completionPayload = { choices: [{ message: { content: JSON.stringify({ ite
 }
 console.log('AI provider: transient retries, transport retry, and deterministic failures passed');
 
-// Persisted compact reuses committed-prefix summaries across provider instances.
-const { mkdtemp, rm } = await import('node:fs/promises');
+// Provider never owns session state, even when handed an old compact cache.
+const { mkdtemp, rm, writeFile, readdir } = await import('node:fs/promises');
 const { tmpdir } = await import('node:os');
 const { join } = await import('node:path');
 const cacheDir = await mkdtemp(join(tmpdir(), 'story-ai-'));
 try {
-  let compactCalls = 0;
-  const fetchCached = async (_url, opts) => {
-    const body = JSON.parse(opts.body);
-    const isCompact = body.messages[0].content.includes('事实摘要');
-    if (isCompact) compactCalls++;
-    return { ok:true, json:async()=>({choices:[{message:{content:JSON.stringify(isCompact ? {summary:'事实和选择'} : {items:[{text:'继续。'}]})}}]}) };
-  };
-  const history=Array.from({length:20},(_,i)=>({event_seq:i,text:'事件'}));
-  const request={session:{session_uuid:'cache-test'},pinned:{},canonical_history:history,input:{}};
-  await createAIProvider({config:{...config,cacheDir},story,fetchImpl:fetchCached}).complete(request);
-  await createAIProvider({config:{...config,cacheDir},story,fetchImpl:fetchCached}).complete({...request,canonical_history:[...history,{event_seq:20,text:'新增事件'}]});
-  assert.equal(compactCalls,1);
-  console.log('AI compact persisted-prefix reuse passed');
-} finally { await rm(cacheDir,{recursive:true,force:true}); }
+  await writeFile(join(cacheDir, 'compact-old.json'), JSON.stringify({ summary: 'obsolete file state' }));
+  let sent;
+  const fresh = createAIProvider({ config: { ...config, cacheDir }, story, fetchImpl: async (_url, opts) => {
+    sent = JSON.parse(JSON.parse(opts.body).messages[1].content);
+    return { ok: true, json: async () => completionPayload };
+  } });
+  const history = Array.from({ length: 20 }, (_, i) => ({ event_seq: i, text: '事件' }));
+  await fresh.complete({ pinned: {}, canonical_history: history, input: {} });
+  assert.equal(sent.committed_summary, null);
+  assert.deepEqual(sent.committed_history, history);
+  assert.deepEqual(await readdir(cacheDir), ['compact-old.json']);
+  console.log('AI provider ignores session file cache and preserves all supplied context');
+} finally { await rm(cacheDir, { recursive: true, force: true }); }
