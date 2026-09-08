@@ -67,7 +67,7 @@ function isEventProtected(event) {
  * into the compact summary. The selection rule is:
  *
  *   1. Start at event_seq = 1.
- *   2. Take the prefix *up to* (compacted_through_seq + 1) — i.e. everything
+ *   2. Take the prefix starting after compacted_through_seq — everything
  *      that has NOT yet been compact is eligible.
  *   3. Never fold any event whose event_type is in
  *      EVENT_TYPES_THAT_NEVER_COMPACT. Folding STOPS at the first such
@@ -76,6 +76,8 @@ function isEventProtected(event) {
  *      past an unresolved choice or a recent player input would both
  *      misorder the summary and make the protected event silently
  *      disappear from the compact view).
+ *      A semantic summarizer may opt into folding older player inputs via
+ *      fold_player_inputs; it must retain their choices and event_seq.
  *   4. Always keep at least KEPT_RECENT_MIN recent committed events
  *      verbatim, so the provider can still see the latest voice.
  *   5. Returned array preserves canonical order.
@@ -86,7 +88,7 @@ function isEventProtected(event) {
  * defensively filters any such input anyway.
  *
  * @param {Array<object>} canonicalHistory canonical session_events
- * @param {{ compacted_through_seq?: number | null, kept_recent?: number }} [options]
+ * @param {{ compacted_through_seq?: number | null, kept_recent?: number, fold_player_inputs?: boolean }} [options]
  * @returns {{ selected: Array<object>, next_through_seq: number, kept_recent: Array<object>, skipped_protected: number }}
  */
 export function selectCompactWindow(canonicalHistory, options = {}) {
@@ -123,7 +125,7 @@ export function selectCompactWindow(canonicalHistory, options = {}) {
   let skippedProtected = 0;
   let lastSelectedSeq = alreadyCompactedThrough;
   for (const event of eligiblePool) {
-    if (isEventProtected(event)) {
+    if (isEventProtected(event) && !(options.fold_player_inputs === true && event.event_type === 'player_input')) {
       // Folding stops here: we do NOT compact this event, and we do NOT
       // fold anything after it either — the summary must never overtake an
       // unresolved choice / recent player input. The span between the fold
@@ -308,9 +310,8 @@ export function renderCompactSummary(summary) {
  *   - canonicalHistory: full session_events (append-only, never truncated)
  *   - existingCompact: { summary_text, summary_payload, through_seq } from
  *     session.context_compact (may be null if compact never fired).
- *   - recentTail: the events we keep verbatim. Defaults to the most recent
- *     KEPT_RECENT_DEFAULT events but the caller can override (e.g. when
- *     rebuilding from history).
+ *   - kept_recent: minimum tail length. Every event after the summary cursor
+ *     stays verbatim, including gaps left by protected events.
  *   - input: the current player/agent input JSON.
  *   - envelope: { system_prompt, tool_definitions, pinned }.
  *   - estimator: a TokenEstimator (see tokenEstimator.mjs).
@@ -318,7 +319,7 @@ export function renderCompactSummary(summary) {
  * Behaviour:
  *   - If estimated tokens <= estimator.compactThreshold(), the assembled
  *     context is "no_compact" and includes the full original + compact (if
- *     any) + current input. Recent tail is the entire history slice.
+ *     any) + current input. Recent events include the entire uncovered suffix.
  *   - Otherwise we run selectCompactWindow + buildCompactSummary +
  *     renderCompactSummary and mark the decision "compact".
  *
@@ -329,7 +330,6 @@ export function renderCompactSummary(summary) {
  * @param {{
  *   canonicalHistory: Array<object>,
  *   existingCompact?: { summary_text?: string|null, summary_payload?: object|null, through_seq?: number|null } | null,
- *   recentTail?: Array<object> | null,
  *   input: object,
  *   envelope: { system_prompt: object|null, tool_definitions: Array<object>, pinned: object },
  *   estimator: import('./tokenEstimator.mjs').TokenEstimator,
@@ -351,15 +351,12 @@ export function assembleContext(args) {
     : { system_prompt: null, tool_definitions: [], pinned: {} };
   const forceCompact = args.force_compact === true;
 
-  const recentTail = Array.isArray(args.recentTail) && args.recentTail.length > 0
-    ? args.recentTail.slice(-keptRecent)
-    : history.slice(-keptRecent);
-
-  // Pre-assemble a draft and measure it.
+  // Estimate every uncovered event, never just the most recent N events.
   const draftNoCompact = {
-    compact_text: existing && typeof existing.summary_text === 'string' ? existing.summary_text : null,
-    compact_through_seq: existing && Number.isInteger(existing.through_seq) ? existing.through_seq : null,
-    recent_events: recentTail,
+    ...buildSessionContext(history, {
+      context_compact_text: existing?.summary_text,
+      compacted_through_seq: existing?.through_seq,
+    }),
     input,
     envelope,
   };
@@ -372,7 +369,7 @@ export function assembleContext(args) {
       prompt_version: String(COMPACT_PROMPT_VERSION),
       compact_text: draftNoCompact.compact_text,
       compact_through_seq: draftNoCompact.compact_through_seq,
-      recent_events: clone(recentTail),
+      recent_events: clone(draftNoCompact.recent_events),
       canonical_history: clone(history),
       input: clone(input),
       envelope: clone(envelope),
@@ -410,7 +407,7 @@ export function assembleContext(args) {
   const assembled = {
     compact_text: summaryText,
     compact_through_seq: window.next_through_seq,
-    recent_events: window.kept_recent,
+    recent_events: history.filter(event => event.event_seq > window.next_through_seq),
     input,
     envelope,
   };
@@ -421,7 +418,7 @@ export function assembleContext(args) {
     prompt_version: String(COMPACT_PROMPT_VERSION),
     compact_text: summaryText,
     compact_through_seq: window.next_through_seq,
-    recent_events: clone(window.kept_recent),
+    recent_events: clone(assembled.recent_events),
     canonical_history: clone(history),
     input: clone(input),
     envelope: clone(envelope),
@@ -442,3 +439,21 @@ export const __testing = {
   projectForCompact,
   fallbackEstimateTokens,
 };
+
+/** Pure runtime projection: a compact cursor may hide only a summarized prefix.
+ * LLM summarization preserves older player inputs (including event_seq); recent
+ * inputs stay verbatim in the tail. Pending tools are never canonical input.
+ */
+export function buildSessionContext(canonicalHistory, compact) {
+  const history = asEventList(canonicalHistory).filter(event =>
+    event.committed !== false && !['pending', 'staged'].includes(event.status));
+  const summary = compact?.context_compact_text;
+  const through = compact?.compacted_through_seq;
+  const valid = typeof summary === 'string' && summary.trim().length > 0
+    && Number.isInteger(through) && history.some(event => event.event_seq === through);
+  return {
+    compact_text: valid ? summary : null,
+    compact_through_seq: valid ? through : null,
+    recent_events: clone(valid ? history.filter(event => event.event_seq > through) : history),
+  };
+}

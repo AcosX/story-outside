@@ -22,3 +22,41 @@ Run offline regression tests with `STORY_OUTSIDE_AI_PROVIDER=mock` to prevent pa
 Real story detail requests prepare playable characters and a short work-level opening through AI. The same content/model/version-keyed result is reused by detail and session bootstrap. Concurrent cache misses share one request, and successful results persist under `secrets/ai-cache/` (override with `STORY_OUTSIDE_AI_CACHE_DIR`). The original `beats` remain complete; `ai_opening_events` is a separately versioned canonical field and ends with an excluded first-choice marker. The opening generator plays only the short prepared scene. `default_role_id` selects an actual first-person character when present; `role_selection_required` asks the player to choose when multiple non-first-person characters exist.
 
 The HTTP transport forbids redirects and embedded URL credentials, limits JSON responses to 2 MB, and never includes upstream response bodies in errors.
+
+
+### Session compact ownership
+
+The real runtime reads `getSessionCompact()` and builds the model context from
+its persisted summary plus **every** canonical event after `compacted_through_seq`.
+`aiProvider.complete()` only sends that context and the complete original story;
+it never reads or writes a Session file cache. Existing `compact-*.json` files are
+ignored. Work-level `storyPreparation` continues to use disposable `aiCache` files.
+
+Runtime measures the actual messages, including original story, system prompt,
+tool schemas, summary, uncovered history, and current input. Compact is triggered
+by the character budget or the token estimator threshold. Optional
+`STORY_OUTSIDE_AI_CONTEXT_TOKENS` sets the configured token window (greater than
+3500); otherwise the estimator uses its model registry and conservative fallback.
+The token threshold reserves 3500 completion tokens and a 10% safety margin.
+The character budget is a separate heuristic, not a token-window declaration.
+
+When enough committed events exist, runtime asks the stateless `summarize()`
+operation to merge the previous summary with the new prefix. It keeps at least
+16 recent events verbatim; extensions wait for at least 16 newly foldable events.
+Older player inputs may be summarized with their choices and event sequence IDs.
+Pending speculation is excluded and unresolved choice events stop the prefix.
+An oversized original or insufficient foldable history can still exceed the
+configured budget: compact does not truncate original text or silently drop events.
+
+`recordCompact()` writes summary, cursor, budget metadata and folded-event audit
+into the Session projection. MariaDB's existing response-time flush persists
+these together; fresh hydration reuses the same text without regenerating it.
+Canonical history is never deleted. Failed summarization records a sanitized
+failure and preserves the prior summary/cursor; the turn fails and may be retried.
+Revision and compact-snapshot checks reject stale results after an interrupt,
+including late failures, before they can overwrite newer summary or audit state.
+
+`npm test` covers real-provider payloads with stubbed HTTP, snapshot hydration,
+replay, incremental compact, failures and interrupt races.
+`npm run test:db` additionally checks SQL round trips and requires an explicitly
+configured empty disposable `STORY_OUTSIDE_TEST_DATABASE_URL`.

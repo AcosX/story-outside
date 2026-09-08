@@ -5,6 +5,9 @@ import { randomUUID } from 'node:crypto';
 import { readFile, readdir } from 'node:fs/promises';
 import { spawnSync } from 'node:child_process';
 import mysql from 'mysql2/promise';
+import { createAIProvider } from '../src/agent/aiProvider.mjs';
+import { createAgentRuntime, runTurn } from '../src/agent/runtime.mjs';
+import { getSession, getSessionCompact } from '../src/stories/sessionService.mjs';
 import { loadDatabaseConfig, connectDatabase, closeDatabase } from '../src/db/mariadb.mjs';
 import { createMariaDbRepositories } from '../src/db/mariaPersistence.mjs';
 import { appendSessionEvent } from '../src/db/sessionEventPersistence.mjs';
@@ -132,6 +135,65 @@ if (!databaseUrl) {
       const [[persisted]] = await tx.query('SELECT payload FROM session_events WHERE event_id = ?', [original.event_id]);
       assert.deepEqual(typeof persisted.payload === 'string' ? JSON.parse(persisted.payload) : persisted.payload, original.payload);
     } finally { tx.release(); }
+    // Exercise runtime -> real provider -> SQL compact -> fresh adapter -> next
+    // real provider request. HTTP is stubbed; persistence uses the isolated DB.
+    const compactIdentity = { repository, session_uuid: sessions[0] };
+    for (let i = 0; i < 19; i++) interruptWithPlayerInput({ ...compactIdentity,
+      text: `SQL compact player choice ${i}`, expected_revision: getSession(compactIdentity).revision });
+    const beforeCompact = listSessionEvents(compactIdentity);
+    const aiRequests = [];
+    let invalidCompact = false;
+    const makeProvider = () => createAIProvider({ config: { apiKey: 'test', baseURL: 'https://example.invalid/v1',
+      model: 'mock', timeoutMs: 1000, contextChars: 1000, maxRetries: 0 },
+      story: { text: '原作'.repeat(1000) }, fetchImpl: async (_url, opts) => {
+        const messages = JSON.parse(opts.body).messages;
+        const compact = messages[0].content.includes('事实摘要');
+        aiRequests.push({ compact, payload: JSON.parse(messages[1].content) });
+        const result = compact ? { summary: invalidCompact ? '' : 'SQL保存的事实摘要' } : { items: [{ text: '继续剧情' }] };
+        return { ok: true, json: async () => ({ choices: [{ message: { content: JSON.stringify(result) }, finish_reason: 'stop' }] }) };
+      } });
+    const generate = (identity, request_id = randomUUID()) => {
+      const session = getSession(identity);
+      return runTurn(createAgentRuntime({ ...identity, provider: makeProvider(), system_prompt: {}, tool_definitions: [],
+        expected_story_version_uuid: session.story_version_uuid, expected_story_version_checksum: session.story_version_checksum,
+        expected_model: session.model, expected_generation_profile: session.generation_profile }),
+        { request_id, input: { text: '继续' }, expected_revision: session.revision });
+    };
+    const compactRequest = randomUUID();
+    const generated = await generate(compactIdentity, compactRequest);
+    await db.flush();
+    const [[compactRow]] = await pool.query('SELECT context_compact_text, compacted_through_seq FROM game_sessions WHERE session_uuid = ?', [sessions[0]]);
+    assert.equal(compactRow.context_compact_text, 'SQL保存的事实摘要');
+    assert.equal(Number(compactRow.compacted_through_seq), 4);
+    const [[audit]] = await pool.query(`SELECT COUNT(*) AS total FROM compact_compacted_events c
+      JOIN game_sessions s ON s.id = c.session_id WHERE s.session_uuid = ?`, [sessions[0]]);
+    assert.equal(Number(audit.total), 1);
+    const freshDb = await adapter(createInMemoryStoryRepository());
+    const freshIdentity = { repository: freshDb.storyRepository, session_uuid: sessions[0] };
+    // created_at is DB insertion metadata, not part of the canonical event
+    // hash or replay contract; occurred_at and every canonical field must match.
+    const canonicalEvents = events => events.map(({ created_at, ...event }) => event);
+    const hydratedHistory = listSessionEvents(freshIdentity);
+    assert.deepEqual(canonicalEvents(hydratedHistory), canonicalEvents(beforeCompact));
+    assert.deepEqual(await generate(freshIdentity, compactRequest), generated);
+    assert.equal(aiRequests.length, 2, 'hydrated replay makes no model call');
+    discardPendingTail(freshIdentity);
+    await generate(freshIdentity);
+    assert.equal(aiRequests.length, 3, 'hydrated compact is reused without regeneration');
+    assert.equal(aiRequests[2].payload.committed_summary, compactRow.context_compact_text);
+    assert.deepEqual(aiRequests[2].payload.committed_history, hydratedHistory.slice(4));
+    for (let i = 0; i < 16; i++) interruptWithPlayerInput({ ...freshIdentity,
+      text: `after restart ${i}`, expected_revision: getSession(freshIdentity).revision });
+    invalidCompact = true;
+    await assert.rejects(generate(freshIdentity), error => error.code === 'provider_failure');
+    await freshDb.flush();
+    const failedDb = await adapter(createInMemoryStoryRepository());
+    const failure = getSessionCompact({ repository: failedDb.storyRepository, session_uuid: sessions[0] });
+    assert.equal(failure.last_compact_status, 'failed');
+    assert.equal(failure.context_compact_text, compactRow.context_compact_text);
+    assert.equal(failure.compacted_through_seq, 4);
+    assert.equal(getSessionCompact({ repository: failedDb.storyRepository, session_uuid: sessions[1] }).context_compact_text, null);
+    console.log('ok - MariaDB runtime compact, SQL audit, fresh adapter reuse, canonical retention and failure persistence');
     console.log('ok - MariaDB legacy upgrade, idempotent migrations, session request isolation, pending isolation, rehydration and conflict rollback');
   } finally { await pool.end(); }
 }

@@ -1,5 +1,6 @@
 import { canonicalJsonStringify } from '../stories/canonicalHash.mjs';
-import { getSession, listSessionEvents, lookupTurnRequest, registerTurnRequest, stageNarrativeBatch } from '../stories/sessionService.mjs';
+import { getSession, getSessionCompact, recordCompact, recordCompactFailure, listSessionEvents, lookupTurnRequest, registerTurnRequest, stageNarrativeBatch } from '../stories/sessionService.mjs';
+import { buildSessionContext, selectCompactWindow } from './contextBuilder.mjs';
 import { randomUUID } from 'node:crypto';
 import { executeToolCall, ToolValidationError } from './tools.mjs';
 
@@ -250,8 +251,8 @@ export function createAgentRuntime({ repository, session_uuid, provider, system_
   return runtime;
 }
 
-function buildRequest(state, inputJson) {
-  return {
+async function buildRequest(state, inputJson) {
+  const request = {
     session: { session_uuid: state.session_uuid, revision: state.base_revision, cursor: state.base_cursor },
     pinned: clone(state.pinned),
     canonical_history: clone(listSessionEvents({ repository: state.repository, session_uuid: state.session_uuid })),
@@ -259,6 +260,62 @@ function buildRequest(state, inputJson) {
     system_prompt: clone(state.system_prompt),
     tool_definitions: clone(state.tool_definitions),
   };
+  state.provider.validateRequest?.(request);
+  const identity = { repository: state.repository, session_uuid: state.session_uuid };
+  const previous = getSessionCompact(identity);
+  request.context = buildSessionContext(request.canonical_history, previous);
+  const policy = state.provider.contextPolicy;
+  if (!policy || typeof state.provider.summarize !== 'function') return request;
+  const measured = policy.measure(request);
+  const estimate = policy.estimator.estimate(measured);
+  if (estimate <= policy.estimator.compactThreshold()
+    && JSON.stringify(measured).length <= policy.contextChars) return request;
+  const window = selectCompactWindow(request.canonical_history, {
+    compacted_through_seq: request.context.compact_through_seq,
+    kept_recent: policy.keptRecent,
+    fold_player_inputs: true,
+  });
+  // Keep the previous paid summary until a meaningful new prefix is ready.
+  if (!window.selected.length || (request.context.compact_text && window.selected.length < policy.keptRecent)) return request;
+  const assertCurrent = () => {
+    const latest = getSession(identity);
+    const compact = getSessionCompact(identity);
+    if (latest.revision !== state.base_revision
+      || compact.compacted_through_seq !== previous.compacted_through_seq
+      || compact.context_compact_text !== previous.context_compact_text) {
+      fail('revision_mismatch', 'compact generation was superseded by a newer player action');
+    }
+  };
+  let summary;
+  try {
+    summary = await state.provider.summarize({
+      previous_summary: request.context.compact_text,
+      new_committed_events: clone(window.selected),
+    });
+    if (typeof summary !== 'string' || !summary.trim()) throw new Error('invalid compact summary');
+  } catch (error) {
+    assertCurrent();
+    // Never store upstream messages, credentials, or response bodies in audit.
+    recordCompactFailure({ ...identity, error_code: 'compact_generation_failed',
+      error_message: 'Session compact generation failed', token_estimate: estimate,
+      context_window: policy.estimator.contextWindow() });
+    throw error;
+  }
+  assertCurrent();
+  const next = { ...previous, context_compact_text: summary, compacted_through_seq: window.next_through_seq };
+  request.context = buildSessionContext(request.canonical_history, next);
+  const budget = policy.estimator.describe();
+  recordCompact({ ...identity, summary_text: summary,
+    summary_payload: { schema_version: 1, summary },
+    through_seq: window.next_through_seq,
+    folded_event_seqs: window.selected.map(event => event.event_seq),
+    skipped_protected: window.skipped_protected,
+    token_estimate: policy.estimator.estimate(policy.measure(request)),
+    context_window: budget.window, safety_ratio: budget.safetyRatio,
+    reserved_completion_tokens: budget.reservedCompletionTokens,
+    schema_version: 1, prompt_version: 1,
+  });
+  return request;
 }
 
 function buildToolCallEnvelope(toolCall, session_uuid, turn_id, base_revision) {
@@ -331,9 +388,15 @@ async function runTurnOnce(runtime, { request_id, input, expected_revision } = {
   try {
     turn_id = randomUUID();
     state.turn_id = turn_id;
-    rawResult = await state.provider.complete(buildRequest(state, inputJson));
+    const request = await buildRequest(state, inputJson);
+    if (getSession({ repository: state.repository, session_uuid: state.session_uuid }).revision !== state.base_revision) {
+      fail('revision_mismatch', 'generation was superseded by a newer player action');
+    }
+    rawResult = await state.provider.complete(request);
   } catch (error) {
-    // Provider calls have not mutated the session yet. A transient network,
+    if (error instanceof AgentRuntimeError) throw error;
+    // Compact projection may have advanced, but canonical events have not.
+    // A transient network,
     // upstream, or model response failure can therefore be retried safely by
     // the idempotent HTTP client without replaying a committed event.
     fail('provider_failure', 'agent provider failed', {
