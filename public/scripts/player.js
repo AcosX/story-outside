@@ -80,6 +80,10 @@ function setText(sel, text) {
 }
 
 function showScreen(name) {
+  document.body.dataset.view = name;
+  $('#nav-stories')?.classList.toggle('active', name !== 'mine');
+  $('#nav-mine')?.classList.toggle('active', name === 'mine');
+  if (name !== 'player' && $('#header-role-select')) $('#header-role-select').hidden = true;
   $$('.screen').forEach((s) => {
     const isActive = s.dataset.screen === name;
     s.classList.toggle('active', isActive);
@@ -106,8 +110,9 @@ function setStatus(next) {
   $('#player-input-form').hidden = finished;
   $('#pause-btn').hidden = finished || next === 'awaiting-choice';
   $('#player-choices').hidden = next !== 'awaiting-choice';
+  if (next !== 'awaiting-choice' && $('#player-choices').parentNode === $('#story-log')) $('#screen-player').appendChild($('#player-choices'));
   $('#player-ending').hidden = !finished;
-  $('#pause-btn-label').textContent = next === 'paused' ? '继续' : '暂停';
+  $('#pause-btn-label').textContent = next === 'paused' ? '自动播放' : '暂停播放';
   $('#pause-btn').setAttribute(
     'aria-label', next === 'paused' ? '继续自动播放' : '暂停自动播放'
   );
@@ -198,6 +203,7 @@ function showToast(message, ms = 2400) {
 // -------- API client --------
 
 async function api(path, options = {}) {
+  const requestSession = path.match(/^\/api\/sessions\/([^/]+)\//)?.[1];
   const res = await fetch(path, {
     headers: { 'content-type': 'application/json' },
     ...options,
@@ -205,6 +211,9 @@ async function api(path, options = {}) {
   let data = null;
   try { data = await res.json(); }
   catch { data = { error: 'bad_json' }; }
+  if (requestSession && requestSession !== state.sessionUuid) {
+    const err = new Error('stale_session'); err.code = 'stale_session'; throw err;
+  }
   if (!res.ok) {
     const err = new Error(data.message || data.error || `http_${res.status}`);
     err.code = data.error || `http_${res.status}`;
@@ -229,6 +238,7 @@ async function loadStories() {
     renderStories();
     status.textContent = '';
   } catch (err) {
+    if (err?.code === 'stale_session') return null;
     list.innerHTML = '<li class="chip-placeholder">加载失败，可以稍后重试。</li>';
     status.textContent = `加载失败：${err.message}`;
   } finally {
@@ -236,43 +246,78 @@ async function loadStories() {
   }
 }
 
+function storyCategories(story) {
+  const cats = story.categories || story.source?.labels || [];
+  return Array.isArray(cats) ? cats.map(c => typeof c === 'string' ? c : c.name || c.title || '').filter(Boolean) : [story.category].filter(Boolean);
+}
+function storyCover(story, cls = '') {
+  const url = story.cover_url || story.source?.artwork || story.source?.tab_artwork;
+  return `<div class="book-cover ${cls}">${url ? `<img src="${escapeHtml(url)}" alt="${escapeHtml(story.title)}封面" loading="lazy" referrerpolicy="no-referrer">` : `<div class="cover-fallback">${escapeHtml(story.title)}</div>`}</div>`;
+}
+function icons() { window.lucide?.createIcons(); }
 function renderStories() {
   const list = $('#story-list');
   list.innerHTML = '';
-  if (!state.stories || !state.stories.length) {
-    list.innerHTML = '<li class="chip-placeholder">暂无可用的故事。</li>';
-    return;
-  }
-  for (const story of state.stories) {
+  const search = ($('#story-search')?.value || '').trim().toLowerCase();
+  const stories = (state.stories || []).filter(story => (!state.category || storyCategories(story).includes(state.category)) && (!search || [story.title, story.author, story.description, story.hook, ...storyCategories(story)].join(' ').toLowerCase().includes(search)));
+  for (const story of stories) {
     const li = document.createElement('li');
     const btn = document.createElement('button');
-    btn.className = 'chip';
-    btn.type = 'button';
-    btn.dataset.storyId = story.id;
-    btn.setAttribute('role', 'option');
-    btn.setAttribute('aria-selected', 'false');
-    btn.innerHTML = `
-      <span class="chip-title">${escapeHtml(story.title)}</span>
-      <span class="chip-hook">${escapeHtml(story.hook || '')}</span>
-    `;
-    btn.addEventListener('click', () => selectStory(story.id));
-    li.appendChild(btn);
-    list.appendChild(li);
+    btn.className = 'book-card'; btn.type = 'button'; btn.dataset.storyId = story.id;
+    btn.innerHTML = `${storyCover(story)}<span class="book-category">${escapeHtml(storyCategories(story).join(' · ') || '互动故事')}</span><h3 class="book-title">${escapeHtml(story.title)}</h3>${story.author ? `<p class="book-author">${escapeHtml(story.author)}</p>` : ''}<p class="book-description">${escapeHtml(story.description || story.hook || '')}</p>`;
+    btn.addEventListener('click', () => { void selectStory(story.id); });
+    li.appendChild(btn); list.appendChild(li);
+  }
+  if (!stories.length) list.innerHTML = '<li class="chip-placeholder">没有找到这本故事，换个关键词试试。</li>';
+  if (!state.filtersBuilt) {
+    state.filtersBuilt = true;
+    const cats = [...new Set((state.stories || []).map(story => story.category || storyCategories(story)[0]).filter(Boolean))];
+    const filters = $('#category-filters');
+    for (const cat of ['', ...cats]) {
+      const btn = document.createElement('button'); btn.textContent = cat || '全部故事'; btn.className = cat === (state.category || '') ? 'active' : '';
+      btn.addEventListener('click', () => {state.category = cat; Array.from(filters.children).forEach(el => el.classList.toggle('active', el === btn)); renderStories();});
+      filters.appendChild(btn);
+    }
   }
 }
-
-function selectStory(storyId) {
-  const story = state.stories.find((s) => s.id === storyId);
-  if (!story) return;
-  $$('#story-list .chip').forEach((c) => {
-    c.setAttribute('aria-selected', String(c.dataset.storyId === storyId));
-  });
-  state.story = story;
-  state.role = null;
-  setText('#story-name', story.title);
-  setText('#role-name', '选一个视角');
-  renderRoles(story.roles || []);
-  $('#role-block').hidden = false;
+async function selectStory(storyId) {
+  let story = state.stories.find(s => s.id === storyId); if (!story) return;
+  state.story = story; state.role = null;
+  setText('#story-name', story.title); setText('#role-name', '故事详情');
+  showScreen('detail'); renderStoryDetail(story);
+  $('#start-story-btn').disabled = true; setText('#detail-status', '正在寻找故事中的角色…'); $('#role-list').innerHTML = '';
+  const request = ++state.detailRequest || (state.detailRequest = 1);
+  try {
+    const detail = await api(`/api/stories/${encodeURIComponent(storyId)}`);
+    if (request !== state.detailRequest || state.story?.id !== storyId) return;
+    const enriched = detail.story || detail;
+    story = { ...story, ...enriched, cover_url: enriched.cover_url || story.cover_url, source: { ...story.source, ...enriched.source } }; state.story = story;
+    state.role = (story.roles || []).find(r => r.id === story.default_role_id) || null;
+    renderStoryDetail(story); renderRoles(story.roles || []);
+    $('#start-story-btn').disabled = !state.role; setText('#detail-status', state.role ? '' : '选一个角色，开始你的故事。');
+  } catch (err) {
+    if (err?.code === 'stale_session') return null; setText('#detail-status', `角色暂时未能加载：${err.message}`); }
+}
+function renderStoryDetail(story) {
+  $('#story-detail').innerHTML = `<div class="detail-hero">${storyCover(story, 'detail-cover')}<div class="detail-meta"><p class="eyebrow">${escapeHtml(storyCategories(story).join(' / ') || 'BEYOND THE STORY')}</p><h1>${escapeHtml(story.title)}</h1><div class="detail-byline">${story.author_avatar ? `<img class="author-avatar" src="${escapeHtml(story.author_avatar)}" alt="" referrerpolicy="no-referrer">` : ''}${story.author ? `<span>${escapeHtml(story.author)}</span>` : ''}${story.word_count ? `<span>${Number(story.word_count).toLocaleString()} 字</span>` : ''}</div><p class="detail-description">${escapeHtml(story.description || story.summary || story.hook || '')}</p></div></div>`;
+}
+function rememberReading() {
+  const saved = { story: state.story, role: state.role, sessionUuid: state.sessionUuid, storyUuid: state.storyUuid, storyVersionUuid: state.storyVersionUuid, cacheUuid: state.cacheUuid, generationProfile: state.generationProfile, openingEvents: state.openingEvents, communityProfileVersion: state.communityProfileVersion, communityProfileUuid: state.communityProfileUuid, communityProfileQueries: state.communityProfileQueries, knowledgeQueries: state.knowledgeQueries };
+  try { localStorage.setItem('story-outside:reading', JSON.stringify(saved)); } catch {}
+}
+function readReading() { try { return JSON.parse(localStorage.getItem('story-outside:reading') || 'null'); } catch { return null; } }
+function renderMine() {
+  const saved = readReading(); const host = $('#recent-session');
+  host.innerHTML = saved?.story ? `<div class="recent-card">${storyCover(saved.story)}<div class="recent-info"><h3>${escapeHtml(saved.story.title)}</h3><p>以 ${escapeHtml(saved.role?.label || '你的')} 的视角</p></div><button class="btn btn-primary" id="resume-session-btn">继续故事 <i data-lucide="arrow-right"></i></button></div>` : '<p class="empty-state">你的书架还很安静。去选一个喜欢的故事吧。</p>';
+  $('#resume-session-btn')?.addEventListener('click', async () => {
+    clearAutoplayTimer(); Object.assign(state, saved, { finished:false, pending:null, pendingIdx:0, queuedToolCall:null, inputInFlight:false, progressTotal:0 });
+    setText('#story-name', state.story.title); setText('#role-name', state.role.label); persistSessionContext(); showScreen('player'); syncHeaderRoles(); await recoverAndStart();
+  }); icons();
+}
+function syncHeaderRoles() {
+  const select = $('#header-role-select'); if (!select) return;
+  select.innerHTML = (state.story?.roles || []).map(r => `<option value="${escapeHtml(r.id)}" ${r.id === state.role?.id ? 'selected' : ''}>${escapeHtml(r.label)}</option>`).join('');
+  select.hidden = state.story?.default_role_id != null || !(state.story?.roles?.length > 1) || document.body.dataset.view !== 'player';
 }
 
 // -------- Story bootstrap (session creation) --------
@@ -286,8 +331,19 @@ async function bootstrapSession({ story, role }) {
   //   story_version_uuid, generation_profile, pinned.
   // The server chooses the model / prompt / generation_profile defaults
   // — the browser does not know about them, by design.
+  const requestToken = (state.bootstrapRequestToken || 0) + 1;
+  state.bootstrapRequestToken = requestToken;
+  state.bootstrapInFlight = true;
+  state.generationEpoch = (state.generationEpoch || 0) + 1;
+  state.startNextBatchInFlight = null;
+  clearAutoplayTimer();
+  if (state.toolCallTimer) clearTimeout(state.toolCallTimer);
+  state.finished = false; state.pending = null; state.pendingIdx = 0; state.queuedToolCall = null; state.progressTotal = 0; state.lastPlayerRequestId = 1; state.nextBatchInput = undefined;
   setStatus('loading');
-  setText('#picker-status', '准备开场&hellip;');
+  $('#start-story-btn').disabled = true;
+  setText('#detail-status', '正在为你写下开场…');
+  setText('#picker-status', '准备开场…');
+  const bootstrapToken = state.navigationToken || 0;
   let cacheUuid, generationProfile;
   try {
     const created = await api('/api/sessions', {
@@ -297,9 +353,17 @@ async function bootstrapSession({ story, role }) {
         role_id: role.id,
       }),
     });
+    if (requestToken !== state.bootstrapRequestToken || bootstrapToken !== (state.navigationToken || 0)) return;
     if (!created || !created.session_uuid || !created.cache_uuid) {
       throw new Error('bad_session_bootstrap');
     }
+    if (created.pinned?.role_id && created.pinned.role_id !== role.id) {
+      throw new Error('session_role_mismatch');
+    }
+    // The requested role becomes canonical only together with the matching
+    // server session. This keeps the header, persisted recovery data and the
+    // model's pinned role on the same selection.
+    state.role = role;
     state.sessionUuid = created.session_uuid;
     state.cacheUuid = created.cache_uuid;
     state.storyUuid = created.story_uuid || null;
@@ -386,11 +450,23 @@ async function bootstrapSession({ story, role }) {
     // when it loaded; this dispatch covers the helper-not-yet-loaded
     // path AND the "no-helper-loaded" harness path.
     dispatchLocalSessionChanged(state.sessionUuid || null, 'player.bootstrapSession');
+    rememberReading();
     showScreen('player');
+    syncHeaderRoles();
     await recoverAndStart();
   } catch (err) {
+    if (requestToken !== state.bootstrapRequestToken || bootstrapToken !== (state.navigationToken || 0)) return null;
+    if (err?.code === 'stale_session') return null;
     setText('#picker-status', `准备失败：${err.message}`);
+    setText('#detail-status', `准备失败：${err.message}`);
     setStatus('picker');
+    showScreen('detail');
+    setText('#role-name', '故事详情');
+  } finally {
+    if (requestToken === state.bootstrapRequestToken) {
+      state.bootstrapInFlight = false;
+      $('#start-story-btn').disabled = !state.role;
+    }
   }
 }
 
@@ -576,6 +652,8 @@ async function recoverAndStart() {
     state.canonicalEventsById = new Map(state.canonicalHistory.map((e) => [e.event_id, e]));
     state.canonicalNarrativeCount = state.canonicalHistory.filter((e) => e.event_type === 'narrative_beat').length;
     const log = $('#story-log');
+    const choices = $('#player-choices');
+    if (choices?.parentNode === log) $('#screen-player').appendChild(choices);
     log.innerHTML = '';
     for (const ev of state.canonicalHistory) {
       appendCanonical(ev);
@@ -626,6 +704,7 @@ async function recoverAndStart() {
     }
     await startNextBatch();
   } catch (err) {
+    if (err?.code === 'stale_session') return null;
     showToast(`恢复失败：${err.message}`);
     setStatus('error');
   }
@@ -660,7 +739,14 @@ function scheduleNext() {
   }
 }
 
-async function runOpeningStep() {
+function runOpeningStep() {
+  if (state.runOpeningStepInFlight) return state.runOpeningStepInFlight;
+  const operation = performrunOpeningStep();
+  state.runOpeningStepInFlight = operation;
+  operation.finally(() => { if (state.runOpeningStepInFlight === operation) state.runOpeningStepInFlight = null; });
+  return operation;
+}
+async function performrunOpeningStep() {
   state.autoplayTimer = null;
   if (state.status !== 'playing' || state.finished) return;
   // Defensive: if we landed here but opening is already done, hand off
@@ -716,6 +802,7 @@ async function runOpeningStep() {
       scheduleOpeningStep();
     }
   } catch (err) {
+    if (err?.code === 'stale_session') return null;
     showToast(`开场提交失败：${err.message}`);
     setStatus('paused');
     $('#skip-btn').hidden = false;
@@ -888,7 +975,14 @@ async function runStep() {
   await startNextBatch();
 }
 
-async function commitNextPendingItem() {
+function commitNextPendingItem() {
+  if (state.commitNextPendingItemInFlight) return state.commitNextPendingItemInFlight;
+  const operation = performcommitNextPendingItem();
+  state.commitNextPendingItemInFlight = operation;
+  operation.finally(() => { if (state.commitNextPendingItemInFlight === operation) state.commitNextPendingItemInFlight = null; });
+  return operation;
+}
+async function performcommitNextPendingItem() {
   const item = state.pending.events[state.pendingIdx];
   if (!item) {
     state.pendingIdx = state.pending.events.length;
@@ -955,6 +1049,7 @@ async function commitNextPendingItem() {
       return;
     }
   } catch (err) {
+    if (err?.code === 'stale_session') return null;
     // Commit failed: surface retryable error, leave the pending line in
     // place, and pause. The user can hit "下一句" to retry.
     showToast(`提交失败：${err.message}`);
@@ -963,7 +1058,15 @@ async function commitNextPendingItem() {
   }
 }
 
-async function startNextBatch() {
+function startNextBatch() {
+  if (state.startNextBatchInFlight) return state.startNextBatchInFlight;
+  const operation = performstartNextBatch();
+  state.startNextBatchInFlight = operation;
+  operation.finally(() => { if (state.startNextBatchInFlight === operation) state.startNextBatchInFlight = null; });
+  return operation;
+}
+async function performstartNextBatch() {
+  const generationEpoch = state.generationEpoch || 0;
   if (state.finished) return;
   // Same guard as runStep: never /generate over an undelivered tool
   // call envelope.
@@ -980,7 +1083,7 @@ async function startNextBatch() {
     if (state.status === 'playing' && !state.finished) scheduleOpeningStep();
     return;
   }
-  setText('#player-help', '正在请求下一段&hellip;');
+  setText('#player-help', '故事正在继续…');
   const expectedRevision = state.lastRevision || 0;
   const requestId = `turn-${state.lastPlayerRequestId}`;
   state.lastPlayerRequestId += 1;
@@ -1000,6 +1103,7 @@ async function startNextBatch() {
         request_id: requestId,
       }),
     });
+    if (generationEpoch !== (state.generationEpoch || 0)) return;
     state.lastRevision = turn.revision;
     state.pending = {
       pending_id: turn.pending_id,
@@ -1019,6 +1123,7 @@ async function startNextBatch() {
       const el = renderPendingPlaceholder(state.pending.events[i], state.canonicalHistory.length + i);
       registerPendingNode(`pending:${state.pending.pending_id}:${i}`, el);
     }
+    if (state.inputInFlight) return;
     if (state.pending.events.length === 0 && state.pending.tool_call) {
       await surfaceToolCall(state.pending.tool_call);
       state.pending = null;
@@ -1029,6 +1134,10 @@ async function startNextBatch() {
       else scheduleNextStep();
     }
   } catch (err) {
+    if (err?.code === 'stale_session') return null;
+    if (generationEpoch !== (state.generationEpoch || 0)) return;
+    setText('#player-help', '');
+    if (state.inputInFlight) return;
     showToast(`请求失败：${err.message}`);
     setStatus('paused');
   }
@@ -1131,6 +1240,7 @@ async function mountEndingPage(sessionMetaOverride) {
       return true;
     }
   } catch (err) {
+    if (err?.code === 'stale_session') return null;
     // Non-fatal: keep the inline ending visible if the module is
     // unreachable (e.g. dev environment without the new files).
     showToast(`结局页加载失败：${err.message}`);
@@ -1141,27 +1251,31 @@ async function mountEndingPage(sessionMetaOverride) {
 
 function renderChoices(toolCall) {
   const wrap = $('#player-choices');
+  wrap.setAttribute('role', 'listitem');
   wrap.innerHTML = '';
   const h = document.createElement('h3');
   h.textContent = toolCall.payload.question || '请选择';
   wrap.appendChild(h);
   const ul = document.createElement('ul');
   ul.className = 'choice-list';
-  for (const opt of toolCall.payload.options || []) {
+  for (const [optionIndex, opt] of (toolCall.payload.options || []).entries()) {
     const li = document.createElement('li');
     const btn = document.createElement('button');
     btn.className = 'choice-btn';
     btn.type = 'button';
     btn.dataset.optionId = opt.id;
     btn.innerHTML = `
-      <span class="choice-id">${escapeHtml(opt.id)}</span>
+      <span class="choice-id">${String.fromCharCode(65 + optionIndex)}</span>
       <span class="choice-label">${escapeHtml(opt.label || opt.text || opt.id)}</span>
     `;
-    btn.addEventListener('click', () => chooseOption(opt));
+    btn.addEventListener('click', () => chooseOption({ ...opt, displayLabel: String.fromCharCode(65 + optionIndex) }));
     li.appendChild(btn);
     ul.appendChild(li);
   }
   wrap.appendChild(ul);
+  const log = $('#story-log');
+  if (wrap.parentNode !== log) log.appendChild(wrap);
+  requestAnimationFrame(() => { log.scrollTop = log.scrollHeight; });
   // Allow free-text input.
   $('#player-input-form').hidden = false;
 }
@@ -1234,6 +1348,8 @@ async function interruptWithPlayerText(text, { input = null, failLabel = '打断
   // disable the form so the UI matches.
   if (state.inputInFlight) return null;
   state.inputInFlight = true;
+  state.generationEpoch = (state.generationEpoch || 0) + 1;
+  state.startNextBatchInFlight = null;
   setInputsDisabled(true);
   // Clear any in-flight schedulers so the failed send cannot race the
   // user's retry; the caller restores the input on failure and the
@@ -1247,6 +1363,13 @@ async function interruptWithPlayerText(text, { input = null, failLabel = '打断
   const previousStatus = state.status;
   setStatus('loading');
   try {
+    const interruptedSession = state.sessionUuid;
+    await Promise.all([state.runOpeningStepInFlight, state.commitNextPendingItemInFlight].filter(Boolean));
+    if (state.sessionUuid !== interruptedSession) return null;
+    clearAutoplayTimer();
+    if (state.toolCallTimer) clearTimeout(state.toolCallTimer);
+    state.toolCallTimer = null; state.queuedToolCall = null;
+    setText('#player-help', '');
     const result = await api(`/api/sessions/${state.sessionUuid}/interrupt`, {
       method: 'POST',
       body: JSON.stringify({
@@ -1275,6 +1398,7 @@ async function interruptWithPlayerText(text, { input = null, failLabel = '打断
     if (inputEl) inputEl.value = '';
     return result;
   } catch (err) {
+    if (err?.code === 'stale_session') return null;
     // Failure: the user must be able to retry. Restore the typed text
     // and the previous status (do NOT pretend we are still playing).
     if (inputEl) {
@@ -1304,7 +1428,7 @@ async function sendPlayerInputChoice(text) {
 
 async function chooseOption(option) {
   // Convert the option pick into a player_input → interrupt, then resume.
-  const text = `${option.id}: ${option.label || option.text || option.id}`;
+  const text = `${option.displayLabel || option.id}: ${option.label || option.text || option.id}`;
   // The sendPlayerInput call already handles the status transitions on
   // success and failure. We only need to nudge the scheduler when the
   // call actually landed in the canonical history.
@@ -1350,6 +1474,16 @@ function togglePause() {
   }
 }
 
+async function advanceStory() {
+  if (state.status === 'playing') { skipCurrent(); return; }
+  if (state.status !== 'paused' || state.inputInFlight) return;
+  setStatus('playing');
+  if (state.queuedToolCall) { const queued = state.queuedToolCall; state.queuedToolCall = null; await surfaceToolCall(queued); }
+  else if (inOpeningPhase()) await runOpeningStep();
+  else await runStep();
+  if (state.status === 'playing') setStatus('paused');
+}
+
 function skipCurrent() {
   // Skip is intentionally a no-op while paused: the user must resume
   // playback first. A paused skip that stages a new batch would
@@ -1389,6 +1523,7 @@ async function share() {
       showToast('已发送分享');
       return;
     } catch (err) {
+    if (err?.code === 'stale_session') return null;
       if (err && err.name === 'AbortError') return;
       // Fall through to clipboard fallback.
     }
@@ -1399,6 +1534,7 @@ async function share() {
       showToast('链接已复制');
       return;
     } catch (err) {
+    if (err?.code === 'stale_session') return null;
       // Fall through to legacy copy. Note: in headless / permission-
       // denied contexts navigator.clipboard.writeText rejects with a
       // NotAllowedError; legacy execCommand is the last resort.
@@ -1431,6 +1567,12 @@ function legacyCopy(text) {
 // -------- Navigation --------
 
 function backToPicker() {
+  state.generationEpoch = (state.generationEpoch || 0) + 1;
+  state.startNextBatchInFlight = null;
+  state.navigationToken = (state.navigationToken || 0) + 1;
+  state.detailRequest = (state.detailRequest || 0) + 1;
+  if (state.toolCallTimer) clearTimeout(state.toolCallTimer);
+  state.toolCallTimer = null;
   state.autoplayTimer && clearTimeout(state.autoplayTimer);
   state.autoplayTimer = null;
   state.sessionUuid = null;
@@ -1438,10 +1580,13 @@ function backToPicker() {
   state.pendingIdx = 0;
   state.finished = false;
   state.queuedToolCall = null;
+  const choices = $('#player-choices');
+  if (choices?.parentNode === $('#story-log')) $('#screen-player').appendChild(choices);
   setText('#story-log', '');
   setText('#player-choices', '');
   setText('#player-ending', '');
-  setText('#role-name', '未选择角色');
+  setText('#role-name', '故事之外');
+  setText('#story-name', '发现故事');
   setStatus('picker');
   showScreen('picker');
 }
@@ -1466,6 +1611,16 @@ function bindEvents() {
   if (eventsBound) return;
   eventsBound = true;
   $('#back-btn').addEventListener('click', backToPicker);
+  $('#nav-stories')?.addEventListener('click', backToPicker);
+  $('#nav-mine')?.addEventListener('click', () => { state.navigationToken = (state.navigationToken || 0) + 1; if (state.status === 'playing') togglePause(); showScreen('mine'); setText('#story-name', '我的'); setText('#role-name', '故事之外'); renderMine(); });
+  $('#story-search')?.addEventListener('input', renderStories);
+  window.addEventListener?.('story:open', e => {
+    if (e.detail?.storyId) void selectStory(e.detail.storyId);
+  });
+  $('#start-story-btn')?.addEventListener('click', () => { if (state.story && state.role) void bootstrapSession({story:state.story, role:state.role}); });
+  $('#header-role-select')?.addEventListener('change', (e) => { const role = state.story?.roles.find(r => r.id === e.target.value); if (role && role.id !== state.role?.id) { void bootstrapSession({story:state.story, role}); } });
+  $('#player-input').addEventListener('focus', () => { if (state.status === 'playing') togglePause(); });
+  $('#story-log').addEventListener('click', e => { if (e.target?.closest('button, a')) return; void advanceStory(); });
   $('#share-btn').addEventListener('click', () => { void share(); });
   $('#pause-btn').addEventListener('click', togglePause);
   $('#skip-btn').addEventListener('click', skipCurrent);
@@ -1518,6 +1673,8 @@ async function bootstrap() {
     const socialMod = await import('/scripts/socialPanel.js');
     if (socialMod && typeof socialMod.mount === 'function') {
       await socialMod.mount();
+      const socialHost = $('#social-panel-host');
+      if (socialHost && $('#community-section')) $('#community-section').appendChild(socialHost);
     }
   } catch { /* panel is best-effort — the core game flow must still run */ }
   setStatus('loading');
@@ -1605,8 +1762,8 @@ async function bootstrap() {
       if (!role) return;
       $$('#role-list .chip').forEach((c) => c.setAttribute('aria-selected', String(c === roleChip)));
       state.role = role;
-      setText('#role-name', role.label);
-      void bootstrapSession({ story: state.story, role });
+      $('#start-story-btn').disabled = false;
+      setText('#detail-status', '');
     });
   }
 }
@@ -1621,7 +1778,7 @@ function renderRoles(roles) {
     btn.type = 'button';
     btn.dataset.roleId = role.id;
     btn.setAttribute('role', 'option');
-    btn.setAttribute('aria-selected', 'false');
+    btn.setAttribute('aria-selected', String(role.id === state.role?.id));
     btn.innerHTML = `
       <span class="chip-title">${escapeHtml(role.label)}</span>
       <span class="chip-hook">${escapeHtml(role.mood || '')}</span>

@@ -140,7 +140,9 @@ export function generateOpeningCache(input) {
   if (!story || typeof story !== 'object') {
     throw new Error('generateOpeningCache: story required');
   }
-  const beats = Array.isArray(story.beats) ? story.beats : [];
+  // AI-prepared public openings end before the first choice. Full source
+  // beats stay intact on the pinned story version for generation/replay.
+  const beats = Array.isArray(story.ai_opening_events) ? story.ai_opening_events : (Array.isArray(story.beats) ? story.beats : []);
   const roles = Array.isArray(story.roles) ? story.roles : [];
   /** @type {OpeningEvent[]} */
   const events = [];

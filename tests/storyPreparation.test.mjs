@@ -1,0 +1,31 @@
+import assert from 'node:assert/strict';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { createPreparedStoryProvider } from '../src/agent/storyPreparation.mjs';
+import { canonicalStoryContent, canonicalStoryHash } from '../src/stories/canonicalHash.mjs';
+import { generateOpeningCache } from '../src/stories/openingGenerator.mjs';
+import { defaultGenerationProfile } from '../src/stories/storyService.mjs';
+const cacheDir=await mkdtemp(join(tmpdir(),'story-preparation-'));
+try {
+  let calls=0;
+  const source={id:'one',title:'原作',hook:'原作简介',roles:[{id:'author',label:'作者',mood:''}],beats:[{index:0,text:'完整原作'.repeat(1000)}]};
+  const config={apiKey:'test',baseURL:'https://example.invalid/v1',model:'test',timeoutMs:1000,cacheDir};
+  const fetchImpl=async()=>{calls++;return {ok:true,json:async()=>({choices:[{message:{content:JSON.stringify({roles:[{id:'self',label:'我',mood:'旅人'}],first_person_role_id:'self',opening_events:[{type:'narration',text:'雨落在窗前。'}]})}}]})};};
+  const provider={name:'real',getStory:async()=>source};
+  const prepared=createPreparedStoryProvider(provider,config,{fetchImpl});
+  const [a,b]=await Promise.all([prepared.getStory('one'),prepared.getStory('one')]);
+  const c=await createPreparedStoryProvider(provider,config,{fetchImpl}).getStory('one');
+  assert.equal(calls,1);
+  assert.deepEqual(a,b);assert.deepEqual(b,c);
+  assert.equal(a.default_role_id,'self');assert.equal(a.role_selection_required,false);
+  const canonical=canonicalStoryContent(a);
+  assert.deepEqual(canonical.beats,source.beats);
+  assert.equal(canonical.ai_opening_events.length,2);
+  assert.notEqual(canonicalStoryHash(a),canonicalStoryHash({...a,ai_opening_events:[{index:0,text:'新开场'}]}));
+  const opening=generateOpeningCache({story_uuid:'11111111-1111-4111-8111-111111111111',story_version_uuid:'22222222-2222-4222-8222-222222222222',opening_key:'default',profile:defaultGenerationProfile(),story:canonical});
+  assert.equal(opening.event_count,1);
+  assert.equal(opening.events[0].text,'雨落在窗前。');
+  assert.equal(opening.boundary,'truncated_before_first_choice');
+  console.log('Story preparation: roles, single-flight/disk cache, canonical full source, opening hash and first-choice boundary passed');
+}finally{await rm(cacheDir,{recursive:true,force:true});}

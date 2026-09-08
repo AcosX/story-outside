@@ -2,237 +2,270 @@
 <html lang="zh-CN">
   <head>
     <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
-    <meta name="color-scheme" content="light dark" />
-    <title>故事之外</title>
-    <meta name="description" content="《故事之外》——一个分支互动叙事 demo。" />
+    <meta
+      name="viewport"
+      content="width=device-width,initial-scale=1,viewport-fit=cover"
+    />
+    <meta name="color-scheme" content="light" />
     <link rel="icon" href="/mascot/liu-kaishan-idle.gif" />
-    <link rel="stylesheet" href="/styles/main.css" />
+    <title>故事之外 · 让故事发生</title>
+    <meta name="description" content="走进故事，成为故事中的人。" />
     <link rel="stylesheet" href="/styles/ending.css" />
+    <link rel="stylesheet" href="/styles/main.css" />
   </head>
   <body>
     <a class="skip-link" href="#player-main">跳到正文</a>
-
-    <header class="topbar" aria-label="页头">
-      <button
-        class="icon-btn"
-        id="back-btn"
-        type="button"
-        aria-label="返回"
-        title="返回"
+    <aside class="sidebar">
+      <a class="brand" href="/"
+        ><span class="brand-mark"><i data-lucide="book-open"></i></span
+        ><span>故事之外<small>BEYOND THE STORY</small></span></a
       >
-        <span class="icon-arrow" aria-hidden="true">&larr;</span>
-        <span class="visually-hidden">返回</span>
-      </button>
-      <div class="topbar-meta">
-        <div class="story-name" id="story-name" aria-live="polite">故事之外</div>
-        <div class="role-name" id="role-name">未选择角色</div>
+      <nav aria-label="主导航">
+        <button id="nav-stories" class="nav-item active">
+          <i data-lucide="library"></i>故事<i
+            data-lucide="chevron-right"
+            class="nav-chevron"
+          ></i></button
+        ><button id="nav-mine" class="nav-item">
+          <i data-lucide="user-round"></i>我的<i
+            data-lucide="chevron-right"
+            class="nav-chevron"
+          ></i>
+        </button>
+      </nav>
+      <div class="sidebar-bottom">
+        <span class="tiny-star">✦</span>
+        <p>每一次选择，<br />都是另一个故事。</p>
+        <span class="sidebar-rule"></span><small>故事未完，等你续写</small>
       </div>
-      <button
-        class="icon-btn"
-        id="share-btn"
-        type="button"
-        aria-label="分享"
-        title="分享"
-      >
-        <span class="icon-share" aria-hidden="true">&#x2197;</span>
-        <span class="visually-hidden">分享</span>
-      </button>
-    </header>
-
-    <main id="player-main" class="player-main" aria-live="polite" tabindex="-1">
-      <section
-        class="screen screen-picker active"
-        id="screen-picker"
-        data-screen="picker"
-        aria-label="故事选择"
-      >
-        <div class="picker-shell">
-          <header class="picker-head">
-            <h1 class="picker-title">如果当时，由你来选</h1>
-            <p class="picker-sub">
-              选一个起点，挑一个视角，剩下的我们替你一句一句播出来。
-            </p>
-          </header>
-
-          <section class="picker-block" aria-labelledby="picker-stories-label">
-            <h2 id="picker-stories-label" class="picker-label">故事</h2>
+    </aside>
+    <div class="workspace">
+      <header class="topbar">
+        <button class="icon-btn" id="back-btn" aria-label="返回">
+          <i data-lucide="arrow-left"></i>
+        </button>
+        <div class="topbar-meta">
+          <div class="story-name" id="story-name">发现故事</div>
+          <div class="role-name" id="role-name">故事之外</div>
+        </div>
+        <select
+          id="header-role-select"
+          aria-label="切换角色并开始新故事"
+          hidden
+        ></select
+        ><button class="icon-btn" id="share-btn" aria-label="分享">
+          <i data-lucide="share-2"></i></button
+        ><span class="topbar-label">YOUR NEXT CHAPTER</span>
+      </header>
+      <main id="player-main" class="player-main" tabindex="-1">
+        <section
+          class="screen screen-picker active"
+          id="screen-picker"
+          data-screen="picker"
+          aria-label="故事选择"
+        >
+          <div class="picker-shell">
+            <header class="picker-head">
+              <p class="eyebrow">A WORLD OF POSSIBILITIES</p>
+              <h1>故事的下一页，<span>由你写。</span></h1>
+              <p class="picker-sub">走进一个故事，遇见另一种可能。</p>
+              <span class="heading-spark" aria-hidden="true">✳</span>
+            </header>
+            <section
+              id="ecosystem-hot-module"
+              class="hot-band"
+              aria-labelledby="ecosystem-hot-label"
+              data-state="loading"
+            >
+              <div class="hot-heading">
+                <span class="hot-symbol"><i data-lucide="flame"></i></span>
+                <div>
+                  <span class="eyebrow">TRENDING NOW</span>
+                  <h2 id="ecosystem-hot-label">知乎此刻热议</h2>
+                </div>
+                <span class="hot-live"><span></span> 此刻的声音</span>
+              </div>
+              <p
+                id="ecosystem-hot-status"
+                class="ecosystem-hot-status"
+                role="status"
+              >
+                载入中…
+              </p>
+              <ol
+                id="ecosystem-hot-list"
+                class="ecosystem-hot-list"
+                aria-label="知乎热榜"
+              ></ol>
+            </section>
+            <div class="library-heading">
+              <div>
+                <p class="eyebrow">FIND YOUR STORY</p>
+                <h2>挑一本，走进去</h2>
+              </div>
+              <label class="search-box"
+                ><i data-lucide="search"></i
+                ><input
+                  id="story-search"
+                  type="search"
+                  placeholder="搜索故事、作者、关键词"
+                  aria-label="搜索故事"
+              /></label>
+            </div>
+            <div
+              id="category-filters"
+              class="category-filters"
+              aria-label="故事分类"
+            ></div>
             <ul
-              class="chip-list"
               id="story-list"
+              class="book-grid"
               aria-busy="true"
-              role="listbox"
               aria-label="故事列表"
             >
-              <li class="chip-placeholder">加载中&hellip;</li>
+              <li class="chip-placeholder">正在打开书架…</li>
             </ul>
-          </section>
-
-          <section
-            class="picker-block"
-            id="ecosystem-hot-module"
-            aria-labelledby="ecosystem-hot-label"
-            data-screen="ecosystem-hot"
-            data-state="loading"
-          >
-            <h2 id="ecosystem-hot-label" class="picker-label">知乎此刻热议</h2>
-            <p
-              class="ecosystem-hot-status"
-              id="ecosystem-hot-status"
-              role="status"
-              aria-live="polite"
-            >载入中…</p>
-            <ol
-              class="ecosystem-hot-list"
-              id="ecosystem-hot-list"
-              aria-label="知乎热榜"
-            ></ol>
-          </section>
-
-          <section
-            class="picker-block"
-            id="role-block"
-            aria-labelledby="picker-roles-label"
-            hidden
-          >
-            <h2 id="picker-roles-label" class="picker-label">视角</h2>
-            <ul
-              class="chip-list"
-              id="role-list"
-              role="listbox"
-              aria-label="角色列表"
-            ></ul>
-          </section>
-
-          <p
-            class="picker-status"
-            id="picker-status"
-            role="status"
-            aria-live="polite"
-          ></p>
-        </div>
-      </section>
-
-      <section
-        class="screen screen-player"
-        id="screen-player"
-        data-screen="player"
-        aria-label="故事播放"
-        hidden
-      >
-        <div class="player-shell">
-          <header class="player-head">
-            <h2 class="visually-hidden">故事正文</h2>
-            <div class="player-status">
-              <span class="status-label" id="status-label">载入中</span>
-              <span class="status-bar" aria-hidden="true">
-                <span class="status-bar-fill" id="status-bar-fill"></span>
-              </span>
-            </div>
-          </header>
-
-          <ol
-            class="story-log"
-            id="story-log"
-            aria-label="故事正文"
-            tabindex="0"
-          ></ol>
-
-          <div class="player-controls">
-            <button
-              class="btn"
-              id="pause-btn"
-              type="button"
-              aria-label="暂停自动播放"
-              title="暂停"
-            >
-              <span class="icon-pause" aria-hidden="true">&#9612;&#9612;</span>
-              <span id="pause-btn-label">暂停</span>
-            </button>
-            <button
-              class="btn"
-              id="skip-btn"
-              type="button"
-              aria-label="立即展示下一句"
-              title="下一句"
-              hidden
-            >
-              <span aria-hidden="true">&raquo;</span>
-              <span>下一句</span>
-            </button>
-            <span class="player-help" id="player-help" aria-live="polite"></span>
+            <p id="picker-status" class="picker-status" role="status"></p>
           </div>
-
-          <form
-            class="player-input"
-            id="player-input-form"
-            autocomplete="off"
-            hidden
-          >
-            <label class="visually-hidden" for="player-input">说一句</label>
-            <input
-              type="text"
-              id="player-input"
-              name="text"
-              placeholder="说一句..."
-              maxlength="200"
-              required
-            />
-            <button class="btn btn-primary" type="submit" id="player-input-btn">
-              发送
-            </button>
-          </form>
-
-          <section
-            class="player-choices"
-            id="player-choices"
-            aria-label="选项"
-            hidden
-          ></section>
-
-          <section
-            class="player-ending"
-            id="player-ending"
-            aria-label="结局"
-            hidden
-          ></section>
-        </div>
-      </section>
-
-      <section
-        class="screen screen-ending"
-        id="screen-ending"
-        data-screen="ending"
-        aria-label="结局页"
-        hidden
-      ></section>
-    </main>
-
-    <aside id="toast" class="toast" hidden role="status" aria-live="polite"></aside>
-
-    <footer class="bottombar">
-      <span class="bottombar-meta">demo · 进程内会话</span>
-    </footer>
-
-    <!-- ClickUp 16.4 P1.v1-2 fix (2026-09-07): load order is significant.
-         identity.js MUST run before player.js / homeHotModule.js so
-         the STORY_OUTSIDE_IDENTITY global is populated from
-         sessionStorage on first paint. homeHotModule.js depends on
-         identity.js for the global + event; player.js sets the
-         identity on pickStory / bootstrapSession. homeHotModule.js
-         is independent (no import on player.js). -->
+        </section>
+        <section
+          class="screen screen-detail"
+          id="screen-detail"
+          data-screen="detail"
+          aria-label="故事详情"
+          hidden
+        >
+          <div class="detail-shell">
+            <div id="story-detail"></div>
+            <section
+              id="role-block"
+              class="role-block"
+              aria-labelledby="picker-roles-label"
+            >
+              <p class="eyebrow">YOUR POINT OF VIEW</p>
+              <h2 id="picker-roles-label">这一次，你是谁？</h2>
+              <ul id="role-list" class="role-list" aria-label="角色列表"></ul>
+            </section>
+            <div class="detail-action">
+              <button class="btn btn-primary" id="start-story-btn">
+                进入故事 <i data-lucide="arrow-up-right"></i>
+              </button>
+              <p id="detail-status" role="status"></p>
+            </div>
+          </div>
+        </section>
+        <section
+          class="screen screen-player"
+          id="screen-player"
+          data-screen="player"
+          aria-label="故事播放"
+          hidden
+        >
+          <div class="player-shell">
+            <header class="player-head">
+              <div class="player-status">
+                <span class="status-dot"></span
+                ><span id="status-label">载入中</span
+                ><span class="status-bar"
+                  ><span id="status-bar-fill" class="status-bar-fill"></span
+                ></span>
+              </div>
+            </header>
+            <ol
+              class="story-log"
+              id="story-log"
+              aria-label="故事正文"
+              tabindex="0"
+            ></ol>
+            <section
+              class="player-choices"
+              id="player-choices"
+              aria-label="选项"
+              hidden
+            ></section>
+            <section
+              class="player-ending"
+              id="player-ending"
+              aria-label="结局"
+              hidden
+            ></section>
+            <div class="composer-area">
+              <div class="player-controls">
+                <button
+                  class="btn playback-btn"
+                  id="pause-btn"
+                  aria-label="暂停自动播放"
+                >
+                  <i data-lucide="play"></i
+                  ><span id="pause-btn-label">暂停</span></button
+                ><button
+                  class="btn playback-btn"
+                  id="skip-btn"
+                  aria-label="立即展示下一句"
+                >
+                  <span>下一句</span><i data-lucide="skip-forward"></i></button
+                ><span class="player-help" id="player-help"></span>
+              </div>
+              <form
+                class="player-input"
+                id="player-input-form"
+                autocomplete="off"
+                hidden
+              >
+                <label class="visually-hidden" for="player-input">说一句</label
+                ><input
+                  type="text"
+                  id="player-input"
+                  name="text"
+                  placeholder="说些什么，让故事向你而来…"
+                  maxlength="200"
+                  required
+                /><button type="submit" id="player-input-btn" aria-label="发送">
+                  <i data-lucide="arrow-up"></i>
+                </button>
+              </form>
+              <p class="composer-caption">你的话，会改变接下来的故事。</p>
+            </div>
+          </div>
+        </section>
+        <section
+          class="screen screen-ending"
+          id="screen-ending"
+          data-screen="ending"
+          aria-label="结局页"
+          hidden
+        ></section>
+        <section
+          class="screen screen-mine"
+          id="screen-mine"
+          data-screen="mine"
+          aria-label="我的"
+          hidden
+        >
+          <div class="mine-shell">
+            <p class="eyebrow">YOUR STORY, CONTINUED</p>
+            <h1>我的故事</h1>
+            <p class="mine-sub">那些走过的章节，和还没说完的话。</p>
+            <section class="recent-section">
+              <h2>继续上次的故事</h2>
+              <div id="recent-session"></div>
+            </section>
+            <section id="community-section"><h2>故事里的相遇</h2></section>
+          </div>
+        </section>
+      </main>
+    </div>
+    <aside id="toast" class="toast" hidden role="status"></aside>
+    <script src="/vendor/lucide.min.js"></script>
     <script src="/scripts/identity.js"></script>
     <script type="module" src="/scripts/player.js"></script>
     <script type="module" src="/scripts/homeHotModule.js"></script>
     <script>
-      // ClickUp 16.2 P1.v2 (2026-09-07): expose a runtime fallback so
-      // the canonical community-profile identity is always readable
-      // from the page (player.js / endingPage.js can override at
-      // runtime; this is the pre-bootstrap default). The handler on
-      // the server is server-authoritative — this is just for the
-      // page-side read convenience.
-      window.STORY_OUTSIDE_COMMUNITY_PROFILE_VERSION = window.STORY_OUTSIDE_COMMUNITY_PROFILE_VERSION || null;
-      window.STORY_OUTSIDE_COMMUNITY_PROFILE_QUERIES = window.STORY_OUTSIDE_COMMUNITY_PROFILE_QUERIES || null;
+      window.STORY_OUTSIDE_COMMUNITY_PROFILE_VERSION =
+        window.STORY_OUTSIDE_COMMUNITY_PROFILE_VERSION || null;
+      window.STORY_OUTSIDE_COMMUNITY_PROFILE_QUERIES =
+        window.STORY_OUTSIDE_COMMUNITY_PROFILE_QUERIES || null;
+      lucide.createIcons();
     </script>
   </body>
 </html>

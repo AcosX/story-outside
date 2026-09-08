@@ -331,3 +331,45 @@ await test('finish_story tool result marks terminal', async () => {
   assert.equal(result.tool_result.kind, 'story_finished');
   assert.equal(result.tool_envelope.terminal, true);
 });
+
+await test('concurrent same-request turns share one paid provider call; competing input fails before provider', async () => {
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  const provider = createMockAgentProvider({ handler: async () => { await gate; return {items:[{text:'并发叙事'}]}; } });
+  const runtime = await buildRuntime(provider);
+  const revision = recoverRuntime(runtime).base_revision;
+  const args={request_id:'same-concurrent',input:{text:'继续'},expected_revision:revision};
+  const first=runTurn(runtime,args);
+  const second=runTurn(runtime,args);
+  await assert.rejects(runTurn(runtime,{...args,input:{text:'另一个选择'}}), error=>error.code==='pending_conflict');
+  release();
+  const [a,b]=await Promise.all([first,second]);
+  assert.equal(provider.callCount,1);
+  assert.equal(a.turn_id,b.turn_id);
+  assert.equal(a.pending_id,b.pending_id);
+});
+
+await test('interrupt starts new revision while old generation finishes; stale result cannot clear the new single-flight lock', async () => {
+  let releaseOld, releaseNew;
+  const oldGate = new Promise(resolve => { releaseOld=resolve; });
+  const newGate = new Promise(resolve => { releaseNew=resolve; });
+  const oldProvider=createMockAgentProvider({handler:async()=>{await oldGate;return {items:[{text:'应丢弃的旧叙事'}]};}});
+  const oldRuntime=await buildRuntime(oldProvider);
+  const recovered=recoverRuntime(oldRuntime);
+  const oldTurn=runTurn(oldRuntime,{request_id:'before-interrupt',input:{text:'继续'},expected_revision:recovered.base_revision});
+  const oldRejected=assert.rejects(oldTurn,error=>error.code==='revision_mismatch');
+  const interrupted=interruptWithPlayerInput({repository:oldRuntime.repository,session_uuid:recovered.session_uuid,text:'我决定转身离开',client_request_id:'during-ai',expected_revision:recovered.base_revision});
+  const provider=createMockAgentProvider({handler:async()=>{await newGate;return {items:[{text:'玩家离开后的新叙事'}]};}});
+  const buildNext=()=>createAgentRuntime({repository:oldRuntime.repository,session_uuid:recovered.session_uuid,provider,system_prompt:{text:'sys'},tool_definitions:[],expected_story_version_uuid:recovered.pinned.story_version_uuid,expected_story_version_checksum:recovered.pinned.story_version_checksum,expected_model:recovered.pinned.model,expected_generation_profile:recovered.pinned.generation_profile});
+  const nextArgs={request_id:'after-interrupt',input:{text:'我决定转身离开'},expected_revision:interrupted.revision};
+  const next=runTurn(buildNext(),nextArgs);
+  assert.equal(provider.callCount,1);
+  releaseOld();await oldRejected;
+  const duplicate=runTurn(buildNext(),nextArgs);
+  assert.equal(provider.callCount,1);
+  releaseNew();
+  const [a,b]=await Promise.all([next,duplicate]);
+  assert.equal(a.turn_id,b.turn_id);
+  assert.equal(a.items[0].text,'玩家离开后的新叙事');
+  assert.equal(provider.callCount,1);
+});

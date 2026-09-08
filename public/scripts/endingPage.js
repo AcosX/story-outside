@@ -204,7 +204,7 @@ function renderKeyChoicesSection(ending) {
     el('h2', {}, '关键选择'),
     el('ul', { class: 'ending-choices', id: 'ending-key-choices' },
       ...choices.map((text, index) => el('li', { class: 'ending-choice', dataset: { index: String(index) } },
-        el('span', { class: 'ending-choice-index' }, `Choice ${index + 1}`),
+        el('span', { class: 'ending-choice-index' }, `选择 ${String.fromCharCode(65 + index)}`),
         el('span', { class: 'ending-choice-text' }, String(text)),
       )),
     ),
@@ -232,19 +232,27 @@ function renderCharacterOutcomesSection(ending) {
 }
 
 function renderFirstDeviationSection(ending) {
-  const deviation = ending.first_deviation;
-  if (!deviation || typeof deviation !== 'object') return null;
+  const deviation = ending.first_divergence;
+  if (!deviation || typeof deviation !== 'object') {
+    return el('section', { class: 'ending-section ending-deviation', dataset: { section: 'first-deviation' } },
+      el('h2', {}, '第一次重大偏离'),
+      el('p', {}, ending.first_divergence_reason || '暂未找到足够依据，确定故事从哪里开始不同。'));
+  }
   return el('section', { class: 'ending-section ending-deviation', dataset: { section: 'first-deviation' } },
     el('h2', {}, '第一次重大偏离'),
     el('div', { class: 'deviation-card', id: 'ending-first-deviation' },
-      el('div', { class: 'deviation-meta' },
-        el('span', { class: 'deviation-event-seq' }, `第 ${deviation.event_seq || 0} 句`),
-        el('span', { class: 'deviation-type' }, deviation.type || 'narrative_beat'),
-      ),
-      deviation.speaker ? el('div', { class: 'deviation-speaker' }, deviation.speaker) : null,
-      el('div', { class: 'deviation-text' }, deviation.text || ''),
-    ),
-  );
+      el('p', {}, el('strong', {}, '原作的选择'), el('span', {}, `　${deviation.original_choice || ''}`)),
+      el('p', {}, el('strong', {}, '你的选择'), el('span', {}, `　${deviation.player_choice || ''}`)),
+      deviation.original_evidence ? el('blockquote', { class: 'original-evidence' }, deviation.original_evidence) : null,
+      deviation.basis ? el('p', { class: 'deviation-meta' }, deviation.basis) : null));
+}
+function renderEndingComparisonSection(ending) {
+  const verdict = ending.same_as_original === true ? '殊途，同归。' : ending.same_as_original === false ? '你写下了不一样的结局。' : '原作与这一次的结局';
+  return el('section', { class:'ending-section ending-verdict', dataset:{section:'ending-verdict'} },
+    el('h2', {}, verdict),
+    ending.original_ending ? el('p', {}, el('strong', {}, '原作结局'), el('span', {}, `　${ending.original_ending}`)) : null,
+    ending.original_ending_evidence ? el('blockquote', {class:'original-evidence'}, ending.original_ending_evidence) : null,
+    el('p', {}, ending.ending_comparison_reason || (ending.same_as_original == null ? '目前的原作信息还不足以判断两个结局是否相同。' : '')));
 }
 
 function renderAnalysisSection(ending) {
@@ -298,7 +306,7 @@ function buildAiTimelineEntries(replay, ending) {
       el('span', { class: 'timeline-kind' }, '无'),
       el('span', { class: 'timeline-text' }, '本次没有产生剧情事件。'))];
   }
-  const deviationSeq = ending && ending.first_deviation && ending.first_deviation.event_seq;
+  const deviationSeq = ending?.first_divergence?.player_event_seq;
   return replay.events.map((ev, index) => {
     const isDeviation = Number.isInteger(deviationSeq) && Number(ev.sequence) === deviationSeq;
     const li = el('li',
@@ -401,9 +409,6 @@ function renderAttribution(originalTimeline) {
       el('strong', {}, '本页右栏、结局摘要、关键选择、角色命运均为 '),
       el('strong', { id: 'ending-attribution-ai' }, 'AI 生成平行时间线'),
       el('span', {}, '；不视为原作。')),
-    el('p', { class: 'attribution-row' },
-      el('small', {},
-        '为未来社区统计预留 ending_key / category 字段（数据契约已定义，MVP 不展示排行榜）。')),
   );
 }
 
@@ -417,7 +422,7 @@ function renderAttribution(originalTimeline) {
 //     ending page mounts (even when the surface is degraded), so a
 //     DOM-test can assert its presence deterministically.
 //   * When `state.relatedKnowledge.degraded === true`, the section
-//     shows the disabled hint "知识延伸暂未启用" instead of an entry
+//     shows the disabled hint "相关问答暂时无法加载，请稍后再试。" instead of an entry
 //     list. The hint's stable id is `#ending-related-knowledge-disabled`.
 //   * When entries are present, the surface disclaimer
 //     "以下内容属于现实/知乎知识延伸，不是原作设定或 AI 世界线事实"
@@ -444,7 +449,7 @@ function renderRelatedKnowledgeSection(knowledgeState) {
       class: 'related-knowledge-disabled',
       id: 'ending-related-knowledge-disabled',
       dataset: { kind: 'disabled' },
-    }, '知识延伸暂未启用');
+    }, '相关问答暂时无法加载，请稍后再试。');
   } else if (entries.length === 0) {
     body = el('p', { class: 'related-knowledge-empty', id: 'ending-related-knowledge-empty' },
       '本次没有匹配的延伸知识。');
@@ -694,6 +699,7 @@ function render(screen, sessionMeta) {
   blocks.push(renderHeader(STATE.ending, sessionMeta));
   const summary = renderSummarySection(STATE.ending); if (summary) blocks.push(summary);
   const deviation = renderFirstDeviationSection(STATE.ending); if (deviation) blocks.push(deviation);
+  blocks.push(renderEndingComparisonSection(STATE.ending));
   const choices = renderKeyChoicesSection(STATE.ending); if (choices) blocks.push(choices);
   const outcomes = renderCharacterOutcomesSection(STATE.ending); if (outcomes) blocks.push(outcomes);
   const analysis = renderAnalysisSection(STATE.ending); if (analysis) blocks.push(analysis);

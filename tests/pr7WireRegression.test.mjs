@@ -214,28 +214,37 @@ try {
 }
 
 // ---------------------------------------------------------------------
-// STORY_OUTSIDE_PROVIDER=real must fail-fast at startup so a
-// misconfigured deploy does not silently serve traffic. We test this
-// in a child process because the in-process server has already booted
-// with the demo provider above.
-// ---------------------------------------------------------------------
-test('STORY_OUTSIDE_PROVIDER=real fails fast at startup (exit code 1)', async () => {
+// Invalid provider configuration must fail fast. The real adapter is now
+// implemented, so real mode itself is no longer a startup error.
+await test('invalid provider fails fast at startup', async () => {
   const child = spawn(process.execPath, [resolvePath(ROOT, 'src/server.mjs')], {
     cwd: ROOT,
-    env: { ...process.env, STORY_OUTSIDE_PROVIDER: 'real' },
+    env: { ...process.env, STORY_OUTSIDE_PROVIDER: 'invalid-provider' },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   let stderr = '';
   child.stderr.on('data', (chunk) => { stderr += chunk.toString(); });
   const exitCode = await new Promise((resolve) => {
-    child.on('exit', (code) => resolve(code));
-    setTimeout(() => {
-      if (!child.killed) child.kill('SIGTERM');
-      resolve('timeout');
-    }, 5000);
+    const timeout = setTimeout(() => { child.kill('SIGTERM'); resolve('timeout'); }, 5000);
+    child.on('exit', (code) => { clearTimeout(timeout); resolve(code); });
   });
-  check('provider=real exits non-zero', exitCode !== 0 && exitCode !== 'timeout', `exitCode=${exitCode}`);
-  check('provider=real emits startup error on stderr', /provider config error|real adapter/.test(stderr), stderr.slice(0, 200));
+  check('invalid provider exits non-zero', exitCode !== 0 && exitCode !== 'timeout', `exitCode=${exitCode}`);
+  check('invalid provider emits startup error on stderr', /provider config error/.test(stderr), stderr.slice(0, 200));
+});
+
+await test('direct server entry starts from Unicode project path', async () => {
+  const child = spawn(process.execPath, [resolvePath(ROOT, 'src/server.mjs')], {
+    cwd: ROOT,
+    env: { ...process.env, STORY_OUTSIDE_PROVIDER: 'mock', STORY_OUTSIDE_AI_PROVIDER: 'mock', PORT: '0' },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  const started = await new Promise((resolve) => {
+    const timeout = setTimeout(() => resolve(false), 5000);
+    child.stdout.on('data', chunk => { if (chunk.toString().includes('listening on')) { clearTimeout(timeout); resolve(true); } });
+    child.on('exit', () => { clearTimeout(timeout); resolve(false); });
+  });
+  child.kill('SIGTERM');
+  check('direct server starts listening', started);
 });
 
 if (failures > 0) {

@@ -192,7 +192,7 @@ console.log('ClickUp 16.3 P1 v1-5 — socialPanel fresh-flow (real player bootst
   // Drive the REAL picker — read whatever story / role the server
   // rendered, do not hard-code the demo story/role names. This way
   // the regression survives future fixture changes.
-  const storyChips = document.querySelectorAll('#story-list .chip');
+  const storyChips = document.querySelectorAll('#story-list .book-card');
   check('fresh: picker rendered at least one story chip', storyChips.length > 0, `count=${storyChips.length}`);
   const storyChip = storyChips[0];
   const storyId = storyChip && (storyChip.dataset ? (storyChip.dataset.storyId || storyChip.attrs['data-story-id']) : null);
@@ -205,6 +205,7 @@ console.log('ClickUp 16.3 P1 v1-5 — socialPanel fresh-flow (real player bootst
   const roleId = roleChip && (roleChip.dataset ? (roleChip.dataset.roleId || roleChip.attrs['data-role-id']) : null);
   check('fresh: first role chip has data-role-id', !!roleId, `attrs=${JSON.stringify(roleChip && roleChip.attrs)} dataset=${JSON.stringify(roleChip && roleChip.dataset)}`);
   if (roleChip) roleChip.dispatch('click');
+        document.querySelector('#start-story-btn')?.dispatch('click');
 
   // Wait for the bootstrap POST /api/sessions round-trip + the
   // session:changed event to flush through the panel listener.

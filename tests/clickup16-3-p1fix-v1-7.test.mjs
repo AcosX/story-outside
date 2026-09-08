@@ -166,7 +166,7 @@ let persistedRawAfterBootstrap = null;
   await new Promise((r) => setTimeout(r, 1500));
 
   const document = globalThis.document;
-  const storyChips = document.querySelectorAll('#story-list .chip');
+  const storyChips = document.querySelectorAll('#story-list .book-card');
   check('fresh: picker rendered at least one story chip', storyChips.length > 0, `count=${storyChips.length}`);
   const storyChip = storyChips[0];
   const storyId = storyChip && (storyChip.dataset ? (storyChip.dataset.storyId || storyChip.attrs['data-story-id']) : null);
@@ -179,6 +179,7 @@ let persistedRawAfterBootstrap = null;
   const roleId = roleChip && (roleChip.dataset ? (roleChip.dataset.roleId || roleChip.attrs['data-role-id']) : null);
   check('fresh: first role chip has data-role-id', !!roleId, `attrs=${JSON.stringify(roleChip && roleChip.attrs)}`);
   if (roleChip) roleChip.dispatch('click');
+        document.querySelector('#start-story-btn')?.dispatch('click');
 
   // Wait for the bootstrap POST /api/sessions round-trip + helper
   // write + session:changed event to flush.

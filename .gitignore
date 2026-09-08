@@ -32,3 +32,6 @@ coverage/
 .nyc_output/
 
 # Vendor scripts that we never run inside the project — keep ignored from grep impact
+# Local browser verification
+.playwright-cli/
+output/playwright/

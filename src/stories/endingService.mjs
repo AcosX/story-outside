@@ -170,6 +170,38 @@ function findFirstDeviation({ canonicalHistory, openingEvents }) {
   return null;
 }
 
+// Comparisons must carry a literal source quote and a canonical player
+// event. Unsupported model claims become explicit unknowns rather than a
+// fabricated original ending. Quote matching establishes provenance; the
+// comparison reasoning remains an attributed AI interpretation.
+function groundedComparison(payload, version, events) {
+  const original = (version?.content_payload?.beats || []).map(beat => typeof beat === 'string' ? beat : beat.text || '').join('\n');
+  const supportedQuote = quote => typeof quote === 'string' && quote.trim().length >= 4 && original.includes(quote.trim());
+  const candidate = payload.first_divergence;
+  const playerEvent = candidate && events.find(event => event.event_seq === candidate.player_event_seq && event.event_type === 'player_input');
+  const playerText = playerEvent?.payload?.text;
+  const divergenceSupported = candidate && supportedQuote(candidate.original_evidence) && typeof candidate.original_choice === 'string' && candidate.original_choice.trim() && typeof playerText === 'string' && playerText.trim();
+  const endingSupported = typeof payload.original_ending === 'string' && payload.original_ending.trim() && supportedQuote(payload.original_ending_evidence);
+  const same = endingSupported && typeof payload.same_as_original === 'boolean' ? payload.same_as_original : null;
+  return {
+    first_divergence: divergenceSupported ? {
+      original_choice: candidate.original_choice,
+      player_choice: playerText,
+      original_evidence: candidate.original_evidence,
+      player_event_seq: playerEvent.event_seq,
+      basis: 'original_quote_and_committed_player_input',
+    } : null,
+    first_divergence_reason: divergenceSupported ? '根据原作引文与已提交的玩家选择进行对照。' : '暂无可核实的原作节点与玩家选择对照，不能确定首次重大偏离。',
+    original_ending: endingSupported ? payload.original_ending : null,
+    original_ending_evidence: endingSupported ? payload.original_ending_evidence : null,
+    same_as_original: same,
+    ending_comparison_reason: endingSupported && typeof payload.ending_comparison_reason === 'string'
+      ? payload.ending_comparison_reason
+      : '现有原文或结局证据不足，暂不能判断与原作结局是否相同。',
+    comparison_source: 'ai_analysis_with_verified_original_quotes',
+  };
+}
+
 /**
  * Build the ending projection. Requires the finish_story tool envelope
  * to have committed (otherwise throws ending_not_committed).
@@ -209,11 +241,12 @@ export function buildEnding({ repository, session_uuid }) {
   const narrativeCount = committedEvents.filter((e) => e && e.event_type === 'narrative_beat').length;
   const openingCount = committedEvents.filter((e) => e && e.event_type === 'story_opening').length;
   const category = deriveCategory({ story, version, cache });
+  const comparison = groundedComparison(payload, version, committedEvents);
   const totalAnalysis = [
     `本次共播放 ${openingCount} 句开场、${narrativeCount} 段剧情、${playerInputCount} 次玩家输入。`,
-    firstDeviation
-      ? `第一次重大偏离发生在第 ${firstDeviation.event_seq} 句。`
-      : '玩家选择全程贴近原作节奏。',
+    comparison.first_divergence
+      ? `首次可核实的重大偏离对应第 ${comparison.first_divergence.player_event_seq} 条玩家选择。`
+      : '尚无足够证据判定首次重大偏离。',
   ].join('');
   return {
     ending_title: payload.ending || payload.summary || '结局',
@@ -227,6 +260,7 @@ export function buildEnding({ repository, session_uuid }) {
         }))
       : [],
     first_deviation: firstDeviation,
+    ...comparison,
     total_analysis: totalAnalysis,
     ending_key: typeof payload.ending_key === 'string' ? payload.ending_key : null,
     category,

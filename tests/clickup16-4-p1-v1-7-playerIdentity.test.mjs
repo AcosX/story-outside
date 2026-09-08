@@ -214,7 +214,7 @@ function ancestorsMatchPrefix(candidate, prefixParts) {
 }
 
 function querySelector(root, sel) {
-  // Multi-segment selector (e.g. '#story-list .chip'): match the first
+  // Multi-segment selector (e.g. '#story-list .book-card'): match the first
   // segment against children, then recurse into matches with the
   // remaining segments.
   const parts = sel.split(/\s+/).filter(Boolean);
@@ -346,6 +346,8 @@ function buildPlayerDom() {
   const pickerScreen = new Element('section'); main.appendChild(pickerScreen); pickerScreen.id = 'screen-picker'; pickerScreen.dataset.screen = 'picker'; pickerScreen.classList.add('screen', 'active');
   const pickerTitle = new Element('h1'); pickerScreen.appendChild(pickerTitle); pickerTitle.id = 'picker-title';
   const storiesList = new Element('ul'); pickerScreen.appendChild(storiesList); storiesList.id = 'story-list';
+  for (const [tag, id] of [['input','story-search'],['div','category-filters'],['div','story-detail'],['button','start-story-btn'],['p','detail-status'],['select','header-role-select']]) { const el = new Element(tag); pickerScreen.appendChild(el); el.id = id; }
+  const detailScreen = new Element('section'); main.appendChild(detailScreen); detailScreen.id = 'screen-detail'; detailScreen.dataset.screen = 'detail'; detailScreen.classList.add('screen');
   const rolesList = new Element('ul'); pickerScreen.appendChild(rolesList); rolesList.id = 'role-list';
   const pickerStatus = new Element('p'); pickerScreen.appendChild(pickerStatus); pickerStatus.id = 'picker-status';
   const roleBlock = new Element('section'); pickerScreen.appendChild(roleBlock); roleBlock.id = 'role-block'; roleBlock.hidden = true;
@@ -544,14 +546,14 @@ async function run() {
     // /api/stories and then renders #story-list chips).
     const storyLoadStart = Date.now();
     while (Date.now() - storyLoadStart < 10000) {
-      const chips = document.querySelectorAll('#story-list .chip');
+      const chips = document.querySelectorAll('#story-list .book-card');
       if (chips.length > 0) break;
       await new Promise((r) => setTimeout(r, 50));
     }
-    let storyChip = document.querySelector('#story-list .chip[data-story-id="cafe-rain"]');
+    let storyChip = document.querySelector('#story-list .book-card[data-story-id="cafe-rain"]');
     if (!storyChip) {
       // Fallback: pick the first chip (server fixture only seeds one story).
-      storyChip = document.querySelector('#story-list .chip');
+      storyChip = document.querySelector('#story-list .book-card');
     }
     assert.ok(storyChip, 'story chip must exist after player.js loads /api/stories');
     storyChip.click();
@@ -560,6 +562,7 @@ async function run() {
       || document.querySelector('#role-list .chip');
     assert.ok(roleChip, 'role chip must exist after selectStory');
     roleChip.click();
+    document.querySelector('#start-story-btn')?.click();
 
     // Wait for bootstrap to complete: state.storyUuid must be set
     // and at least one identity-changed event must have fired.
