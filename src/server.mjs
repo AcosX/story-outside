@@ -888,6 +888,20 @@ function sessionErrorResponse(res, err) {
   return jsonResponse(res, status, body);
 }
 
+function agentRuntimeErrorResponse(res, err, decoration = {}) {
+  // AgentRuntimeError always carries an explicit boolean. Keep the
+  // fallback for older callers, but never turn an explicit false into a
+  // retryable 502 merely because the code is provider_failure.
+  const retryable = err?.retryable === true
+    || (err?.retryable === undefined && err?.code === 'provider_failure');
+  return jsonResponse(res, retryable ? 502 : 400, {
+    error: err.code,
+    message: err.message,
+    ...(retryable ? { retryable: true } : {}),
+    ...decoration,
+  });
+}
+
 function rejectInvalidSessionUuid(res, session_uuid) {
   if (isSessionUuid(session_uuid)) return false;
   jsonResponse(res, 400, {
@@ -1679,9 +1693,7 @@ async function handleRequest(req, res) {
       });
     } catch (err) {
       if (err instanceof AgentRuntimeError) {
-        return jsonResponse(res, 400, {
-          error: err.code, message: err.message, demo: currentDemoFlag(), dev: DEV_FLAG,
-        });
+        return agentRuntimeErrorResponse(res, err, { demo: currentDemoFlag(), dev: DEV_FLAG });
       }
       return sessionErrorResponse(res, err);
     }
@@ -1705,9 +1717,7 @@ async function handleRequest(req, res) {
       });
     } catch (err) {
       if (err instanceof AgentRuntimeError) {
-        return jsonResponse(res, 400, {
-          error: err.code, message: err.message, demo: currentDemoFlag(), dev: DEV_FLAG,
-        });
+        return agentRuntimeErrorResponse(res, err, { demo: currentDemoFlag(), dev: DEV_FLAG });
       }
       return sessionErrorResponse(res, err);
     }
@@ -2339,9 +2349,7 @@ async function handleRequest(req, res) {
       });
     } catch (err) {
       if (err instanceof AgentRuntimeError) {
-        return jsonResponse(res, 400, {
-          error: err.code, message: err.message, ...PUBLIC_DECORATE(),
-        });
+        return agentRuntimeErrorResponse(res, err, PUBLIC_DECORATE());
       }
       return sessionErrorResponse(res, err);
     }
@@ -2362,9 +2370,7 @@ async function handleRequest(req, res) {
       });
     } catch (err) {
       if (err instanceof AgentRuntimeError) {
-        return jsonResponse(res, 400, {
-          error: err.code, message: err.message, ...PUBLIC_DECORATE(),
-        });
+        return agentRuntimeErrorResponse(res, err, PUBLIC_DECORATE());
       }
       return sessionErrorResponse(res, err);
     }

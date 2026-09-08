@@ -240,6 +240,18 @@ await test('sensitive keys are rejected recursively and provider rejects are san
   assert.equal(provider.callCount, 2);
 });
 
+await test('provider can mark a deterministic failure as non-retryable', async () => {
+  const failure = new Error('malformed provider output');
+  failure.retryable = false;
+  const provider = createMockAgentProvider({ failure });
+  const runtime = await buildRuntime(provider);
+  await assert.rejects(
+    () => runTurn(runtime, { input: { ok: true }, expected_revision: recoverRuntime(runtime).base_revision }),
+    (error) => error instanceof AgentRuntimeError
+      && error.code === 'provider_failure' && error.retryable === false,
+  );
+});
+
 await test('system_prompt and tool_definitions reject sensitive keys and camelCase accessToken', async () => {
   const base = await setup();
   assert.throws(() => createAgentRuntime({

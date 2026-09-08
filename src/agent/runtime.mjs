@@ -14,16 +14,17 @@ const MIN_NARRATIVE = 1;
 const MAX_NARRATIVE = 4;
 
 class AgentRuntimeError extends Error {
-  constructor(code, message) {
+  constructor(code, message, { retryable = code === 'provider_failure' } = {}) {
     super(message);
     this.name = 'AgentRuntimeError';
     this.code = code;
+    this.retryable = retryable === true;
   }
 }
 
-function fail(code, message) {
+function fail(code, message, options) {
   if (!ERROR_CODES.has(code)) throw new Error(`agent/runtime: unknown error code '${code}'`);
-  throw new AgentRuntimeError(code, message);
+  throw new AgentRuntimeError(code, message, options);
 }
 
 function clone(value) {
@@ -331,8 +332,13 @@ async function runTurnOnce(runtime, { request_id, input, expected_revision } = {
     turn_id = randomUUID();
     state.turn_id = turn_id;
     rawResult = await state.provider.complete(buildRequest(state, inputJson));
-  } catch {
-    fail('provider_failure', 'agent provider failed');
+  } catch (error) {
+    // Provider calls have not mutated the session yet. A transient network,
+    // upstream, or model response failure can therefore be retried safely by
+    // the idempotent HTTP client without replaying a committed event.
+    fail('provider_failure', 'agent provider failed', {
+      retryable: error && typeof error.retryable === 'boolean' ? error.retryable : true,
+    });
   }
   const latest = getSession({ repository: state.repository, session_uuid: state.session_uuid });
   if (latest.revision !== state.base_revision) fail('revision_mismatch', 'generation was superseded by a newer player action');

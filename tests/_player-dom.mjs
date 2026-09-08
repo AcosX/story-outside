@@ -216,7 +216,12 @@ class Element {
     if (idx >= 0) this.parent.children.splice(idx, 1);
     this.parent = null;
   }
-  setAttribute(name, value) { this.attrs[name] = value; }
+  setAttribute(name, value) {
+    const stringValue = String(value);
+    this.attrs[name] = stringValue;
+    if (name === 'id') this.id = stringValue;
+    if (name.startsWith('data-')) this.dataset[camelCase(name.slice(5))] = stringValue;
+  }
   getAttribute(name) { return this.attrs[name]; }
   removeAttribute(name) { delete this.attrs[name]; }
   addEventListener(type, fn) {
@@ -454,6 +459,7 @@ export function createPlayerDom({ baseUrl, viewport = null, stepDelayMs = null, 
     const storyName = new Element('div'); meta.appendChild(storyName); storyName.id = 'story-name'; storyName.classList.add('story-name');
     const roleName = new Element('div'); meta.appendChild(roleName); roleName.id = 'role-name'; roleName.classList.add('role-name');
     const shareBtn = new Element('button'); topbar.appendChild(shareBtn); shareBtn.id = 'share-btn'; shareBtn.classList.add('icon-btn'); shareBtn.attrs.type = 'button'; shareBtn.attrs['aria-label'] = '分享'; shareBtn.attrs.title = '分享';
+    const navMine = new Element('button'); document.body.appendChild(navMine); navMine.id = 'nav-mine';
     const main = new Element('main'); document.body.appendChild(main); main.id = 'player-main'; main.classList.add('player-main');
     const pickerScreen = new Element('section'); main.appendChild(pickerScreen); pickerScreen.id = 'screen-picker'; pickerScreen.classList.add('screen', 'screen-picker', 'active'); pickerScreen.dataset.screen = 'picker';
     const pickerShell = new Element('div'); pickerScreen.appendChild(pickerShell); pickerShell.classList.add('picker-shell');
@@ -490,6 +496,8 @@ export function createPlayerDom({ baseUrl, viewport = null, stepDelayMs = null, 
     const inputBtn = new Element('button'); inputForm.appendChild(inputBtn); inputBtn.id = 'player-input-btn'; inputBtn.classList.add('btn', 'btn-primary'); inputBtn.attrs.type = 'submit';
     const choices = new Element('section'); playerShell.appendChild(choices); choices.id = 'player-choices'; choices.classList.add('player-choices'); choices.hidden = true;
     const ending = new Element('section'); playerShell.appendChild(ending); ending.id = 'player-ending'; ending.classList.add('player-ending'); ending.hidden = true;
+    const mineScreen = new Element('section'); main.appendChild(mineScreen); mineScreen.id = 'screen-mine'; mineScreen.classList.add('screen', 'screen-mine'); mineScreen.dataset.screen = 'mine'; mineScreen.hidden = true;
+    const recentSession = new Element('div'); mineScreen.appendChild(recentSession); recentSession.id = 'recent-session';
     const toast = new Element('aside'); document.body.appendChild(toast); toast.id = 'toast'; toast.classList.add('toast'); toast.hidden = true;
     const footer = new Element('footer'); document.body.appendChild(footer); footer.classList.add('bottombar');
   }
@@ -794,7 +802,7 @@ export function createPlayerDom({ baseUrl, viewport = null, stepDelayMs = null, 
     // module's lexical scope.
     const wrapped = `${source}\n`
       + 'globalThis.__PLAYER_STATE__ = state; globalThis.__PLAYER_BOOTSTRAP__ = bootstrap; '
-      + 'globalThis.__PLAYER_INTERNALS__ = { recoverAndStart, scheduleNextStep, runStep, startNextBatch, surfaceToolCall, sendPlayerInput, sendPlayerInputChoice };';
+      + 'globalThis.__PLAYER_INTERNALS__ = { api, formatOptionText, normalizeOptionLabel, renderMine, recoverAndStart, resumeSavedReading, scheduleNextStep, runStep, startNextBatch, surfaceToolCall, sendPlayerInput, sendPlayerInputChoice };';
     const fn = new Function(wrapped);
     // Do NOT swallow execution errors: if player.js does not even run,
     // every downstream assertion would pass vacuously. Surface the

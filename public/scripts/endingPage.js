@@ -40,6 +40,26 @@ const STATE = {
 
 // ---------- API helper ----------
 
+const RETRYABLE_HTTP_STATUSES = new Set([408, 425, 429, 500, 502, 503, 504]);
+const API_MAX_RETRIES = 2;
+const API_RETRY_BASE_DELAY_MS = 250;
+const API_RETRY_MAX_DELAY_MS = 2000;
+
+function retryAfterMs(response, attempt) {
+  const backoff = Math.min(API_RETRY_MAX_DELAY_MS, API_RETRY_BASE_DELAY_MS * (2 ** attempt));
+  const value = response?.headers?.get?.('retry-after');
+  if (!value) return backoff;
+  const seconds = Number(value);
+  const retryAfter = Number.isFinite(seconds) && seconds >= 0
+    ? seconds * 1000
+    : Math.max(0, Date.parse(value) - Date.now());
+  return Math.min(API_RETRY_MAX_DELAY_MS, Math.max(backoff, Number.isFinite(retryAfter) ? retryAfter : 0));
+}
+
+function waitForRetry(response, attempt) {
+  return new Promise((resolve) => setTimeout(resolve, retryAfterMs(response, attempt)));
+}
+
 async function api(path, options = {}) {
   // ClickUp 16.2 P1.v2 (2026-09-07): accept an optional options bag
   // so callers can submit POST bodies (the previous helper always
@@ -53,17 +73,45 @@ async function api(path, options = {}) {
     fetchOpts.body = JSON.stringify(fetchOpts.body);
     fetchOpts.headers = Object.assign({}, fetchOpts.headers, { 'content-type': 'application/json' });
   }
-  const res = await fetch(path, fetchOpts);
-  let data = null;
-  try { data = await res.json(); } catch { data = null; }
-  if (!res.ok) {
-    const err = new Error((data && data.message) || (data && data.error) || `http_${res.status}`);
-    err.code = data && data.error;
-    err.status = res.status;
-    err.data = data;
-    throw err;
+  const method = String(fetchOpts.method || 'GET').toUpperCase();
+  const retryableRequest = method === 'GET';
+  for (let attempt = 0; attempt <= API_MAX_RETRIES; attempt += 1) {
+    let res;
+    try {
+      res = await fetch(path, fetchOpts);
+    } catch (error) {
+      if (!retryableRequest || attempt === API_MAX_RETRIES) throw error;
+      await waitForRetry(null, attempt);
+      continue;
+    }
+    let data = null;
+    let validJson = true;
+    try { data = await res.json(); } catch { validJson = false; data = { error: 'bad_json' }; }
+    if (!validJson) {
+      const err = new Error('invalid_json_response');
+      err.code = 'bad_json';
+      err.status = res.status;
+      err.data = data;
+      if (retryableRequest && RETRYABLE_HTTP_STATUSES.has(res.status) && attempt < API_MAX_RETRIES) {
+        await waitForRetry(res, attempt);
+        continue;
+      }
+      throw err;
+    }
+    if (!res.ok) {
+      const err = new Error((data && data.message) || (data && data.error) || `http_${res.status}`);
+      err.code = data && data.error;
+      err.status = res.status;
+      err.data = data;
+      if (retryableRequest && RETRYABLE_HTTP_STATUSES.has(res.status) && attempt < API_MAX_RETRIES) {
+        await waitForRetry(res, attempt);
+        continue;
+      }
+      throw err;
+    }
+    return data;
   }
-  return data;
+  throw new Error('request_retry_exhausted');
 }
 
 async function fetchProjections(sessionUuid) {
@@ -211,14 +259,22 @@ function renderKeyChoicesSection(ending) {
   );
 }
 
-function renderCharacterOutcomesSection(ending) {
+function displayRoleName(value, sessionMeta) {
+  const raw = String(value ?? '');
+  const roles = Array.isArray(sessionMeta?.roles) ? sessionMeta.roles : [];
+  const role = roles.find((item) => item && (String(item.id) === raw || String(item.label) === raw));
+  return role && typeof role.label === 'string' && role.label ? role.label : raw;
+}
+
+function renderCharacterOutcomesSection(ending, sessionMeta) {
   const outcomes = Array.isArray(ending.character_outcomes) ? ending.character_outcomes : [];
   if (outcomes.length === 0) return null;
   return el('section', { class: 'ending-section', dataset: { section: 'character-outcomes' } },
     el('h2', {}, '角色最终命运'),
     el('ul', { class: 'ending-outcomes', id: 'ending-character-outcomes' },
       ...outcomes.map((item, index) => {
-        const character = item && item.character ? String(item.character) : '';
+        const character = item && (item.character_label || item.character)
+          ? String(item.character_label || displayRoleName(item.character, sessionMeta)) : '';
         const fate = item && item.fate ? String(item.fate) : '';
         const change = item && item.change ? String(item.change) : '';
         return el('li', { class: 'ending-outcome', dataset: { character, index: String(index) } },
@@ -374,7 +430,7 @@ function renderEcosystemDiscussionsSection(ecosystem, ecosystemError) {
   );
 }
 
-function renderReplaySection(replay) {
+function renderReplaySection(replay, sessionMeta) {
   const events = replay && Array.isArray(replay.events) ? replay.events : [];
   return el('section', { class: 'ending-section ending-replay', dataset: { section: 'replay' } },
     el('h2', {}, '世界线回放'),
@@ -393,7 +449,7 @@ function renderReplaySection(replay) {
           dataset: { sequence: String(ev.sequence || index + 1) },
         },
         el('span', { class: 'replay-sequence' }, `${ev.sequence || index + 1}`),
-        ev.speaker ? el('span', { class: 'replay-speaker' }, ev.speaker) : null,
+        ev.speaker ? el('span', { class: 'replay-speaker' }, ev.speaker_label || displayRoleName(ev.speaker, sessionMeta)) : null,
         el('span', { class: 'replay-text' }, ev.text || ''),
       )),
     ),
@@ -701,7 +757,7 @@ function render(screen, sessionMeta) {
   const deviation = renderFirstDeviationSection(STATE.ending); if (deviation) blocks.push(deviation);
   blocks.push(renderEndingComparisonSection(STATE.ending));
   const choices = renderKeyChoicesSection(STATE.ending); if (choices) blocks.push(choices);
-  const outcomes = renderCharacterOutcomesSection(STATE.ending); if (outcomes) blocks.push(outcomes);
+  const outcomes = renderCharacterOutcomesSection(STATE.ending, sessionMeta); if (outcomes) blocks.push(outcomes);
   const analysis = renderAnalysisSection(STATE.ending); if (analysis) blocks.push(analysis);
   const comparison = renderComparisonSection(STATE.originalTimeline, STATE.ending, STATE.replay); if (comparison) blocks.push(comparison);
   // ClickUp 16.2 P1.v2 (2026-09-07): ecosystem discussions from
@@ -713,7 +769,7 @@ function render(screen, sessionMeta) {
   // so a DOM-test can assert its presence deterministically. The
   // surface is independent from `relatedDiscussions` (16.2 / 16.4).
   blocks.push(renderRelatedKnowledgeSection(STATE.relatedKnowledge || { degraded: true, knowledge: [] }));
-  const replay = renderReplaySection(STATE.replay);
+  const replay = renderReplaySection(STATE.replay, sessionMeta);
   blocks.push(replay);
   blocks.push(renderAttribution(STATE.originalTimeline));
   for (const block of blocks) screen.appendChild(block);

@@ -202,26 +202,87 @@ function showToast(message, ms = 2400) {
 
 // -------- API client --------
 
+const RETRYABLE_HTTP_STATUSES = new Set([408, 425, 429, 500, 502, 503, 504]);
+const API_MAX_RETRIES = 2;
+const API_RETRY_BASE_DELAY_MS = 250;
+const API_RETRY_MAX_DELAY_MS = 2000;
+
+function hasStableRequestId(options) {
+  if (!options || typeof options.body !== 'string') return false;
+  try {
+    const body = JSON.parse(options.body);
+    return (typeof body?.client_request_id === 'string' && body.client_request_id.length > 0)
+      || (typeof body?.request_id === 'string' && body.request_id.length > 0);
+  } catch {
+    return false;
+  }
+}
+
+function retryAfterMs(response, attempt) {
+  const backoff = Math.min(API_RETRY_MAX_DELAY_MS, API_RETRY_BASE_DELAY_MS * (2 ** attempt));
+  const value = response?.headers?.get?.('retry-after');
+  if (!value) return backoff;
+  const seconds = Number(value);
+  const retryAfter = Number.isFinite(seconds) && seconds >= 0
+    ? seconds * 1000
+    : Math.max(0, Date.parse(value) - Date.now());
+  return Math.min(API_RETRY_MAX_DELAY_MS, Math.max(backoff, Number.isFinite(retryAfter) ? retryAfter : 0));
+}
+
+function waitForRetry(response, attempt) {
+  return new Promise((resolve) => setTimeout(resolve, retryAfterMs(response, attempt)));
+}
+
 async function api(path, options = {}) {
   const requestSession = path.match(/^\/api\/sessions\/([^/]+)\//)?.[1];
-  const res = await fetch(path, {
-    headers: { 'content-type': 'application/json' },
-    ...options,
-  });
-  let data = null;
-  try { data = await res.json(); }
-  catch { data = { error: 'bad_json' }; }
-  if (requestSession && requestSession !== state.sessionUuid) {
-    const err = new Error('stale_session'); err.code = 'stale_session'; throw err;
+  const method = String(options.method || 'GET').toUpperCase();
+  // POST is retry-safe only when the server can deduplicate the same
+  // logical operation after a lost response.
+  const retryableRequest = method === 'GET' || (method === 'POST' && hasStableRequestId(options));
+  for (let attempt = 0; attempt <= API_MAX_RETRIES; attempt += 1) {
+    let res;
+    try {
+      res = await fetch(path, {
+        headers: { 'content-type': 'application/json' },
+        ...options,
+      });
+    } catch (error) {
+      if (!retryableRequest || attempt === API_MAX_RETRIES) throw error;
+      await waitForRetry(null, attempt);
+      continue;
+    }
+    let data = null;
+    let validJson = true;
+    try { data = await res.json(); }
+    catch { validJson = false; data = { error: 'bad_json' }; }
+    if (requestSession && requestSession !== state.sessionUuid) {
+      const err = new Error('stale_session'); err.code = 'stale_session'; throw err;
+    }
+    if (!validJson) {
+      const err = new Error('invalid_json_response');
+      err.code = 'bad_json';
+      err.status = res.status;
+      err.data = data;
+      if (retryableRequest && RETRYABLE_HTTP_STATUSES.has(res.status) && attempt < API_MAX_RETRIES) {
+        await waitForRetry(res, attempt);
+        continue;
+      }
+      throw err;
+    }
+    if (!res.ok) {
+      const err = new Error(data.message || data.error || `http_${res.status}`);
+      err.code = data.error || `http_${res.status}`;
+      err.status = res.status;
+      err.data = data;
+      if (retryableRequest && RETRYABLE_HTTP_STATUSES.has(res.status) && attempt < API_MAX_RETRIES) {
+        await waitForRetry(res, attempt);
+        continue;
+      }
+      throw err;
+    }
+    return data;
   }
-  if (!res.ok) {
-    const err = new Error(data.message || data.error || `http_${res.status}`);
-    err.code = data.error || `http_${res.status}`;
-    err.status = res.status;
-    err.data = data;
-    throw err;
-  }
-  return data;
+  throw new Error('request_retry_exhausted');
 }
 
 // -------- Picker (story + role) --------
@@ -302,17 +363,51 @@ function renderStoryDetail(story) {
   $('#story-detail').innerHTML = `<div class="detail-hero">${storyCover(story, 'detail-cover')}<div class="detail-meta"><p class="eyebrow">${escapeHtml(storyCategories(story).join(' / ') || 'BEYOND THE STORY')}</p><h1>${escapeHtml(story.title)}</h1><div class="detail-byline">${story.author_avatar ? `<img class="author-avatar" src="${escapeHtml(story.author_avatar)}" alt="" referrerpolicy="no-referrer">` : ''}${story.author ? `<span>${escapeHtml(story.author)}</span>` : ''}${story.word_count ? `<span>${Number(story.word_count).toLocaleString()} 字</span>` : ''}</div><p class="detail-description">${escapeHtml(story.description || story.summary || story.hook || '')}</p></div></div>`;
 }
 function rememberReading() {
-  const saved = { story: state.story, role: state.role, sessionUuid: state.sessionUuid, storyUuid: state.storyUuid, storyVersionUuid: state.storyVersionUuid, cacheUuid: state.cacheUuid, generationProfile: state.generationProfile, openingEvents: state.openingEvents, communityProfileVersion: state.communityProfileVersion, communityProfileUuid: state.communityProfileUuid, communityProfileQueries: state.communityProfileQueries, knowledgeQueries: state.knowledgeQueries };
+  const saved = { story: state.story, role: state.role, sessionUuid: state.sessionUuid, storyUuid: state.storyUuid, storyVersionUuid: state.storyVersionUuid, cacheUuid: state.cacheUuid, generationProfile: state.generationProfile, openingEvents: state.openingEvents, communityProfileVersion: state.communityProfileVersion, communityProfileUuid: state.communityProfileUuid, communityProfileQueries: state.communityProfileQueries, knowledgeQueries: state.knowledgeQueries, finished: state.finished || state.status === 'finished' };
   try { localStorage.setItem('story-outside:reading', JSON.stringify(saved)); } catch {}
 }
 function readReading() { try { return JSON.parse(localStorage.getItem('story-outside:reading') || 'null'); } catch { return null; } }
+function isEndingNotCommittedError(error) {
+  return error?.code === 'ending_not_committed'
+    || (error?.status === 404 && error?.data?.error === 'ending_not_committed');
+}
+async function hasCommittedEnding(sessionUuid) {
+  try {
+    await api(`/api/sessions/${sessionUuid}/ending`);
+    return true;
+  } catch (error) {
+    if (isEndingNotCommittedError(error)) return false;
+    throw error;
+  }
+}
+async function resumeSavedReading(saved) {
+  if (!saved?.story || !saved.sessionUuid) return;
+  clearAutoplayTimer();
+  Object.assign(state, saved, { finished: Boolean(saved.finished), pending:null, pendingIdx:0, queuedToolCall:null, inputInFlight:false, progressTotal:0 });
+  setText('#story-name', state.story.title); setText('#role-name', state.role?.label || '故事之外'); persistSessionContext(); syncHeaderRoles(); setStatus('loading');
+  try {
+    const endingCommitted = await hasCommittedEnding(state.sessionUuid);
+    if (endingCommitted) {
+      state.finished = true;
+      rememberReading();
+      setStatus('finished');
+      await mountEndingPage();
+      return;
+    }
+    state.finished = false;
+    rememberReading();
+    showScreen('player');
+    await recoverAndStart();
+  } catch (err) {
+    showToast(`读取会话失败：${err.message}`);
+    setStatus('error');
+  }
+}
 function renderMine() {
   const saved = readReading(); const host = $('#recent-session');
-  host.innerHTML = saved?.story ? `<div class="recent-card">${storyCover(saved.story)}<div class="recent-info"><h3>${escapeHtml(saved.story.title)}</h3><p>以 ${escapeHtml(saved.role?.label || '你的')} 的视角</p></div><button class="btn btn-primary" id="resume-session-btn">继续故事 <i data-lucide="arrow-right"></i></button></div>` : '<p class="empty-state">你的书架还很安静。去选一个喜欢的故事吧。</p>';
-  $('#resume-session-btn')?.addEventListener('click', async () => {
-    clearAutoplayTimer(); Object.assign(state, saved, { finished:false, pending:null, pendingIdx:0, queuedToolCall:null, inputInFlight:false, progressTotal:0 });
-    setText('#story-name', state.story.title); setText('#role-name', state.role.label); persistSessionContext(); showScreen('player'); syncHeaderRoles(); await recoverAndStart();
-  }); icons();
+  const actionLabel = saved?.finished ? '查看结局' : '继续故事';
+  host.innerHTML = saved?.story ? `<div class="recent-card">${storyCover(saved.story)}<div class="recent-info"><h3>${escapeHtml(saved.story.title)}</h3><p>以 ${escapeHtml(saved.role?.label || '你的')} 的视角</p></div><button class="btn btn-primary" id="resume-session-btn">${actionLabel} <i data-lucide="arrow-right"></i></button></div>` : '<p class="empty-state">你的书架还很安静。去选一个喜欢的故事吧。</p>';
+  $('#resume-session-btn')?.addEventListener('click', () => { void resumeSavedReading(saved); }); icons();
 }
 function syncHeaderRoles() {
   const select = $('#header-role-select'); if (!select) return;
@@ -689,15 +784,20 @@ async function recoverAndStart() {
     // finished (e.g. a reload after finish_story committed). Probe the
     // read-only ending projection: 200 means the finish envelope is
     // committed and playback must NOT continue — mount the ending page
-    // instead. 404 (error=ending_not_committed) or any transient failure
-    // keeps the original behavior: generate the next batch.
+    // instead. An explicit ending_not_committed response means the story
+    // is still live and may generate. Any other probe failure is surfaced
+    // as an error; it is not evidence that another generation is safe.
     let endingCommitted = false;
     try {
-      await api(`/api/sessions/${state.sessionUuid}/ending`);
-      endingCommitted = true;
-    } catch { /* ending_not_committed (404) or transient failure */ }
+      endingCommitted = await hasCommittedEnding(state.sessionUuid);
+    } catch (error) {
+      // A failed ending probe is not evidence that the story is unfinished.
+      // Stop here so a transient 502/timeout cannot start another generation.
+      throw error;
+    }
     if (endingCommitted) {
       state.finished = true;
+      rememberReading();
       setStatus('finished');
       await mountEndingPage();
       return;
@@ -820,6 +920,13 @@ function appendCanonical(ev) {
   }
 }
 
+function roleDisplayName(value, story = state.story) {
+  const raw = String(value ?? '');
+  const roles = Array.isArray(story?.roles) ? story.roles : [];
+  const role = roles.find((item) => item && (String(item.id) === raw || String(item.label) === raw));
+  return role && typeof role.label === 'string' && role.label ? role.label : raw;
+}
+
 function renderPendingPlaceholder(item, position) {
   const log = $('#story-log');
   // If we already have a placeholder at this position from prior recovery
@@ -838,7 +945,7 @@ function renderPendingPlaceholder(item, position) {
   if (item.speaker) {
     const sp = document.createElement('span');
     sp.className = 'line-speaker';
-    sp.textContent = item.speaker;
+    sp.textContent = roleDisplayName(item.speaker);
     li.appendChild(sp);
   }
   const txt = document.createElement('span');
@@ -860,7 +967,7 @@ function appendLine(item, { pending, kind } = {}) {
     li.dataset.speaker = item.speaker;
     const sp = document.createElement('span');
     sp.className = 'line-speaker';
-    sp.textContent = item.speaker;
+    sp.textContent = roleDisplayName(item.speaker);
     li.appendChild(sp);
   }
   const txt = document.createElement('span');
@@ -1154,10 +1261,11 @@ async function surfaceToolCall(toolCall) {
     return;
   }
   if (toolCall.name === 'finish_story') {
+    state.finished = true;
     setStatus('finished');
     renderEnding(toolCall);
     setText('#player-help', '');
-    state.finished = true;
+    rememberReading();
     await mountEndingPage();
     return;
   }
@@ -1221,6 +1329,7 @@ async function mountEndingPage(sessionMetaOverride) {
         story_title: state.story ? state.story.title : '',
         storyTitle: state.story ? state.story.title : '',
         roleLabel: state.role ? state.role.label : '',
+        roles: Array.isArray(state.story?.roles) ? state.story.roles : [],
         communityProfileVersion: state.communityProfileVersion || '',
         communityProfileQueries: state.communityProfileQueries || null,
         storyUuid: state.storyUuid || '',
@@ -1259,16 +1368,18 @@ function renderChoices(toolCall) {
   const ul = document.createElement('ul');
   ul.className = 'choice-list';
   for (const [optionIndex, opt] of (toolCall.payload.options || []).entries()) {
+    const displayLabel = String.fromCharCode(65 + optionIndex);
+    const optionText = normalizeOptionLabel(opt.label || opt.text || opt.id);
     const li = document.createElement('li');
     const btn = document.createElement('button');
     btn.className = 'choice-btn';
     btn.type = 'button';
     btn.dataset.optionId = opt.id;
     btn.innerHTML = `
-      <span class="choice-id">${String.fromCharCode(65 + optionIndex)}</span>
-      <span class="choice-label">${escapeHtml(opt.label || opt.text || opt.id)}</span>
+      <span class="choice-id">${displayLabel}</span>
+      <span class="choice-label">${escapeHtml(optionText)}</span>
     `;
-    btn.addEventListener('click', () => chooseOption({ ...opt, displayLabel: String.fromCharCode(65 + optionIndex) }));
+    btn.addEventListener('click', () => chooseOption({ ...opt, displayLabel }));
     li.appendChild(btn);
     ul.appendChild(li);
   }
@@ -1278,6 +1389,24 @@ function renderChoices(toolCall) {
   requestAnimationFrame(() => { log.scrollTop = log.scrollHeight; });
   // Allow free-text input.
   $('#player-input-form').hidden = false;
+}
+
+const OPTION_PREFIX_RE = /^\s*[A-Za-zＡ-Ｚａ-ｚ]\s*[.．:：、)）]\s*/u;
+
+function normalizeOptionLabel(value) {
+  let label = String(value ?? '').trim();
+  let previous = null;
+  while (label && label !== previous) {
+    previous = label;
+    label = label.replace(OPTION_PREFIX_RE, '').trim();
+  }
+  return label;
+}
+
+function formatOptionText(option) {
+  const prefix = String(option?.displayLabel || option?.id || '').trim().replace(/[.．:：、)）]$/, '');
+  const label = normalizeOptionLabel(option?.label || option?.text || option?.id);
+  return prefix ? `${prefix}. ${label}` : label;
 }
 
 function renderEnding(toolCall) {
@@ -1306,7 +1435,7 @@ function renderEnding(toolCall) {
         const li = document.createElement('li');
         if (typeof item === 'string') li.textContent = item;
         else if (item && typeof item === 'object') {
-          const character = item.character ? `${item.character}: ` : '';
+          const character = item.character ? `${roleDisplayName(item.character)}: ` : '';
           const change = item.change ? ` (${item.change})` : '';
           li.textContent = `${character}${item.fate || ''}${change}`;
         }
@@ -1428,7 +1557,7 @@ async function sendPlayerInputChoice(text) {
 
 async function chooseOption(option) {
   // Convert the option pick into a player_input → interrupt, then resume.
-  const text = `${option.displayLabel || option.id}: ${option.label || option.text || option.id}`;
+  const text = formatOptionText(option);
   // The sendPlayerInput call already handles the status transitions on
   // success and failure. We only need to nudge the scheduler when the
   // call actually landed in the canonical history.

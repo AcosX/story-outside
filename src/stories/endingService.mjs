@@ -50,6 +50,18 @@ function clone(value) {
   return value === undefined ? undefined : JSON.parse(JSON.stringify(value));
 }
 
+function rolesForVersion(version) {
+  if (Array.isArray(version?.content_payload?.roles)) return version.content_payload.roles;
+  if (Array.isArray(version?.roles_payload)) return version.roles_payload;
+  return [];
+}
+
+function roleDisplayName(roles, value) {
+  const raw = String(value ?? '');
+  const role = roles.find((item) => item && (String(item.id) === raw || String(item.label) === raw));
+  return role && typeof role.label === 'string' && role.label ? role.label : raw;
+}
+
 function sessionFor(repository, session_uuid) {
   const state = repository.sessionState;
   if (!state || !state.sessions) {
@@ -136,7 +148,7 @@ function deriveCategory({ story, version, cache }) {
  * comparison): the UI highlights this in the ending summary and as the
  * red anchor in the comparison view.
  */
-function findFirstDeviation({ canonicalHistory, openingEvents }) {
+function findFirstDeviation({ canonicalHistory, openingEvents, roles = [] }) {
   if (!Array.isArray(canonicalHistory) || canonicalHistory.length === 0) return null;
   // Count how many opening-cache events actually reached canonical history
   // (they are always the head of the stream: opening commits stop the
@@ -159,6 +171,7 @@ function findFirstDeviation({ canonicalHistory, openingEvents }) {
         type: ev.event_type,
         text: payload.text || '',
         speaker: payload.speaker || null,
+        speaker_label: payload.speaker ? roleDisplayName(roles, payload.speaker) : null,
         occurred_at: ev.occurred_at,
         // For UI display: a short label comparing to the next opening
         // beat ("after beat X"). Anchored on the opening events actually
@@ -226,8 +239,10 @@ export function buildEnding({ repository, session_uuid }) {
   const story = repository.findStoryByUuid(session.story_uuid);
   const version = repository.findVersion(session.story_version_uuid);
   const cache = repository.findOpeningCacheByUuid(session.cache_uuid);
+  const roles = rolesForVersion(version);
   const firstDeviation = findFirstDeviation({
     canonicalHistory: session.history,
+    roles,
     openingEvents: (cache && cache.content_payload && Array.isArray(cache.content_payload.events))
       ? cache.content_payload.events
       : [],
@@ -255,6 +270,7 @@ export function buildEnding({ repository, session_uuid }) {
     character_outcomes: Array.isArray(payload.character_outcomes)
       ? payload.character_outcomes.map((item) => ({
           character: String(item.character || ''),
+          character_label: roleDisplayName(roles, item.character || ''),
           fate: String(item.fate || ''),
           change: item.change ? String(item.change) : undefined,
         }))
@@ -372,6 +388,8 @@ export function buildReplay({ repository, session_uuid }) {
   if (!repository) throw new Error('buildReplay: repository required');
   assertUuid('session_uuid', session_uuid);
   const session = sessionFor(repository, session_uuid);
+  const version = repository.findVersion(session.story_version_uuid);
+  const roles = rolesForVersion(version);
   const history = Array.isArray(session.history) ? session.history.slice() : [];
   // Defensive: filter any pre-canonical rows (should never be present
   // in the hydrated history, but the contract requires explicit rejection
@@ -397,7 +415,10 @@ export function buildReplay({ repository, session_uuid }) {
       occurred_at: ev.occurred_at,
       source: ev.source || null,
     };
-    if (payload.speaker) out.speaker = String(payload.speaker);
+    if (payload.speaker) {
+      out.speaker = String(payload.speaker);
+      out.speaker_label = roleDisplayName(roles, payload.speaker);
+    }
     return out;
   });
   return { events };
