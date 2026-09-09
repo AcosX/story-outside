@@ -137,8 +137,8 @@ try {
 // Two sessions over the same first-person source retain distinct identities,
 // including after compacting a history written from the original narrator.
 {
-  const roles = [{id:'self',label:'我',mood:'旅人'}, {id:'doctor',label:'林医生',mood:'值班医生'}];
-  const story = {roles, beats:[{index:0,text:'我推开诊室的门，看见林医生。'}]};
+  const roles = [{id:'traveler',label:'陈远',mood:'旅人'}, {id:'doctor',label:'林医生',mood:'值班医生'}];
+  const story = {roles, first_person_role_id:'traveler', beats:[{index:0,text:'我推开诊室的门，看见林医生。'}]};
   const requests = [];
   const provider = createAIProvider({config, story, fetchImpl:async(_url, options)=>{
     requests.push(JSON.parse(options.body));
@@ -157,6 +157,8 @@ try {
     assert.equal(payload.committed_history[0].event_seq, 12);
     assert.match(actual[0].content, /不得让玩家替原作主角或其他角色做决定/);
     assert.match(actual[0].content, /即使旧历史误用了原作视角/);
+    assert.match(actual[0].content, /不得虚构“你知道”“你听说”“你记得”“你曾认识”/);
+    assert.match(actual[0].content, /不确定时让玩家通过观察、询问或调查获得信息/);
   }
 }
 console.log('AI perspective: distinct player roles survive shared source and compact history');

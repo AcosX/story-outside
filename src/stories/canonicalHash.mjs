@@ -40,6 +40,7 @@ import { createHash } from 'node:crypto';
  * @property {string} title
  * @property {string} hook
  * @property {Array<{id:string,label:string,mood:string}>} roles
+ * @property {string|null} [first_person_role_id]
  * @property {Array<{index:number,text:string,type?:string,speaker?:string}>} beats
  */
 
@@ -146,6 +147,17 @@ export function canonicalStoryContent(detail) {
       mood: typeof r.mood === 'string' ? r.mood : '',
     };
   });
+  const hasFirstPersonRoleId = Object.prototype.hasOwnProperty.call(d, 'first_person_role_id');
+  let firstPersonRoleId = null;
+  if (hasFirstPersonRoleId) {
+    if (d.first_person_role_id !== null && typeof d.first_person_role_id !== 'string') {
+      throw new TypeError('canonicalStoryContent: first_person_role_id must be a role id or null');
+    }
+    firstPersonRoleId = d.first_person_role_id;
+    if (typeof firstPersonRoleId === 'string' && !roles.some((role) => role.id === firstPersonRoleId)) {
+      throw new TypeError('canonicalStoryContent: first_person_role_id must reference roles[]');
+    }
+  }
   const beats = d.beats.map((b, i) => {
     if (typeof b === 'string') return { index: i, text: b };
     if (!b || typeof b !== 'object') {
@@ -165,6 +177,7 @@ export function canonicalStoryContent(detail) {
     title: d.title,
     hook: d.hook,
     roles,
+    ...(hasFirstPersonRoleId ? { first_person_role_id: firstPersonRoleId } : {}),
     beats,
     ...(Array.isArray(d.ai_opening_events) ? {
       ai_opening_events: canonicalStoryContent({ id: d.id, title: d.title, hook: d.hook, roles: d.roles, beats: d.ai_opening_events }).beats,
