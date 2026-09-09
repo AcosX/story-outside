@@ -133,3 +133,30 @@ try {
   assert.deepEqual(await readdir(cacheDir), ['compact-old.json']);
   console.log('AI provider ignores session file cache and preserves all supplied context');
 } finally { await rm(cacheDir, { recursive: true, force: true }); }
+
+// Two sessions over the same first-person source retain distinct identities,
+// including after compacting a history written from the original narrator.
+{
+  const roles = [{id:'self',label:'我',mood:'旅人'}, {id:'doctor',label:'林医生',mood:'值班医生'}];
+  const story = {roles, beats:[{index:0,text:'我推开诊室的门，看见林医生。'}]};
+  const requests = [];
+  const provider = createAIProvider({config, story, fetchImpl:async(_url, options)=>{
+    requests.push(JSON.parse(options.body));
+    return {ok:true,json:async()=>({choices:[{message:{content:JSON.stringify({items:[{type:'narration',text:'走廊传来脚步声。'}]})}}]})};
+  }});
+  for (const role of roles) {
+    const request = {pinned:{role_id:role.id}, context:{compact_text:'我推门看见医生。',recent_events:[{event_seq:12,type:'player_input',text:'等一下'}]},input:{text:'继续'}};
+    await provider.complete(request);
+    const actual = requests.at(-1).messages;
+    assert.deepEqual(provider.contextPolicy.measure(request), actual);
+    const payload = JSON.parse(actual[1].content);
+    assert.deepEqual(payload.player_perspective.role, role);
+    assert.deepEqual(payload.player_perspective.original_first_person_role, roles[0]);
+    assert.equal(payload.player_perspective.narration_person, 'second_person');
+    assert.deepEqual(payload.original_story, story);
+    assert.equal(payload.committed_history[0].event_seq, 12);
+    assert.match(actual[0].content, /不得让玩家替原作主角或其他角色做决定/);
+    assert.match(actual[0].content, /即使旧历史误用了原作视角/);
+  }
+}
+console.log('AI perspective: distinct player roles survive shared source and compact history');
