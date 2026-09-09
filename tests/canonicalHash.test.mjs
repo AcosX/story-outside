@@ -188,6 +188,16 @@ check('structured speaker/type change DOES change the story hash', () => {
   assert.notEqual(a, c);
 });
 
+check('first_person_role_id is canonical, validated, and versioned', () => {
+  const roles = [{ id: 'traveler', label: '陈远', mood: '旅人' }, { id: 'doctor', label: '林医生', mood: '医生' }];
+  const base = { ...BASE, roles, first_person_role_id: 'traveler' };
+  const out = canonicalStoryContent(base);
+  assert.equal(out.first_person_role_id, 'traveler');
+  assert.notEqual(canonicalStoryHash(base), canonicalStoryHash({ ...base, first_person_role_id: 'doctor' }));
+  assert.throws(() => canonicalStoryContent({ ...base, first_person_role_id: 'missing' }), /must reference roles/);
+  assert.throws(() => canonicalStoryContent({ ...base, first_person_role_id: 42 }), /must be a role id or null/);
+});
+
 check('unknown extra beat fields are still stripped', () => {
   const out = canonicalStoryContent({
     ...BASE,
