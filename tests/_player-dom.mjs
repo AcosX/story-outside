@@ -92,7 +92,7 @@ async function importCommunitySectionForHarness() {
   const stripped = patched
     .replace(/export\s*\{[^}]*\}\s*;?\s*$/m, '')
     .replace(/export\s+default\s+\{[^}]*\}\s*;?\s*$/m, '');
-  const fn = new Function(`${stripped}\nreturn { mount, refreshFeed, refreshShareAction, refreshAuthStatus, currentShareTargetUuid };`);
+  const fn = new Function(`${stripped}\nreturn { mount, refreshFeed, refreshShareAction, refreshAuthStatus };`);
   return fn();
 }
 

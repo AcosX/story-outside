@@ -1,28 +1,6 @@
-// src/ecosystem/following/service.mjs — business rules for the follow /
-// share surface.
-//
-// 2026-09-13 转正（「故事里的相遇」从 demo 变为正式功能）：
-//   关注关系**不再**由本站自己维护。以前的 `POST /v1/ecosystem/follow` 要求
-//   玩家手输一个对方的内部 UUID，这在真实产品里不可能发生，本质是 demo 夹具。
-//   现在的真实语义是：
-//
-//     我在知乎关注的人 → （按 url_token 反查本站账号）→ 他主动公开的世界线
-//
-//   左端来自知乎官方 `/api/v1/user/followees`（见
-//   src/providers/ecosystem/zhihuFolloweeSource.mjs），中间是登录时登记的账号
-//   目录（见 ./directory.mjs），右端仍然是本站的显式分享记录。
-//
-// 保留下来的不变量：
-//   1. **身份不来自请求体。** 调用方身份一律由服务端会话解析（OAuth 模式下是
-//      `__Host-` 会话 Cookie），路由层拒绝任何身份形状的字段。
-//   2. **分享/撤回校验 canonical owner。** 服务端把会话创建时绑定的 owner 与
-//      当前调用者比对，不一致就拒绝。靠猜 URL 里的 UUID 分享别人的会话不可能。
-//   3. **关注 ≠ 公开。** 关注某人不会改变对方世界线的可见性；只有对方自己调用
-//      `POST /share` 才会进入别人的关注流。
-//   4. **关注流按调用者缓存。** 缓存键包含 follower，A→B→A 不会互相污染。
-//
-// 失败隔离：关注流任何失败都降级为「暂时看不到」，绝不冒泡成 5xx，也绝不影响
-// 故事创建与推进链路。
+// Official followees intersect with account-visible session activity in production.
+// Legacy explicit sharing remains available when no activity reader is injected.
+// Owners always come from canonical sessions; blocks and privacy apply at read time.
 
 import { findOwnerBySession as findCanonicalOwnerBySession } from '../../stories/sessionService.mjs';
 
@@ -67,6 +45,7 @@ export function computeFriendTimelines({
   decorate = null,
   since = null,
   limit = 50,
+  listActivities = null,
 }) {
   assertUuid('followerUuid', followerUuid);
   /** @type {Array<Record<string, unknown>>} */
@@ -78,7 +57,8 @@ export function computeFriendTimelines({
     if (ownerUuid === followerUuid) continue;
     if (visited.has(ownerUuid)) continue;
     visited.add(ownerUuid);
-    const shares = repository.listSharedSessionsByOwner(ownerUuid);
+    if (repository.isVisible?.(ownerUuid) === false) continue;
+    const shares = listActivities ? listActivities(ownerUuid) : repository.listSharedSessionsByOwner(ownerUuid);
     for (const share of shares) {
       // 对方屏蔽了我，或我屏蔽了对方，都不展示。
       if (repository.findBlock(share.owner_user_uuid, followerUuid)) continue;
@@ -113,9 +93,10 @@ export function computeFriendTimelines({
  *        知乎 url_token → 本站账号的映射目录（登录时登记）。
  * @param {(args: { oauthToken: string, limit?: number }) => Promise<{ items: Array<{ url_token: string, fullname: string, url: string, avatar_url: string, headline: string }>, total: number | null, truncated: boolean }>} [input.fetchFollowees]
  *        知乎官方关注接口适配层。缺省时关注流为「未配置」降级态。
+ * @param {(ownerUuid: string) => Array<object>} [input.listActivities] Canonical activity projection.
  * @returns {FollowingService}
  */
-export function createFollowingService({ repository, accountDirectory = null, fetchFollowees = null }) {
+export function createFollowingService({ repository, accountDirectory = null, fetchFollowees = null, listActivities = null }) {
   if (!repository) throw new Error('createFollowingService: repository required');
   const repo = repository;
 
@@ -127,6 +108,7 @@ export function createFollowingService({ repository, accountDirectory = null, fe
   }
 
   return {
+    invalidateAllFeeds,
     /**
      * 读取「我在知乎关注的人，在这里公开了哪些世界线」。
      *
@@ -140,7 +122,7 @@ export function createFollowingService({ repository, accountDirectory = null, fe
       // 因此只用「有/无」这一位。
       const cacheKey = `${followerUuid}\u0000${typeof oauthToken === 'string' && oauthToken ? '1' : '0'}\u0000${since || ''}\u0000${limit}`;
       const cached = feedCache.get(cacheKey);
-      if (cached && cached.expiresAt > Date.now()) return cached.payload;
+      if (!listActivities && cached && cached.expiresAt > Date.now()) return cached.payload;
 
       const empty = (status, extra = {}) => ({
         items: Object.freeze([]),
@@ -182,6 +164,7 @@ export function createFollowingService({ repository, accountDirectory = null, fe
         const profile = profileByUuid.get(share.owner_user_uuid) || null;
         const item = {
           session_uuid: share.session_uuid,
+          state: share.state || null,
           shared_at: share.updated_at,
           updated_at: share.updated_at,
           created_at: share.created_at,
@@ -212,6 +195,7 @@ export function createFollowingService({ repository, accountDirectory = null, fe
           repository: repo,
           followerUuid,
           ownerUuids,
+          listActivities,
           decorate,
           since,
           limit,

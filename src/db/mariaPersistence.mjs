@@ -168,6 +168,8 @@ export async function createMariaDbRepositories({
     '_hydrateSnapshot',
   ]), persistence);
   const following = wrapRepository(followingRepository, new Set([
+    'setVisibility',
+    'rememberAccount',
     'upsertFollow',
     'removeFollow',
     'upsertBlock',
@@ -312,13 +314,15 @@ export async function createMariaDbRepositories({
           .filter(Boolean));
       }
 
+      const [accountRows] = await pool.query('SELECT user_uuid, url_token, visible FROM ecosystem_account_preferences');
       const [followRows] = await pool.query('SELECT follower_uuid, target_user_uuid, created_at FROM ecosystem_follow_edges');
       const [blockRows] = await pool.query('SELECT owner_uuid, target_user_uuid, created_at FROM ecosystem_block_edges');
       const [shareRows] = await pool.query(
         'SELECT session_uuid, owner_user_uuid, title, story_uuid, story_version_uuid, created_at, updated_at FROM ecosystem_shared_sessions',
       );
-      if (followRows.length || blockRows.length || shareRows.length) {
+      if (accountRows.length || followRows.length || blockRows.length || shareRows.length) {
         following._hydrateSnapshot({
+          accounts: accountRows.map(row => ({ ...row, visible: Boolean(row.visible) })),
           follows: followRows.map((row) => ({ ...row, created_at: iso(row.created_at) })),
           blocks: blockRows.map((row) => ({ ...row, created_at: iso(row.created_at) })),
           sharedSessions: shareRows.map((row) => ({
@@ -764,6 +768,11 @@ export async function createMariaDbRepositories({
   }
 
   async function syncFollowing(connection, snapshot) {
+    await connection.query('DELETE FROM ecosystem_account_preferences');
+    for (const row of snapshot.following?.accounts || []) {
+      await connection.query('INSERT INTO ecosystem_account_preferences (user_uuid, url_token, visible) VALUES (?, ?, ?)',
+        [row.user_uuid, row.url_token || null, row.visible !== false]);
+    }
     await connection.query('DELETE FROM ecosystem_follow_edges');
     for (const row of snapshot.following?.follows || []) {
       await connection.query(

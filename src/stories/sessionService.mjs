@@ -699,6 +699,14 @@ function mapEntries(map) {
  * runtime payload carries the idempotency windows, pending envelope, owner,
  * finish envelope, and compact audit needed for an exact process restart.
  */
+export function listOwnerActivities(repository, ownerUuid) {
+  return [...repositoryState(repository).sessions.values()]
+    .filter(session => session.user_uuid === ownerUuid)
+    .map(session => ({ session_uuid: session.session_uuid, owner_user_uuid: ownerUuid,
+      story_uuid: session.story_uuid, updated_at: session.lastTouchedAt || '',
+      state: session.state, role_id: session.role_id }));
+}
+
 export function exportSessionPersistenceSnapshot(repository) {
   const state = repositoryState(repository);
   return [...state.sessions.values()].map((session) => ({

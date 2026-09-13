@@ -87,12 +87,32 @@ export function createInMemoryFollowingRepository() {
   const blocks = new Map();
   /** @type {Map<string, SharedSessionRow>} */
   const sharedSessions = new Map();
+  const accounts = new Map();
 
   function followKey(follower, target) {
     return `${follower}\u0000${target}`;
   }
 
   return {
+    isVisible(userUuid) { return accounts.get(userUuid)?.visible !== false; },
+    setVisibility(userUuid, visible) {
+      assertUuid('user_uuid', userUuid);
+      if (typeof visible !== 'boolean') throw new Error('visible must be boolean');
+      accounts.set(userUuid, { ...accounts.get(userUuid), user_uuid: userUuid, visible });
+    },
+    rememberAccount(owner) {
+      assertUuid('user_uuid', owner.user_uuid);
+      if (!/^[A-Za-z0-9_-]{1,64}$/.test(owner.url_token || '')) return false;
+      for (const [id, row] of accounts) {
+        if (id !== owner.user_uuid && row.url_token === owner.url_token) accounts.set(id, { ...row, url_token: null });
+      }
+      accounts.set(owner.user_uuid, { visible: true, ...accounts.get(owner.user_uuid), user_uuid: owner.user_uuid, url_token: owner.url_token });
+      return true;
+    },
+    resolveAccount(urlToken) {
+      if (!urlToken) return null;
+      return [...accounts.values()].find(row => row.url_token === urlToken)?.user_uuid || null;
+    },
     findFollow(follower_uuid, target_user_uuid) {
       assertUuid('follower_uuid', follower_uuid);
       assertUuid('target_user_uuid', target_user_uuid);
@@ -243,6 +263,7 @@ export function createInMemoryFollowingRepository() {
     },
     _exportSnapshot() {
       return {
+        accounts: [...accounts.values()].map(row => ({ ...row })),
         follows: [...follows.values()].map((row) => ({ ...row })),
         blocks: [...blocks.values()].map((row) => ({ ...row })),
         sharedSessions: [...sharedSessions.values()].map((row) => ({ ...row })),
@@ -250,6 +271,10 @@ export function createInMemoryFollowingRepository() {
     },
     _hydrateSnapshot(snapshot) {
       if (!snapshot || typeof snapshot !== 'object') throw new Error('followingRepository: snapshot required');
+      accounts.clear();
+      for (const row of snapshot.accounts || []) {
+        if (UUID_PATTERN.test(row.user_uuid || '')) accounts.set(row.user_uuid, { ...row, visible: row.visible !== false });
+      }
       follows.clear();
       blocks.clear();
       sharedSessions.clear();

@@ -40,7 +40,7 @@ try {
   const config = { apiKey: 'test', baseURL: 'https://example.invalid/v1', model: 'test', timeoutMs: 1000, cacheDir };
   // Every superseded preparation version must be ignored, otherwise a stale
   // pre-perspective-track opening would be served without per-role tracks.
-  for (const version of ['story-preparation-v1', 'story-preparation-v2', 'story-preparation-v3', 'story-preparation-v4', 'story-preparation-v5']) {
+  for (const version of ['story-preparation-v1', 'story-preparation-v2', 'story-preparation-v3', 'story-preparation-v4', 'story-preparation-v5', 'story-preparation-v6']) {
     await writeAICache(config, 'story-' + cacheHash({ version, model: config.model, id: source.id, title: source.title, beats: source.beats }), { roles: [{ id: 'traveler', label: '陈远', mood: '旅人' }], first_person_role_id: 'traveler', opening_events: [{ type: 'narration', text: '旅人走进了房间。' }] });
   }
   const analysis = {
@@ -255,7 +255,7 @@ try {
       if (body.tool_choice?.function?.name === 'save_role_opening') {
         const roleId = /"target_role":\{"id":"([a-z0-9-]+)"/.exec(body.messages[1].content)[1];
         roleCallCounts[roleId] = (roleCallCounts[roleId] ?? 0) + 1;
-        const payload = roleId === 'doctor' && roleCallCounts.doctor <= 2 ? leaking : valid[roleId];
+        const payload = roleId === 'doctor' ? leaking : [{ index: 0, text: '你推开了门。' }];
         return { ok: true, json: async () => ({ choices: [{ message: { content: JSON.stringify({ texts: payload }) } }] }) };
       }
       return baseImpl(url, options);
@@ -263,7 +263,7 @@ try {
     const prepared = createPreparedStoryProvider({ name: 'real', getStory: async () => source }, config, { fetchImpl });
     const story = await prepared.getStory('seven');
     assert.equal(roleCallCounts.doctor, 2, 'the leaking doctor track is retried once before falling back');
-    assert.equal(roleCallCounts.traveler, 1);
+    assert.equal(roleCallCounts.traveler, 2, 'invalid narrator track retries before deterministic fallback');
     assert.equal(story.ai_opening_events[0].text_by_role.traveler, valid.traveler[0].text);
     assert.ok(!('doctor' in story.ai_opening_events[0].text_by_role), 'a track that keeps violating is omitted instead of cached');
     console.log('Story preparation: perspective tracks are voice-validated and fall back per role');

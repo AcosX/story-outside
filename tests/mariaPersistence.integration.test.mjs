@@ -33,7 +33,7 @@ if (!databaseUrl) {
     const migrations = new URL('../db/migrations/', import.meta.url);
     const connection = await pool.getConnection();
     try {
-      for (const name of (await readdir(migrations)).filter((name) => /^000[1-6]_.*\.sql$/.test(name)).sort()) {
+      for (const name of (await readdir(migrations)).filter((name) => /^000[1-69]_.*\.sql$/.test(name)).sort()) {
         let delimiter = ';';
         let buffer = '';
         for (const line of (await readFile(new URL(name, migrations), 'utf8')).split(/\r?\n/)) {
