@@ -209,6 +209,9 @@ async function requestCompletion({ config, fetchImpl, messages, maxTokens, attem
   } else {
     body.response_format = { type: 'json_object' };
   }
+  const responseContentType = typeof response.headers?.get === 'function'
+    ? (response.headers.get('content-type') || '').split(';', 1)[0].trim().toLowerCase()
+    : null;
   let response;
   try {
     response = await fetchImpl(`${config.baseURL.replace(/\/$/, '')}/chat/completions`, {
@@ -234,14 +237,30 @@ async function requestCompletion({ config, fetchImpl, messages, maxTokens, attem
       },
     );
   }
-  const result = await readAIResponse(response);
+  let result;
+  try {
+    result = await readAIResponse(response);
+  } catch (error) {
+    if (error instanceof AIProviderError && error.code === 'invalid_response') {
+      loggerWarn('ai.response.invalid', {
+        component: 'agent', model: config.model, error_code: error.code,
+        extra: { phase: 'envelope', content_type: responseContentType, status: Number(response.status) || null },
+      });
+    }
+    throw error;
+  }
   if (!result || typeof result !== 'object' || Array.isArray(result)) {
     throw new AIProviderError('AI returned invalid or oversized JSON', {
       code: 'invalid_response', retryable: false,
     });
   }
   const choice = result.choices?.[0];
+  const finishReason = choice?.finish_reason ?? null;
+  const toolCalls = Array.isArray(choice?.message?.tool_calls) ? choice.message.tool_calls.length : 0;
   if (choice?.finish_reason === 'length') {
+    loggerWarn('ai.response.invalid', { component: 'agent', model: config.model, error_code: 'invalid_response',
+      extra: { phase: 'choice', content_type: responseContentType, status: Number(response.status) || null,
+        finish_reason: finishReason, tool_calls: toolCalls, has_choices: Array.isArray(result.choices) } });
     throw new AIProviderError('AI response exceeded output budget', {
       code: 'invalid_response', retryable: false,
     });
@@ -249,6 +268,9 @@ async function requestCompletion({ config, fetchImpl, messages, maxTokens, attem
   if (tool) {
     const calls = choice?.message?.tool_calls;
     if (Array.isArray(calls) && calls.length > 1) {
+      loggerWarn('ai.response.invalid', { component: 'agent', model: config.model, error_code: 'invalid_response',
+        extra: { phase: 'tool_calls', content_type: responseContentType, status: Number(response.status) || null,
+          finish_reason: finishReason, tool_calls: calls.length, has_choices: true } });
       throw new AIProviderError('AI returned multiple tool calls', {
         code: 'invalid_response', retryable: true,
       });
@@ -260,6 +282,9 @@ async function requestCompletion({ config, fetchImpl, messages, maxTokens, attem
         if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new TypeError('arguments must be an object');
         return parsed;
       } catch {
+        loggerWarn('ai.response.invalid', { component: 'agent', model: config.model, error_code: 'invalid_response',
+          extra: { phase: 'tool_arguments', content_type: responseContentType, status: Number(response.status) || null,
+            finish_reason: finishReason, tool_calls: calls.length, has_choices: true } });
         // Truncated or malformed tool arguments are the tool-channel twin of
         // prose-instead-of-JSON: an independent re-draw usually fixes it.
         throw new AIProviderError('AI returned malformed tool arguments', {
@@ -273,6 +298,9 @@ async function requestCompletion({ config, fetchImpl, messages, maxTokens, attem
   }
   const content = choice?.message?.content;
   if (typeof content !== 'string' || !content.trim()) {
+    loggerWarn('ai.response.invalid', { component: 'agent', model: config.model, error_code: 'invalid_response',
+      extra: { phase: 'content', content_type: responseContentType, status: Number(response.status) || null,
+        finish_reason: finishReason, tool_calls: toolCalls, has_choices: Array.isArray(result.choices) } });
     throw new AIProviderError('AI returned no content', {
       code: 'invalid_response', retryable: true,
     });
@@ -280,6 +308,9 @@ async function requestCompletion({ config, fetchImpl, messages, maxTokens, attem
   try {
     return JSON.parse(content.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, ''));
   } catch {
+    loggerWarn('ai.response.invalid', { component: 'agent', model: config.model, error_code: 'invalid_response',
+      extra: { phase: 'content_json', content_type: responseContentType, status: Number(response.status) || null,
+        finish_reason: finishReason, tool_calls: toolCalls, has_choices: Array.isArray(result.choices) } });
     // The model replying with prose instead of the required JSON object is
     // the dominant production failure (measured 2026-09-13: 5 of 6 upstream
     // calls ignored response_format json_object). At temperature > 0 the
