@@ -198,6 +198,86 @@ console.log('AI provider: transient retries, transport retry, and deterministic 
 }
 console.log('AI provider: backup channel fallback after primary retry exhaustion passed');
 
+// Structured output rides the forced narrate tool call. The request must
+// carry the tool schema and tool_choice, and never request json_object
+// alongside it.
+{
+  const requests = [];
+  const narrateArgs = {
+    items: [{ type: 'narration', text: '门开了。', story_progress: 0.2 }],
+    tool_call: { name: 'ask_player_choice', arguments: { question: '进入吗？', options: [{ id: 'a', label: '进入' }, { id: 'b', label: '等待' }] } },
+  };
+  const provider = createAIProvider({ config, story: {}, fetchImpl: async (url, opts) => {
+    requests.push({ url, body: JSON.parse(opts.body) });
+    return { ok: true, json: async () => ({ choices: [{ message: { tool_calls: [{ function: { name: 'narrate', arguments: JSON.stringify(narrateArgs) } }] }, finish_reason: 'tool_calls' }] }) };
+  } });
+  const result = await provider.complete({ canonical_history: [], input: {}, pinned: {} });
+  assert.deepEqual(result.items.map(it => it.text), ['门开了。']);
+  assert.ok(result.tool_call.tool_call_id, 'inner tool call is normalized with an id');
+  assert.equal(requests[0].body.tool_choice.function.name, 'narrate');
+  assert.equal(requests[0].body.tools[0].function.name, 'narrate');
+  assert.equal(requests[0].body.response_format, undefined);
+  assert.match(requests[0].body.messages[0].content, /必须且只能通过调用 narrate 工具/);
+}
+// Malformed tool arguments are retried like prose-instead-of-JSON.
+{
+  let calls = 0;
+  const completion = createAICompletion({
+    config: retryConfig,
+    fetchImpl: async () => {
+      calls += 1;
+      const args = calls < 2 ? '{"items":[{"text":"截断的' : JSON.stringify({ items: [{ type: 'narration', text: '重试成功。' }] });
+      return { ok: true, json: async () => ({ choices: [{ message: { tool_calls: [{ function: { name: 'narrate', arguments: args } }] } }] }) };
+    },
+  });
+  const result = await completion([{ role: 'user', content: 'test' }], 100, { name: 'narrate', description: '', parameters: {} });
+  assert.deepEqual(result, { items: [{ type: 'narration', text: '重试成功。' }] });
+  assert.equal(calls, 2);
+}
+{
+  let calls = 0;
+  const completion = createAICompletion({
+    config: retryConfig,
+    fetchImpl: async () => {
+      calls += 1;
+      return { ok: true, json: async () => ({ choices: [{ message: { tool_calls: [{ function: { name: 'narrate', arguments: 'nope' } }, { function: { name: 'narrate', arguments: '{}' } }] } }] }) };
+    },
+  });
+  await assert.rejects(
+    () => completion([{ role: 'user', content: 'test' }], 100, { name: 'narrate', description: '', parameters: {} }),
+    (error) => error instanceof AIProviderError && error.retryable === true,
+  );
+  assert.equal(calls, 3, 'multiple tool calls are rejected inside the retry budget');
+}
+// A channel without function-calling support that silently ignores `tools`
+// is still served through the legacy message-content JSON shape.
+{
+  const completion = createAICompletion({
+    config: { ...config, maxRetries: 0, retryBaseDelayMs: 0, retryMaxDelayMs: 0 },
+    fetchImpl: async (url, opts) => {
+      assert.equal(JSON.parse(opts.body).tools[0].function.name, 'narrate');
+      return { ok: true, json: async () => ({ choices: [{ message: { content: JSON.stringify({ items: [{ text: '旧通道正文。' }] }) }, finish_reason: 'stop' }] }) };
+    },
+  });
+  const result = await completion([{ role: 'user', content: 'test' }], 100, { name: 'narrate', description: '', parameters: {} });
+  assert.deepEqual(result, { items: [{ text: '旧通道正文。' }] });
+}
+// Summaries ride the same channel through save_summary.
+{
+  const requests = [];
+  const completion = createAICompletion({
+    config: { ...config, maxRetries: 0, retryBaseDelayMs: 0, retryMaxDelayMs: 0 },
+    fetchImpl: async (url, opts) => {
+      requests.push(JSON.parse(opts.body));
+      return { ok: true, json: async () => ({ choices: [{ message: { tool_calls: [{ function: { name: 'save_summary', arguments: JSON.stringify({ summary: '玩家在雨夜进入咖啡馆。' } ) } }] } }] }) };
+    },
+  });
+  const summary = await completion([{ role: 'user', content: 'test' }], 100, { name: 'save_summary', description: '', parameters: {} });
+  assert.deepEqual(summary, { summary: '玩家在雨夜进入咖啡馆。' });
+  assert.equal(requests[0].tool_choice.function.name, 'save_summary');
+}
+console.log('AI provider: forced narrate tool call, tool-argument retries, legacy fallback and summary tool passed');
+
 // Provider never owns session state, even when handed an old compact cache.
 const { mkdtemp, rm, writeFile, readdir } = await import('node:fs/promises');
 const { tmpdir } = await import('node:os');
