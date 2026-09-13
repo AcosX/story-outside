@@ -67,6 +67,7 @@ import {
   createSession,
   discardPendingTail,
   findOwnerBySession,
+  getSession,
   interruptWithPlayerInput,
   listSessionEvents,
   recoverSession,
@@ -129,12 +130,17 @@ import {
   FollowingError,
   createInMemoryFollowingRepository,
   createFollowingService,
-  getMockFollowingIdentity,
-  isValidUserUuid,
+  createZhihuAccountDirectory,
 } from './ecosystem/following/index.mjs';
+import { fetchFollowees as fetchZhihuFollowees } from './providers/ecosystem/zhihuFolloweeSource.mjs';
 import { currentUserProvider, bindCurrentUser } from './auth/currentUserProvider.mjs';
 import { createZhihuOAuth, loadOAuthConfig } from './auth/zhihuOAuth.mjs';
-const oauth = createZhihuOAuth(loadOAuthConfig());
+// 知乎账号目录：登录成功时登记「本人的 url_token → 本站业务 UUID」，「故事里的
+// 相遇」靠它把知乎关注列表反查成本站账号。与会话一样是进程内状态。
+const zhihuAccountDirectory = createZhihuAccountDirectory();
+const oauth = createZhihuOAuth(loadOAuthConfig(), {
+  onLogin: (owner) => { zhihuAccountDirectory.remember(owner); },
+});
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 const ROOT = resolve(__dirname, '..');
@@ -564,15 +570,16 @@ if (typeof globalThis !== 'undefined') {
 // cache survives across requests; tests can build a fresh one.
 const ecosystemHotOrchestrator = createEcosystemHotOrchestrator();
 
-// ClickUp 16.3 P1 rebuild on `44343b2` (ChatGPT 2026-09-07 re-review of
-// PR #21): the follow / share surface lives in its own module wired
-// here. The repository is process-local; the service is the only caller
-// of the share / unshare routes. The `storyRepo` reference is passed
-// into shareSession / unshareSession so the service can verify the
-// canonical owner persisted by sessionService.createSession against
-// the cookie-derived caller identity. There is no header-based auth
-// path; every ecosystem route reads `req.cookies.story_outside_session`.
-followingService = createFollowingService({ repository: followingRepo });
+// 「故事里的相遇」的关注关系来自知乎官方 `/api/v1/user/followees`，不由本站
+// 维护（见 src/ecosystem/following/service.mjs 顶部说明）。这里把三样东西装
+// 配起来：本地的分享/屏蔽记录仓库、登录时登记的「知乎 url_token → 本站账号」
+// 目录、以及官方关注接口适配层。适配层按每次请求传入当前登录者的 OAuth
+// token；缺少 Access Secret 配置或未登录时，关注流降级为明确的空态。
+followingService = createFollowingService({
+  repository: followingRepo,
+  accountDirectory: zhihuAccountDirectory,
+  fetchFollowees: (args) => fetchZhihuFollowees(args),
+});
 
 // ClickUp 16.3 — the public surface decorator is hoisted near the
 // ecosystem helpers so the cookie / share / follow code below can
@@ -921,7 +928,7 @@ async function handleRequest(req, res) {
   if (oauth.enabled) bindCurrentUser(req, oauth.owner(req));
   const authRoute = pathname.startsWith('/auth/') || pathname === '/api/auth/status';
   const personalRoute = /^\/api\/sessions(?:\/|$)/.test(pathname)
-    || /^\/v1\/ecosystem\/(?:follow(?:\/|$)|friend-timelines$|sessions\/)/.test(pathname);
+    || /^\/v1\/ecosystem\/(?:friend-timelines$|sessions\/)/.test(pathname);
   if (authRoute || personalRoute) {
     res.setHeader('Cache-Control', 'no-store');
     res.setHeader('Referrer-Policy', 'no-referrer');
@@ -930,7 +937,9 @@ async function handleRequest(req, res) {
     try {
       let location;
       if (pathname === '/auth/login' && method === 'GET') location = oauth.start(req, res, url);
-      else if (pathname === '/auth/callback' && method === 'GET') location = await oauth.callback(req, res, url);
+      else if (pathname === '/auth/callback' && method === 'GET') {
+        location = await oauth.callback(req, res, url);
+      }
       else if (pathname === '/auth/logout' && method === 'POST' && oauth.enabled) {
         oauth.logout(req, res);
         return jsonResponse(res, 200, { ok: true });
@@ -3075,76 +3084,15 @@ async function handleRequest(req, res) {
     return owner.user_uuid;
   }
 
-  // POST /v1/ecosystem/follow — add a follow.
-  //   body: { target_user_uuid }
-  //   auth: story_outside_session cookie.
-  if (method === 'POST' && pathname === '/v1/ecosystem/follow') {
-    let body = {};
-    try {
-      body = await readJsonBody(req);
-    } catch (err) {
-      return sessionErrorResponse(res, err);
-    }
-    if (rejectIdentityInBody(res, body, ['target_user_uuid'])) return;
-    const authUuid = requireAuthUserUuid(res, req);
-    if (!authUuid) return;
-    if (typeof body.target_user_uuid !== 'string' || !body.target_user_uuid) {
-      return jsonResponse(res, 400, {
-        error: 'validation_failed',
-        message: 'target_user_uuid is required.',
-        field: 'target_user_uuid',
-        ...publicDecorate(),
-      });
-    }
-    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(body.target_user_uuid)) {
-      return jsonResponse(res, 400, {
-        error: 'validation_failed',
-        message: 'target_user_uuid must be a UUID.',
-        field: 'target_user_uuid',
-        ...publicDecorate(),
-      });
-    }
-    try {
-      const row = followingService.follow({
-        followerUuid: authUuid,
-        targetUserUuid: body.target_user_uuid,
-      });
-      return jsonResponse(res, 200, { ...publicDecorate(), follow: row });
-    } catch (err) {
-      return sendFollowingError(res, err);
-    }
-  }
-
-  // DELETE /v1/ecosystem/follow/:target_user_uuid — remove a follow.
-  //   auth: story_outside_session cookie.
-  if (method === 'DELETE' && pathname.startsWith('/v1/ecosystem/follow/')) {
-    const target = pathname.slice('/v1/ecosystem/follow/'.length);
-    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(target)) {
-      return jsonResponse(res, 400, {
-        error: 'validation_failed',
-        message: 'target_user_uuid must be a UUID.',
-        ...publicDecorate(),
-      });
-    }
-    const authUuid = requireAuthUserUuid(res, req);
-    if (!authUuid) return;
-    try {
-      const removed = followingService.unfollow({
-        followerUuid: authUuid,
-        targetUserUuid: target,
-      });
-      return jsonResponse(res, 200, {
-        ...publicDecorate(),
-        removed,
-        target_user_uuid: target,
-      });
-    } catch (err) {
-      return sendFollowingError(res, err);
-    }
-  }
+  // 「故事里的相遇」转正（2026-09-13）：本站不再维护关注关系，因此
+  // `POST /v1/ecosystem/follow` 和 `DELETE /v1/ecosystem/follow/:uuid` 已删除。
+  // 以前它们要求玩家手输对方的内部 UUID —— 那是 demo 夹具，不是产品行为。
+  // 关注关系现在读自知乎官方 `/api/v1/user/followees`，要增减关注请到知乎。
 
   // GET /v1/ecosystem/friend-timelines?since=...&limit=...
-  //   auth: story_outside_session cookie.
+  //   auth: __Host- 会话 Cookie（OAuth 模式）。
+  //   关注关系来自知乎官方接口，代表当前登录用户调用；未登录 / 未配置 /
+  //   上游失败一律 200 + 明确 status，让「我的」页面能如实说明原因。
   if (method === 'GET' && pathname === '/v1/ecosystem/friend-timelines') {
     const authUuid = requireAuthUserUuid(res, req);
     if (!authUuid) return;
@@ -3152,8 +3100,11 @@ async function handleRequest(req, res) {
     const limitRaw = url.searchParams.get('limit');
     const limit = limitRaw !== null ? Number(limitRaw) : 50;
     try {
-      const payload = followingService.friendTimelinesSafe({
+      const payload = await followingService.friendTimelinesSafe({
         followerUuid: authUuid,
+        // 用户 access token 只在服务端流转，用于官方接口的 `X-OAuth-Token`。
+        oauthToken: oauth.enabled ? oauth.accessToken(req) : null,
+        storyRepository: storyRepo,
         since: sinceRaw,
         limit: Number.isInteger(limit) && limit > 0 ? limit : 50,
       });
@@ -3220,10 +3171,27 @@ async function handleRequest(req, res) {
     const authUuid = requireAuthUserUuid(res, req);
     if (!authUuid) return;
     try {
+      // 补上故事标识与书名，关注流才能显示「谁走了哪本书」，而不是一串
+      // session UUID。这些都是服务端自己查出来的，调用方仍然不能传任何字段。
+      let title;
+      let storyUuid;
+      let storyVersionUuid;
+      try {
+        const session = getSession({ repository: storyRepo, session_uuid: tail });
+        storyUuid = session?.story_uuid || undefined;
+        storyVersionUuid = session?.story_version_uuid || undefined;
+        if (storyUuid) {
+          const story = storyRepo.findStoryByUuid(storyUuid);
+          if (story && typeof story.title === 'string' && story.title) title = story.title;
+        }
+      } catch { /* 展示增强而已：查不到就只存 session 归属 */ }
       const row = followingService.shareSession({
         storyRepository: storyRepo,
         sessionUuid: tail,
         ownerUuid: authUuid,
+        title,
+        story_uuid: storyUuid,
+        story_version_uuid: storyVersionUuid,
       });
       return jsonResponse(res, 200, {
         ...publicDecorate(),

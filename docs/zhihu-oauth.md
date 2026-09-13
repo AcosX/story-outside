@@ -35,6 +35,7 @@ OAuth Redirect URI: https://storyoutside.acosx.top/auth/callback
 - 授权尝试有效期 10 分钟，一次使用；退出或重新发起登录会使旧授权尝试失效。会话最多 8 小时且不超过 Token 有效期。
 - Token 只在服务端换取和读取资料时使用，随后丢弃；邮箱、手机号及原始资料不落盘、不返给前端。只保留稳定业务 UUID 和显示昵称。
 - 会话存在单一 Node 进程内，重启后必须重新登录。业务故事所有权使用 `app_id + uid` 稳定映射，仍持久化在现有 MariaDB 会话字段；重新登录不丢失所有权。多进程部署前必须改为共享会话存储。
+- 会话还保留该用户的 access token 与公开主页标识 `url_token`，仅供服务端代表本人调用知乎用户数据接口（`X-OAuth-Token`）。两者都不返回浏览器：`/api/auth/status` 只投影 `user_uuid`、`display_name`、`auth_source`。`url_token` 用于「故事里的相遇」的账号映射，详见 [故事里的相遇](zhihu-followees.md)。
 - 创建、读取、续写、回放、结局以及分享/关注均绑定服务端身份；个人写请求还必须通过同源 Origin 校验。OAuth 模式下禁用旧 `/api/admin/*` 和 `/api/dev/*` 入口。
 - 浏览器书架按账号筛选；以前 demo 身份的历史保留但不自动归属给第一个登录账号。
 - `POST /auth/logout` 只退出本站，不代表撤销知乎授权。平台当前没有 refresh_token；过期后重新授权。

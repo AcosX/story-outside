@@ -44,7 +44,14 @@ try {
   const anonymous = await get('/api/auth/status');
   assert.equal(anonymous.headers.get('cache-control'), 'no-store');
   assert.equal((await anonymous.json()).owner, null);
-  for (const path of ['/api/sessions', '/v1/ecosystem/follow']) assert.equal((await post(path, {})).status, 401);
+  assert.equal((await post('/api/sessions', {})).status, 401);
+  // 「故事里的相遇」转正后，本站不再自建关注关系：手输 UUID 的
+  // POST /v1/ecosystem/follow 已下线。它既不能成功，也不该再表现为
+  // 401 这种「路由还在、只是没登录」的语义。
+  const removedFollow = await post('/v1/ecosystem/follow', { target_user_uuid: '11111111-1111-4111-8111-aaaaaaaaaaaa' });
+  assert.ok(removedFollow.status !== 200 && removedFollow.status !== 401, `follow 路由应已下线，实际 ${removedFollow.status}`);
+  // 关注流才是需要登录的个人路由。
+  assert.equal((await get('/v1/ecosystem/friend-timelines')).status, 401);
   assert.equal((await get('/api/dev/sessions/00000000-0000-4000-8000-00000000cafe')).status, 403);
   const a = await login(100); const b = await login(200);
   assert.equal(exchangeCount, 2);

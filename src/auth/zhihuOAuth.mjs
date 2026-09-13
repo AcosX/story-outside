@@ -69,6 +69,19 @@ function safeReturn(value) {
   for (const key of ['code', 'authorization_code', 'state', 'oauth_error']) url.searchParams.delete(key);
   return url.pathname + url.search;
 }
+// 知乎主页地址形如 https://www.zhihu.com/people/<url_token>。关注列表
+// (`/api/v1/user/followees`) 只提供 `UrlToken`，没有 uid，因此本站需要用
+// url_token 作为「同一个知乎账号」的比对键。解析失败时返回 null：目录匹配
+// 退化为空结果，绝不猜测或伪造标识。
+export function urlTokenFromProfileUrl(value) {
+  if (typeof value !== 'string' || !value) return null;
+  let parsed;
+  try { parsed = new URL(value); } catch { return null; }
+  if (!/(^|\.)zhihu\.com$/i.test(parsed.hostname)) return null;
+  const match = parsed.pathname.match(/^\/people\/([A-Za-z0-9_-]{1,64})\/?$/);
+  return match ? match[1] : null;
+}
+
 export function ownerFromProfile(payload, appId) {
   const source = payload?.uid !== undefined ? payload : payload?.data;
   if (payload?.code !== undefined && payload.code !== 20000) throw fail('oauth_identity_unavailable', 502);
@@ -80,14 +93,19 @@ export function ownerFromProfile(payload, appId) {
   const bytes = createHash('sha256').update(`zhihu:${appId}:${idText}`).digest().subarray(0, 16);
   bytes[6] = (bytes[6] & 15) | 0x50; bytes[8] = (bytes[8] & 63) | 0x80;
   const hex = bytes.toString('hex');
-  return Object.freeze({
+  const owner = {
     user_uuid: `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`,
     display_name: typeof source.fullname === 'string' && source.fullname.trim() ? source.fullname.trim().slice(0, 100) : '知乎用户',
     auth_source: 'zhihu_oauth',
-  });
+  };
+  // 公开主页标识：用于把「我关注的知乎账号」映射回本站已登录账号。它是公开
+  // 资料，不含手机号、邮箱或 token，可以安全地留在服务端会话里。
+  const urlToken = urlTokenFromProfileUrl(source.url);
+  if (urlToken) owner.url_token = urlToken;
+  return Object.freeze(owner);
 }
 
-export function createZhihuOAuth(config, { fetchImpl = (...args) => fetch(...args), now = Date.now, maxEntries = 10000 } = {}) {
+export function createZhihuOAuth(config, { fetchImpl = (...args) => fetch(...args), now = Date.now, maxEntries = 10000, onLogin = null } = {}) {
   const flows = new Map();
   const sessions = new Map();
   const enabled = Boolean(config);
@@ -125,7 +143,12 @@ export function createZhihuOAuth(config, { fetchImpl = (...args) => fetch(...arg
   }
   function status(req) {
     const session = current(req);
-    return { configured: enabled, authenticated: Boolean(session), owner: session?.owner || null, expires_at: session ? new Date(session.expiresAt).toISOString() : null, login_url: enabled ? '/auth/login' : null };
+    // 只投影公开展示字段。会话内还保存了 url_token 和用户 access token，
+    // 它们只在服务端调用知乎用户数据接口时使用，绝不返回给浏览器。
+    const owner = session?.owner
+      ? { user_uuid: session.owner.user_uuid, display_name: session.owner.display_name, auth_source: session.owner.auth_source }
+      : null;
+    return { configured: enabled, authenticated: Boolean(session), owner, expires_at: session ? new Date(session.expiresAt).toISOString() : null, login_url: enabled ? '/auth/login' : null };
   }
   function start(req, res, url) {
     if (!enabled) throw fail('oauth_not_configured', 503);
@@ -171,8 +194,15 @@ export function createZhihuOAuth(config, { fetchImpl = (...args) => fetch(...arg
       sessions.delete(cookie(req, COOKIE));
       const sessionId = random();
       // Tokens and sessions are process-local; restarting requires reauthorization.
-      sessions.set(sessionId, { owner, expiresAt });
+      // 用户 access token 只留在服务端会话里，供调用知乎用户数据接口
+      // （`X-OAuth-Token`）使用；它不进入任何响应体、日志或 Cookie。
+      sessions.set(sessionId, { owner, expiresAt, accessToken: data.access_token });
       setCookie(res, COOKIE, sessionId, Math.max(1, Math.floor((expiresAt - now()) / 1000)));
+      // 登录成功钩子：把本人的公开主页标识登记到账号目录。失败不能影响登录
+      // 本身——最坏结果只是关注流暂时匹配不到人。
+      if (typeof onLogin === 'function') {
+        try { onLogin(owner); } catch { /* 目录登记是增强，不阻断登录 */ }
+      }
       return flow.returnTo;
     } finally { if (flows.get(id) === flow) flows.delete(id); }
   }
@@ -181,5 +211,17 @@ export function createZhihuOAuth(config, { fetchImpl = (...args) => fetch(...arg
     sessions.delete(cookie(req, COOKIE)); flows.delete(cookie(req, FLOW_COOKIE));
     setCookie(res, COOKIE, '', 0); setCookie(res, FLOW_COOKIE, '', 0);
   }
-  return { enabled, status, start, callback, logout, assertOrigin, owner: req => current(req)?.owner || null };
+  return {
+    enabled,
+    status,
+    start,
+    callback,
+    logout,
+    assertOrigin,
+    owner: req => current(req)?.owner || null,
+    // 服务端专用：取当前会话的知乎用户 access token，用于代表该用户调用
+    // 官方用户数据接口。调用方必须把它当作凭据处理——不落盘、不出日志、
+    // 不回传浏览器。
+    accessToken: req => current(req)?.accessToken || null,
+  };
 }
