@@ -6,7 +6,8 @@ const FIELDS = ['requestIds', 'turnRequests', 'compact_history'];
 export function encodeRuntimePayload(runtime) {
   const replay = Object.fromEntries(FIELDS.filter(key => key in runtime).map(key => [key, runtime[key]]));
   const raw = JSON.stringify(replay);
-  if (Buffer.byteLength(raw) < 16384) return runtime;
+  const bytes = Buffer.byteLength(raw);
+  if (bytes < 16384 || bytes > 32 * 1024 * 1024) return runtime;
   const out = { ...runtime };
   for (const key of FIELDS) delete out[key];
   out.replay_cache = { codec: 'gzip-json-v1', data: gzipSync(raw, { level: 6 }).toString('base64') };
