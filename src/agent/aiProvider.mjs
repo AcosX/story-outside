@@ -209,9 +209,6 @@ async function requestCompletion({ config, fetchImpl, messages, maxTokens, attem
   } else {
     body.response_format = { type: 'json_object' };
   }
-  const responseContentType = typeof response.headers?.get === 'function'
-    ? (response.headers.get('content-type') || '').split(';', 1)[0].trim().toLowerCase()
-    : null;
   let response;
   try {
     response = await fetchImpl(`${config.baseURL.replace(/\/$/, '')}/chat/completions`, {
@@ -224,6 +221,9 @@ async function requestCompletion({ config, fetchImpl, messages, maxTokens, attem
       code: 'transport_error', retryable: true,
     });
   }
+  const responseContentType = typeof response.headers?.get === 'function'
+    ? (response.headers.get('content-type') || '').split(';', 1)[0].trim().toLowerCase()
+    : null;
   if (!response?.ok) {
     const status = Number(response?.status);
     const retryable = RETRYABLE_HTTP_STATUSES.has(status);
