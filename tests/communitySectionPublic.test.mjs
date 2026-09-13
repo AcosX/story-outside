@@ -289,7 +289,7 @@ console.log('故事里的相遇 — 区块公开面');
     check('dom: 渲染引导文案', !!host.querySelector('.community-lead'), 'lead missing');
     check('dom: 渲染关注流容器 #community-feed', !!document.getElementById('community-feed'), 'feed missing');
     check('dom: 渲染状态行 #community-status', !!document.getElementById('community-status'), 'status missing');
-    check('dom: 渲染「公开这段故事」入口', !!document.getElementById('community-share-btn'), 'share entry missing');
+    check('dom: 渲染账号可见性开关', !!document.getElementById('community-visibility-toggle'), 'share entry missing');
     check(
       'dom: 没有关闭按钮',
       !document.getElementById('social-panel-close') && !host.querySelector('#community-close-btn'),

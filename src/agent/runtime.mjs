@@ -103,7 +103,7 @@ function sanitizeFiniteJson(value, label) {
  *   * illegal tool payloads (unknown name / bad arguments / missing id)
  * A normalised tool call never becomes a canonical event.
  */
-function normalizeProviderResult(result) {
+export function normalizeProviderResult(result) {
   if (!result || typeof result !== 'object') fail('provider_failure', 'provider result must be an object');
   const hasMessages = result.messages !== undefined;
   const hasToolCalls = result.tool_calls !== undefined;

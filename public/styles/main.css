@@ -1439,3 +1439,10 @@ body > #social-panel-host {
 .account-controls a, .account-controls button { color: #1768c6; background: #eef5ff; border: 0; border-radius: 8px; padding: 8px 10px; text-decoration: none; cursor: pointer; white-space: nowrap; }
 #account-name { max-width: 110px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 @media (max-width: 600px) { #account-name { max-width: 64px; } .account-controls { gap: 4px; } }
+
+.community-visibility-toggle { width: 44px; height: 26px; padding: 3px; border: 0; border-radius: 20px; background: #a8b1c0; cursor: pointer; flex-shrink: 0; }
+.community-visibility-toggle::before { content: ''; display: block; width: 20px; height: 20px; border-radius: 50%; background: white; transition: transform .15s; }
+.community-visibility-toggle[aria-checked="true"] { background: #345dff; }
+.community-visibility-toggle[aria-checked="true"]::before { transform: translateX(18px); }
+.community-visibility-toggle:disabled { opacity: .5; cursor: wait; }
+.community-visibility-toggle:focus-visible { outline: 3px solid #9eb2ff; outline-offset: 3px; }

@@ -124,29 +124,12 @@ console.log('故事里的相遇 — 新标签页开局');
   const host = document.getElementById('community-section');
   check('dom: #community-section 已渲染', !!host, 'section missing');
 
-  const shareBtn = document.getElementById('community-share-btn');
-  const unshareBtn = document.getElementById('community-unshare-btn');
-  const shareText = document.getElementById('community-share-text');
-
-  check('dom: 「公开这段故事」按钮存在', !!shareBtn, 'share button missing');
-  check('dom: 「撤回」按钮存在', !!unshareBtn, 'unshare button missing');
-  check('dom: 公开说明文案存在', !!shareText, 'share text missing');
-  check(
-    'dom: 没有「创建 session」按钮（区块从不自造会话）',
-    !document.getElementById('community-create-session-btn') && !document.getElementById('social-panel-create-session-btn'),
-    'create-session button leaked back in'
-  );
-
-  check(
-    'fresh: 还没有会话时，公开入口隐藏',
-    shareBtn && shareBtn.hidden === true,
-    `shareBtn.hidden=${shareBtn && shareBtn.hidden}`
-  );
-  check(
-    'fresh: 还没有会话时，文案提示先去选故事',
-    shareText && typeof shareText.textContent === 'string' && shareText.textContent.length > 0,
-    `text=${shareText && shareText.textContent}`
-  );
+  const toggle = document.getElementById('community-visibility-toggle');
+  check('dom: 账号开关不依赖当前故事', !!toggle && !toggle.disabled);
+  check('fresh: 默认对关注者可见', toggle?.getAttribute('aria-checked') === 'true');
+  toggle?.dispatch('click');
+  await new Promise(r => setTimeout(r, 200));
+  check('fresh: 可以在开局前隐身', toggle?.getAttribute('aria-checked') === 'false');
 
   // 走真实书架：读服务端渲染出来的第一本书和第一个角色，不写死夹具名。
   const storyChips = document.querySelectorAll('#story-list .book-card');
@@ -187,24 +170,12 @@ console.log('故事里的相遇 — 新标签页开局');
     `stored=${stored}`
   );
 
-  check(
-    'fresh: 有了真实会话后，公开入口出现',
-    shareBtn && shareBtn.hidden === false,
-    `shareBtn.hidden=${shareBtn && shareBtn.hidden}`
-  );
-
-  // 通过区块自身的按钮走一遍，确认它指向真实会话。
-  if (realUuid && shareBtn) {
-    shareBtn.dispatch('click');
-    await new Promise((r) => setTimeout(r, 400));
-    check(
-      'fresh: 点击公开后，切换为「撤回」入口',
-      unshareBtn && unshareBtn.hidden === false,
-      `unshareBtn.hidden=${unshareBtn && unshareBtn.hidden}`
-    );
-    unshareBtn.dispatch('click');
-    await new Promise((r) => setTimeout(r, 400));
-  }
+  check('fresh: 开局不会重置隐身', toggle?.getAttribute('aria-checked') === 'false');
+  const visibility = await (await fetch(`${baseUrl}/v1/ecosystem/visibility`)).json();
+  check('wire: 服务端保存隐身设置', visibility.visible === false);
+  toggle?.dispatch('click');
+  await new Promise(r => setTimeout(r, 200));
+  check('fresh: 可以恢复可见', toggle?.getAttribute('aria-checked') === 'true');
 
   if (realUuid) {
     const shareRes = await fetch(`${baseUrl}/v1/ecosystem/sessions/${realUuid}/share`, { method: 'POST' });

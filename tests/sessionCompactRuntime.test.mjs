@@ -89,7 +89,7 @@ assert.equal(exportSessionPersistenceSnapshot(restored.repository)[0].runtime_pa
 appendInputs(restored, 16);
 const beforeFailure = getSessionCompact(restored);
 const invalid = ai(({ compact }) => compact ? { summary: '' } : { items: [{ text: 'must not be called' }] });
-await assert.rejects(run(restored, invalid.provider), error => error.code === 'provider_failure' && !error.retryable);
+await assert.rejects(run(restored, invalid.provider), error => error.code === 'provider_failure' && error.retryable);
 const failed = getSessionCompact(restored);
 assert.equal(failed.context_compact_text, beforeFailure.context_compact_text);
 assert.equal(failed.compacted_through_seq, beforeFailure.compacted_through_seq);

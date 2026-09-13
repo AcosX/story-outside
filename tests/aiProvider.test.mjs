@@ -320,7 +320,7 @@ try {
     const payload = JSON.parse(actual[1].content);
     assert.deepEqual(payload.player_perspective.role, role);
     assert.deepEqual(payload.player_perspective.original_first_person_role, roles[0]);
-    assert.equal(payload.player_perspective.narration_person, 'second_person');
+    assert.equal(payload.player_perspective.narration_person, role.id === 'traveler' ? 'first_person' : 'second_person');
     assert.deepEqual(payload.original_story, story);
     assert.equal(payload.committed_history[0].event_seq, 12);
     assert.match(actual[0].content, /不得让玩家替原作第一人称角色或其他角色做决定/);

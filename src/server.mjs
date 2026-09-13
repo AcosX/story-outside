@@ -1,3 +1,4 @@
+import { warn as loggerWarn } from './observability/logger.mjs';
 // Story Outside — minimal Node HTTP server (no framework).
 // Serves static files from ./public and exposes a few JSON endpoints
 // used by the home page demo flow. The endpoints are clearly marked as
@@ -130,16 +131,16 @@ import {
   FollowingError,
   createInMemoryFollowingRepository,
   createFollowingService,
-  createZhihuAccountDirectory,
 } from './ecosystem/following/index.mjs';
+import { loadZhihuAccessSecret } from './providers/ecosystem/zhihuHotSource.mjs';
+import { listOwnerActivities } from './stories/sessionService.mjs';
 import { fetchFollowees as fetchZhihuFollowees } from './providers/ecosystem/zhihuFolloweeSource.mjs';
 import { currentUserProvider, bindCurrentUser } from './auth/currentUserProvider.mjs';
 import { createZhihuOAuth, loadOAuthConfig } from './auth/zhihuOAuth.mjs';
 // 知乎账号目录：登录成功时登记「本人的 url_token → 本站业务 UUID」，「故事里的
-// 相遇」靠它把知乎关注列表反查成本站账号。与会话一样是进程内状态。
-const zhihuAccountDirectory = createZhihuAccountDirectory();
+// 相遇」靠它把知乎关注列表反查成本站账号。账号映射随业务仓库持久化。
 const oauth = createZhihuOAuth(loadOAuthConfig(), {
-  onLogin: (owner) => { zhihuAccountDirectory.remember(owner); },
+  onLogin: (owner) => { followingRepo.rememberAccount(owner); },
 });
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
@@ -577,8 +578,9 @@ const ecosystemHotOrchestrator = createEcosystemHotOrchestrator();
 // token；缺少 Access Secret 配置或未登录时，关注流降级为明确的空态。
 followingService = createFollowingService({
   repository: followingRepo,
-  accountDirectory: zhihuAccountDirectory,
-  fetchFollowees: (args) => fetchZhihuFollowees(args),
+  accountDirectory: { resolve: (token) => followingRepo.resolveAccount(token) },
+  fetchFollowees: (args) => fetchZhihuFollowees(args, { env: { ZHIHU_ACCESS_SECRET: loadZhihuAccessSecret() } }),
+  listActivities: (ownerUuid) => listOwnerActivities(storyRepo, ownerUuid),
 });
 
 // ClickUp 16.3 — the public surface decorator is hoisted near the
@@ -882,6 +884,7 @@ function sessionErrorResponse(res, err) {
 }
 
 function agentRuntimeErrorResponse(res, err, decoration = {}) {
+  loggerWarn('agent.request.failed', { component: 'agent', error_code: err.code, extra: { retryable: err.retryable === true } });
   // AgentRuntimeError always carries an explicit boolean. Keep the
   // fallback for older callers, but never turn an explicit false into a
   // retryable 502 merely because the code is provider_failure.
@@ -928,7 +931,7 @@ async function handleRequest(req, res) {
   if (oauth.enabled) bindCurrentUser(req, oauth.owner(req));
   const authRoute = pathname.startsWith('/auth/') || pathname === '/api/auth/status';
   const personalRoute = /^\/api\/sessions(?:\/|$)/.test(pathname)
-    || /^\/v1\/ecosystem\/(?:friend-timelines$|sessions\/)/.test(pathname);
+    || /^\/v1\/ecosystem\/(?:friend-timelines$|visibility$|sessions\/)/.test(pathname);
   if (authRoute || personalRoute) {
     res.setHeader('Cache-Control', 'no-store');
     res.setHeader('Referrer-Policy', 'no-referrer');
@@ -3088,6 +3091,21 @@ async function handleRequest(req, res) {
   // `POST /v1/ecosystem/follow` 和 `DELETE /v1/ecosystem/follow/:uuid` 已删除。
   // 以前它们要求玩家手输对方的内部 UUID —— 那是 demo 夹具，不是产品行为。
   // 关注关系现在读自知乎官方 `/api/v1/user/followees`，要增减关注请到知乎。
+
+  if (pathname === '/v1/ecosystem/visibility' && ['GET', 'PUT'].includes(method)) {
+    const ownerUuid = requireAuthUserUuid(res, req);
+    if (!ownerUuid) return;
+    if (method === 'PUT') {
+      let body;
+      try { body = await readJsonBody(req); } catch (error) { return sessionErrorResponse(res, error); }
+      if (!body || Object.keys(body).length !== 1 || typeof body.visible !== 'boolean') {
+        return jsonResponse(res, 400, { error: 'validation_failed' });
+      }
+      followingRepo.setVisibility(ownerUuid, body.visible);
+      followingService.invalidateAllFeeds();
+    }
+    return jsonResponse(res, 200, { visible: followingRepo.isVisible(ownerUuid) });
+  }
 
   // GET /v1/ecosystem/friend-timelines?since=...&limit=...
   //   auth: __Host- 会话 Cookie（OAuth 模式）。

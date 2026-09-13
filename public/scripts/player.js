@@ -1995,7 +1995,7 @@ function renderRoles(roles) {
     btn.setAttribute('role', 'option');
     btn.setAttribute('aria-selected', String(role.id === state.role?.id));
     btn.innerHTML = `
-      <span class="chip-title">${escapeHtml(role.label)}</span>
+      <span class="chip-title">${escapeHtml(role.label)}${role.id === state.story?.first_person_role_id && role.label !== '我' ? ' · 我' : ''}</span>
       <span class="chip-hook">${escapeHtml(role.mood || '')}</span>
     `;
     li.appendChild(btn);

@@ -53,8 +53,17 @@ try {
   // 关注流才是需要登录的个人路由。
   assert.equal((await get('/v1/ecosystem/friend-timelines')).status, 401);
   assert.equal((await get('/api/dev/sessions/00000000-0000-4000-8000-00000000cafe')).status, 403);
+  assert.equal((await get('/v1/ecosystem/visibility')).status, 401);
   const a = await login(100); const b = await login(200);
   assert.equal(exchangeCount, 2);
+  const putVisibility = (cookie, body, origin='https://story.example') => realFetch(base + '/v1/ecosystem/visibility', {method:'PUT',headers:{cookie,origin,'content-type':'application/json'},body:JSON.stringify(body)});
+  assert.equal((await (await get('/v1/ecosystem/visibility', a)).json()).visible, true);
+  assert.equal((await putVisibility(a,{visible:false},'https://evil.example')).status,403);
+  assert.equal((await putVisibility(a,{visible:false,user_uuid:'forged'})).status,400);
+  assert.equal((await putVisibility(a,{visible:false})).status,200);
+  assert.equal((await (await get('/v1/ecosystem/visibility', a)).json()).visible,false);
+  assert.equal((await (await get('/v1/ecosystem/visibility', b)).json()).visible,true);
+
   assert.equal((await get('/api/auth/status', a)).status, 200);
   assert.equal((await post('/api/sessions', {}, a, 'https://evil.example')).status, 403);
   const create = await post('/api/sessions', {}, a);
@@ -76,6 +85,7 @@ try {
   assert.equal((await get('/api/sessions/' + uuid + '/recover', a)).status, 401);
   assert.equal((await (await get('/api/auth/status', b)).json()).authenticated, true);
   const a2 = await login(100);
+  assert.equal((await (await get('/v1/ecosystem/visibility', a2)).json()).visible,false, 're-login preserves privacy');
   assert.equal((await get('/api/sessions/' + uuid + '/recover', a2)).status, 200, 'stable user identity restores ownership');
   const error = await get('/auth/callback?authorization_code=sensitive-value&state=bad');
   assert.equal(error.status, 303);

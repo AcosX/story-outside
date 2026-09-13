@@ -1,5 +1,7 @@
 import { spawnSync } from 'node:child_process';
 const tests = [
+  "tests/followeeFileCredentialsHttp.test.mjs",
+  "tests/onlineFixes.test.mjs",
   "tests/zhihuOAuth.test.mjs",
   "tests/zhihuOAuthHttp.test.mjs",
   "tests/mariadbConfig.test.mjs",
