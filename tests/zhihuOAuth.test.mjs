@@ -107,3 +107,28 @@ for (const upstream of [() => { throw new Error('test-token'); }, () => new Resp
   assert.equal(failed.status(req(flow.cookie)).authenticated, false);
 }
 console.log('OAuth concurrent callback cancellation and redacted upstream failures: PASS');
+
+// 知乎 /user 的 uid 是 19 位十进制整数，超过 IEEE-754 安全整数范围。
+// 上线首日真实登录因此被拒（oauth_identity_unavailable）：JSON.parse 把末位
+// 改写后 Number.isSafeInteger 失败。回归锁定完整精度与 user_uuid 稳定性。
+{
+  const bigUid = '1234567890123456789';
+  const owner = ownerFromProfile({ uid: bigUid, fullname: '大号用户' }, '413');
+  assert.match(owner.user_uuid, /^[0-9a-f-]{36}$/);
+  assert.equal(owner.display_name, '大号用户');
+  // 同一 uid 无论以字符串还是安全整数出现，业务 UUID 必须一致，否则老用户丢失故事所有权。
+  assert.equal(ownerFromProfile({ uid: '123456' }, '413').user_uuid, ownerFromProfile({ uid: 123456 }, '413').user_uuid);
+  // 不同的 19 位 uid 必须区分开，不能因精度丢失被折叠成同一账号。
+  assert.notEqual(owner.user_uuid, ownerFromProfile({ uid: '1234567890123456788' }, '413').user_uuid);
+  for (const bad of [null, undefined, 0, -1, 1.5, '0', '01', 'abc', '', '12 34', {}, []]) {
+    assert.throws(() => ownerFromProfile({ uid: bad }, '413'), { code: 'oauth_identity_unavailable' }, String(bad));
+  }
+  // 端到端：模拟上游以 19 位裸整数返回 uid，登录必须成功。
+  const bigIntOAuth = createZhihuOAuth(config, { fetchImpl: async url => new Response(url.endsWith('/access_token')
+    ? '{"access_token":"test-big-token","token_type":"Bearer","expires_in":3600}'
+    : `{"avatar_path":"/a.jpg","uid":${bigUid},"fullname":"大号用户","hash_id":"abc"}`) });
+  const bigFlow = begin(bigIntOAuth);
+  const bigSession = await finish(bigFlow, bigIntOAuth);
+  assert.equal(bigIntOAuth.owner(req(bigSession.cookie)).user_uuid, owner.user_uuid, 'raw 19-digit uid survives JSON parsing');
+  console.log('OAuth 19-digit uid precision and stable business UUID: PASS');
+}
