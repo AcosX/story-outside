@@ -13,7 +13,7 @@ import { dirname, resolve } from 'node:path';
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PLAYER_PATH = resolve(__dirname, '..', 'public', 'scripts', 'player.js');
 const ENDING_PAGE_PATH = resolve(__dirname, '..', 'public', 'scripts', 'endingPage.js');
-const SOCIAL_PANEL_PATH = resolve(__dirname, '..', 'public', 'scripts', 'socialPanel.js');
+const COMMUNITY_SECTION_PATH = resolve(__dirname, '..', 'public', 'scripts', 'communitySection.js');
 const SESSION_CONTEXT_PATH = resolve(__dirname, '..', 'public', 'scripts', 'sessionContext.js');
 
 export async function loadFixtureScript() {
@@ -26,10 +26,10 @@ async function readEndingPageSource() {
   return endingPageSourceCache;
 }
 
-let socialPanelSourceCache = null;
-async function readSocialPanelSource() {
-  if (!socialPanelSourceCache) socialPanelSourceCache = readFile(SOCIAL_PANEL_PATH, 'utf-8');
-  return socialPanelSourceCache;
+let communitySectionSourceCache = null;
+async function readCommunitySectionSource() {
+  if (!communitySectionSourceCache) communitySectionSourceCache = readFile(COMMUNITY_SECTION_PATH, 'utf-8');
+  return communitySectionSourceCache;
 }
 
 let sessionContextSourceCache = null;
@@ -75,15 +75,15 @@ async function importEndingPageForHarness() {
   return mod;
 }
 
-// The player lazy-loads the social panel via `import('/scripts/socialPanel.js')`
+// The player lazy-loads the community section via `import('/scripts/communitySection.js')`
 // (ClickUp 16.3 P1 v1-3). The harness rewrites that dynamic import to a
-// hook that evaluates the REAL socialPanel.js source — the panel mounts
+// hook that evaluates the REAL communitySection.js source — the section renders
 // its own DOM and the player's lazy-import wiring stays under test.
-const PLAYER_SOCIAL_PANEL_IMPORT = "import('/scripts/socialPanel.js')";
-const PLAYER_SOCIAL_PANEL_HOOK = 'globalThis.__HARNESS_IMPORT_SOCIAL_PANEL__()';
+const PLAYER_COMMUNITY_SECTION_IMPORT = "import('/scripts/communitySection.js')";
+const PLAYER_COMMUNITY_SECTION_HOOK = 'globalThis.__HARNESS_IMPORT_COMMUNITY_SECTION__()';
 
-async function importSocialPanelForHarness() {
-  const source = await readSocialPanelSource();
+async function importCommunitySectionForHarness() {
+  const source = await readCommunitySectionSource();
   const patched = applyHarnessPatches(source);
   // Strip both `export {...}` and `export default {...}` so the
   // source can be evaluated inside `new Function` (which has no
@@ -92,7 +92,7 @@ async function importSocialPanelForHarness() {
   const stripped = patched
     .replace(/export\s*\{[^}]*\}\s*;?\s*$/m, '')
     .replace(/export\s+default\s+\{[^}]*\}\s*;?\s*$/m, '');
-  const fn = new Function(`${stripped}\nreturn { mount, refreshFeed, refreshShareButton, refreshAuthStatus, currentShareTargetUuid };`);
+  const fn = new Function(`${stripped}\nreturn { mount, refreshFeed, refreshShareAction, refreshAuthStatus, currentShareTargetUuid };`);
   return fn();
 }
 
@@ -112,7 +112,7 @@ async function importSessionContextForHarness() {
 
 function applyHarnessPatches(source) {
   let patched = source;
-  // ClickUp 16.3 P1 v1-4: the player AND the social panel both
+  // ClickUp 16.3 P1 v1-4: the player AND the community section both
   // lazy-import the session-context helper. Rewrite that import to
   // a harness hook that evaluates the REAL sessionContext.js source
   // — same pattern as the panel and ending-page hooks above.
@@ -127,11 +127,11 @@ function applyHarnessPatches(source) {
   if (patched.includes(PLAYER_ENDING_IMPORT)) {
     patched = patched.replaceAll(PLAYER_ENDING_IMPORT, PLAYER_ENDING_HOOK);
   }
-  // The social panel import is OPTIONAL: it was added by ClickUp 16.3
+  // The community section import is OPTIONAL: it was added by ClickUp 16.3
   // P1 v1-3. Older player.js source (before the panel wiring) does
   // not include the import, so we tolerate that.
-  if (patched.includes(PLAYER_SOCIAL_PANEL_IMPORT)) {
-    patched = patched.replaceAll(PLAYER_SOCIAL_PANEL_IMPORT, PLAYER_SOCIAL_PANEL_HOOK);
+  if (patched.includes(PLAYER_COMMUNITY_SECTION_IMPORT)) {
+    patched = patched.replaceAll(PLAYER_COMMUNITY_SECTION_IMPORT, PLAYER_COMMUNITY_SECTION_HOOK);
   }
   return patched;
 }
@@ -390,7 +390,7 @@ const document = {
   body: new Element('body'),
   head: new Element('head'),
   createElement(tag) { return new Element(tag); },
-  // getElementById: ClickUp 16.3 P1 v1-3 — the socialPanel module
+  // getElementById: ClickUp 16.3 P1 v1-3 — the communitySection module
   // looks up its own host / status / feed elements by id. We map an
   // id selector onto the existing querySelector path so the panel
   // can mount under the harness without an extra polyfill surface.
@@ -720,7 +720,7 @@ export function createPlayerDom({ baseUrl, viewport = null, stepDelayMs = null, 
     // overriding the inner clientWidth used by `layoutOverflow`.
     const search = startScreen ? `?s=${startScreen}` : '';
     // ClickUp 16.3 P1 v1-4: give the harness window addEventListener /
-    // dispatchEvent / CustomEvent support so the social panel can
+    // dispatchEvent / CustomEvent support so the community section can
     // subscribe to the session-context helper's `session:changed`
     // CustomEvent. Without this surface the harness would silently
     // drop every event and the listener never fires.
@@ -759,10 +759,10 @@ export function createPlayerDom({ baseUrl, viewport = null, stepDelayMs = null, 
     globalThis.fetch = fetchStub;
     // Lazy ending-page import hook (see importEndingPageForHarness).
     globalThis.__HARNESS_IMPORT_ENDING_PAGE__ = importEndingPageForHarness;
-    // ClickUp 16.3 P1 v1-3: same hook pattern for the social panel.
-    globalThis.__HARNESS_IMPORT_SOCIAL_PANEL__ = importSocialPanelForHarness;
+    // ClickUp 16.3 P1 v1-3: same hook pattern for the community section.
+    globalThis.__HARNESS_IMPORT_COMMUNITY_SECTION__ = importCommunitySectionForHarness;
     // ClickUp 16.3 P1 v1-4: same hook pattern for the session-context
-    // helper (loaded by player.js AND by socialPanel.js).
+    // helper (loaded by player.js AND by communitySection.js).
     globalThis.__HARNESS_IMPORT_SESSION_CONTEXT__ = importSessionContextForHarness;
     if (!globalThis.crypto) globalThis.crypto = {};
     if (typeof globalThis.crypto.randomUUID !== 'function') {

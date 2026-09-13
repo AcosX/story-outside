@@ -433,6 +433,18 @@ async function resumeSavedReading(saved) {
     setStatus('error');
   }
 }
+// 「故事里的相遇」区块模块：进入「我的」页面时重新拉取，避免登录或会话变化后
+// 仍显示旧内容。模块加载失败时保持 null，该区块静默缺席。
+let communitySectionModule = null;
+async function refreshCommunitySection() {
+  if (!communitySectionModule) return;
+  try {
+    if (typeof communitySectionModule.refreshAuthStatus === 'function') await communitySectionModule.refreshAuthStatus();
+    if (typeof communitySectionModule.refreshShareAction === 'function') await communitySectionModule.refreshShareAction();
+    if (typeof communitySectionModule.refreshFeed === 'function') await communitySectionModule.refreshFeed();
+  } catch { /* 区块是增强项，失败不影响「我的」页面其余内容 */ }
+}
+
 function renderMine(requestedPage = 1) {
   const all = readReadingHistory();
   const { page, pages, records } = readingHistoryPage(all, requestedPage);
@@ -571,7 +583,7 @@ async function bootstrapSession({ story, role }) {
     setText('#story-name', story.title);
     setText('#role-name', role.label);
     persistSessionContext();
-    // ClickUp 16.3 P1 v1-4: tell every listener (socialPanel etc.)
+    // ClickUp 16.3 P1 v1-4: tell every listener (communitySection etc.)
     // that a fresh session exists so share/unshare can point at it.
     // `persistSessionContext` already dispatches through the helper
     // when it loaded; this dispatch covers the helper-not-yet-loaded
@@ -1777,7 +1789,7 @@ function bindEvents() {
   });
   window.addEventListener?.('story:home', backToPicker);
   $('#nav-stories')?.addEventListener('click', backToPicker);
-  $('#nav-mine')?.addEventListener('click', () => { state.navigationToken = (state.navigationToken || 0) + 1; if (state.status === 'playing') togglePause(); showScreen('mine'); setText('#story-name', '我的'); setText('#role-name', '故事之外'); renderMine(); });
+  $('#nav-mine')?.addEventListener('click', () => { state.navigationToken = (state.navigationToken || 0) + 1; if (state.status === 'playing') togglePause(); showScreen('mine'); setText('#story-name', '我的'); setText('#role-name', '故事之外'); renderMine(); void refreshCommunitySection(); });
   $('#story-search')?.addEventListener('input', renderStories);
   window.addEventListener?.('story:open', e => {
     if (e.detail?.storyId) void selectStory(e.detail.storyId);
@@ -1883,25 +1895,19 @@ async function initializeAccount() {
 async function bootstrap() {
   await initializeAccount();
   bindEvents();
-  // ClickUp 16.3 P1 v1-4 (主人 2026-09-07 06:24 巡检 + ChatGPT
-  // 复核): lazily load the session-context helper FIRST so the
-  // social panel can read through it. Then load the public social
-  // panel itself; the panel subscribes to the helper's
-  // `session:changed` event and refreshes in place when the player
-  // bootstraps a new session. The panel mounts a single floating
-  // host element at document.body and is non-intrusive to the
-  // existing picker / story / ending-card surfaces. The panel
-  // itself never carries caller principal — see
-  // public/scripts/socialPanel.js for the hard rules.
+  // 「故事里的相遇」区块（2026-09-13 转正）：以前它是 socialPanel.js 挂在
+  // document.body 上的悬浮 demo 卡片，再被搬进 #community-section。现在它就是
+  // 「我的」页面里的一个正常区块，直接渲染进 #community-section，不再有悬浮
+  // 宿主、关闭按钮和内联样式。它同样不携带调用者身份 —— 见
+  // public/scripts/communitySection.js 顶部的边界说明。
   try {
     await loadSessionContext();
-    const socialMod = await import('/scripts/socialPanel.js');
-    if (socialMod && typeof socialMod.mount === 'function') {
-      await socialMod.mount();
-      const socialHost = $('#social-panel-host');
-      if (socialHost && $('#community-section')) $('#community-section').appendChild(socialHost);
+    const communityMod = await import('/scripts/communitySection.js');
+    if (communityMod && typeof communityMod.mount === 'function') {
+      communitySectionModule = communityMod;
+      await communityMod.mount();
     }
-  } catch { /* panel is best-effort — the core game flow must still run */ }
+  } catch { /* 区块是增强项 —— 核心故事流程必须照常运行 */ }
   setStatus('loading');
   // Deep link: showScreen writes ?s=<screen> into the URL, and a reload
   // on the ending screen must land back on the ending page instead of

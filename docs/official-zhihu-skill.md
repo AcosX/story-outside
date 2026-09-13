@@ -137,7 +137,8 @@ X-OAuth-Token: <OAuth access_token>
 
 - ❌ 现在：不引入官方 `zhihu-cli`、不写 OAuth handler、不写 Token 会话。
 - ✅ 现在：`STORY_OUTSIDE_PROVIDER=real` 可直接对接黑客松故事 API；无 Access Secret；超时 / 429 / 5xx / 缺字段统一返回 typed error；不循环重试。
-- ✅ 以后：先在生产域名上把 OAuth 跑通 → 验收 5 项用户接口（创作 / 关注 / 收藏夹列表 / 收藏夹内容 / 近期收藏）→ 才把用户数据接入游戏业务。
+- ✅ 已完成（2026-09-13）：知乎登录（见 [知乎 OAuth 登录](zhihu-oauth.md)）与用户关注接口（见 [故事里的相遇](zhihu-followees.md)）。后者以 `Authorization: Bearer <Access Secret>` + `X-OAuth-Token` 双凭证调用 `developer.zhihu.com/api/v1/user/followees`，驱动「我的」页面的「故事里的相遇」。
+- ✅ 以后：验收其余用户接口（创作 / 收藏夹列表 / 收藏夹内容 / 近期收藏）后再接入对应游戏业务。
 - ✅ 以后：医生脚本（`vendor/zhihu-hackathon/scripts/doctor.mjs`）只在开发机运行；CI 不跑。
 
 ## 6. 校验快照

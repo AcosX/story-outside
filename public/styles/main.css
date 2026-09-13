@@ -910,54 +910,95 @@ body[data-view="player"] .story-name {
   color: #909bad;
   font-size: 13px;
 }
-#social-panel-host {
-  position: static !important;
-  width: 100%;
-  font-family: inherit !important;
-  z-index: auto !important;
+/* 故事里的相遇 —— 与「阅读历史」同一套版式语言 */
+.community-lead {
+  font-size: 13px;
+  color: var(--muted);
+  margin: -8px 0 18px;
 }
-.social-panel-card {
-  width: 100% !important;
-  max-width: none !important;
-  background: white !important;
-  color: #69768c !important;
-  box-shadow: none !important;
-  padding: 0 !important;
-  backdrop-filter: none !important;
-  border-radius: 0 !important;
+.community-share {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
+  padding: 14px 16px;
+  margin-bottom: 22px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #f8faff;
 }
-.social-panel-card > div:first-child,
-#social-panel-close,
-#social-panel-share-target {
-  display: none !important;
+.community-share-text {
+  margin: 0;
+  flex: 1 1 220px;
+  font-size: 13px;
+  color: #68768d;
 }
-#social-panel-auth {
-  padding: 0 0 14px;
-  font-size: 12px !important;
+.community-share .btn {
+  min-height: 36px;
+  padding: 8px 16px;
+  font-size: 12px;
 }
-#social-panel-actions {
-  gap: 9px !important;
-  margin: 0 0 20px !important;
+.community-share .btn[hidden] {
+  display: none;
 }
-#social-panel-actions button {
-  padding: 9px 14px !important;
-  border: 1px solid var(--line) !important;
-  background: #f8faff !important;
-  border-radius: 6px !important;
-  color: #4e679c !important;
+.community-feed {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
 }
-#social-panel-feed {
-  max-height: 400px !important;
-  font-size: 13px !important;
-  padding: 20px 0;
+.community-item {
+  display: flex;
+  gap: 14px;
+  align-items: flex-start;
+  padding: 16px 0;
   border-top: 1px solid var(--line);
-  line-height: 1.9 !important;
 }
-#social-panel-feed > div {
-  border-color: var(--line) !important;
+.community-item:first-child {
+  border-top: none;
+  padding-top: 0;
 }
-#social-panel-status {
-  font-size: 11px !important;
+.community-avatar {
+  width: 40px;
+  height: 40px;
+  border-radius: 50%;
+  object-fit: cover;
+  flex: none;
+}
+.community-item-body {
+  min-width: 0;
+}
+.community-item-name {
+  margin: 0 0 4px;
+  font-size: 14px;
+  font-weight: 600;
+}
+.community-item-name a {
+  color: inherit;
+  text-decoration: none;
+}
+.community-item-name a:hover {
+  text-decoration: underline;
+}
+.community-item-story {
+  margin: 0 0 4px;
+  font-size: 13px;
+  color: #68768d;
+  overflow-wrap: anywhere;
+}
+.community-item-meta {
+  margin: 0;
+  font-size: 12px;
+  color: var(--muted);
+}
+.community-status {
+  padding: 20px 0 0;
+  color: #909bad;
+  font-size: 13px;
+}
+.community-status[hidden] {
+  display: none;
 }
 #screen-ending {
   padding: 25px 35px;
