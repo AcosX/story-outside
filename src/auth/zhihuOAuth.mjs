@@ -9,6 +9,18 @@ const random = () => randomBytes(32).toString('base64url');
 const fail = (code, status = 400) => Object.assign(new Error(code), { code, status });
 const validSecret = value => typeof value === 'string' && value.length > 0 && value.length <= 8192 && !/[\s\x00-\x1f\x7f]/.test(value);
 
+// 知乎 /user 返回的 uid 是 19 位十进制整数，超出 IEEE-754 安全整数范围
+// (2^53-1，16 位)。直接 JSON.parse 会静默改写末几位，既拿不回真实 uid，
+// 也会让 Number.isSafeInteger 校验失败。解析前把超长整数字面量转成字符串，
+// 保留完整精度；短整数保持原有 number 语义不变。
+function parseJsonPreservingLongIntegers(text) {
+  const quoted = text.replace(
+    /("(?:\\.|[^"\\])*")|(-?\d{16,})(?=\s*[,}\]])/g,
+    (match, stringLiteral, longInteger) => (stringLiteral ? stringLiteral : `"${longInteger}"`),
+  );
+  return JSON.parse(quoted);
+}
+
 export function loadOAuthConfig(env = process.env) {
   let fields = {};
   try {
@@ -63,8 +75,9 @@ export function ownerFromProfile(payload, appId) {
   // Accept the documented stable uid only; never
   // derive identity from a display name, token, or Access Secret's account.
   const id = source?.uid;
-  if (!source || Array.isArray(source) || !((typeof id === 'string' && /^[1-9][0-9]{0,19}$/.test(id)) || (Number.isSafeInteger(id) && id > 0))) throw fail('oauth_identity_unavailable', 502);
-  const bytes = createHash('sha256').update(`zhihu:${appId}:${id}`).digest().subarray(0, 16);
+  const idText = typeof id === 'number' && Number.isSafeInteger(id) ? String(id) : id;
+  if (!source || Array.isArray(source) || typeof idText !== 'string' || !/^[1-9][0-9]{0,31}$/.test(idText)) throw fail('oauth_identity_unavailable', 502);
+  const bytes = createHash('sha256').update(`zhihu:${appId}:${idText}`).digest().subarray(0, 16);
   bytes[6] = (bytes[6] & 15) | 0x50; bytes[8] = (bytes[8] & 63) | 0x80;
   const hex = bytes.toString('hex');
   return Object.freeze({
@@ -102,7 +115,7 @@ export function createZhihuOAuth(config, { fetchImpl = (...args) => fetch(...arg
         if (length > 65536) throw fail('oauth_upstream_failed', 502);
         chunks.push(Buffer.from(chunk));
       }
-      const payload = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+      const payload = parseJsonPreservingLongIntegers(Buffer.concat(chunks).toString('utf8'));
       if (!payload || typeof payload !== 'object' || Array.isArray(payload)) throw fail('oauth_upstream_failed', 502);
       return payload;
     } catch { throw fail('oauth_upstream_failed', 502); }
