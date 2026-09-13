@@ -226,8 +226,45 @@ console.log('故事里的相遇 — 区块公开面');
     `status=${feedData && feedData.status}`
   );
 
+  // share-status：恢复按钮初始态的只读端点。非本人 / 不存在的会话一律
+  // shared:false，不确认存在性。注意顺序：上面刚 share 过，先 unshare 回到
+  // 未公开态再验证 shared:false → 重新 share 验证 shared:true → 撤回。
+  const unshareFirstRes = await fetch(`${baseUrl}/v1/ecosystem/sessions/${sessionData.session_uuid}/unshare`, { method: 'POST' });
+  check('network: unshare（无 body）→ 200', unshareFirstRes.status === 200, `got ${unshareFirstRes.status}`);
+  const statusRes = await fetch(`${baseUrl}/v1/ecosystem/sessions/${sessionData.session_uuid}/share-status`);
+  const statusData = await statusRes.json();
+  check('network: share-status（未公开）→ 200 + shared:false', statusRes.status === 200 && statusData && statusData.shared === false, `got ${statusRes.status} ${JSON.stringify(statusData)}`);
+  const otherSession = '11111111-2222-4333-8444-555566667777';
+  const notMineRes = await fetch(`${baseUrl}/v1/ecosystem/sessions/${otherSession}/share-status`);
+  const notMineData = await notMineRes.json();
+  check(
+    'network: share-status（不存在的会话）→ 200 + shared:false，不确认存在性',
+    notMineRes.status === 200 && notMineData && notMineData.shared === false,
+    `got ${notMineRes.status} ${JSON.stringify(notMineData)}`,
+  );
+  const badUuidRes = await fetch(`${baseUrl}/v1/ecosystem/sessions/not-a-uuid/share-status`);
+  check('network: share-status（非法 UUID）→ 400', badUuidRes.status === 400, `got ${badUuidRes.status}`);
+
+  // 重新公开 → shared:true + shared_at。前端靠这个在刷新页面后
+  // 恢复「公开 / 撤回」按钮的正确初始态。
+  await fetch(`${baseUrl}/v1/ecosystem/sessions/${sessionData.session_uuid}/share`, { method: 'POST' });
+  const sharedRes = await fetch(`${baseUrl}/v1/ecosystem/sessions/${sessionData.session_uuid}/share-status`);
+  const sharedData = await sharedRes.json();
+  check(
+    'network: share-status（已公开）→ 200 + shared:true + shared_at',
+    sharedRes.status === 200 && sharedData && sharedData.shared === true && typeof sharedData.shared_at === 'string',
+    `got ${sharedRes.status} ${JSON.stringify(sharedData)}`,
+  );
+
   const unshareRes = await fetch(`${baseUrl}/v1/ecosystem/sessions/${sessionData.session_uuid}/unshare`, { method: 'POST' });
-  check('network: unshare（无 body）→ 200', unshareRes.status === 200, `got ${unshareRes.status}`);
+  check('network: unshare（再次撤回）→ 200', unshareRes.status === 200, `got ${unshareRes.status}`);
+  const backRes = await fetch(`${baseUrl}/v1/ecosystem/sessions/${sessionData.session_uuid}/share-status`);
+  const backData = await backRes.json();
+  check(
+    'network: share-status（撤回后）→ shared:false',
+    backRes.status === 200 && backData && backData.shared === false,
+    `got ${backRes.status} ${JSON.stringify(backData)}`,
+  );
 }
 
 // ---------------------------------------------------------------------------

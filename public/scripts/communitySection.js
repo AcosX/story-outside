@@ -191,9 +191,14 @@ async function refreshShareAction() {
     return;
   }
   // 公开与撤回的最终权限由服务端按 canonical owner 判定；这里只是入口。
-  shareBtn.hidden = false;
-  unshareBtn.hidden = true;
-  setShareText(COPY.shareIdle);
+  // 先按服务端的分享状态恢复按钮：已公开的会话刷新页面后仍显示「撤回」，
+  // 而不是回到「公开」并声称「只有你自己能看到」。
+  let shared = false;
+  const { status, data } = await fetchJson(`/v1/ecosystem/sessions/${uuid}/share-status`, { method: 'GET' });
+  if (status === 200 && data && data.shared === true) shared = true;
+  shareBtn.hidden = shared;
+  unshareBtn.hidden = !shared;
+  setShareText(shared ? COPY.shareShared : COPY.shareIdle);
 }
 
 function renderFeedItems(items) {

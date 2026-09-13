@@ -3252,6 +3252,42 @@ async function handleRequest(req, res) {
     }
   }
 
+  // GET /v1/ecosystem/sessions/:session_uuid/share-status — 本人查询当前
+  // 会话是否已被自己公开。只读、不带 body；用于「我的」页面恢复「公开这段
+  // 故事 / 撤回」按钮的正确初始态（否则刷新后已公开的会话仍显示「公开」）。
+  // 非本人会话一律 shared:false —— 不确认存在性，也不返回归属信息。
+  if (
+    method === 'GET'
+    && pathname.startsWith('/v1/ecosystem/sessions/')
+    && pathname.endsWith('/share-status')
+  ) {
+    const tail = pathname.slice('/v1/ecosystem/sessions/'.length, -'/share-status'.length);
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(tail)) {
+      return jsonResponse(res, 400, {
+        error: 'validation_failed',
+        message: 'session_uuid must be a UUID.',
+        ...publicDecorate(),
+      });
+    }
+    const authUuid = requireAuthUserUuid(res, req);
+    if (!authUuid) return;
+    try {
+      const row = followingService.findOwnShare({
+        storyRepository: storyRepo,
+        sessionUuid: tail,
+        ownerUuid: authUuid,
+      });
+      return jsonResponse(res, 200, {
+        ...publicDecorate(),
+        session_uuid: tail,
+        shared: !!row,
+        shared_at: row ? row.updated_at : null,
+      });
+    } catch (err) {
+      return sendFollowingError(res, err);
+    }
+  }
+
   // ClickUp 16.2 P1.v2 (2026-09-07 ChatGPT review):
   //   POST /v1/ecosystem/discussions — public surface.
   //

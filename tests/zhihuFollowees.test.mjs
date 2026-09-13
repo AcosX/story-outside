@@ -27,6 +27,7 @@ import { createZhihuAccountDirectory } from '../src/ecosystem/following/director
 import { computeFriendTimelines, createFollowingService } from '../src/ecosystem/following/service.mjs';
 import { createInMemoryFollowingRepository } from '../src/ecosystem/following/repository.mjs';
 import { urlTokenFromProfileUrl, ownerFromProfile } from '../src/auth/zhihuOAuth.mjs';
+import { repositoryState } from '../src/stories/sessionService.mjs';
 
 const SECRET = 'test-access-secret-value';
 const TOKEN = 'test-user-oauth-token';
@@ -275,6 +276,11 @@ const NORMALISED = [
   const storyRepository = {
     findStoryByUuid: () => ({ title: '兜底书名' }),
   };
+  // findOwnShare 走 findCanonicalOwnerBySession（真实 sessionService），归属
+  // 存在 symbol 键的会话状态里；用真实导出的 repositoryState 播种，不伪造形状。
+  const ownershipRepository = {};
+  const ownershipSessions = repositoryState(ownershipRepository).sessions;
+  ownershipSessions.set(friendSession, { user_uuid: friend });
 
   const service = createFollowingService({
     repository,
@@ -340,6 +346,21 @@ const NORMALISED = [
   const pure = computeFriendTimelines({ repository, followerUuid: me, ownerUuids: [friend] });
   assert.equal(pure.follower_uuid, me);
   assert.ok(pure.items.length >= 1);
+
+  // findOwnShare：本人查询「当前会话是否已被自己公开」，供 share-status
+  // 路由恢复按钮初始态。非本人或未公开一律 null，不确认存在性。
+  const mySession = randomUUID();
+  ownershipSessions.set(mySession, { user_uuid: me });
+  assert.equal(service.findOwnShare({ storyRepository: ownershipRepository, sessionUuid: friendSession, ownerUuid: me }), null, '别人的会话查不到自己的分享');
+  assert.equal(service.findOwnShare({ storyRepository: ownershipRepository, sessionUuid: mySession, ownerUuid: me }), null, '未公开的会话返回 null');
+  repository.upsertSharedSession({ session_uuid: mySession, owner_user_uuid: me, title: '我的公开' });
+  const ownShare = service.findOwnShare({ storyRepository: ownershipRepository, sessionUuid: mySession, ownerUuid: me });
+  assert.ok(ownShare && ownShare.session_uuid === mySession, '本人已公开的会话能查到');
+  assert.equal(
+    service.findOwnShare({ storyRepository: ownershipRepository, sessionUuid: mySession, ownerUuid: friend }),
+    null,
+    '其他账号查同一会话必须返回 null',
+  );
   console.log('关注流编排：真实关注 ∩ 本站账号 ∩ 已公开，含屏蔽与全部降级路径: PASS');
 }
 

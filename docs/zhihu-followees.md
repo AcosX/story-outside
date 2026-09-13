@@ -71,16 +71,16 @@ Content-Type:        application/json
 - 自己的世界线不进自己的关注流。
 - 双向屏蔽都生效：对方屏蔽我、或我屏蔽对方，均不展示。
 - 公开投影不含对方的本站内部账号标识。
-- 响应缓存 5 分钟，缓存键包含 follower 与**登录态**（token 本身是凭据，不入键）。公开或撤回后整体失效，撤回立即从所有人关注流消失。
+- 响应缓存 5 分钟，缓存键包含 follower 与**登录态**（token 本身是凭据，不入键）。公开或撤回后整体失效，撤回立即从所有人关注流消失。降级结果（`unavailable` 等）不写缓存：上游持续故障时每次进入「我的」都会重试，代价是最长一次上游超时的等待；如需负面缓存再议。
 
 ## 降级（这是必须正确的部分）
 
-`GET /v1/ecosystem/friend-timelines` 任何情况都返回 200 + 明确 `status`，绝不抛 5xx，也绝不影响故事创建与推进链路：
+`GET /v1/ecosystem/friend-timelines` 已登录时任何失败都返回 200 + 明确 `status`，绝不抛 5xx，也绝不影响故事创建与推进链路。**未登录是例外：路由层直接 401**（`requireAuthUserUuid`），不会走到 service 层的 `login_required` 分支——该分支只在「已登录但会话内无用户 token」时出现。前端对 401 和 `status` 两个分支都有处理：
 
 | `status` | 含义 | 前端文案 |
 | --- | --- | --- |
 | `ok` | 正常 | 列表，或「还没有人公开过」 |
-| `login_required` | 未登录 | 登录知乎后查看 |
+| `login_required` | 已登录但会话内无用户 token（未登录在路由层即 401） | 登录知乎后查看 |
 | `unconfigured` | 未配置 Access Secret | 该能力未在本次部署启用 |
 | `missing_oauth_token` | 会话无用户 token | 同上 |
 | `unavailable` | 上游超时 / 限流 / 异常 | 暂时读不到，稍后再看 |
@@ -91,7 +91,7 @@ Content-Type:        application/json
 
 模块从 `public/scripts/socialPanel.js` 改名为 `public/scripts/communitySection.js`，直接渲染进 `#community-section`，复用 `.recent-section` 的 eyebrow / h2 / 卡片 / 空态语言，与「阅读历史」一致；不再有悬浮宿主与内联样式。
 
-按钮按「无需则取消」处理：关闭、加关注、刷新关注流全部删除（进入「我的」自动加载）。**只保留「公开这段故事 / 撤回」**——那是本人对自己内容的处置，无法由知乎代劳。分享时服务端补上故事标题，列表显示头像、昵称（链到知乎主页）、《书名》与时间。
+按钮按「无需则取消」处理：关闭、加关注、刷新关注流全部删除（进入「我的」自动加载）。**只保留「公开这段故事 / 撤回」**——那是本人对自己内容的处置，无法由知乎代劳。分享时服务端补上故事标题，列表显示头像、昵称（链到知乎主页）、《书名》与时间。按钮初始态由 `GET /v1/ecosystem/sessions/:uuid/share-status` 恢复（服务端按 canonical owner 判定，非本人会话恒为 `shared:false`，不确认存在性）；否则刷新页面后已公开的会话会错误地显示「公开」。
 
 前端身份边界未松动：不携带任何调用者身份，分享 / 撤回不带 body（服务端要求 `Content-Length: 0`）。转正后前端连 `target_user_uuid` 都不再需要，`public/scripts/` 代码行的调用者身份名命中数要求为 0（比改版前更严格）。
 
