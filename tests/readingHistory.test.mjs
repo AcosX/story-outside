@@ -50,3 +50,18 @@ assert.deepEqual(resumed, []);
 probes[1](false); await b;
 assert.deepEqual(resumed, ['session-b']);
 console.log('reading history stale resume isolation: PASS');
+
+// Account switching cannot expose the legacy/shared demo shelf or another user.
+state.authConfigured = true; state.ownerUuid = 'account-a';
+assert.equal(bind.readReadingHistory().length, 0);
+Object.assign(state, saved('a'), { finished: false }); bind.rememberReading();
+assert.equal(bind.readReadingHistory().length, 1);
+state.ownerUuid = 'account-b';
+assert.equal(bind.readReadingHistory().length, 0);
+Object.assign(state, saved('b')); bind.rememberReading();
+assert.equal(bind.readReadingHistory().length, 1);
+state.ownerUuid = 'account-a';
+assert.deepEqual(bind.readReadingHistory().map(x => x.sessionUuid), ['session-a']);
+state.ownerUuid = null;
+assert.equal(bind.readReadingHistory().length, 0);
+console.log('reading history account isolation and anonymous privacy: PASS');

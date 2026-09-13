@@ -1392,3 +1392,9 @@ body > #social-panel-host {
 .reading-pagination button:disabled { opacity: .4; cursor: default; }
 @media (max-width: 600px) { .reading-grid { grid-template-columns: repeat(3, minmax(0, 120px)); gap: 20px 12px; } .reading-card .cover-fallback { font-size: 15px; padding: 8px; } }
 @media (max-width: 360px) { .reading-grid { grid-template-columns: repeat(2, minmax(0, 120px)); } .reading-pagination { gap: 8px; } }
+
+.account-controls { display: flex; align-items: center; gap: 8px; font-size: 13px; }
+.account-controls[hidden], .account-controls [hidden] { display: none; }
+.account-controls a, .account-controls button { color: #1768c6; background: #eef5ff; border: 0; border-radius: 8px; padding: 8px 10px; text-decoration: none; cursor: pointer; white-space: nowrap; }
+#account-name { max-width: 110px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+@media (max-width: 600px) { #account-name { max-width: 64px; } .account-controls { gap: 4px; } }
