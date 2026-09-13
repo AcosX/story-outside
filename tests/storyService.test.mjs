@@ -379,7 +379,7 @@ async function runChecks() {
       story_version_uuid: cafe.story_version_uuid,
       profile: {
         identifier: 'opening-default',
-        rules_version: 'opening-rules/2',
+        rules_version: 'opening-rules/next',
         locale: 'zh-CN',
       },
     });
@@ -403,7 +403,7 @@ async function runChecks() {
       story_version_uuid: cafe.story_version_uuid,
       profile: {
         identifier: 'opening-default',
-        rules_version: 'opening-rules/2',
+        rules_version: 'opening-rules/next',
         locale: 'zh-CN',
       },
     });

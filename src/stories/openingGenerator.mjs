@@ -166,8 +166,15 @@ export function generateOpeningCache(input) {
       structured && typeof structured.speaker === 'string' && structured.speaker
         ? structured.speaker
         : undefined;
+    // Carry the verbatim first-person track through to the cache event when
+    // the preparation step produced one. Both tracks live on the same event
+    // so the cache stays work-level: no role ever reaches the cache key.
+    const firstPerson =
+      structured && typeof structured.text_first_person === 'string' && structured.text_first_person
+        ? { text_first_person: structured.text_first_person }
+        : {};
     if (type === 'action') {
-      events.push({ type: 'action', sequence: events.length, text, ...progressMetadata(structured) });
+      events.push({ type: 'action', sequence: events.length, text, ...firstPerson, ...progressMetadata(structured) });
       continue;
     }
     const speaker =
@@ -178,7 +185,7 @@ export function generateOpeningCache(input) {
     const ev = speaker
       ? { type: 'dialogue', sequence: events.length, text, speaker }
       : { type: 'narration', sequence: events.length, text };
-    events.push({ ...ev, ...progressMetadata(structured) });
+    events.push({ ...ev, ...firstPerson, ...progressMetadata(structured) });
   }
   if (events.length === 0) {
     boundary = 'empty_story';

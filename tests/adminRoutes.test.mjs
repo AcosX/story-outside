@@ -104,7 +104,7 @@ try {
         story_version_uuid: cafeFixture.versions[0].story_version_uuid,
         profile: {
           identifier: 'opening-default',
-          rules_version: 'opening-rules/2',
+          rules_version: 'opening-rules/next',
           locale: 'zh-CN',
         },
       }),

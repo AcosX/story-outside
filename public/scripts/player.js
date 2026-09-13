@@ -906,7 +906,10 @@ async function performrunOpeningStep() {
   // landed in between.
   const placeholderEl = renderPendingPlaceholder({
     type: event.type,
-    text: event.text,
+    // The server projects the opening onto the track this role should read
+    // (original first person for "我", neutral third person otherwise).
+    // `text` stays the canonical neutral value for the commit comparison.
+    text: typeof event.display_text === 'string' ? event.display_text : event.text,
     speaker: event.speaker,
     sequence,
   }, state.canonicalHistory.length + sequence);

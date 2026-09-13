@@ -170,6 +170,12 @@ export function canonicalStoryContent(detail) {
     };
     if (typeof b.type === 'string' && b.type) beat.type = b.type;
     if (typeof b.speaker === 'string' && b.speaker) beat.speaker = b.speaker;
+    // Second narration track for first-person sources (see
+    // stories/openingFirstPerson.mjs). It is content, so it participates in
+    // the content hash; absent on third-person stories and legacy rows.
+    if (typeof b.text_first_person === 'string' && b.text_first_person) {
+      beat.text_first_person = b.text_first_person;
+    }
     return beat;
   });
   return {

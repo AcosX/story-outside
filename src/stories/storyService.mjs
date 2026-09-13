@@ -76,7 +76,11 @@ import { generateOpeningCache } from './openingGenerator.mjs';
 export function defaultGenerationProfile() {
   return {
     identifier: 'opening-default',
-    rules_version: 'opening-rules/1',
+    // opening-rules/2 adds the dual-track opening (neutral third person +
+    // verbatim first person). Bumping the rules version gives every existing
+    // work a new generation_hash, so single-track caches are rebuilt instead
+    // of being served without a first-person track.
+    rules_version: 'opening-rules/2',
     locale: 'zh-CN',
     variant: 'default',
   };

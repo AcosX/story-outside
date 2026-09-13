@@ -155,7 +155,12 @@ try {
     assert.equal(payload.player_perspective.narration_person, 'second_person');
     assert.deepEqual(payload.original_story, story);
     assert.equal(payload.committed_history[0].event_seq, 12);
-    assert.match(actual[0].content, /不得让玩家替原作主角或其他角色做决定/);
+    assert.match(actual[0].content, /不得让玩家替原作第一人称角色或其他角色做决定/);
+    assert.match(actual[0].content, /不要使用“主角”“男主”“女主”“主人公”这类代称/);
+    assert.deepEqual(
+      payload.player_perspective.other_roles,
+      roles.filter((candidate) => candidate.id !== role.id),
+    );
     assert.match(actual[0].content, /即使旧历史误用了原作视角/);
     assert.match(actual[0].content, /不得虚构“你知道”“你听说”“你记得”“你曾认识”/);
     assert.match(actual[0].content, /不确定时让玩家通过观察、询问或调查获得信息/);

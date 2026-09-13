@@ -13,6 +13,7 @@ const tests = [
   "tests/canonicalHash.test.mjs",
   "tests/cacheKey.test.mjs",
   "tests/openingGenerator.test.mjs",
+  "tests/openingFirstPerson.test.mjs",
   "tests/storyService.test.mjs",
   "tests/sessionService.test.mjs",
   "tests/sessionHttp.test.mjs",
