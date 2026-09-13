@@ -1306,9 +1306,26 @@ export function registerTurnRequest({ repository, session_uuid, request_id, fing
 /**
  * Discard any speculative pending batch without committing.
  */
-export function discardPendingTail({ repository, session_uuid }) {
+export function discardPendingTail({ repository, session_uuid, pending_id }) {
   if (!repository) throw new Error('discardPendingTail: repository required');
   const session = sessionForActive(repository, session_uuid);
+  // Optional targeted discard. A client that abandons an in-flight turn
+  // asks to drop THAT batch by id; between its request and this call an
+  // interrupt may already have dropped it and a newer turn may have
+  // staged a different one. Without this guard the late cleanup would
+  // silently delete the new batch and desynchronise the live player.
+  // An id that no longer matches is a benign no-op, not an error: the
+  // caller's intent (that batch must not stay pending) already holds.
+  if (pending_id !== undefined && pending_id !== null) {
+    assertUuid('pending_id', pending_id);
+    if (!session.pending || session.pending.pending_id !== pending_id) {
+      return {
+        dropped_pending_id: null,
+        dropped_pending_count: 0,
+        state: session.state,
+      };
+    }
+  }
   const dropped = session.pending;
   session.pending = null;
   return {

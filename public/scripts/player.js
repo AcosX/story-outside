@@ -1210,6 +1210,29 @@ async function performcommitNextPendingItem() {
   }
 }
 
+// Release a pending batch that was staged by a turn the client has
+// already abandoned. Without this the server keeps an unconsumed
+// pending batch and every subsequent /generate on that session fails
+// with `pending_conflict` until the page is reloaded.
+//
+// Strictly best-effort and deliberately silent:
+//   * the player has already moved on, so there is nothing to render
+//     and nothing actionable to report;
+//   * an interrupt that lands first already dropped the batch, so a
+//     404 / state error here is an expected benign race;
+//   * this must never throw into performstartNextBatch's catch, or a
+//     cleanup failure would surface as a bogus "请求失败" toast for a
+//     turn the player abandoned on purpose.
+async function discardSupersededPending(sessionUuid, pendingId) {
+  if (!sessionUuid || !pendingId) return;
+  try {
+    await api(`/api/sessions/${sessionUuid}/discard-pending`, {
+      method: 'POST',
+      body: JSON.stringify({ pending_id: pendingId }),
+    });
+  } catch { /* superseded cleanup is best-effort by design */ }
+}
+
 function startNextBatch() {
   if (state.startNextBatchInFlight) return state.startNextBatchInFlight;
   const operation = performstartNextBatch();
@@ -1246,6 +1269,10 @@ async function performstartNextBatch() {
   // see narration/dialogue mix.
   const inputText = state.nextBatchInput || 'hello';
   state.nextBatchInput = null;
+  // Remember which session this turn was issued for: the superseded
+  // cleanup below must target THAT session, never whatever session the
+  // player has navigated to in the meantime.
+  const supersededSession = state.sessionUuid;
   try {
     const turn = await api(`/api/sessions/${state.sessionUuid}/generate`, {
       method: 'POST',
@@ -1255,7 +1282,19 @@ async function performstartNextBatch() {
         request_id: requestId,
       }),
     });
-    if (generationEpoch !== (state.generationEpoch || 0)) return;
+    if (generationEpoch !== (state.generationEpoch || 0)) {
+      // The turn was superseded (player interrupt / navigation / reload)
+      // WHILE the request was in flight. The response still landed a real
+      // pending batch on the server. Dropping it here without telling the
+      // server would leave an unconsumed pending batch that no client
+      // tracks: every later /generate then fails closed with
+      // `pending_conflict` (stageNarrativeBatch refuses to overwrite an
+      // active pending) and the session is stuck until a reload.
+      // Release it explicitly. Best-effort: a failure here must never
+      // replace the newer turn's outcome.
+      await discardSupersededPending(supersededSession, turn.pending_id);
+      return;
+    }
     state.lastRevision = turn.revision;
     state.pending = {
       pending_id: turn.pending_id,
