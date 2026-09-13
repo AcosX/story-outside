@@ -20,4 +20,3 @@ export function narratesWith(text, pronoun) {
   for (const term of PRONOUN_FALSE_POSITIVES) stripped = stripped.split(term).join('');
   return stripped.includes(pronoun);
 }
-
