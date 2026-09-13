@@ -4,12 +4,17 @@ import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { createTokenEstimator } from './tokenEstimator.mjs';
 import { TOOL_DEFINITIONS, executeToolCall } from './tools.mjs';
+import { warn as loggerWarn } from '../observability/logger.mjs';
 
 const RETRYABLE_HTTP_STATUSES = new Set([408, 425, 429, 500, 502, 503, 504]);
 const MAX_RESPONSE_BYTES = 2_000_000;
-const DEFAULT_MAX_RETRIES = 2;
+const DEFAULT_MAX_RETRIES = 3;
 const DEFAULT_RETRY_BASE_DELAY_MS = 250;
 const DEFAULT_RETRY_MAX_DELAY_MS = 2_000;
+// A backup OpenAI-compatible channel gets at most one retry: it only runs
+// after the primary channel already exhausted its own budget, so a long
+// backup loop would push the total turn past proxy timeouts.
+const BACKUP_MAX_RETRIES = 1;
 
 export class AIProviderError extends Error {
   constructor(message, { code = 'provider_failure', retryable = false, status, retryAfterMs } = {}) {
@@ -41,13 +46,28 @@ export function loadAIConfig(env = process.env) {
     cacheDir: env.STORY_OUTSIDE_AI_CACHE_DIR || fileURLToPath(new URL('../../secrets/ai-cache/', import.meta.url)),
     contextChars: Number(env.STORY_OUTSIDE_AI_CONTEXT_CHARS || 180000),
     contextWindow: env.STORY_OUTSIDE_AI_CONTEXT_TOKENS ? Number(env.STORY_OUTSIDE_AI_CONTEXT_TOKENS) : undefined,
+    maxRetries: env.STORY_OUTSIDE_AI_MAX_RETRIES !== undefined ? Number(env.STORY_OUTSIDE_AI_MAX_RETRIES) : undefined,
+    backupApiKey: env.STORY_OUTSIDE_AI_BACKUP_API_KEY || fields['AI Backup API Key'],
+    backupBaseURL: env.STORY_OUTSIDE_AI_BACKUP_BASE_URL || fields['AI Backup OpenAI Base URL'],
+    backupModel: env.STORY_OUTSIDE_AI_BACKUP_MODEL || fields['AI Backup Model'],
   };
   if (!config.apiKey || !config.model || !config.baseURL) throw new Error('AI configuration missing: API key, base URL and model are required');
   if (!Number.isFinite(config.timeoutMs) || config.timeoutMs < 1000 || config.timeoutMs > 300000 || !Number.isFinite(config.contextChars) || config.contextChars < 1000) throw new Error('Invalid AI timeout or context limit');
   if (config.contextWindow !== undefined && (!Number.isInteger(config.contextWindow) || config.contextWindow <= 3500)) throw new Error('Invalid AI token context window');
+  if (config.maxRetries !== undefined && (!Number.isInteger(config.maxRetries) || config.maxRetries < 0 || config.maxRetries > DEFAULT_MAX_RETRIES)) throw new Error('Invalid AI retry limit');
   const url = new URL(config.baseURL);
   if (url.username || url.password || url.search || url.hash) throw new Error('AI base URL must not include credentials, query or fragment');
   if (url.protocol !== 'https:' && !['localhost', '127.0.0.1'].includes(url.hostname)) throw new Error('AI base URL must use HTTPS');
+  const backupParts = [config.backupApiKey, config.backupBaseURL, config.backupModel];
+  if (backupParts.some(part => part !== undefined && part !== null && part !== '') && backupParts.some(part => part === undefined || part === null || part === '')) {
+    throw new Error('AI backup configuration requires API key, base URL and model together');
+  }
+  if (backupParts.every(part => part)) {
+    let backupUrl;
+    try { backupUrl = new URL(config.backupBaseURL); } catch { throw new Error('AI backup base URL is not a valid URL'); }
+    if (backupUrl.username || backupUrl.password || backupUrl.search || backupUrl.hash) throw new Error('AI backup base URL must not include credentials, query or fragment');
+    if (backupUrl.protocol !== 'https:' && !['localhost', '127.0.0.1'].includes(backupUrl.hostname)) throw new Error('AI backup base URL must use HTTPS');
+  }
   return config;
 }
 
@@ -167,16 +187,22 @@ async function requestCompletion({ config, fetchImpl, messages, maxTokens, attem
   try {
     return JSON.parse(content.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, ''));
   } catch {
+    // The model replying with prose instead of the required JSON object is
+    // the dominant production failure (measured 2026-09-13: 5 of 6 upstream
+    // calls ignored response_format json_object). At temperature > 0 the
+    // next attempt is an independent draw and frequently parses, so this
+    // MUST stay inside the retry budget rather than fail the turn outright.
     throw new AIProviderError('AI returned malformed structured content', {
-      code: 'invalid_response', retryable: false,
+      code: 'invalid_response', retryable: true,
     });
   }
 }
 
-export function createAICompletion({ config, fetchImpl = fetch }) {
+function retryChannel({ config, fetchImpl, label }) {
   return async function completion(messages, maxTokens) {
     const options = retryOptions(config);
     for (let attempt = 0; attempt <= options.maxRetries; attempt += 1) {
+      const startedAt = Date.now();
       try {
         return await requestCompletion({ config, fetchImpl, messages, maxTokens, attempt, options });
       } catch (error) {
@@ -186,12 +212,40 @@ export function createAICompletion({ config, fetchImpl = fetch }) {
               code: 'transport_error', retryable: true,
             });
         if (!typed.retryable || attempt >= options.maxRetries) throw typed;
+        loggerWarn('ai.completion.retry', {
+          component: 'agent', model: config.model, error_code: typed.code,
+          latency_ms: Date.now() - startedAt, retried: true,
+          extra: { attempt: attempt + 1, channel: label, status: typed.status ?? null },
+        });
         await waitForRetry(typed.retryAfterMs ?? retryAfterMs(null, attempt, options));
       }
     }
     throw new AIProviderError('AI request unavailable or timed out', {
       code: 'transport_error', retryable: true,
     });
+  };
+}
+
+export function createAICompletion({ config, fetchImpl = fetch }) {
+  const primary = retryChannel({ config, fetchImpl, label: 'primary' });
+  const backupConfig = config.backupApiKey && config.backupBaseURL && config.backupModel
+    ? { ...config, apiKey: config.backupApiKey, baseURL: config.backupBaseURL, model: config.backupModel, maxRetries: BACKUP_MAX_RETRIES }
+    : null;
+  const backup = backupConfig ? retryChannel({ config: backupConfig, fetchImpl, label: 'backup' }) : null;
+  return async function completion(messages, maxTokens) {
+    try {
+      return await primary(messages, maxTokens);
+    } catch (error) {
+      if (!backup || !(error instanceof AIProviderError)) throw error;
+      // The primary channel is exhausted (network, upstream errors, or
+      // repeated malformed output). Any other OpenAI-compatible channel is
+      // strictly better than failing the player's turn.
+      loggerWarn('ai.completion.fallback', {
+        component: 'agent', model: backupConfig.model, error_code: error.code,
+        extra: { primary_model: config.model, status: error.status ?? null },
+      });
+      return backup(messages, maxTokens);
+    }
   };
 }
 

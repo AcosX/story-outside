@@ -6,6 +6,17 @@ assert.throws(()=>loadAIConfig({STORY_OUTSIDE_AI_PROVIDER:'invalid'}));
 const env = { STORY_OUTSIDE_AI_PROVIDER: 'real', STORY_OUTSIDE_AI_API_KEY: 'test', STORY_OUTSIDE_AI_BASE_URL: 'https://example.invalid/v1', STORY_OUTSIDE_AI_MODEL: 'test', STORY_OUTSIDE_AI_SECRET_FILE: '/nonexistent/compact-test-secret' };
 assert.equal(loadAIConfig({ ...env, STORY_OUTSIDE_AI_CONTEXT_TOKENS: '128000' }).contextWindow, 128000);
 assert.throws(() => loadAIConfig({ ...env, STORY_OUTSIDE_AI_CONTEXT_TOKENS: '3500' }), /token context window/);
+assert.equal(loadAIConfig({ ...env, STORY_OUTSIDE_AI_MAX_RETRIES: '2' }).maxRetries, 2);
+assert.throws(() => loadAIConfig({ ...env, STORY_OUTSIDE_AI_MAX_RETRIES: '9' }), /retry limit/);
+assert.throws(() => loadAIConfig({ ...env, STORY_OUTSIDE_AI_MAX_RETRIES: '1.5' }), /retry limit/);
+const backupEnv = { ...env, STORY_OUTSIDE_AI_BACKUP_API_KEY: 'backup-k', STORY_OUTSIDE_AI_BACKUP_BASE_URL: 'https://backup.invalid/v1', STORY_OUTSIDE_AI_BACKUP_MODEL: 'backup-m' };
+const loadedBackup = loadAIConfig(backupEnv);
+assert.equal(loadedBackup.backupApiKey, 'backup-k');
+assert.equal(loadedBackup.backupBaseURL, 'https://backup.invalid/v1');
+assert.equal(loadedBackup.backupModel, 'backup-m');
+assert.throws(() => loadAIConfig({ ...backupEnv, STORY_OUTSIDE_AI_BACKUP_MODEL: undefined }), /backup configuration requires/);
+assert.throws(() => loadAIConfig({ ...backupEnv, STORY_OUTSIDE_AI_BACKUP_BASE_URL: 'not a url :' }), /backup base URL/);
+assert.throws(() => loadAIConfig({ ...backupEnv, STORY_OUTSIDE_AI_BACKUP_BASE_URL: 'http://backup.invalid/v1' }), /backup base URL must use HTTPS/);
 const story={content:'完整原作'.repeat(500)};
 const calls=[];
 const provider=createAIProvider({config,story,fetchImpl:async(url,opts)=>{
@@ -23,9 +34,8 @@ assert.equal(sent.current_story_progress,0.23, 'latest estimate survives compact
 assert.match(calls[0].body.messages[0].content, /story_progress/);
 assert.ok(result.tool_call.tool_call_id);
 assert.ok(!JSON.stringify(calls).includes(config.apiKey));
-for(const stub of [async()=>({ok:false,status:401}),async()=>({ok:true,json:async()=>({choices:[{message:{content:'not json'}}]})})]) {
-  await assert.rejects(createAIProvider({config,story:{},fetchImpl:stub}).complete({canonical_history:[],input:{},pinned:{}}));
-}
+await assert.rejects(createAIProvider({config,story:{},fetchImpl:async()=>({ok:false,status:401})}).complete({canonical_history:[],input:{},pinned:{}}));
+await assert.rejects(createAIProvider({config:{...config,maxRetries:0},story:{},fetchImpl:async()=>({ok:true,json:async()=>({choices:[{message:{content:'not json'}}]})})}).complete({canonical_history:[],input:{},pinned:{}}));
 console.log('AI provider: config, full original, compact, validated choice, upstream failure and malformed JSON passed');
 
 const retryConfig = { ...config, maxRetries: 2, retryBaseDelayMs: 0, retryMaxDelayMs: 0 };
@@ -91,9 +101,27 @@ const completionPayload = { choices: [{ message: { content: JSON.stringify({ ite
   });
   await assert.rejects(
     () => completion([{ role: 'user', content: 'test' }], 100),
-    (error) => error instanceof AIProviderError && error.retryable === false,
+    (error) => error instanceof AIProviderError && error.retryable === true,
   );
-  assert.equal(calls, 1);
+  assert.equal(calls, 3);
+}
+
+// Malformed model output is the dominant production failure mode: the next
+// attempt is an independent draw, so a retry within the same budget often
+// succeeds where failing the player's turn did not.
+{
+  let calls = 0;
+  const completion = createAICompletion({
+    config: retryConfig,
+    fetchImpl: async () => {
+      calls += 1;
+      if (calls < 3) return { ok: true, json: async () => ({ choices: [{ message: { content: '你睁开眼睛，四周是灰白色的石墙。' } }] }) };
+      return { ok: true, json: async () => completionPayload };
+    },
+  });
+  const result = await completion([{ role: 'user', content: 'test' }], 100);
+  assert.deepEqual(result, { items: [{ text: '重试成功。' }] });
+  assert.equal(calls, 3);
 }
 
 {
@@ -113,6 +141,62 @@ const completionPayload = { choices: [{ message: { content: JSON.stringify({ ite
   assert.equal(calls, 3);
 }
 console.log('AI provider: transient retries, transport retry, and deterministic failures passed');
+
+// A configured backup OpenAI-compatible channel takes over after the
+// primary channel exhausts its retry budget, with its own credentials and
+// model and a shorter retry budget.
+{
+  let primaryCalls = 0;
+  let backupCalls = 0;
+  const withBackup = { ...config, backupApiKey: 'backup-secret', backupBaseURL: 'https://backup.invalid/v1', backupModel: 'backup-model', maxRetries: 1, retryBaseDelayMs: 0, retryMaxDelayMs: 0 };
+  const completion = createAICompletion({
+    config: withBackup,
+    fetchImpl: async (url, options) => {
+      if (url.startsWith('https://backup.invalid/')) {
+        backupCalls += 1;
+        assert.equal(JSON.parse(options.body).model, 'backup-model');
+        assert.equal(options.headers.authorization, 'Bearer backup-secret');
+        return { ok: true, json: async () => completionPayload };
+      }
+      primaryCalls += 1;
+      assert.equal(options.headers.authorization, 'Bearer private-test-secret');
+      return { ok: false, status: 503, headers: { get: () => null } };
+    },
+  });
+  const result = await completion([{ role: 'user', content: 'test' }], 100);
+  assert.deepEqual(result, { items: [{ text: '重试成功。' }] });
+  assert.equal(primaryCalls, 2, 'primary channel: initial attempt + 1 retry');
+  assert.equal(backupCalls, 1, 'backup channel: succeeds on its first attempt');
+}
+{
+  let primaryCalls = 0;
+  let backupCalls = 0;
+  const withBackup = { ...config, backupApiKey: 'backup-secret', backupBaseURL: 'https://backup.invalid/v1', backupModel: 'backup-model', maxRetries: 0, retryBaseDelayMs: 0, retryMaxDelayMs: 0 };
+  const completion = createAICompletion({
+    config: withBackup,
+    fetchImpl: async (url) => {
+      if (url.startsWith('https://backup.invalid/')) { backupCalls += 1; return { ok: false, status: 429, headers: { get: () => null } }; }
+      primaryCalls += 1;
+      return { ok: false, status: 503, headers: { get: () => null } };
+    },
+  });
+  await assert.rejects(
+    () => completion([{ role: 'user', content: 'test' }], 100),
+    (error) => error instanceof AIProviderError && error.status === 429 && error.retryable === true,
+  );
+  assert.equal(primaryCalls, 1);
+  assert.equal(backupCalls, 2, 'backup channel: initial attempt + 1 retry');
+}
+{
+  let calls = 0;
+  const completion = createAICompletion({
+    config: { ...config, maxRetries: 0, retryBaseDelayMs: 0, retryMaxDelayMs: 0 },
+    fetchImpl: async () => { calls += 1; return { ok: false, status: 503, headers: { get: () => null } }; },
+  });
+  await assert.rejects(() => completion([{ role: 'user', content: 'test' }], 100));
+  assert.equal(calls, 1, 'no backup configured: primary failure is final');
+}
+console.log('AI provider: backup channel fallback after primary retry exhaustion passed');
 
 // Provider never owns session state, even when handed an old compact cache.
 const { mkdtemp, rm, writeFile, readdir } = await import('node:fs/promises');
