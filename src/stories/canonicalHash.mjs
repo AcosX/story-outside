@@ -170,9 +170,13 @@ export function canonicalStoryContent(detail) {
     };
     if (typeof b.type === 'string' && b.type) beat.type = b.type;
     if (typeof b.speaker === 'string' && b.speaker) beat.speaker = b.speaker;
-    // Second narration track for first-person sources (see
-    // stories/openingFirstPerson.mjs). It is content, so it participates in
-    // the content hash; absent on third-person stories and legacy rows.
+    // Per-role narration tracks (see stories/openingFirstPerson.mjs). They
+    // are content, so they participate in the content hash; absent on
+    // stories without generated perspective tracks and on legacy rows.
+    if (b.text_by_role && typeof b.text_by_role === 'object' && !Array.isArray(b.text_by_role)) {
+      beat.text_by_role = b.text_by_role;
+    }
+    // Legacy verbatim first-person slice from opening-rules/2 rows.
     if (typeof b.text_first_person === 'string' && b.text_first_person) {
       beat.text_first_person = b.text_first_person;
     }

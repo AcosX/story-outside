@@ -458,7 +458,7 @@ function normalizeCacheEvent(event, pinned, cache_uuid, session_uuid) {
   }
   const payload = event.payload && typeof event.payload === 'object'
     ? event.payload
-    : { type: eventType, ...progressMetadata(event), ...(event.text === undefined ? {} : { text: event.text }), ...(event.speaker === undefined ? {} : { speaker: event.speaker }), ...(typeof event.text_first_person === 'string' && event.text_first_person ? { text_first_person: event.text_first_person } : {}) };
+    : { type: eventType, ...progressMetadata(event), ...(event.text === undefined ? {} : { text: event.text }), ...(event.speaker === undefined ? {} : { speaker: event.speaker }), ...(event.text_by_role && typeof event.text_by_role === 'object' && !Array.isArray(event.text_by_role) ? { text_by_role: event.text_by_role } : {}), ...(typeof event.text_first_person === 'string' && event.text_first_person ? { text_first_person: event.text_first_person } : {}) };
   if (!pinned || pinned.sequence !== event.sequence || pinned.type !== eventType) {
     throw new Error('commitOpeningEvent: event does not belong to pinned cache');
   }

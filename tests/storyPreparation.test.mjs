@@ -8,9 +8,30 @@ import { canonicalStoryContent, canonicalStoryHash } from '../src/stories/canoni
 import { generateOpeningCache } from '../src/stories/openingGenerator.mjs';
 import { defaultGenerationProfile } from '../src/stories/storyService.mjs';
 
-// Source text is first person and long enough that the deterministic
-// first-person slicer has real sentences to work with.
 const SOURCE_TEXT = '我推开诊室的门，雨水顺着衣角滴落。林医生正在桌后整理病历。他抬头问我哪里不舒服。我没有回答，只把信放在桌沿。信封上写着请交林医生亲启。走廊里忽然响起脚步声。门缝下露出一截黑色衣摆。林医生停下笔，看了看我，又看了看信。';
+
+// Build a fetch stub that answers the two preparation call kinds: the work
+// analysis (save_story_analysis) and one per-role perspective track
+// (save_role_opening). Responses ride the legacy message-content JSON shape —
+// channels that ignore `tools` must keep working.
+function preparationStub({ analysis, tracks, onCall }) {
+  let calls = 0;
+  const seenTools = [];
+  const fetchImpl = async (_url, options) => {
+    calls += 1;
+    const body = JSON.parse(options.body);
+    const tool = body.tool_choice?.function?.name ?? 'none';
+    seenTools.push(tool);
+    if (onCall) onCall(calls, body, tool);
+    if (tool === 'save_role_opening') {
+      const target = body.messages[1].content;
+      const roleMatch = /"target_role":\{"id":"([a-z0-9-]+)"/.exec(target);
+      return { ok: true, json: async () => ({ choices: [{ message: { content: JSON.stringify({ texts: tracks[roleMatch[1]] }) } }] }) };
+    }
+    return { ok: true, json: async () => ({ choices: [{ message: { content: JSON.stringify(analysis) } }] }) };
+  };
+  return { fetchImpl, calls: () => calls, seenTools };
+}
 
 const cacheDir = await mkdtemp(join(tmpdir(), 'story-preparation-'));
 try {
@@ -18,8 +39,8 @@ try {
   const source = { id: 'one', title: '原作', hook: '原作简介', roles: [{ id: 'author', label: '作者', mood: '' }], beats: [{ index: 0, text: SOURCE_TEXT }] };
   const config = { apiKey: 'test', baseURL: 'https://example.invalid/v1', model: 'test', timeoutMs: 1000, cacheDir };
   // Every superseded preparation version must be ignored, otherwise a stale
-  // single-track opening would be served without a first-person track.
-  for (const version of ['story-preparation-v1', 'story-preparation-v2', 'story-preparation-v3', 'story-preparation-v4']) {
+  // pre-perspective-track opening would be served without per-role tracks.
+  for (const version of ['story-preparation-v1', 'story-preparation-v2', 'story-preparation-v3', 'story-preparation-v4', 'story-preparation-v5']) {
     await writeAICache(config, 'story-' + cacheHash({ version, model: config.model, id: source.id, title: source.title, beats: source.beats }), { roles: [{ id: 'traveler', label: '陈远', mood: '旅人' }], first_person_role_id: 'traveler', opening_events: [{ type: 'narration', text: '旅人走进了房间。' }] });
   }
   const analysis = {
@@ -32,49 +53,73 @@ try {
       { type: 'narration', text: '林医生停下笔，看了看桌沿的信封。', story_progress: 0.08 },
     ],
   };
-  const fetchImpl = async (_url, options) => {
-    calls++;
-    const prompt = JSON.parse(options.body).messages[0].content;
-    assert.match(prompt, /中立第三人称/);
-    assert.match(prompt, /speaker必须指向实际说话者/);
-    assert.match(prompt, /共享开场只能写所有可选玩家角色都安全的外部可观察事实/);
-    assert.match(prompt, /不得提及任何角色私有的秘密、叮嘱、记忆、认知或内心/);
-    assert.match(prompt, /严禁使用“主角”“男主”“女主”“叙述者”“那位旅人”这类代称/);
-    assert.match(prompt, /opening_source_sentence_count/);
-    return { ok: true, json: async () => ({ choices: [{ message: { content: JSON.stringify(analysis) } }] }) };
+  const tracks = {
+    traveler: [
+      { index: 0, text: '我推开诊室的门，雨水顺着衣角往下滴。' },
+      { index: 1, text: '我把信放在桌沿，看见林医生停下笔看向信封。' },
+    ],
+    doctor: [
+      { index: 0, text: '你听见诊室的门被推开，雨气涌了进来。' },
+      { index: 1, text: '你放下笔，看见来人把一封信放在桌沿。' },
+    ],
   };
+  let analysisPromptSeen = '';
+  let perspectivePromptSeen = '';
+  const stub = preparationStub({
+    analysis,
+    tracks,
+    onCall: (_call, body, tool) => {
+      if (tool === 'save_story_analysis') analysisPromptSeen = body.messages[0].content;
+      if (tool === 'save_role_opening') perspectivePromptSeen = body.messages[0].content;
+    },
+  });
   const provider = { name: 'real', getStory: async () => source };
-  const prepared = createPreparedStoryProvider(provider, config, { fetchImpl });
+  const prepared = createPreparedStoryProvider(provider, config, { fetchImpl: stub.fetchImpl });
   const [a, b] = await Promise.all([prepared.getStory('one'), prepared.getStory('one')]);
-  const c = await createPreparedStoryProvider(provider, config, { fetchImpl }).getStory('one');
-  assert.equal(calls, 1);
+  const c = await createPreparedStoryProvider(provider, config, { fetchImpl: stub.fetchImpl }).getStory('one');
+  // One analysis call plus one perspective-track call per role, all deduped
+  // by the work-level cache across repeated imports.
+  assert.equal(stub.calls(), 3);
   assert.deepEqual(a, b); assert.deepEqual(b, c);
   assert.equal(a.first_person_role_id, 'traveler'); assert.equal(a.default_role_id, 'traveler'); assert.equal(a.role_selection_required, false);
 
-  // Dual track: neutral third person keeps the AI text, first person is a
-  // verbatim prefix of the source, and both tracks have the same length.
+  // Prompt contracts: the analysis stays a neutral shared base, and the
+  // per-role calls must focalise on the target role only.
+  assert.match(analysisPromptSeen, /中立第三人称/);
+  assert.match(analysisPromptSeen, /speaker必须指向实际说话者/);
+  assert.match(analysisPromptSeen, /共享开场只能写所有可选玩家角色都安全的外部可观察事实/);
+  assert.match(analysisPromptSeen, /不得提及任何角色私有的秘密、叮嘱、记忆、认知或内心/);
+  assert.match(analysisPromptSeen, /严禁使用“主角”“男主”“女主”“叙述者”“那位旅人”这类代称/);
+  assert.match(analysisPromptSeen, /opening_source_sentence_count/);
+  assert.match(perspectivePromptSeen, /第二人称“你”指代 target_role/);
+  assert.match(perspectivePromptSeen, /第一人称“我”的口吻/);
+  assert.match(perspectivePromptSeen, /不得引入此阶段不存在的关键事件/);
+  assert.match(perspectivePromptSeen, /不得提及任何角色私有的秘密、叮嘱、记忆、认知或内心/);
+  assert.match(perspectivePromptSeen, /dialogue 条目由系统原样保留/);
+
+  // Per-role tracks: the original narrator reads a first-person generated
+  // opening, everyone else a second-person one, all on the same beats.
   const narration = a.ai_opening_events.filter((event) => event.type !== 'ask_player_choice');
   assert.equal(narration.length, 2);
-  assert.ok(narration.every((event) => typeof event.text_first_person === 'string' && event.text_first_person));
-  const firstPersonJoined = narration.map((event) => event.text_first_person).join('');
-  assert.ok(SOURCE_TEXT.startsWith(firstPersonJoined), 'first-person track must be a verbatim prefix of the source');
-  assert.ok(firstPersonJoined.includes('我推开诊室的门'), 'first-person track keeps the original narration voice');
-  assert.ok(!narration.some((event) => event.text.includes('主角')), 'neutral track must not use a generic protagonist stand-in');
+  assert.equal(narration[0].text_by_role.traveler, tracks.traveler[0].text);
+  assert.equal(narration[0].text_by_role.doctor, tracks.doctor[0].text);
+  assert.ok(tracks.traveler.every((entry) => entry.text.includes('我') && !entry.text.includes('你')), 'narrator track keeps the first-person voice');
+  assert.ok(tracks.doctor.every((entry) => entry.text.includes('你') && !entry.text.includes('我')), 'other-role track is focalised on the chosen role');
   assert.ok(narration.some((event) => event.text.includes('陈远')), 'neutral track addresses the protagonist by name');
 
   const canonical = canonicalStoryContent(a);
   assert.equal(canonical.first_person_role_id, 'traveler');
   assert.deepEqual(canonical.beats, source.beats);
   assert.equal(canonical.ai_opening_events.length, 3);
-  // The first-person track is content, so it must survive canonicalisation
+  // The per-role tracks are content, so they must survive canonicalisation
   // and participate in the content hash.
-  assert.equal(canonical.ai_opening_events[0].text_first_person, narration[0].text_first_person);
+  assert.deepEqual(canonical.ai_opening_events[0].text_by_role, narration[0].text_by_role);
   assert.notEqual(
     canonicalStoryHash(a),
     canonicalStoryHash({
       ...a,
       ai_opening_events: a.ai_opening_events.map((event, index) => (
-        index === 0 ? { ...event, text_first_person: '改写过的第一人称。' } : event
+        index === 0 ? { ...event, text_by_role: { ...event.text_by_role, traveler: '改写过的第一人称。' } } : event
       )),
     }),
   );
@@ -83,10 +128,10 @@ try {
   const opening = generateOpeningCache({ story_uuid: '11111111-1111-4111-8111-111111111111', story_version_uuid: '22222222-2222-4222-8222-222222222222', opening_key: 'default', profile: defaultGenerationProfile(), story: canonical });
   assert.equal(opening.event_count, 2);
   assert.equal(opening.events[0].text, '陈远推开诊室的门，雨水顺着衣角滴落。');
-  assert.equal(opening.events[0].text_first_person, narration[0].text_first_person);
+  assert.equal(opening.events[0].text_by_role.traveler, narration[0].text_by_role.traveler);
   assert.equal(opening.events[0].story_progress, 0.03);
   assert.equal(opening.boundary, 'truncated_before_first_choice');
-  console.log('Story preparation: roles, dual-track opening, canonical hash and first-choice boundary passed');
+  console.log('Story preparation: roles, per-role perspective tracks, canonical hash and first-choice boundary passed');
 } finally { await rm(cacheDir, { recursive: true, force: true }); }
 
 // Protagonist naming is enforced deterministically: a generic stand-in is
@@ -110,8 +155,8 @@ try {
   } finally { await rm(cacheDir2, { recursive: true, force: true }); }
 }
 
-// An invalid opening boundary is rejected. Without this the slicer would fall
-// back to the whole novel and spoil it.
+// An invalid opening boundary is rejected. Without this the scene reference
+// handed to the per-role calls would cover the whole novel and invite spoilers.
 {
   const cacheDir4 = await mkdtemp(join(tmpdir(), 'story-preparation-boundary-'));
   try {
@@ -133,7 +178,7 @@ try {
   } finally { await rm(cacheDir4, { recursive: true, force: true }); }
 }
 
-// A rejected sample is retried rather than failing the whole import.
+// A rejected analysis sample is retried rather than failing the whole import.
 {
   const cacheDir5 = await mkdtemp(join(tmpdir(), 'story-preparation-retry-'));
   try {
@@ -153,22 +198,80 @@ try {
       opening_source_sentence_count: 4,
       opening_events: [{ type: 'narration', text: '陈远推开诊室的门，雨水顺着衣角滴落。' }],
     };
+    const tracks = { traveler: [{ index: 0, text: '我推开诊室的门，雨水顺着衣角滴落。' }] };
+    let analysisCalls = 0;
+    const stub = preparationStub({
+      analysis: good,
+      tracks,
+      onCall: (_call, _body, tool) => {
+        if (tool === 'save_story_analysis') analysisCalls += 1;
+      },
+    });
     let calls = 0;
-    const fetchImpl = async () => {
-      calls++;
-      const body = calls === 1 ? bad : good;
-      return { ok: true, json: async () => ({ choices: [{ message: { content: JSON.stringify(body) } }] }) };
+    const fetchImpl = async (url, options) => {
+      calls += 1;
+      // First analysis attempt violates the naming validator; the retry and
+      // every later call are served by the standard stub.
+      if (calls === 1) return { ok: true, json: async () => ({ choices: [{ message: { content: JSON.stringify(bad) } }] }) };
+      return stub.fetchImpl(url, options);
     };
     const prepared = createPreparedStoryProvider({ name: 'real', getStory: async () => source }, config, { fetchImpl });
     const story = await prepared.getStory('five');
-    assert.equal(calls, 2, 'a rejected sample must be retried once');
-    assert.ok(story.ai_opening_events[0].text.includes('陈远'));
-    console.log('Story preparation: a rejected sample is retried instead of failing the import');
+    assert.equal(calls, 3, 'one rejected analysis + one analysis retry + one role track call');
+    assert.equal(analysisCalls, 1);
+    assert.equal(story.ai_opening_events[0].text_by_role.traveler, tracks.traveler[0].text);
+    console.log('Story preparation: a rejected analysis sample is retried instead of failing the import');
   } finally { await rm(cacheDir5, { recursive: true, force: true }); }
 }
 
-// Dialogue events render as speech bubbles, so they must not carry a prose
-// slice as their first-person track.
+// Perspective-track validators: voice violations are retried, and a track
+// that keeps violating falls back to the neutral base instead of poisoning
+// the cache — the import itself still succeeds.
+{
+  const cacheDir7 = await mkdtemp(join(tmpdir(), 'story-preparation-track-'));
+  try {
+    const source = { id: 'seven', title: '原作七', hook: '简介', roles: [], beats: [{ index: 0, text: SOURCE_TEXT }] };
+    const config = { apiKey: 'test', baseURL: 'https://example.invalid/v1', model: 'test', timeoutMs: 1000, cacheDir: cacheDir7 };
+    const analysis = {
+      roles: [{ id: 'traveler', label: '陈远', mood: '旅人' }, { id: 'doctor', label: '林医生', mood: '医生' }],
+      first_person_role_id: 'traveler',
+      protagonist_display_name: '陈远',
+      opening_source_sentence_count: 4,
+      opening_events: [{ type: 'narration', text: '陈远推开诊室的门，雨水顺着衣角滴落。' }],
+    };
+    // The doctor track keeps narrating as 我 (the original narrator's voice):
+    // exactly the regression this feature exists to prevent. Calls are keyed
+    // per role because the per-role generations run in parallel.
+    const leaking = [{ index: 0, text: '你抬头时，我推开了诊室的门。' }];
+    const valid = {
+      traveler: [{ index: 0, text: '我推开诊室的门，雨水顺着衣角滴落。' }],
+      doctor: [{ index: 0, text: '你抬起头，看见门被推开，雨气涌了进来。' }],
+    };
+    const roleCallCounts = {};
+    const stub = preparationStub({ analysis, tracks: valid });
+    const baseImpl = stub.fetchImpl;
+    const fetchImpl = async (url, options) => {
+      const body = JSON.parse(options.body);
+      if (body.tool_choice?.function?.name === 'save_role_opening') {
+        const roleId = /"target_role":\{"id":"([a-z0-9-]+)"/.exec(body.messages[1].content)[1];
+        roleCallCounts[roleId] = (roleCallCounts[roleId] ?? 0) + 1;
+        const payload = roleId === 'doctor' && roleCallCounts.doctor <= 2 ? leaking : valid[roleId];
+        return { ok: true, json: async () => ({ choices: [{ message: { content: JSON.stringify({ texts: payload }) } }] }) };
+      }
+      return baseImpl(url, options);
+    };
+    const prepared = createPreparedStoryProvider({ name: 'real', getStory: async () => source }, config, { fetchImpl });
+    const story = await prepared.getStory('seven');
+    assert.equal(roleCallCounts.doctor, 2, 'the leaking doctor track is retried once before falling back');
+    assert.equal(roleCallCounts.traveler, 1);
+    assert.equal(story.ai_opening_events[0].text_by_role.traveler, valid.traveler[0].text);
+    assert.ok(!('doctor' in story.ai_opening_events[0].text_by_role), 'a track that keeps violating is omitted instead of cached');
+    console.log('Story preparation: perspective tracks are voice-validated and fall back per role');
+  } finally { await rm(cacheDir7, { recursive: true, force: true }); }
+}
+
+// Dialogue beats are spoken lines: they must not be re-focalised, so the
+// system copies them verbatim into every perspective track.
 {
   const cacheDir6 = await mkdtemp(join(tmpdir(), 'story-preparation-dialogue-'));
   try {
@@ -184,18 +287,23 @@ try {
         { type: 'dialogue', speaker: 'doctor', text: '哪里不舒服？' },
       ],
     };
-    const fetchImpl = async () => ({ ok: true, json: async () => ({ choices: [{ message: { content: JSON.stringify(analysis) } }] }) });
-    const prepared = createPreparedStoryProvider({ name: 'real', getStory: async () => source }, config, { fetchImpl });
+    const tracks = {
+      traveler: [{ index: 0, text: '我推开诊室的门，雨水顺着衣角往下滴。' }],
+      doctor: [{ index: 0, text: '你听见门被推开，抬起头看向来人。' }],
+    };
+    const stub = preparationStub({ analysis, tracks });
+    const prepared = createPreparedStoryProvider({ name: 'real', getStory: async () => source }, config, { fetchImpl: stub.fetchImpl });
     const story = await prepared.getStory('six');
-    assert.ok(
-      !story.ai_opening_events.some((event) => 'text_first_person' in event),
-      'an opening containing dialogue must not get a first-person track',
-    );
-    console.log('Story preparation: dialogue openings keep a single neutral track');
+    const dialogue = story.ai_opening_events.find((event) => event.type === 'dialogue');
+    assert.equal(dialogue.text_by_role.traveler, '哪里不舒服？', 'the spoken line is copied verbatim into every track');
+    assert.equal(dialogue.text_by_role.doctor, '哪里不舒服？');
+    assert.equal(dialogue.speaker, 'doctor');
+    console.log('Story preparation: dialogue beats are copied verbatim into perspective tracks');
   } finally { await rm(cacheDir6, { recursive: true, force: true }); }
 }
 
-// A third-person source has no first-person track at all, and keeps working.
+// A third-person source has no narrator role; every role gets its own
+// second-person perspective track and the neutral base stays the fallback.
 {
   const cacheDir3 = await mkdtemp(join(tmpdir(), 'story-preparation-third-'));
   try {
@@ -208,12 +316,17 @@ try {
       opening_source_sentence_count: 2,
       opening_events: [{ type: 'narration', text: '陈远走进房间，林医生抬起头。' }],
     };
-    const fetchImpl = async () => ({ ok: true, json: async () => ({ choices: [{ message: { content: JSON.stringify(analysis) } }] }) });
-    const prepared = createPreparedStoryProvider({ name: 'real', getStory: async () => source }, config, { fetchImpl });
+    const tracks = {
+      traveler: [{ index: 0, text: '你推开房门，径直走了进来。' }],
+      doctor: [{ index: 0, text: '你抬起头，看见陈远走进房间。' }],
+    };
+    const stub = preparationStub({ analysis, tracks });
+    const prepared = createPreparedStoryProvider({ name: 'real', getStory: async () => source }, config, { fetchImpl: stub.fetchImpl });
     const story = await prepared.getStory('three');
     assert.equal(story.first_person_role_id, null);
     assert.equal(story.role_selection_required, true);
-    assert.ok(!story.ai_opening_events.some((event) => 'text_first_person' in event), 'third-person sources must not get a first-person track');
-    console.log('Story preparation: third-person source keeps a single neutral track');
+    assert.equal(story.ai_opening_events[0].text_by_role.traveler, tracks.traveler[0].text);
+    assert.equal(story.ai_opening_events[0].text_by_role.doctor, tracks.doctor[0].text);
+    console.log('Story preparation: third-person sources give every role a perspective track');
   } finally { await rm(cacheDir3, { recursive: true, force: true }); }
 }
