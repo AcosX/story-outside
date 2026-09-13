@@ -7,7 +7,7 @@ import { spawnSync } from 'node:child_process';
 import mysql from 'mysql2/promise';
 import { createAIProvider } from '../src/agent/aiProvider.mjs';
 import { createAgentRuntime, runTurn } from '../src/agent/runtime.mjs';
-import { getSession, getSessionCompact } from '../src/stories/sessionService.mjs';
+import { getSession, getSessionCompact, recoverSession } from '../src/stories/sessionService.mjs';
 import { loadDatabaseConfig, connectDatabase, closeDatabase } from '../src/db/mariadb.mjs';
 import { createMariaDbRepositories } from '../src/db/mariaPersistence.mjs';
 import { appendSessionEvent } from '../src/db/sessionEventPersistence.mjs';
@@ -193,6 +193,51 @@ if (!databaseUrl) {
     assert.equal(failure.context_compact_text, compactRow.context_compact_text);
     assert.equal(failure.compacted_through_seq, 4);
     assert.equal(getSessionCompact({ repository: failedDb.storyRepository, session_uuid: sessions[1] }).context_compact_text, null);
+    // Incremental flush touches only one session and the NEW event. Stage
+    // a second mutation while the first commit is still in flight: its delta
+    // must be based on the first committed snapshot, never discarded.
+    await failedDb.flush(); // Persist lazy compact normalization from the reads above.
+    const originalGet = pool.getConnection.bind(pool);
+    const queries = [];
+    let commitEntered, releaseCommit;
+    const entered = new Promise(resolve => { commitEntered = resolve; });
+    const held = new Promise(resolve => { releaseCommit = resolve; });
+    let firstCommit = true;
+    pool.getConnection = async () => {
+      const connection = await originalGet();
+      return new Proxy(connection, { get(target, name) {
+        if (name === 'query') return (sql, args) => { queries.push(sql); return target.query(sql, args); };
+        if (name === 'commit') return async () => {
+          if (firstCommit) { firstCommit = false; commitEntered(); await held; }
+          return target.commit();
+        };
+        const value = target[name]; return typeof value === 'function' ? value.bind(target) : value;
+      } });
+    };
+    const incremental = { repository: failedDb.storyRepository, session_uuid: sessions[0] };
+    recoverSession(incremental);
+    await failedDb.flush();
+    assert.equal(queries.length, 0, 'read-only LRU touch must not open a write transaction');
+    interruptWithPlayerInput({ ...incremental, text: 'delta one', expected_revision: getSession(incremental).revision });
+    const writing = failedDb.flush();
+    await entered;
+    interruptWithPlayerInput({ ...incremental, text: 'delta two', expected_revision: getSession(incremental).revision });
+    const nextWrite = failedDb.flush();
+    releaseCommit();
+    await Promise.all([writing, nextWrite]);
+    pool.getConnection = originalGet;
+    assert.equal(queries.filter(sql => sql.includes('INSERT INTO game_sessions')).length, 2, 'one session per transaction');
+    assert.equal(queries.filter(sql => sql.includes('INSERT INTO session_events')).length, 2, 'only new events');
+    assert.equal(queries.filter(sql => /INSERT INTO (stories|story_versions|story_opening_caches|story_community_profiles)/.test(sql)).length, 0);
+    assert.equal(queries.filter(sql => sql.startsWith('DELETE FROM ecosystem')).length, 0, 'unrelated following/search state is untouched');
+    const deltaRestored = await adapter(createInMemoryStoryRepository());
+    const deltaEvents = listSessionEvents({ repository: deltaRestored.storyRepository, session_uuid: sessions[0] });
+    assert.equal(deltaEvents.at(-1).payload.text, 'delta two', 'mutation during commit survives reload');
+    deltaRestored.storyRepository.recordSessionFirstChoice({ session_uuid: sessions[1], opening_cache_uuid: cache.cache_uuid });
+    await deltaRestored.flush();
+    const [[markerRow]] = await pool.query('SELECT first_choice_at FROM game_sessions WHERE session_uuid = ?', [sessions[1]]);
+    assert.ok(markerRow.first_choice_at, 'marker-only changes persist even without a session mutation');
+    console.log('ok - MariaDB incremental session/event writes and mutation during commit');
     console.log('ok - MariaDB runtime compact, SQL audit, fresh adapter reuse, canonical retention and failure persistence');
     console.log('ok - MariaDB legacy upgrade, idempotent migrations, session request isolation, pending isolation, rehydration and conflict rollback');
   } finally { await pool.end(); }

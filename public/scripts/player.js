@@ -161,7 +161,7 @@ function showToast(message, ms = 2400) {
 
 // -------- API client --------
 
-const RETRYABLE_HTTP_STATUSES = new Set([408, 425, 429, 500, 502, 503, 504]);
+const RETRYABLE_HTTP_STATUSES = new Set([408, 425, 429, 500, 502, 503, 504, 524]);
 const API_MAX_RETRIES = 2;
 const API_RETRY_BASE_DELAY_MS = 250;
 const API_RETRY_MAX_DELAY_MS = 2000;
@@ -208,6 +208,7 @@ async function api(path, options = {}) {
 
 async function requestApi(path, options = {}) {
   const requestSession = path.match(/^\/api\/sessions\/([^/]+)\//)?.[1];
+  const { allowStaleSession = false, ...fetchOptions } = options;
   const method = String(options.method || 'GET').toUpperCase();
   // POST is retry-safe only when the server can deduplicate the same
   // logical operation after a lost response.
@@ -217,7 +218,7 @@ async function requestApi(path, options = {}) {
     try {
       res = await fetch(path, {
         headers: { 'content-type': 'application/json' },
-        ...options,
+        ...fetchOptions,
       });
     } catch (error) {
       if (!retryableRequest || attempt === API_MAX_RETRIES) throw error;
@@ -228,12 +229,13 @@ async function requestApi(path, options = {}) {
     let validJson = true;
     try { data = await res.json(); }
     catch { validJson = false; data = { error: 'bad_json' }; }
-    if (requestSession && requestSession !== state.sessionUuid) {
+    if (!allowStaleSession && requestSession && requestSession !== state.sessionUuid) {
       const err = new Error('stale_session'); err.code = 'stale_session'; throw err;
     }
     if (!validJson) {
-      const err = new Error('invalid_json_response');
-      err.code = 'bad_json';
+      const timedOut = [408, 504, 524].includes(res.status);
+      const err = new Error(timedOut ? '请求超时，请重试。' : (!res.ok ? `http_${res.status}` : 'invalid_json_response'));
+      err.code = timedOut ? 'request_timeout' : (!res.ok ? `http_${res.status}` : 'bad_json');
       err.status = res.status;
       err.data = data;
       if (retryableRequest && RETRYABLE_HTTP_STATUSES.has(res.status) && attempt < API_MAX_RETRIES) {
@@ -248,8 +250,9 @@ async function requestApi(path, options = {}) {
         showToast('请点击知乎登录后继续。');
         const link = $('#login-link'); if (link) link.hidden = false;
       }
-      const err = new Error(data.message || data.error || `http_${res.status}`);
-      err.code = data.error || `http_${res.status}`;
+      const timedOut = [408, 504, 524].includes(res.status);
+      const err = new Error(timedOut ? '请求超时，请重试。' : (data.message || data.error || `http_${res.status}`));
+      err.code = timedOut ? 'request_timeout' : (data.error || `http_${res.status}`);
       err.status = res.status;
       err.data = data;
       if (retryableRequest && RETRYABLE_HTTP_STATUSES.has(res.status) && attempt < API_MAX_RETRIES) {
@@ -767,13 +770,16 @@ function readSessionContext() {
 // -------- Recovery + autoplay driver --------
 
 async function recoverAndStart() {
+  const sessionUuid = state.sessionUuid;
+  const recoveryEpoch = state.generationEpoch || 0;
   // Read canonical history + active pending. We do NOT call /generate
   // here — recovery is read-only. The autoplay driver only kicks in if
   // there is something pending to display.
   setStatus('loading');
   clearAllPendingNodes();
   try {
-    const recovered = await api(`/api/sessions/${state.sessionUuid}/recover`);
+    const recovered = await api(`/api/sessions/${sessionUuid}/recover`);
+    if (sessionUuid !== state.sessionUuid || recoveryEpoch !== (state.generationEpoch || 0)) return;
     state.lastRevision = recovered.revision || 0;
     state.openingCursor = recovered.opening_cursor || 0;
     // ClickUp 16.2 P1.v2 (2026-09-07): refresh the canonical
@@ -1260,29 +1266,43 @@ async function performstartNextBatch() {
   }
   setText('#player-help', '故事正在继续…');
   const expectedRevision = state.lastRevision || 0;
-  const requestId = `turn-${state.lastPlayerRequestId}`;
-  state.lastPlayerRequestId += 1;
-  // The deterministic demo provider reads input.text to decide what to
-  // emit: default → 3-item batch, "choice" → choice tool call, "finish"
-  // → finish_story tool call, "long" → 4-item batch, "short" → 1-item
-  // batch. The first call defaults to a 3-item batch so the player can
-  // see narration/dialogue mix.
-  const inputText = state.nextBatchInput || 'hello';
-  state.nextBatchInput = null;
+  // Keep the identity AND input after a lost response. A manual retry must
+  // replay the first turn, not buy another completion over its pending slot.
+  let request = state.generationRequest;
+  if (!request || request.sessionUuid !== state.sessionUuid || request.revision !== expectedRevision || request.epoch !== generationEpoch) {
+    request = { sessionUuid: state.sessionUuid, revision: expectedRevision, epoch: generationEpoch,
+      id: `turn-${expectedRevision}-${state.lastPlayerRequestId}`, input: state.nextBatchInput || 'hello' };
+    state.lastPlayerRequestId += 1;
+    state.nextBatchInput = null;
+    state.generationRequest = request;
+  }
   // Remember which session this turn was issued for: the superseded
   // cleanup below must target THAT session, never whatever session the
   // player has navigated to in the meantime.
   const supersededSession = state.sessionUuid;
   try {
-    const turn = await api(`/api/sessions/${state.sessionUuid}/generate`, {
+    const path = `/api/sessions/${state.sessionUuid}/generate`;
+    const options = {
       method: 'POST',
       body: JSON.stringify({
-        input: { text: inputText },
+        input: { text: request.input },
         expected_revision: expectedRevision,
-        request_id: requestId,
+        request_id: request.id,
       }),
-    });
-    if (generationEpoch !== (state.generationEpoch || 0)) {
+      headers: { 'content-type': 'application/json', prefer: 'respond-async' },
+      allowStaleSession: true,
+    };
+    let turn;
+    const deadline = Date.now() + 10 * 60 * 1000;
+    while (true) {
+      turn = await api(path, options);
+      if (turn.status !== 'pending') break;
+      if (Date.now() >= deadline) {
+        const error = new Error('生成仍在处理中，请稍后重试。'); error.code = 'request_timeout'; throw error;
+      }
+      await new Promise(resolve => setTimeout(resolve, 1000));
+    }
+    if (generationEpoch !== (state.generationEpoch || 0) || supersededSession !== state.sessionUuid) {
       // The turn was superseded (player interrupt / navigation / reload)
       // WHILE the request was in flight. The response still landed a real
       // pending batch on the server. Dropping it here without telling the
@@ -1295,6 +1315,7 @@ async function performstartNextBatch() {
       await discardSupersededPending(supersededSession, turn.pending_id);
       return;
     }
+    if (state.generationRequest === request) state.generationRequest = null;
     state.lastRevision = turn.revision;
     state.pending = {
       pending_id: turn.pending_id,
@@ -1323,9 +1344,14 @@ async function performstartNextBatch() {
     }
   } catch (err) {
     if (err?.code === 'stale_session') return null;
-    if (generationEpoch !== (state.generationEpoch || 0)) return;
+    if (generationEpoch !== (state.generationEpoch || 0) || supersededSession !== state.sessionUuid) return;
     setText('#player-help', '');
     if (state.inputInFlight) return;
+    if (err?.code === 'pending_conflict') {
+      state.generationRequest = null;
+      await recoverAndStart();
+      return;
+    }
     showToast(`请求失败：${err.message}`);
     setStatus('paused');
   }

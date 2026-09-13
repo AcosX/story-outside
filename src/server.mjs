@@ -1,4 +1,4 @@
-import { warn as loggerWarn } from './observability/logger.mjs';
+import { warn as loggerWarn, info as loggerInfo } from './observability/logger.mjs';
 // Story Outside — minimal Node HTTP server (no framework).
 // Serves static files from ./public and exposes a few JSON endpoints
 // used by the home page demo flow. The endpoints are clearly marked as
@@ -9,6 +9,7 @@ import { warn as loggerWarn } from './observability/logger.mjs';
 // (default: mock). Routes never call Zhihu APIs directly.
 
 import http from 'node:http';
+import { createGenerationTasks } from './agent/generationTasks.mjs';
 import { randomUUID } from 'node:crypto';
 import { readFile, stat } from 'node:fs/promises';
 import { extname, isAbsolute, join, normalize, relative, resolve } from 'node:path';
@@ -146,6 +147,7 @@ const oauth = createZhihuOAuth(loadOAuthConfig(), {
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 const ROOT = resolve(__dirname, '..');
 const PUBLIC_DIR = resolve(ROOT, 'public');
+const generationTasks = createGenerationTasks();
 const PORT = Number(process.env.PORT || 4173);
 const HOST = process.env.HOST || '127.0.0.1';
 let databasePersistence = null;
@@ -375,7 +377,7 @@ const MIME = {
   '.md': 'text/markdown; charset=utf-8',
 };
 
-function jsonResponse(res, status, payload) {
+function jsonResponse(res, status, payload, { persist = true } = {}) {
   const body = JSON.stringify(payload);
   const write = (writeStatus = status, writePayload = payload) => {
     const serialized = JSON.stringify(writePayload);
@@ -386,7 +388,7 @@ function jsonResponse(res, status, payload) {
     });
     res.end(serialized);
   };
-  if (!databasePersistence) {
+  if (!databasePersistence || !persist) {
     write();
     return;
   }
@@ -895,7 +897,7 @@ function agentRuntimeErrorResponse(res, err, decoration = {}, context = {}) {
     message: err.message,
     ...(retryable ? { retryable: true } : {}),
     ...decoration,
-  });
+  }, { persist: context.persist !== false });
 }
 
 function rejectInvalidSessionUuid(res, session_uuid) {
@@ -2373,6 +2375,7 @@ async function handleRequest(req, res) {
         ...PUBLIC_DECORATE(),
       });
     }
+    const asynchronous = /(?:^|,)\s*respond-async\s*(?:,|$)/i.test(req.headers.prefer || '') && Boolean(body.request_id);
     let runtime;
     try {
       const recovered = recoverSession({ repository: storyRepo, session_uuid: sessionUuid });
@@ -2391,16 +2394,41 @@ async function handleRequest(req, res) {
       });
     } catch (err) {
       if (err instanceof AgentRuntimeError) {
-        return agentRuntimeErrorResponse(res, err, PUBLIC_DECORATE(), { session_uuid: sessionUuid });
+        return agentRuntimeErrorResponse(res, err, PUBLIC_DECORATE(), { session_uuid: sessionUuid, persist: !asynchronous });
       }
       return sessionErrorResponse(res, err);
     }
     try {
-      const result = await runTurn(runtime, {
+      const args = {
         ...(body.request_id ? { request_id: body.request_id } : {}),
         input: body.input,
         expected_revision: body.expected_revision,
-      });
+      };
+      let result;
+      if (asynchronous) {
+        const key = canonicalJsonStringify({ session_uuid: sessionUuid, ...args });
+        const outcome = await generationTasks.poll(key, async () => {
+          const startedAt = performance.now();
+          let generated = false;
+          try { const result = await runTurn(runtime, args); generated = true; return result; }
+          finally {
+            const persistenceStart = performance.now();
+            try { if (databasePersistence) await databasePersistence.flush(); }
+            finally { loggerInfo('generation.task', { component: 'agent', session_uuid: sessionUuid,
+              latency_ms: Math.round(performance.now() - startedAt),
+              extra: { generated, generation_ms: Math.round(persistenceStart - startedAt), persist_ms: Math.round(performance.now() - persistenceStart) } }); }
+          }
+        });
+        if (outcome.kind === 'pending' || outcome.kind === 'busy') {
+          res.setHeader('Retry-After', '1');
+          return jsonResponse(res, outcome.kind === 'pending' ? 202 : 503, {
+            error: outcome.kind === 'busy' ? 'generation_busy' : undefined,
+            status: 'pending', request_id: body.request_id, session_uuid: sessionUuid,
+          }, { persist: false }); // An acknowledgement, never a claim of saved progress.
+        }
+        if (outcome.kind === 'failed') throw outcome.error;
+        result = outcome.value;
+      } else result = await runTurn(runtime, args);
       return jsonResponse(res, 200, {
         ...PUBLIC_DECORATE(),
         ...result,
@@ -2409,11 +2437,12 @@ async function handleRequest(req, res) {
         events: result.items,
         revision: result.base_revision,
         pending_remaining: result.pending_total - result.pending_committed_count,
-      });
+      }, { persist: !asynchronous });
     } catch (err) {
       if (err instanceof AgentRuntimeError) {
-        return agentRuntimeErrorResponse(res, err, PUBLIC_DECORATE(), { session_uuid: sessionUuid });
+        return agentRuntimeErrorResponse(res, err, PUBLIC_DECORATE(), { session_uuid: sessionUuid, persist: !asynchronous });
       }
+      if (asynchronous) return jsonResponse(res, 503, { error: 'generation_unavailable', message: '生成暂时未能完成，请重试。' }, { persist: false });
       return sessionErrorResponse(res, err);
     }
   }
@@ -3446,6 +3475,17 @@ async function handleRequest(req, res) {
 }
 
 const server = http.createServer((req, res) => {
+  const path = (req.url || '').split('?')[0];
+  const match = path.match(/^\/api\/sessions\/([0-9a-f-]{36})\/(generate|recover|opening-events|narrative-events|interrupt)$/i);
+  if (match) {
+    const startedAt = performance.now();
+    const record = disconnected => loggerInfo('http.session.response', {
+      component: 'http', session_uuid: match[1], latency_ms: Math.round(performance.now() - startedAt),
+      extra: { route: match[2], method: req.method, status: res.statusCode, disconnected },
+    });
+    res.once('finish', () => record(false));
+    res.once('close', () => { if (!res.writableFinished) record(true); });
+  }
   handleRequest(req, res).catch((err) => {
     // Last-resort guard: an async route must never crash the process.
     const message = String(err && err.message ? err.message : err);

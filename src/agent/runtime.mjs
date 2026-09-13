@@ -1,6 +1,6 @@
 import { progressMetadata } from '../stories/plotProgress.mjs';
 import { canonicalJsonStringify } from '../stories/canonicalHash.mjs';
-import { getSession, getSessionCompact, recordCompact, recordCompactFailure, listSessionEvents, lookupTurnRequest, registerTurnRequest, stageNarrativeBatch } from '../stories/sessionService.mjs';
+import { getSession, getSessionCompact, recordCompact, recordCompactFailure, listSessionEvents, recoverSession, lookupTurnRequest, registerTurnRequest, stageNarrativeBatch } from '../stories/sessionService.mjs';
 import { buildSessionContext, selectCompactWindow } from './contextBuilder.mjs';
 import { randomUUID } from 'node:crypto';
 import { executeToolCall, ToolValidationError } from './tools.mjs';
@@ -384,6 +384,9 @@ async function runTurnOnce(runtime, { request_id, input, expected_revision } = {
   }
   if (expected_revision !== state.base_revision) fail('revision_mismatch', 'revision mismatch');
   if (session.revision !== state.base_revision) fail('revision_mismatch', 'revision mismatch');
+  if (key && recoverSession({ repository: state.repository, session_uuid: state.session_uuid }).pending) {
+    fail('pending_conflict', 'session has unconsumed pending events');
+  }
   let rawResult;
   let turn_id;
   try {

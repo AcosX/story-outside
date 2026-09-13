@@ -1,5 +1,8 @@
 import { spawnSync } from 'node:child_process';
 const tests = [
+  "tests/generationTasks.test.mjs",
+  "tests/asyncGenerationHttp.test.mjs",
+  "tests/frontendTimeoutRecovery.test.mjs",
   "tests/followeeFileCredentialsHttp.test.mjs",
   "tests/onlineFixes.test.mjs",
   "tests/zhihuOAuth.test.mjs",
