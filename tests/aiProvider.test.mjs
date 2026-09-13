@@ -7,6 +7,10 @@ const env = { STORY_OUTSIDE_AI_PROVIDER: 'real', STORY_OUTSIDE_AI_API_KEY: 'test
 assert.equal(loadAIConfig({ ...env, STORY_OUTSIDE_AI_CONTEXT_TOKENS: '128000' }).contextWindow, 128000);
 assert.throws(() => loadAIConfig({ ...env, STORY_OUTSIDE_AI_CONTEXT_TOKENS: '3500' }), /token context window/);
 assert.equal(loadAIConfig({ ...env, STORY_OUTSIDE_AI_MAX_RETRIES: '2' }).maxRetries, 2);
+// The documented operator range is 0-5; 5 must be accepted and 6 rejected.
+assert.equal(loadAIConfig({ ...env, STORY_OUTSIDE_AI_MAX_RETRIES: '0' }).maxRetries, 0);
+assert.equal(loadAIConfig({ ...env, STORY_OUTSIDE_AI_MAX_RETRIES: '5' }).maxRetries, 5);
+assert.throws(() => loadAIConfig({ ...env, STORY_OUTSIDE_AI_MAX_RETRIES: '6' }), /retry limit/);
 assert.throws(() => loadAIConfig({ ...env, STORY_OUTSIDE_AI_MAX_RETRIES: '9' }), /retry limit/);
 assert.throws(() => loadAIConfig({ ...env, STORY_OUTSIDE_AI_MAX_RETRIES: '1.5' }), /retry limit/);
 const backupEnv = { ...env, STORY_OUTSIDE_AI_BACKUP_API_KEY: 'backup-k', STORY_OUTSIDE_AI_BACKUP_BASE_URL: 'https://backup.invalid/v1', STORY_OUTSIDE_AI_BACKUP_MODEL: 'backup-m' };

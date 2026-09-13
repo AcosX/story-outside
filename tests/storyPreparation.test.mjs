@@ -330,3 +330,81 @@ try {
     console.log('Story preparation: third-person sources give every role a perspective track');
   } finally { await rm(cacheDir3, { recursive: true, force: true }); }
 }
+
+// PR46 review — the opening boundary feeds the per-role scene reference on
+// EVERY source now, so a third-person analysis without a usable boundary must
+// be rejected instead of silently slicing the whole book into the prompt.
+{
+  const cacheDir8 = await mkdtemp(join(tmpdir(), 'story-preparation-boundary-'));
+  try {
+    const source = { id: 'eight', title: '原作八', hook: '简介', roles: [], beats: [{ index: 0, text: SOURCE_TEXT }] };
+    const config = { apiKey: 'test', baseURL: 'https://example.invalid/v1', model: 'test', timeoutMs: 1000, cacheDir: cacheDir8 };
+    const analysis = {
+      roles: [{ id: 'traveler', label: '陈远', mood: '旅人' }, { id: 'doctor', label: '林医生', mood: '医生' }],
+      first_person_role_id: null,
+      protagonist_display_name: null,
+      opening_source_sentence_count: 9999,
+      opening_events: [
+        { type: 'narration', text: '陈远走进房间，林医生抬起头。' },
+        { type: 'narration', text: '雨声敲在窗上，屋里一时安静。' },
+        { type: 'narration', text: '桌上的病历摊开着，没有人去动。' },
+      ],
+    };
+    const tracks = {
+      traveler: [{ index: 0, text: '你推开房门走了进来。' }, { index: 1, text: '你听见雨声敲窗。' }, { index: 2, text: '你看见摊开的病历。' }],
+      doctor: [{ index: 0, text: '你抬起头，看见陈远。' }, { index: 1, text: '你听着窗外的雨。' }, { index: 2, text: '你没有去动那份病历。' }],
+    };
+    const stub = preparationStub({ analysis, tracks });
+    const prepared = createPreparedStoryProvider({ name: 'real', getStory: async () => source }, config, { fetchImpl: stub.fetchImpl });
+    await assert.rejects(
+      () => prepared.getStory('eight'),
+      'a third-person analysis with an absurd opening boundary must not be cached or served',
+    );
+    console.log('Story preparation: third-person sources also enforce the opening boundary');
+  } finally { await rm(cacheDir8, { recursive: true, force: true }); }
+}
+
+// PR46 review — the voice validator must read NARRATION voice, not raw
+// substrings: quoted speech and compounds like 我们 / 自我 are legitimate in a
+// second-person track and must not silently degrade the role to the base.
+{
+  const cacheDir9 = await mkdtemp(join(tmpdir(), 'story-preparation-voice-'));
+  try {
+    const source = { id: 'nine', title: '原作九', hook: '简介', roles: [], beats: [{ index: 0, text: SOURCE_TEXT }] };
+    const config = { apiKey: 'test', baseURL: 'https://example.invalid/v1', model: 'test', timeoutMs: 1000, cacheDir: cacheDir9 };
+    const analysis = {
+      roles: [{ id: 'traveler', label: '陈远', mood: '旅人' }, { id: 'doctor', label: '林医生', mood: '医生' }],
+      first_person_role_id: 'traveler',
+      protagonist_display_name: '陈远',
+      opening_source_sentence_count: 4,
+      opening_events: [
+        { type: 'narration', text: '陈远推开诊室的门，雨水顺着衣角滴落。' },
+        { type: 'narration', text: '林医生在桌后整理病历，屋里只有纸页声。' },
+        { type: 'narration', text: '走廊尽头忽然响起脚步声。' },
+      ],
+    };
+    const tracks = {
+      // Second person, but carrying quoted 我 and the compound 我们 / 自我.
+      doctor: [
+        { index: 0, text: '你抬起头，听见陈远在门口低声说：“我来晚了。”' },
+        { index: 1, text: '你压下心底的自我怀疑，继续整理手里的病历。' },
+        { index: 2, text: '你和陈远之间的沉默被脚步声打断，我们这一层本该没有别人。' },
+      ],
+      // First person, but quoting someone addressing 你.
+      traveler: [
+        { index: 0, text: '我推开诊室的门，雨水顺着衣角滴落下来。' },
+        { index: 1, text: '我看着林医生整理病历，没有开口。' },
+        { index: 2, text: '我听见他问：“你怎么才来？”走廊尽头有脚步声。' },
+      ],
+    };
+    const stub = preparationStub({ analysis, tracks });
+    const prepared = createPreparedStoryProvider({ name: 'real', getStory: async () => source }, config, { fetchImpl: stub.fetchImpl });
+    const story = await prepared.getStory('nine');
+    const byRole = story.ai_opening_events.map((event) => event.text_by_role ?? {});
+    assert.equal(byRole[0].doctor, tracks.doctor[0].text, 'quoted 我 must not reject a second-person track');
+    assert.equal(byRole[1].doctor, tracks.doctor[1].text, '自我 must not reject a second-person track');
+    assert.equal(byRole[2].doctor, tracks.doctor[2].text, '我们 must not reject a second-person track');
+    assert.equal(byRole[2].traveler, tracks.traveler[2].text, 'quoted 你 must not reject a first-person track');
+    console.log('Story preparation: quoted speech and pronoun compounds pass the voice validator');
+  } finally { await rm(cacheDir9, { recursive: true, force: true }); }
+}

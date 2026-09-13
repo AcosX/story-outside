@@ -52,13 +52,16 @@ const STORY_ANALYSIS_TOOL = {
       },
       first_person_role_id: { description: '第一人称“我”对应的角色 id；无则填 null' },
       protagonist_display_name: { description: '开场中实际用来称呼原作第一人称角色的名字；无则填 null' },
-      opening_source_sentence_count: { type: 'integer', description: '开场覆盖的原文开头句子数量' },
+      opening_source_sentence_count: { type: 'integer', minimum: 1, description: '开场覆盖的原文开头句子数量（至少 1，不含第一个有意义选择之后的内容）' },
       opening_events: {
         type: 'array', minItems: 3, maxItems: 6,
         items: { type: 'object', properties: { type: { type: 'string', enum: ['narration', 'action', 'dialogue'] }, text: { type: 'string' }, speaker: { type: 'string' }, story_progress: { type: 'number' } }, required: ['type', 'text'] },
       },
     },
-    required: ['roles', 'opening_events'],
+    // The boundary is required for every source now that it feeds the
+    // per-role scene reference: a missing value is a rejected sample, not a
+    // silently unbounded slice.
+    required: ['roles', 'opening_events', 'opening_source_sentence_count'],
   },
 };
 
@@ -104,8 +107,12 @@ function validPreparation(result) {
 // Imported novels carry no ask_player_choice marker, so a missing or absurd
 // value would slice the ENTIRE book into the per-role scene reference and
 // invite spoilers. Reject it here instead of caching and serving it.
+//
+// opening-rules/3 generates a perspective track for EVERY role, so the
+// boundary now feeds the scene reference on third-person sources too. It is
+// therefore validated unconditionally: the old `first_person_role_id === null`
+// exemption dated from when only first-person sources were sliced.
 function validOpeningBoundary(result) {
-  if (result.first_person_role_id === null) return true;
   const count = result.opening_source_sentence_count;
   return Number.isInteger(count) && count >= 1 && count <= MAX_OPENING_SOURCE_SENTENCES;
 }
@@ -130,6 +137,32 @@ function validProtagonistNaming(result) {
   return narration.includes(name);
 }
 
+// Chinese quotation pairs whose contents are SPOKEN or QUOTED text. A quoted
+// line keeps the speaker's own pronouns regardless of who is reading, so the
+// voice check must not see them.
+const QUOTED_SPANS = /[「『“"'][^「』“”"']*[」』”"']|（[^）]*）|\([^)]*\)/g;
+
+// Compounds that merely CONTAIN 我 or 你 without being a narrating pronoun.
+// Without these, ordinary prose like 「我们之间」 or 「自我怀疑」 fails a
+// second-person track and silently degrades that role to the neutral base.
+const PRONOUN_FALSE_POSITIVES = [
+  '我们', '自我', '忘我', '我行我素', '你们', '你死我活', '你来我往', '你追我赶',
+];
+
+/**
+ * Strip quoted spans and pronoun-bearing compounds, then report whether the
+ * remaining narration actually uses `pronoun` as a narrating pronoun.
+ *
+ * @param {string} text
+ * @param {'我' | '你'} pronoun
+ * @returns {boolean}
+ */
+function narratesWith(text, pronoun) {
+  let stripped = text.replace(QUOTED_SPANS, '');
+  for (const term of PRONOUN_FALSE_POSITIVES) stripped = stripped.split(term).join('');
+  return stripped.includes(pronoun);
+}
+
 /**
  * Validate ONE generated perspective track against the neutral base track.
  *
@@ -139,6 +172,10 @@ function validProtagonistNaming(result) {
  * and never addresses 你. Dialogue beats are not focalised (a spoken line is
  * the same line from every seat), so the caller copies them verbatim and the
  * model never submits them.
+ *
+ * The voice check looks at NARRATION only: quoted speech inside a narration
+ * beat and compounds like 我们 / 自我 are stripped first, because a line such
+ * as 「你推开门，他说：“我不该来的。”」 is correct second-person narration.
  *
  * @param {Array<{index: number, text: string}>} texts
  * @param {{ first_person: boolean, baseEvents: Array<{index: number, type: string, text: string}> }} plan
@@ -154,6 +191,8 @@ function validRoleTrack(texts, plan) {
     byIndex.set(entry.index, entry.text.trim());
   }
   const track = [];
+  // Only model-written narration is voice-checked; copied dialogue is not.
+  const narrated = [];
   for (const event of plan.baseEvents) {
     if (event.type === 'dialogue') {
       // A spoken line does not change with the reading perspective.
@@ -164,18 +203,19 @@ function validRoleTrack(texts, plan) {
     if (text === undefined) return null;
     if (text.length > MAX_TRACK_ENTRY_CHARS) return null;
     track.push(text);
+    narrated.push(text);
   }
   if (byIndex.size !== targets.length) return null;
-  const joined = track.join('\n');
+  const joined = narrated.join('\n');
   if (plan.first_person) {
     // First-person voice: 我 narrates, 你 must not address the player role.
-    if (!joined.includes('我')) return null;
-    if (joined.includes('你')) return null;
+    if (!narratesWith(joined, '我')) return null;
+    if (narratesWith(joined, '你')) return null;
   } else {
     // Second-person voice: the track must address the chosen role and must
     // never fall back to narrating as the original narrator 我.
-    if (joined.includes('我')) return null;
-    if (!joined.includes('你')) return null;
+    if (narratesWith(joined, '我')) return null;
+    if (!narratesWith(joined, '你')) return null;
   }
   return track;
 }

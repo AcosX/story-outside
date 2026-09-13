@@ -9,6 +9,11 @@ import { warn as loggerWarn } from '../observability/logger.mjs';
 const RETRYABLE_HTTP_STATUSES = new Set([408, 425, 429, 500, 502, 503, 504]);
 const MAX_RESPONSE_BYTES = 2_000_000;
 const DEFAULT_MAX_RETRIES = 3;
+// Ceiling for the operator-configurable retry budget. Higher than the default
+// so a deployment behind a long proxy timeout (VM3 runs timeout=300) can trade
+// latency for success rate; the worst case is bounded by
+// MAX_CONFIGURABLE_RETRIES + 1 primary attempts plus the backup channel.
+const MAX_CONFIGURABLE_RETRIES = 5;
 const DEFAULT_RETRY_BASE_DELAY_MS = 250;
 const DEFAULT_RETRY_MAX_DELAY_MS = 2_000;
 // A backup OpenAI-compatible channel gets at most one retry: it only runs
@@ -106,7 +111,7 @@ export function loadAIConfig(env = process.env) {
   if (!config.apiKey || !config.model || !config.baseURL) throw new Error('AI configuration missing: API key, base URL and model are required');
   if (!Number.isFinite(config.timeoutMs) || config.timeoutMs < 1000 || config.timeoutMs > 300000 || !Number.isFinite(config.contextChars) || config.contextChars < 1000) throw new Error('Invalid AI timeout or context limit');
   if (config.contextWindow !== undefined && (!Number.isInteger(config.contextWindow) || config.contextWindow <= 3500)) throw new Error('Invalid AI token context window');
-  if (config.maxRetries !== undefined && (!Number.isInteger(config.maxRetries) || config.maxRetries < 0 || config.maxRetries > DEFAULT_MAX_RETRIES)) throw new Error('Invalid AI retry limit');
+  if (config.maxRetries !== undefined && (!Number.isInteger(config.maxRetries) || config.maxRetries < 0 || config.maxRetries > MAX_CONFIGURABLE_RETRIES)) throw new Error('Invalid AI retry limit');
   const url = new URL(config.baseURL);
   if (url.username || url.password || url.search || url.hash) throw new Error('AI base URL must not include credentials, query or fragment');
   if (url.protocol !== 'https:' && !['localhost', '127.0.0.1'].includes(url.hostname)) throw new Error('AI base URL must use HTTPS');
@@ -125,7 +130,7 @@ export function loadAIConfig(env = process.env) {
 
 function retryOptions(config) {
   const maxRetries = Number.isInteger(config.maxRetries)
-    ? Math.max(0, Math.min(DEFAULT_MAX_RETRIES, config.maxRetries))
+    ? Math.max(0, Math.min(MAX_CONFIGURABLE_RETRIES, config.maxRetries))
     : DEFAULT_MAX_RETRIES;
   const baseDelayMs = Number.isFinite(config.retryBaseDelayMs) && config.retryBaseDelayMs >= 0
     ? config.retryBaseDelayMs : DEFAULT_RETRY_BASE_DELAY_MS;

@@ -1527,7 +1527,19 @@ function renderHistoryForSession(repository, session, history) {
     role_id: session.role_id,
     first_person_role_id: firstPersonRoleIdOf(repository, session.story_version_uuid),
   };
-  if (!perspective.first_person_role_id) return history;
+  // opening-rules/3 gives EVERY role a generated `text_by_role` track, third
+  // person sources included, so a null `first_person_role_id` no longer means
+  // "single track". Only skip the projection when neither track exists, or
+  // recovery would serve the neutral base while the first read served the
+  // role track (and the model would be fed a different opening than the
+  // player saw). Legacy single-track rows still short-circuit here.
+  const hasRoleTrack = history.some((event) => {
+    const byRole = event && event.event_type === 'story_opening' && event.payload
+      ? event.payload.text_by_role
+      : null;
+    return Boolean(byRole && typeof byRole === 'object' && !Array.isArray(byRole));
+  });
+  if (!perspective.first_person_role_id && !hasRoleTrack) return history;
   return history.map((event) => {
     if (!event || event.event_type !== 'story_opening' || !event.payload) return event;
     const text = renderOpeningText(event.payload, perspective);

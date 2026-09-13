@@ -231,3 +231,76 @@ const SOURCE = '我推开诊室的门，雨水顺着衣角滴落。林医生正�
   assert.equal(history[0].payload.text, '我推开诊室的门。');
   console.log('Opening tracks: legacy verbatim rows still render and commit');
 }
+
+// ---------------------------------------------------------------------
+// PR46 review — a THIRD-PERSON source has no narrator role, but
+// opening-rules/3 still gives every role a generated `text_by_role` track.
+// Recovery and the model-facing history must stay on that track instead of
+// falling back to the neutral base the moment `first_person_role_id` is null.
+// ---------------------------------------------------------------------
+{
+  const roles = [
+    { id: 'traveler', label: '陈远', mood: '旅人' },
+    { id: 'doctor', label: '林医生', mood: '值班医生' },
+  ];
+  const detail = {
+    id: 'clinic-third', title: '第三人称诊室', hook: '简介',
+    roles,
+    first_person_role_id: null,
+    beats: [{ index: 0, text: '陈远推开诊室的门。林医生正在桌后整理病历。' }],
+    ai_opening_events: [
+      {
+        index: 0, type: 'narration', text: '陈远推开诊室的门，雨水顺着衣角滴落。',
+        text_by_role: {
+          traveler: '你推开诊室的门，雨水顺着衣角滴落。',
+          doctor: '你正在桌后整理病历，听见诊室的门被推开。',
+        },
+      },
+      { index: 1, type: 'ask_player_choice', text: '等待玩家的第一个选择。' },
+    ],
+    ai_preparation_version: 'story-preparation-v6',
+  };
+  const provider = { name: 'real', getStory: async () => detail };
+
+  const bootstrapFor = async (role_id) => {
+    const repository = createInMemoryStoryRepository();
+    const session_uuid = randomUUID();
+    const result = await bootstrapSessionFromWork({
+      repository, provider, session_uuid, work_id: 'clinic-third', role_id,
+      identity: { user_ref: `player-${role_id}` },
+    });
+    let revision = result.session.revision;
+    for (const event of result.opening_events) {
+      const committed = commitOpeningEvent({
+        repository, session_uuid, cache_uuid: result.cache_uuid,
+        event: { ...event, displayed: true },
+        client_request_id: `third-${session_uuid}-${event.sequence}`,
+        expected_revision: revision,
+      });
+      revision = committed.revision;
+    }
+    return { repository, session_uuid, result };
+  };
+
+  const asTraveler = await bootstrapFor('traveler');
+  const asDoctor = await bootstrapFor('doctor');
+
+  // First read already projects per role even without a narrator role.
+  assert.equal(asTraveler.result.opening_events[0].display_text, '你推开诊室的门，雨水顺着衣角滴落。');
+  assert.equal(asDoctor.result.opening_events[0].display_text, '你正在桌后整理病历，听见诊室的门被推开。');
+
+  // Recovery must NOT regress to the neutral base track.
+  const travelerRecovered = recoverSession({ repository: asTraveler.repository, session_uuid: asTraveler.session_uuid }).history;
+  const doctorRecovered = recoverSession({ repository: asDoctor.repository, session_uuid: asDoctor.session_uuid }).history;
+  assert.equal(travelerRecovered[0].payload.text, '你推开诊室的门，雨水顺着衣角滴落。', 'third-person recovery must keep the role track');
+  assert.equal(doctorRecovered[0].payload.text, '你正在桌后整理病历，听见诊室的门被推开。', 'third-person recovery must keep the role track');
+
+  // The model must be fed the same opening the player actually read.
+  const travelerModelView = listSessionEvents({ repository: asTraveler.repository, session_uuid: asTraveler.session_uuid });
+  const doctorModelView = listSessionEvents({ repository: asDoctor.repository, session_uuid: asDoctor.session_uuid });
+  assert.equal(travelerModelView[0].payload.text, '你推开诊室的门，雨水顺着衣角滴落。');
+  assert.equal(doctorModelView[0].payload.text, '你正在桌后整理病历，听见诊室的门被推开。');
+  assert.notEqual(travelerModelView[0].payload.text, doctorModelView[0].payload.text, 'two roles must not converge on one narration');
+
+  console.log('Opening tracks: third-person sources keep per-role tracks through recovery');
+}
