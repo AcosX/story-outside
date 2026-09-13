@@ -48,6 +48,10 @@ export const NARRATE_TOOL = {
   parameters: {
     type: 'object',
     properties: {
+      arc_status: {
+        type: 'string', enum: ['ongoing', 'resolved'],
+        description: '先判断本局原有核心冲突是否已解决。已通关、重逢并离开或人物命运已确定为resolved，必须finish_story。不要为维持互动虚构新目标；日常后续不算未解决的核心冲突。',
+      },
       items: {
         type: 'array', minItems: 1, maxItems: 4,
         items: {
@@ -71,7 +75,7 @@ export const NARRATE_TOOL = {
         required: ['name', 'arguments'],
       },
     },
-    required: ['items'],
+    required: ['arc_status', 'items'],
   },
 };
 
@@ -439,7 +443,7 @@ export function createAIProvider({ config, story, fetchImpl = fetch }) {
         try {
           if (result?.tool_call) result.tool_call.tool_call_id = randomUUID();
           normalizeProviderResult(result);
-          if (storyPacing(request.canonical_history, request.input).must_finish && result.tool_call?.name !== 'finish_story') throw new Error('ending_required');
+          if ((result.arc_status === 'resolved' || storyPacing(request.canonical_history, request.input).must_finish) && result.tool_call?.name !== 'finish_story') throw new Error('ending_required');
           const firstPerson = request.pinned?.role_id === (Object.prototype.hasOwnProperty.call(story, 'first_person_role_id') ? story.first_person_role_id : 'self');
           const prose = result.items.filter(item => item.type !== 'dialogue').map(item => item.text || item.content).join('\n');
           if (narratesWith(prose, firstPerson ? '你' : '我')) throw new Error('narration_person_mismatch');

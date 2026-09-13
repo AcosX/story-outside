@@ -67,3 +67,15 @@ row.state = 'realtime';
 hydrateSessionPersistence({ repository, row, history: row.history, runtime_payload: row.runtime_payload });
 assert.equal(getSession({ repository, session_uuid: id }).state, 'finished');
 console.log('Ending activation: terminal durability/replay, legacy recovery, pacing, grounded intro, official search/catalogue, lossless compressed replay passed');
+
+// A model that declares the original arc resolved must not open another choice.
+const { createAIProvider } = await import('../src/agent/aiProvider.mjs');
+const resolvedOutput = {
+  arc_status: 'resolved', items: [{ type: 'narration', text: '列车驶离小镇。' }],
+  tool_call: { name: 'ask_player_choice', arguments: { question: '接下来呢？', options: [{ id: 'a', label: '继续' }, { id: 'b', label: '等候' }] } },
+};
+const resolvedProvider = createAIProvider({
+  story: {}, config: { apiKey: 'test', baseURL: 'https://example.invalid/v1', model: 'test', timeoutMs: 1000, maxRetries: 0 },
+  fetchImpl: async () => new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify(resolvedOutput) }, finish_reason: 'stop' }] })),
+});
+await assert.rejects(resolvedProvider.complete({ pinned: {}, canonical_history: [], input: { text: '继续' } }), error => error.code === 'invalid_response');
