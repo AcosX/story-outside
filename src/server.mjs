@@ -883,8 +883,8 @@ function sessionErrorResponse(res, err) {
   return jsonResponse(res, status, body);
 }
 
-function agentRuntimeErrorResponse(res, err, decoration = {}) {
-  loggerWarn('agent.request.failed', { component: 'agent', error_code: err.code, extra: { retryable: err.retryable === true } });
+function agentRuntimeErrorResponse(res, err, decoration = {}, context = {}) {
+  loggerWarn('agent.request.failed', { session_uuid: context.session_uuid || null, component: 'agent', error_code: err.code, extra: { retryable: err.retryable === true } });
   // AgentRuntimeError always carries an explicit boolean. Keep the
   // fallback for older callers, but never turn an explicit false into a
   // retryable 502 merely because the code is provider_failure.
@@ -1739,7 +1739,7 @@ async function handleRequest(req, res) {
       });
     } catch (err) {
       if (err instanceof AgentRuntimeError) {
-        return agentRuntimeErrorResponse(res, err, { demo: currentDemoFlag(), dev: DEV_FLAG });
+        return agentRuntimeErrorResponse(res, err, { demo: currentDemoFlag(), dev: DEV_FLAG }, { session_uuid: sessionUuid });
       }
       return sessionErrorResponse(res, err);
     }
@@ -1763,7 +1763,7 @@ async function handleRequest(req, res) {
       });
     } catch (err) {
       if (err instanceof AgentRuntimeError) {
-        return agentRuntimeErrorResponse(res, err, { demo: currentDemoFlag(), dev: DEV_FLAG });
+        return agentRuntimeErrorResponse(res, err, { demo: currentDemoFlag(), dev: DEV_FLAG }, { session_uuid: sessionUuid });
       }
       return sessionErrorResponse(res, err);
     }
@@ -2391,7 +2391,7 @@ async function handleRequest(req, res) {
       });
     } catch (err) {
       if (err instanceof AgentRuntimeError) {
-        return agentRuntimeErrorResponse(res, err, PUBLIC_DECORATE());
+        return agentRuntimeErrorResponse(res, err, PUBLIC_DECORATE(), { session_uuid: sessionUuid });
       }
       return sessionErrorResponse(res, err);
     }
@@ -2412,7 +2412,7 @@ async function handleRequest(req, res) {
       });
     } catch (err) {
       if (err instanceof AgentRuntimeError) {
-        return agentRuntimeErrorResponse(res, err, PUBLIC_DECORATE());
+        return agentRuntimeErrorResponse(res, err, PUBLIC_DECORATE(), { session_uuid: sessionUuid });
       }
       return sessionErrorResponse(res, err);
     }
