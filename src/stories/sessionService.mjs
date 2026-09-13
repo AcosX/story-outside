@@ -774,7 +774,7 @@ export function hydrateSessionPersistence({ repository, row, history = [], runti
     role_id: row.role_id,
     model: row.model,
     prompt: row.prompt,
-    state: runtime.state || row.state || (row.status === 'ended' ? 'finished' : 'opening'),
+    state: runtime.finish_envelope?.tool_call?.name === 'finish_story' ? 'finished' : runtime.state || row.state || (row.status === 'ended' ? 'finished' : 'opening'),
     cursor: Number.isInteger(runtime.cursor) ? runtime.cursor : restoredHistory.length,
     opening_cursor: Number.isInteger(runtime.opening_cursor) ? runtime.opening_cursor : Number(row.opening_cursor || 0),
     revision: Number.isInteger(runtime.revision) ? runtime.revision : Number(row.session_revision || restoredHistory.length),
@@ -1168,6 +1168,7 @@ export function commitNarrativeEvent({ repository, session_uuid, pending_id, seq
     // envelope would be unreachable and GET /ending would 404 forever.
     // Only finish_story (the terminal tool) writes it, so a later
     // ask_player_choice batch can never clobber a finished story.
+    session.state = 'finished';
     session.finish_envelope = {
       tool_call: toolCallSurface,
       pending_id,

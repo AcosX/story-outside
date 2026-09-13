@@ -1,3 +1,5 @@
+import { repositoryState } from '../src/stories/sessionService.mjs';
+import { decodeRuntimePayload } from '../src/db/runtimePayloadCodec.mjs';
 // Opt-in only: point STORY_OUTSIDE_TEST_DATABASE_URL at an EMPTY disposable
 // MariaDB database. This test leaves its fixtures for inspection, never drops data.
 import assert from 'node:assert/strict';
@@ -237,6 +239,18 @@ if (!databaseUrl) {
     await deltaRestored.flush();
     const [[markerRow]] = await pool.query('SELECT first_choice_at FROM game_sessions WHERE session_uuid = ?', [sessions[1]]);
     assert.ok(markerRow.first_choice_at, 'marker-only changes persist even without a session mutation');
+    const retained = repositoryState(deltaRestored.storyRepository).sessions.get(sessions[0]);
+    const replayRecord = [...retained.requestIds.values()][0];
+    for (let i = 0; i < 180; i++) retained.requestIds.set(`codec-${i}`, structuredClone(replayRecord));
+    const priorEntries = [...retained.requestIds];
+    await deltaRestored.flush();
+    const [[encodedRow]] = await pool.query('SELECT runtime_payload FROM game_sessions WHERE session_uuid = ?', [sessions[0]]);
+    const storedRuntime = typeof encodedRow.runtime_payload === 'string' ? JSON.parse(encodedRow.runtime_payload) : encodedRow.runtime_payload;
+    assert.equal(storedRuntime.replay_cache.codec, 'gzip-json-v1');
+    assert.deepEqual(decodeRuntimePayload(storedRuntime).requestIds, priorEntries);
+    const compressedRestored = await adapter(createInMemoryStoryRepository());
+    assert.deepEqual([...repositoryState(compressedRestored.storyRepository).sessions.get(sessions[0]).requestIds], priorEntries);
+    console.log('ok - MariaDB compressed idempotency caches survive fresh adapter hydration without loss');
     console.log('ok - MariaDB incremental session/event writes and mutation during commit');
     console.log('ok - MariaDB runtime compact, SQL audit, fresh adapter reuse, canonical retention and failure persistence');
     console.log('ok - MariaDB legacy upgrade, idempotent migrations, session request isolation, pending isolation, rehydration and conflict rollback');

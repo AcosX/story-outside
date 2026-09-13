@@ -1,3 +1,4 @@
+import { encodeRuntimePayload, decodeRuntimePayload } from './runtimePayloadCodec.mjs';
 // MariaDB persistence adapter for the synchronous application repositories.
 //
 // The service layer intentionally keeps its existing synchronous contract.
@@ -415,8 +416,10 @@ export async function createMariaDbRepositories({
       );
       const history = eventRowsBySession(eventRows);
       const pending = pendingRowsBySession(pendingRows);
+      const legacyFinished = new Set();
       for (const row of sessionRows) {
-        const runtime = parseJson(row.runtime_payload, {}) || {};
+        const runtime = decodeRuntimePayload(parseJson(row.runtime_payload, {}) || {});
+        if (runtime.finish_envelope?.tool_call?.name === 'finish_story' && row.status !== 'ended') legacyFinished.add(row.session_uuid);
         hydrateSessionPersistence({
           repository: story,
           row: {
@@ -460,6 +463,10 @@ export async function createMariaDbRepositories({
       }
       dirty = false;
       lastSnapshot = storyRows.length ? captureSnapshot() : null;
+      if (lastSnapshot && legacyFinished.size) {
+        lastSnapshot.sessions = lastSnapshot.sessions.map(row => legacyFinished.has(row.session_uuid) ? { ...row, state: 'realtime' } : row);
+        dirty = true;
+      }
       lastHash = lastSnapshot ? snapshotHash(lastSnapshot) : null;
     } catch (error) {
       if (error && (error.code === 'ER_NO_SUCH_TABLE' || error.code === 'ER_BAD_FIELD_ERROR')) {
@@ -656,7 +663,7 @@ export async function createMariaDbRepositories({
            last_compact_at = VALUES(last_compact_at), last_compact_attempt_at = VALUES(last_compact_attempt_at),
            last_compact_status = VALUES(last_compact_status), last_compact_error = VALUES(last_compact_error),
            runtime_payload = VALUES(runtime_payload), ended_at = VALUES(ended_at)`,
-        [item.session_uuid, storyId, versionId, item.user_uuid || null, item.user_ref, item.role_id, item.model, item.prompt, json(item.generation_profile || {}), status, ids.cacheIdByUuid.get(item.cache_uuid) || null, dateValue(marker && marker.first_choice_at), item.opening_cursor || 0, openingState, item.revision || 0, item.compact?.context_compact_text || null, json(item.compact?.context_compact_payload || null), item.compact?.compacted_through_seq ?? null, item.compact?.compacted_event_count ?? null, item.compact?.token_estimate ?? null, item.compact?.context_window ?? null, item.compact?.context_safety_ratio ?? null, item.compact?.reserved_completion_tokens ?? null, item.compact?.context_schema_version ?? 1, item.compact?.prompt_version ?? 1, dateValue(item.compact?.last_compact_at), dateValue(item.compact?.last_compact_attempt_at), item.compact?.last_compact_status || 'idle', item.compact?.last_compact_error || null, json(runtimePayload), status === 'ended' ? new Date() : null, creationTime],
+        [item.session_uuid, storyId, versionId, item.user_uuid || null, item.user_ref, item.role_id, item.model, item.prompt, json(item.generation_profile || {}), status, ids.cacheIdByUuid.get(item.cache_uuid) || null, dateValue(marker && marker.first_choice_at), item.opening_cursor || 0, openingState, item.revision || 0, item.compact?.context_compact_text || null, json(item.compact?.context_compact_payload || null), item.compact?.compacted_through_seq ?? null, item.compact?.compacted_event_count ?? null, item.compact?.token_estimate ?? null, item.compact?.context_window ?? null, item.compact?.context_safety_ratio ?? null, item.compact?.reserved_completion_tokens ?? null, item.compact?.context_schema_version ?? 1, item.compact?.prompt_version ?? 1, dateValue(item.compact?.last_compact_at), dateValue(item.compact?.last_compact_attempt_at), item.compact?.last_compact_status || 'idle', item.compact?.last_compact_error || null, json(encodeRuntimePayload(runtimePayload)), status === 'ended' ? new Date() : null, creationTime],
       );
     }
     const [sessionRows] = await connection.query('SELECT id, session_uuid FROM game_sessions');

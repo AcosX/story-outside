@@ -268,7 +268,7 @@ function aggregateOutcomes(perQueryResults) {
 async function fetchOneQuery(args) {
   const { cache, adapter, sq, story_uuid, story_version_uuid, community_profile_version, limit, signal } = args;
   const key = buildEcosystemSearchCacheKey({
-    query: sq.query,
+    query: adapter.name === 'official-zhihu-search-v1' ? `official-v1:${sq.query}` : sq.query,
     story_version_uuid,
     community_profile_version,
     query_id: sq.id,
