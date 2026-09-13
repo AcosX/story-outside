@@ -2423,10 +2423,30 @@ async function handleRequest(req, res) {
   const publicDiscard = pathname.match(/^\/api\/sessions\/([^/]+)\/discard-pending$/);
   if (method === 'POST' && publicDiscard) {
     if (rejectInvalidSessionUuid(res, publicDiscard[1])) return;
+    // `pending_id` is optional and narrows the discard to one batch, so a
+    // late cleanup for an abandoned turn cannot drop a newer batch that
+    // was staged in the meantime. An empty/absent body keeps the original
+    // unconditional behaviour.
+    let discardBody = {};
+    try {
+      discardBody = await readJsonBody(req);
+    } catch {
+      discardBody = {};
+    }
+    if (discardBody?.pending_id !== undefined
+      && discardBody?.pending_id !== null
+      && typeof discardBody.pending_id !== 'string') {
+      return jsonResponse(res, 400, {
+        error: 'validation_failed',
+        message: 'pending_id must be a string when present',
+        ...PUBLIC_DECORATE(),
+      });
+    }
     try {
       const result = discardPendingTail({
         repository: storyRepo,
         session_uuid: publicDiscard[1],
+        ...(discardBody?.pending_id ? { pending_id: discardBody.pending_id } : {}),
       });
       return jsonResponse(res, 200, {
         ...PUBLIC_DECORATE(),

@@ -582,3 +582,41 @@ await test('legacy interrupt path leaves the lifecycle coherent by itself', asyn
   assert.equal(recovered.history[0].event_type, 'narrative_beat');
   assert.equal(recovered.history[1].event_type, 'player_input');
 });
+await test('targeted discardPendingTail only drops the batch it was asked to drop', async () => {
+  // Regression for the 2026-09-13 production incident: a client whose
+  // turn was superseded releases the batch that turn staged. That
+  // cleanup can arrive late, so it must never drop a NEWER batch.
+  const { repository, session_uuid } = await buildSession();
+  const stale = stageNarrativeBatch({
+    repository, session_uuid, events: makeBatch(3), source: 'runtime', expected_revision: 0,
+  });
+
+  // Targeted discard of the active batch works and reports what it dropped.
+  const dropped = discardPendingTail({
+    repository, session_uuid, pending_id: stale.pending_id,
+  });
+  assert.equal(dropped.dropped_pending_id, stale.pending_id);
+  assert.equal(dropped.dropped_pending_count, 3);
+  assert.equal(recoverPendingSession({ repository, session_uuid }).pending, null);
+
+  // A newer batch is staged after the stale turn was abandoned.
+  const fresh = stageNarrativeBatch({
+    repository, session_uuid, events: makeBatch(2), source: 'runtime', expected_revision: 0,
+  });
+  assert.notEqual(fresh.pending_id, stale.pending_id);
+
+  // The late cleanup for the OLD batch must be a no-op, not a silent
+  // delete of the batch the player is currently reading.
+  const lateCleanup = discardPendingTail({
+    repository, session_uuid, pending_id: stale.pending_id,
+  });
+  assert.equal(lateCleanup.dropped_pending_id, null);
+  assert.equal(lateCleanup.dropped_pending_count, 0);
+  const stillActive = recoverPendingSession({ repository, session_uuid }).pending;
+  assert.equal(stillActive.pending_id, fresh.pending_id, 'the newer batch survives a late cleanup');
+
+  // Omitting pending_id keeps the original unconditional behaviour.
+  const unconditional = discardPendingTail({ repository, session_uuid });
+  assert.equal(unconditional.dropped_pending_id, fresh.pending_id);
+  assert.equal(recoverPendingSession({ repository, session_uuid }).pending, null);
+});

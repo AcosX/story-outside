@@ -67,6 +67,7 @@ const tests = [
   "tests/endingComparison.test.mjs",
   "tests/frontendGenerationRace.test.mjs",
   "tests/frontendRoleBootstrapRace.test.mjs",
+  "tests/frontendSupersededPendingDiscard.test.mjs",
   "tests/readingHistory.test.mjs"
 ];
 for (const file of tests) {
