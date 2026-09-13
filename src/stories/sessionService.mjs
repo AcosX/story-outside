@@ -458,7 +458,7 @@ function normalizeCacheEvent(event, pinned, cache_uuid, session_uuid) {
   }
   const payload = event.payload && typeof event.payload === 'object'
     ? event.payload
-    : { type: eventType, ...progressMetadata(event), ...(event.text === undefined ? {} : { text: event.text }), ...(event.speaker === undefined ? {} : { speaker: event.speaker }), ...(typeof event.text_first_person === 'string' && event.text_first_person ? { text_first_person: event.text_first_person } : {}) };
+    : { type: eventType, ...progressMetadata(event), ...(event.text === undefined ? {} : { text: event.text }), ...(event.speaker === undefined ? {} : { speaker: event.speaker }), ...(event.text_by_role && typeof event.text_by_role === 'object' && !Array.isArray(event.text_by_role) ? { text_by_role: event.text_by_role } : {}), ...(typeof event.text_first_person === 'string' && event.text_first_person ? { text_first_person: event.text_first_person } : {}) };
   if (!pinned || pinned.sequence !== event.sequence || pinned.type !== eventType) {
     throw new Error('commitOpeningEvent: event does not belong to pinned cache');
   }
@@ -1527,7 +1527,19 @@ function renderHistoryForSession(repository, session, history) {
     role_id: session.role_id,
     first_person_role_id: firstPersonRoleIdOf(repository, session.story_version_uuid),
   };
-  if (!perspective.first_person_role_id) return history;
+  // opening-rules/3 gives EVERY role a generated `text_by_role` track, third
+  // person sources included, so a null `first_person_role_id` no longer means
+  // "single track". Only skip the projection when neither track exists, or
+  // recovery would serve the neutral base while the first read served the
+  // role track (and the model would be fed a different opening than the
+  // player saw). Legacy single-track rows still short-circuit here.
+  const hasRoleTrack = history.some((event) => {
+    const byRole = event && event.event_type === 'story_opening' && event.payload
+      ? event.payload.text_by_role
+      : null;
+    return Boolean(byRole && typeof byRole === 'object' && !Array.isArray(byRole));
+  });
+  if (!perspective.first_person_role_id && !hasRoleTrack) return history;
   return history.map((event) => {
     if (!event || event.event_type !== 'story_opening' || !event.payload) return event;
     const text = renderOpeningText(event.payload, perspective);

@@ -166,15 +166,19 @@ export function generateOpeningCache(input) {
       structured && typeof structured.speaker === 'string' && structured.speaker
         ? structured.speaker
         : undefined;
-    // Carry the verbatim first-person track through to the cache event when
-    // the preparation step produced one. Both tracks live on the same event
+    // Carry the per-role narration tracks through to the cache event when
+    // the preparation step produced them. All tracks live on the same event
     // so the cache stays work-level: no role ever reaches the cache key.
+    const byRole =
+      structured && structured.text_by_role && typeof structured.text_by_role === 'object' && !Array.isArray(structured.text_by_role)
+        ? { text_by_role: structured.text_by_role }
+        : {};
     const firstPerson =
       structured && typeof structured.text_first_person === 'string' && structured.text_first_person
         ? { text_first_person: structured.text_first_person }
         : {};
     if (type === 'action') {
-      events.push({ type: 'action', sequence: events.length, text, ...firstPerson, ...progressMetadata(structured) });
+      events.push({ type: 'action', sequence: events.length, text, ...byRole, ...firstPerson, ...progressMetadata(structured) });
       continue;
     }
     const speaker =
@@ -185,7 +189,7 @@ export function generateOpeningCache(input) {
     const ev = speaker
       ? { type: 'dialogue', sequence: events.length, text, speaker }
       : { type: 'narration', sequence: events.length, text };
-    events.push({ ...ev, ...firstPerson, ...progressMetadata(structured) });
+    events.push({ ...ev, ...byRole, ...firstPerson, ...progressMetadata(structured) });
   }
   if (events.length === 0) {
     boundary = 'empty_story';

@@ -400,7 +400,11 @@ async function runTurnOnce(runtime, { request_id, input, expected_revision } = {
     // A transient network,
     // upstream, or model response failure can therefore be retried safely by
     // the idempotent HTTP client without replaying a committed event.
-    fail('provider_failure', 'agent provider failed', {
+    // Surface the underlying error class (e.g. invalid_response) in the
+    // message so player-facing toasts and support reports are not a black
+    // box; the stable machine code remains provider_failure.
+    const detail = error && typeof error.code === 'string' && error.code ? ` (${error.code})` : '';
+    fail('provider_failure', `agent provider failed${detail}`, {
       retryable: error && typeof error.retryable === 'boolean' ? error.retryable : true,
     });
   }

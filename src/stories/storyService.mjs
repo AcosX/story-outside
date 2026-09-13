@@ -76,11 +76,14 @@ import { generateOpeningCache } from './openingGenerator.mjs';
 export function defaultGenerationProfile() {
   return {
     identifier: 'opening-default',
-    // opening-rules/2 adds the dual-track opening (neutral third person +
-    // verbatim first person). Bumping the rules version gives every existing
-    // work a new generation_hash, so single-track caches are rebuilt instead
-    // of being served without a first-person track.
-    rules_version: 'opening-rules/2',
+    // opening-rules/3 replaces the verbatim first-person slice with generated
+    // per-role perspective tracks (text_by_role): the original narrator gets
+    // a first-person-voice generated opening, every other role a second-person
+    // one. Bumping the rules version gives every existing work a new
+    // generation_hash, so dual-track caches are rebuilt instead of being
+    // served without per-role tracks. Legacy text_first_person rows stay
+    // renderable through the read-time fallback chain.
+    rules_version: 'opening-rules/3',
     locale: 'zh-CN',
     variant: 'default',
   };
