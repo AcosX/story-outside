@@ -8,6 +8,7 @@
 // state that has no normalized equivalent in the current service API.
 
 import { createHash } from 'node:crypto';
+import { info as logInfo } from '../observability/logger.mjs';
 import { appendSessionEvent, pendingRequestFingerprint } from './sessionEventPersistence.mjs';
 
 import { canonicalJsonStringify, canonicalSha256 } from '../stories/canonicalHash.mjs';
@@ -46,8 +47,24 @@ function dateValue(value) {
   return valueIso ? new Date(valueIso) : null;
 }
 
+function comparableSession(session) {
+  // LRU touches are process-local cache bookkeeping, not gameplay writes.
+  // Persist the latest value opportunistically with the next real mutation.
+  const { lastTouchedAt, ...runtime } = session.runtime_payload || {};
+  return { ...session, runtime_payload: runtime };
+}
+
 function snapshotHash(snapshot) {
-  return createHash('sha256').update(JSON.stringify(snapshot)).digest('hex');
+  return createHash('sha256').update(JSON.stringify({ ...snapshot,
+    sessions: snapshot.sessions.map(comparableSession),
+  })).digest('hex');
+}
+
+// Compare against the last COMMITTED snapshot, never the in-flight one.
+// Changed old events still go through appendSessionEvent's conflict checks.
+function changedRows(rows = [], previous = [], key, comparable = row => row) {
+  const before = new Map(previous.map(row => [row[key], JSON.stringify(comparable(row))]));
+  return rows.filter(row => before.get(row[key]) !== JSON.stringify(comparable(row)));
 }
 
 function stableUuid(input) {
@@ -144,6 +161,7 @@ export async function createMariaDbRepositories({
 
   let dirty = true;
   let lastHash = null;
+  let lastSnapshot = null;
   let writeChain = Promise.resolve();
   const persistence = {
     markDirty() {
@@ -441,7 +459,8 @@ export async function createMariaDbRepositories({
         });
       }
       dirty = false;
-      lastHash = snapshotHash(captureSnapshot());
+      lastSnapshot = storyRows.length ? captureSnapshot() : null;
+      lastHash = lastSnapshot ? snapshotHash(lastSnapshot) : null;
     } catch (error) {
       if (error && (error.code === 'ER_NO_SUCH_TABLE' || error.code === 'ER_BAD_FIELD_ERROR')) {
         throw new Error('MariaDB business schema is incomplete; run npm run db:migrate before starting the server');
@@ -587,8 +606,14 @@ export async function createMariaDbRepositories({
     }
   }
 
-  async function syncSessions(connection, snapshot, ids) {
+  async function syncSessions(connection, snapshot, ids, previous) {
+    const priorSessions = new Map((previous?.sessions || []).map(row => [row.session_uuid, row]));
     const sessionIdByUuid = new Map();
+    // CHECK(first_choice_at >= created_at) is evaluated before duplicate-key
+    // resolution; retain the existing creation time on the INSERT candidate.
+    const [creationRows] = snapshot.sessions.length
+      ? await connection.query('SELECT session_uuid, created_at FROM game_sessions') : [[]];
+    const createdAt = new Map(creationRows.map(row => [row.session_uuid, row.created_at]));
     for (const item of snapshot.sessions || []) {
       const storyId = ids.storyIdByUuid.get(item.story_uuid);
       const versionId = ids.versionIdByUuid.get(item.story_version_uuid);
@@ -604,6 +629,7 @@ export async function createMariaDbRepositories({
       };
       const status = storyStatusForSession(item.state);
       const openingState = openingStateForSession(item.state);
+      const creationTime = dateValue(createdAt.get(item.session_uuid) || marker?.first_choice_at) || new Date();
       await connection.query(
         `INSERT INTO game_sessions
           (session_uuid, story_id, story_version_id, user_uuid, user_ref, role_id,
@@ -613,8 +639,8 @@ export async function createMariaDbRepositories({
            compacted_event_count, token_estimate, context_window,
            context_safety_ratio, reserved_completion_tokens, context_schema_version,
            prompt_version, last_compact_at, last_compact_attempt_at,
-           last_compact_status, last_compact_error, runtime_payload, ended_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           last_compact_status, last_compact_error, runtime_payload, ended_at, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON DUPLICATE KEY UPDATE
            story_id = VALUES(story_id), story_version_id = VALUES(story_version_id),
            user_uuid = VALUES(user_uuid), user_ref = VALUES(user_ref), role_id = VALUES(role_id),
@@ -630,7 +656,7 @@ export async function createMariaDbRepositories({
            last_compact_at = VALUES(last_compact_at), last_compact_attempt_at = VALUES(last_compact_attempt_at),
            last_compact_status = VALUES(last_compact_status), last_compact_error = VALUES(last_compact_error),
            runtime_payload = VALUES(runtime_payload), ended_at = VALUES(ended_at)`,
-        [item.session_uuid, storyId, versionId, item.user_uuid || null, item.user_ref, item.role_id, item.model, item.prompt, json(item.generation_profile || {}), status, ids.cacheIdByUuid.get(item.cache_uuid) || null, dateValue(marker && marker.first_choice_at), item.opening_cursor || 0, openingState, item.revision || 0, item.compact?.context_compact_text || null, json(item.compact?.context_compact_payload || null), item.compact?.compacted_through_seq ?? null, item.compact?.compacted_event_count ?? null, item.compact?.token_estimate ?? null, item.compact?.context_window ?? null, item.compact?.context_safety_ratio ?? null, item.compact?.reserved_completion_tokens ?? null, item.compact?.context_schema_version ?? 1, item.compact?.prompt_version ?? 1, dateValue(item.compact?.last_compact_at), dateValue(item.compact?.last_compact_attempt_at), item.compact?.last_compact_status || 'idle', item.compact?.last_compact_error || null, json(runtimePayload), status === 'ended' ? new Date() : null],
+        [item.session_uuid, storyId, versionId, item.user_uuid || null, item.user_ref, item.role_id, item.model, item.prompt, json(item.generation_profile || {}), status, ids.cacheIdByUuid.get(item.cache_uuid) || null, dateValue(marker && marker.first_choice_at), item.opening_cursor || 0, openingState, item.revision || 0, item.compact?.context_compact_text || null, json(item.compact?.context_compact_payload || null), item.compact?.compacted_through_seq ?? null, item.compact?.compacted_event_count ?? null, item.compact?.token_estimate ?? null, item.compact?.context_window ?? null, item.compact?.context_safety_ratio ?? null, item.compact?.reserved_completion_tokens ?? null, item.compact?.context_schema_version ?? 1, item.compact?.prompt_version ?? 1, dateValue(item.compact?.last_compact_at), dateValue(item.compact?.last_compact_attempt_at), item.compact?.last_compact_status || 'idle', item.compact?.last_compact_error || null, json(runtimePayload), status === 'ended' ? new Date() : null, creationTime],
       );
     }
     const [sessionRows] = await connection.query('SELECT id, session_uuid FROM game_sessions');
@@ -646,7 +672,7 @@ export async function createMariaDbRepositories({
         ? pending.pending_id
         : null;
 
-      for (const event of item.history || []) {
+      for (const event of changedRows(item.history, priorSessions.get(item.session_uuid)?.history, 'event_id')) {
         await appendSessionEvent(connection, sessionId, event);
       }
 
@@ -752,7 +778,7 @@ export async function createMariaDbRepositories({
         [sessionId, stableUuid(`checkpoint:${item.session_uuid}`), lastEvent ? lastEvent.event_id : null, lastEvent ? lastEvent.event_seq : null, history.length, canonicalSha256(history), item.compact?.context_compact_text || null, json(runtimeState)],
       );
 
-      for (const record of item.runtime_payload?.compact_history || []) {
+      for (const record of changedRows(item.runtime_payload?.compact_history, priorSessions.get(item.session_uuid)?.runtime_payload?.compact_history, 'attempt_uuid')) {
         if (!record || !record.attempt_uuid || !UUID_PATTERN.test(record.attempt_uuid)) continue;
         await connection.query(
           `INSERT IGNORE INTO compact_compacted_events
@@ -813,34 +839,64 @@ export async function createMariaDbRepositories({
   }
 
   async function flush() {
+    const queuedAt = performance.now();
     const write = writeChain.then(async () => {
+      const startedAt = performance.now();
       const snapshot = captureSnapshot();
       const currentHash = snapshotHash(snapshot);
       if (!dirty && currentHash === lastHash) return;
-      if (currentHash === lastHash) {
-        dirty = false;
-        return;
-      }
+      if (currentHash === lastHash) { dirty = false; return; }
+      const previous = lastSnapshot;
+      const markerChanges = new Set(changedRows(snapshot.stories?.sessionFirstChoices, previous?.stories?.sessionFirstChoices, 'session_uuid').map(row => row.session_uuid));
+      const changedSessions = changedRows(snapshot.sessions, previous?.sessions, 'session_uuid', comparableSession);
+      const changedSessionIds = new Set(changedSessions.map(row => row.session_uuid));
+      const delta = {
+        stories: {
+          stories: changedRows(snapshot.stories?.stories, previous?.stories?.stories, 'story_uuid'),
+          versions: changedRows(snapshot.stories?.versions, previous?.stories?.versions, 'version_uuid'),
+          openingCaches: changedRows(snapshot.stories?.openingCaches, previous?.stories?.openingCaches, 'cache_uuid'),
+        },
+        sessions: snapshot.sessions.filter(row => changedSessionIds.has(row.session_uuid) || markerChanges.has(row.session_uuid)),
+        community: changedRows(snapshot.community, previous?.community, 'profile_uuid'),
+      };
       const connection = await pool.getConnection();
+      let sqlMs = 0;
+      let commitMs = 0;
+      let committed = false;
       try {
+        const sqlStart = performance.now();
         await connection.beginTransaction();
-        const ids = await syncStories(connection, snapshot);
-        await syncCommunity(connection, snapshot, ids);
-        await syncSessions(connection, snapshot, ids);
-        await syncFollowing(connection, snapshot);
-        await syncSearch(connection, snapshot);
+        const ids = await syncStories(connection, delta);
+        await syncCommunity(connection, delta, ids);
+        await syncSessions(connection, delta, ids, previous);
+        if (JSON.stringify(snapshot.following) !== JSON.stringify(previous?.following)) {
+          await syncFollowing(connection, snapshot);
+        }
+        if (JSON.stringify(snapshot.search) !== JSON.stringify(previous?.search)) {
+          await syncSearch(connection, snapshot);
+        }
+        sqlMs = performance.now() - sqlStart;
+        const commitStart = performance.now();
         await connection.commit();
+        commitMs = performance.now() - commitStart;
+        committed = true;
         lastHash = currentHash;
+        lastSnapshot = snapshot;
         dirty = false;
       } catch (error) {
         await connection.rollback().catch(() => {});
         throw error;
       } finally {
         connection.release();
+        logInfo('database.flush', { component: 'database', latency_ms: Math.round(performance.now() - startedAt),
+          extra: { queue_ms: Math.round(startedAt - queuedAt), sql_ms: Math.round(sqlMs),
+            commit_ms: Math.round(commitMs), committed, sessions: delta.sessions.length,
+            stories: delta.stories.stories.length, versions: delta.stories.versions.length } });
       }
     });
     // A failed transaction must reject its caller, but must not poison the
-    // serialization queue. Keep the snapshot dirty so the next flush retries.
+    // queue or advance the baseline. Mutations during a write are captured
+    // by the next flush even if markDirty ran before this write committed.
     writeChain = write.catch(() => {});
     return write;
   }

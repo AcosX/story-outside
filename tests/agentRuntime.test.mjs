@@ -387,3 +387,13 @@ await test('interrupt starts new revision while old generation finishes; stale r
   assert.equal(a.items[0].text,'玩家离开后的新叙事');
   assert.equal(provider.callCount,1);
 });
+
+await test('new keyed turn over pending is rejected before a second paid call', async () => {
+  const provider = createMockAgentProvider({ responses: [{ messages: [{ role: 'assistant', content: 'first' }] }] });
+  const runtime = await buildRuntime(provider);
+  const args = { request_id: 'first', input: { text: 'continue' }, expected_revision: recoverRuntime(runtime).base_revision };
+  const first = await runTurn(runtime, args);
+  await assert.rejects(runTurn(runtime, { ...args, request_id: 'new' }), error => error.code === 'pending_conflict');
+  assert.equal(provider.callCount, 1);
+  assert.deepEqual(await runTurn(runtime, args), first, 'original id still replays exactly');
+});

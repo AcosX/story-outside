@@ -40,7 +40,7 @@ const STATE = {
 
 // ---------- API helper ----------
 
-const RETRYABLE_HTTP_STATUSES = new Set([408, 425, 429, 500, 502, 503, 504]);
+const RETRYABLE_HTTP_STATUSES = new Set([408, 425, 429, 500, 502, 503, 504, 524]);
 const API_MAX_RETRIES = 2;
 const API_RETRY_BASE_DELAY_MS = 250;
 const API_RETRY_MAX_DELAY_MS = 2000;
@@ -88,8 +88,9 @@ async function api(path, options = {}) {
     let validJson = true;
     try { data = await res.json(); } catch { validJson = false; data = { error: 'bad_json' }; }
     if (!validJson) {
-      const err = new Error('invalid_json_response');
-      err.code = 'bad_json';
+      const timedOut = [408, 504, 524].includes(res.status);
+      const err = new Error(timedOut ? '请求超时，请重试。' : (!res.ok ? `http_${res.status}` : 'invalid_json_response'));
+      err.code = timedOut ? 'request_timeout' : (!res.ok ? `http_${res.status}` : 'bad_json');
       err.status = res.status;
       err.data = data;
       if (retryableRequest && RETRYABLE_HTTP_STATUSES.has(res.status) && attempt < API_MAX_RETRIES) {
@@ -99,8 +100,9 @@ async function api(path, options = {}) {
       throw err;
     }
     if (!res.ok) {
-      const err = new Error((data && data.message) || (data && data.error) || `http_${res.status}`);
-      err.code = data && data.error;
+      const timedOut = [408, 504, 524].includes(res.status);
+      const err = new Error(timedOut ? '请求超时，请重试。' : ((data && data.message) || (data && data.error) || `http_${res.status}`));
+      err.code = timedOut ? 'request_timeout' : ((data && data.error) || `http_${res.status}`);
       err.status = res.status;
       err.data = data;
       if (retryableRequest && RETRYABLE_HTTP_STATUSES.has(res.status) && attempt < API_MAX_RETRIES) {
