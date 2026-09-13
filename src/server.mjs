@@ -884,7 +884,7 @@ function sessionErrorResponse(res, err) {
 }
 
 function agentRuntimeErrorResponse(res, err, decoration = {}) {
-  loggerWarn('agent.request.failed', { component: 'agent', error_code: err.code, extra: { retryable: err.retryable === true } });
+  loggerWarn('agent.request.failed', { session_uuid: decoration?.session_uuid || null, component: 'agent', error_code: err.code, extra: { retryable: err.retryable === true } });
   // AgentRuntimeError always carries an explicit boolean. Keep the
   // fallback for older callers, but never turn an explicit false into a
   // retryable 502 merely because the code is provider_failure.
