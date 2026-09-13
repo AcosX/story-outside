@@ -311,9 +311,19 @@ async function currentShareTargetUuid() {
 
 async function refreshAuthStatus() {
   const { status, data } = await fetchJson('/api/auth/status', { method: 'GET' });
+  if (status === 200 && data?.configured && !data.authenticated) {
+    setAuthStatus('登录知乎后，查看朋友的故事');
+    for (const id of ['social-panel-follow-btn', 'social-panel-share-btn', 'social-panel-unshare-btn']) {
+      const button = document.getElementById(id); if (button) button.disabled = true;
+    }
+    return null;
+  }
   if (status !== 200 || !data || !data.owner) {
     setAuthStatus('暂时无法读取账户');
     return null;
+  }
+  for (const id of ['social-panel-follow-btn', 'social-panel-share-btn', 'social-panel-unshare-btn']) {
+    const button = document.getElementById(id); if (button) button.disabled = false;
   }
   const name = data.owner.display_name || OAUTH_PENDING_DISPLAY_NAME;
   setAuthStatus(`已登录 · ${name}`);
@@ -347,6 +357,10 @@ async function refreshShareButton() {
 
 async function refreshFeed() {
   const { status, data } = await fetchJson('/v1/ecosystem/friend-timelines?limit=20', { method: 'GET' });
+  if (status === 401) {
+    setStatus('请点击页面上方的知乎登录。');
+    return;
+  }
   if (status !== 200 || !data) {
     setStatus('动态暂时未能加载，请稍后刷新。');
     return;

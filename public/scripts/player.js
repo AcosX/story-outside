@@ -243,6 +243,11 @@ async function requestApi(path, options = {}) {
       throw err;
     }
     if (!res.ok) {
+      if (res.status === 401 && data.error === 'login_required') {
+        clearAutoplayTimer();
+        showToast('请点击知乎登录后继续。');
+        const link = $('#login-link'); if (link) link.hidden = false;
+      }
       const err = new Error(data.message || data.error || `http_${res.status}`);
       err.code = data.error || `http_${res.status}`;
       err.status = res.status;
@@ -252,6 +257,11 @@ async function requestApi(path, options = {}) {
         continue;
       }
       throw err;
+    }
+    if (state.authConfigured && path !== '/api/auth/status' && data?.owner && oauthOwnerId(data.owner) !== state.ownerUuid) {
+      clearAutoplayTimer();
+      window.location.replace('/');
+      const error = new Error('account_changed'); error.code = 'stale_session'; throw error;
     }
     return data;
   }
@@ -340,7 +350,7 @@ const READING_PAGE_SIZE = 9;
 
 function rememberReading() {
   if (!state.story || !state.sessionUuid) return;
-  const saved = { story: state.story, role: state.role, sessionUuid: state.sessionUuid, storyUuid: state.storyUuid, storyVersionUuid: state.storyVersionUuid, cacheUuid: state.cacheUuid, generationProfile: state.generationProfile, openingEvents: state.openingEvents, communityProfileVersion: state.communityProfileVersion, communityProfileUuid: state.communityProfileUuid, communityProfileQueries: state.communityProfileQueries, knowledgeQueries: state.knowledgeQueries, finished: state.finished || state.status === 'finished', updatedAt: Date.now() };
+  const saved = { ownerUuid: state.ownerUuid || null, story: state.story, role: state.role, sessionUuid: state.sessionUuid, storyUuid: state.storyUuid, storyVersionUuid: state.storyVersionUuid, cacheUuid: state.cacheUuid, generationProfile: state.generationProfile, openingEvents: state.openingEvents, communityProfileVersion: state.communityProfileVersion, communityProfileUuid: state.communityProfileUuid, communityProfileQueries: state.communityProfileQueries, knowledgeQueries: state.knowledgeQueries, finished: state.finished || state.status === 'finished', updatedAt: Date.now() };
   try {
     migrateReading();
     localStorage.setItem(READING_HISTORY_PREFIX + saved.sessionUuid, JSON.stringify(saved));
@@ -348,7 +358,8 @@ function rememberReading() {
     setText('#autosave-status', '已自动保存');
   } catch { setText('#autosave-status', '进度已提交，本机续读记录未保存'); }
 }
-function readReading() { try { return JSON.parse(localStorage.getItem('story-outside:reading') || 'null'); } catch { return null; } }
+function ownsReading(saved) { return !state.authConfigured || Boolean(state.ownerUuid && saved?.ownerUuid === state.ownerUuid); }
+function readReading() { try { const saved = JSON.parse(localStorage.getItem('story-outside:reading') || 'null'); return ownsReading(saved) ? saved : null; } catch { return null; } }
 // Keep one storage entry per session so independent tabs do not overwrite a shared list.
 function migrateReading() {
   const legacy = readReading();
@@ -367,7 +378,7 @@ function readReadingHistory() {
       if (!key?.startsWith(READING_HISTORY_PREFIX)) continue;
       try {
         const saved = JSON.parse(localStorage.getItem(key));
-        if (saved?.story && saved.sessionUuid && key === READING_HISTORY_PREFIX + saved.sessionUuid) records.set(saved.sessionUuid, saved);
+        if (ownsReading(saved) && saved?.story && saved.sessionUuid && key === READING_HISTORY_PREFIX + saved.sessionUuid) records.set(saved.sessionUuid, saved);
       } catch { /* A damaged entry must not hide the rest of the bookshelf. */ }
     }
   } catch { /* Storage may be unavailable; retain the legacy record if readable. */ }
@@ -1806,7 +1817,68 @@ function bindEvents() {
   });
 }
 
+function oauthOwnerId(owner) { return owner?.user_uuid || null; }
+
+async function initializeAccount() {
+  const params = new URLSearchParams(window.location.search);
+  const error = params.get('oauth_error');
+  if (error) {
+    const messages = {
+      oauth_state_invalid: '登录验证未通过，请重新使用知乎登录。',
+      oauth_denied: '你已取消知乎授权。',
+      oauth_identity_unavailable: '暂时无法读取知乎账号，请稍后重试。',
+    };
+    showToast(messages[error] || '知乎登录暂时未成功，请稍后重试。');
+    params.delete('oauth_error');
+    history.replaceState(null, '', window.location.pathname + (params.size ? '?' + params : ''));
+  }
+  try {
+    const authStatus = await api('/api/auth/status');
+    state.authConfigured = authStatus.configured === true;
+    state.ownerUuid = oauthOwnerId(authStatus.owner);
+    state.ownerDisplayName = authStatus.owner?.display_name || '';
+    state.ownerAuthSource = authStatus.owner?.auth_source || '';
+    setText('#owner-display-name', state.ownerDisplayName);
+    if (!state.authConfigured) return;
+    // Never reuse a previous account's last-session pointer on a shared browser.
+    try {
+      const accountKey = 'story-outside:session-account';
+      if (sessionStorage.getItem(accountKey) !== state.ownerUuid) sessionStorage.removeItem('story-outside:last-session');
+      sessionStorage.setItem(accountKey, state.ownerUuid || '');
+      const activeKey = 'story-outside:active-account';
+      localStorage.setItem(activeKey, state.ownerUuid || '');
+      window.addEventListener('storage', event => {
+        if (event.key === activeKey && event.newValue !== (state.ownerUuid || '')) {
+          clearAutoplayTimer(); window.location.replace('/');
+        }
+      });
+    } catch { /* unavailable storage */ }
+    const controls = $('#account-controls'); if (controls) controls.hidden = false;
+    setText('#account-name', state.ownerDisplayName);
+    const login = $('#login-link');
+    if (login) { login.hidden = authStatus.authenticated; login.href = '/auth/login?return_to=' + encodeURIComponent(window.location.pathname + window.location.search); }
+    const logout = $('#logout-btn');
+    if (logout) {
+      logout.hidden = !authStatus.authenticated;
+      logout.addEventListener('click', async () => {
+        logout.disabled = true; clearAutoplayTimer();
+        try {
+          await api('/auth/logout', { method: 'POST' });
+          try { localStorage.setItem('story-outside:active-account', ''); } catch { /* unavailable storage */ }
+          window.location.assign('/');
+        } catch { logout.disabled = false; showToast('退出未成功，请重试。'); }
+      });
+    }
+  } catch {
+    // Until identity can be resolved, do not display a previous account's shelf.
+    state.authConfigured = true; state.ownerUuid = null;
+    try { sessionStorage.removeItem('story-outside:last-session'); } catch { /* unavailable storage */ }
+    showToast('暂时无法确认登录状态，请刷新后重试。');
+  }
+}
+
 async function bootstrap() {
+  await initializeAccount();
   bindEvents();
   // ClickUp 16.3 P1 v1-4 (主人 2026-09-07 06:24 巡检 + ChatGPT
   // 复核): lazily load the session-context helper FIRST so the
@@ -1828,22 +1900,6 @@ async function bootstrap() {
     }
   } catch { /* panel is best-effort — the core game flow must still run */ }
   setStatus('loading');
-  // ClickUp 16.3 P1 v1-2 (主人 2026-09-07 04:21 巡检): resolve the
-  // canonical owner once on page load via GET /api/auth/status. The
-  // server returns OAUTH_PENDING_USER until OAuth lands — we render
-  // that display name on the picker and on the ending page. We do
-  // NOT mint a cookie or any per-browser principal id; the principal
-  // flows exclusively from currentUserProvider(req) on the server.
-  try {
-    const authStatus = await api('/api/auth/status');
-    if (authStatus && authStatus.owner) {
-      state.ownerDisplayName = authStatus.owner.display_name || '';
-      state.ownerAuthSource = authStatus.owner.auth_source || '';
-      if (state.ownerDisplayName) {
-        setText('#owner-display-name', state.ownerDisplayName);
-      }
-    }
-  } catch { /* leave owner-display-name blank if the endpoint is unavailable */ }
   // Deep link: showScreen writes ?s=<screen> into the URL, and a reload
   // on the ending screen must land back on the ending page instead of
   // silently dropping the player into the picker. Attempt the mount

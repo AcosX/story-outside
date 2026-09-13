@@ -132,7 +132,9 @@ import {
   getMockFollowingIdentity,
   isValidUserUuid,
 } from './ecosystem/following/index.mjs';
-import { OAUTH_PENDING_USER, currentUserProvider } from './auth/currentUserProvider.mjs';
+import { currentUserProvider, bindCurrentUser } from './auth/currentUserProvider.mjs';
+import { createZhihuOAuth, loadOAuthConfig } from './auth/zhihuOAuth.mjs';
+const oauth = createZhihuOAuth(loadOAuthConfig());
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 const ROOT = resolve(__dirname, '..');
@@ -582,23 +584,7 @@ function publicDecorate() {
   return PUBLIC_DECORATE_FOR_ECOSYSTEM();
 }
 
-// ClickUp 16.3 P1 v1-2 rebuild (主人 2026-09-07 04:21 巡检): the auth
-// seam is a SINGLE fixed function — `currentUserProvider(req)` from
-// src/auth/currentUserProvider.mjs — which returns OAUTH_PENDING_USER
-// regardless of the request. There is no cookie, no fake-user header,
-// no per-browser random user_uuid, no signed-token login path, and
-// no body-derived identity. Every route resolves the caller through
-// `currentUserProvider(req)`. When OAuth lands, only
-// src/auth/currentUserProvider.mjs changes.
-//
-// The previous v1 cookie path
-// (`STORY_OUTSIDE_SESSION_COOKIE`, `parseCookieHeader`,
-// `readSessionUserUuid`, `ensureSessionUserUuid`,
-// `requireAuthUserUuid`) is gone. v2's signed-login path is NOT
-// cherry-picked. The single helper that the rest of the file touches
-// is:
-//   const auth = currentUserProvider(req);
-//   // auth.user_uuid, auth.display_name, auth.auth_source
+// All personal routes resolve the server-verified owner through currentUserProvider.
 
 /**
  * Map a FollowingError to an HTTP status. Used by every /v1/ecosystem
@@ -931,6 +917,54 @@ async function handleRequest(req, res) {
   const method = req.method || 'GET';
   const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
   const pathname = url.pathname;
+
+  if (oauth.enabled) bindCurrentUser(req, oauth.owner(req));
+  const authRoute = pathname.startsWith('/auth/') || pathname === '/api/auth/status';
+  const personalRoute = /^\/api\/sessions(?:\/|$)/.test(pathname)
+    || /^\/v1\/ecosystem\/(?:follow(?:\/|$)|friend-timelines$|sessions\/)/.test(pathname);
+  if (authRoute || personalRoute) {
+    res.setHeader('Cache-Control', 'no-store');
+    res.setHeader('Referrer-Policy', 'no-referrer');
+  }
+  if (pathname.startsWith('/auth/')) {
+    try {
+      let location;
+      if (pathname === '/auth/login' && method === 'GET') location = oauth.start(req, res, url);
+      else if (pathname === '/auth/callback' && method === 'GET') location = await oauth.callback(req, res, url);
+      else if (pathname === '/auth/logout' && method === 'POST' && oauth.enabled) {
+        oauth.logout(req, res);
+        return jsonResponse(res, 200, { ok: true });
+      } else return jsonResponse(res, 405, { error: 'method_not_allowed' });
+      res.writeHead(303, { Location: location }); res.end(); return;
+    } catch (error) {
+      const code = /^oauth_|^csrf_rejected$/.test(error.code || '') ? error.code : 'oauth_failed';
+      if (pathname === '/auth/callback') {
+        // Drop the authorization code from the browser URL and any subsequent referrer.
+        res.writeHead(303, { Location: '/?oauth_error=' + encodeURIComponent(code) }); res.end(); return;
+      }
+      return jsonResponse(res, error.status || 400, { error: code });
+    }
+  }
+  if (method === 'GET' && pathname === '/api/auth/status' && oauth.enabled) {
+    return jsonResponse(res, 200, oauth.status(req));
+  }
+  if (oauth.enabled) {
+    // The old development APIs accept caller-provided identities; never expose
+    // this alternative path in an OAuth deployment, even without a proxy ACL.
+    if (/^\/api\/(admin|dev)(?:\/|$)/.test(pathname)) return jsonResponse(res, 403, { error: 'forbidden' });
+    if (personalRoute) {
+      const owner = currentUserProvider(req);
+      if (!owner) return jsonResponse(res, 401, { error: 'login_required', message: '请先使用知乎登录。', login_url: '/auth/login' });
+      if (!['GET', 'HEAD'].includes(method)) {
+        try { oauth.assertOrigin(req); } catch { return jsonResponse(res, 403, { error: 'csrf_rejected' }); }
+      }
+      const match = pathname.match(/^\/api\/sessions\/([^/]+)/);
+      if (match && isSessionUuid(match[1])) {
+        const sessionOwner = findOwnerBySession({ repository: storyRepo, session_uuid: match[1] });
+        if (sessionOwner !== owner.user_uuid) return jsonResponse(res, 404, { error: 'session_not_found' });
+      }
+    }
+  }
 
   // Health & meta
   if (method === 'GET' && pathname === '/api/health') {
@@ -2018,11 +2052,7 @@ async function handleRequest(req, res) {
       });
     }
     const sessionUuid = randomUUID();
-    // ClickUp 16.3 P1 v1-2 (主人 2026-09-07 04:21 巡检): the canonical
-    // session owner comes from `currentUserProvider(req)`. The fixed
-    // function returns OAUTH_PENDING_USER regardless of cookies,
-    // headers, or body. There is NO cookie minting, NO Set-Cookie
-    // header is emitted, and the player never supplies the identity.
+    // Bind new stories to the server-verified caller, never a body field.
     const auth = currentUserProvider(req);
     try {
       // PR #10 review (B1): we deliberately do NOT pass an `identity`
@@ -3039,13 +3069,10 @@ async function handleRequest(req, res) {
     return false;
   }
 
-  // ClickUp 16.3 P1 v1-2 (主人 2026-09-07 04:21 巡检): identity is a
-  // SINGLE fixed function — there is no auth failure mode. The
-  // canonical owner is OAUTH_PENDING_USER. We deliberately do NOT
-  // return 401: every request resolves to the same identity, and the
-  // share / follow / friend-timelines surfaces always succeed.
   function requireAuthUserUuid(res, req) {
-    return currentUserProvider(req).user_uuid;
+    const owner = currentUserProvider(req);
+    if (!owner) { jsonResponse(res, 401, { error: 'login_required' }); return null; }
+    return owner.user_uuid;
   }
 
   // POST /v1/ecosystem/follow — add a follow.
