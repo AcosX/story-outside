@@ -579,7 +579,7 @@ const ecosystemHotOrchestrator = createEcosystemHotOrchestrator();
 followingService = createFollowingService({
   repository: followingRepo,
   accountDirectory: { resolve: (token) => followingRepo.resolveAccount(token) },
-  fetchFollowees: (args) => fetchZhihuFollowees({ ...args, env: { ZHIHU_ACCESS_SECRET: loadZhihuAccessSecret() } }),
+  fetchFollowees: (args) => fetchZhihuFollowees(args, { env: { ZHIHU_ACCESS_SECRET: loadZhihuAccessSecret() } }),
   listActivities: (ownerUuid) => listOwnerActivities(storyRepo, ownerUuid),
 });
 
