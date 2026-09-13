@@ -10,6 +10,16 @@ const ANALYSIS_PROMPT = `你为互动小说准备角色和公共开场。阅读�
 // "the protagonist". Rejecting them deterministically is the only reliable
 // enforcement — a model asked to self-check will happily claim compliance.
 const GENERIC_PROTAGONIST_TERMS = ['主角', '男主', '女主', '主人公', '叙述者', '主角儿'];
+
+// Upper bound for the model-supplied opening boundary. The prompt asks for
+// 3–6 short beats covering the span before the first choice, so a value past
+// this is an estimate error, not a long opening.
+const MAX_OPENING_SOURCE_SENTENCES = 60;
+
+// Total attempts for one preparation. Bounded on purpose: each attempt is a
+// paid long-context call, so this trades a little latency on a rare bad
+// sample for not failing the import outright.
+const PREPARATION_ATTEMPTS = 2;
 function validPreparation(result) {
   if (!result || !Array.isArray(result.roles) || result.roles.length < 1 || result.roles.length > 6) return false;
   const ids = new Set();
@@ -23,7 +33,18 @@ function validPreparation(result) {
   if (!result.opening_events.every(event => event && ['narration','action','dialogue'].includes(event.type)
     && typeof event.text === 'string' && event.text.trim() && event.text.length <= 800
     && (event.type !== 'dialogue' || ids.has(event.speaker)))) return false;
+  if (!validOpeningBoundary(result)) return false;
   return validProtagonistNaming(result);
+}
+
+// The opening boundary drives the verbatim first-person slice. Imported novels
+// carry no ask_player_choice marker, so a missing or absurd value would slice
+// the ENTIRE book into the opening and spoil it. Reject it here instead of
+// caching and serving it.
+function validOpeningBoundary(result) {
+  if (result.first_person_role_id === null) return true;
+  const count = result.opening_source_sentence_count;
+  return Number.isInteger(count) && count >= 1 && count <= MAX_OPENING_SOURCE_SENTENCES;
 }
 
 // The shared opening must address a named protagonist by name. This runs as a
@@ -41,9 +62,8 @@ function validProtagonistNaming(result) {
   const name = typeof result.protagonist_display_name === 'string' ? result.protagonist_display_name.trim() : '';
   if (!name) return false;
   if (GENERIC_PROTAGONIST_TERMS.some(term => name.includes(term))) return false;
-  // The label is the name taken from the source text; when it is a real name
-  // the narration has to actually use it rather than an invented alias.
-  if (name !== role.label.trim() && !narration.includes(name)) return false;
+  // The narration has to actually use the name rather than an invented alias
+  // or a bare pronoun.
   return narration.includes(name);
 }
 
@@ -56,10 +76,22 @@ export function createPreparedStoryProvider(provider, config, { fetchImpl = fetc
       const key = 'story-' + cacheHash({ version: PREPARATION_VERSION, model: config.model, id: story.id, title: story.title, beats: story.beats });
       const analysis = await cachedAIResult(config, key, async () => {
         const complete = createAICompletion({ config, fetchImpl });
-        return complete([
+        const messages = [
           { role: 'system', content: ANALYSIS_PROMPT + '\n' + PLOT_PROGRESS_PROMPT },
           { role: 'user', content: JSON.stringify({ title: story.title, original_beats: story.beats }) },
-        ], 3500);
+        ];
+        // Bounded retry: the deterministic validators (protagonist naming and
+        // opening boundary) reject a non-conforming analysis, and a single
+        // sample is not a reliable signal of "this model cannot comply".
+        // Without this the first bad sample fails the whole import and the
+        // player sees an error. The last attempt's result is returned as-is so
+        // cachedAIResult still performs the authoritative validation.
+        let last;
+        for (let attempt = 0; attempt < PREPARATION_ATTEMPTS; attempt += 1) {
+          last = await complete(messages, 3500);
+          if (validPreparation(last)) return last;
+        }
+        return last;
       }, validPreparation);
       return {
         ...story,
@@ -90,10 +122,16 @@ function withFirstPersonTrack(analysis, beats) {
     ...(event.speaker ? { speaker: event.speaker } : {}),
   }));
   if (analysis.first_person_role_id === null) return neutral;
+  // A dialogue event renders as a speech bubble attributed to `speaker`.
+  // The first-person slice is plain prose, so attaching it to a dialogue
+  // event would put narration in someone's mouth. Only a fully
+  // dialogue-free opening gets the second track.
+  if (neutral.some((event) => event.type === 'dialogue')) return neutral;
   const texts = firstPersonOpeningTexts({
     beats,
     sentenceCount: analysis.opening_source_sentence_count,
     eventCount: neutral.length,
+    neutralChars: neutral.reduce((sum, event) => sum + event.text.length, 0),
   });
   if (!texts) return neutral;
   return neutral.map((event, index) => ({ ...event, text_first_person: texts[index] }));

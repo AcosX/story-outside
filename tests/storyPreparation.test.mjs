@@ -110,6 +110,91 @@ try {
   } finally { await rm(cacheDir2, { recursive: true, force: true }); }
 }
 
+// An invalid opening boundary is rejected. Without this the slicer would fall
+// back to the whole novel and spoil it.
+{
+  const cacheDir4 = await mkdtemp(join(tmpdir(), 'story-preparation-boundary-'));
+  try {
+    const source = { id: 'four', title: '原作四', hook: '简介', roles: [], beats: [{ index: 0, text: SOURCE_TEXT }] };
+    const config = { apiKey: 'test', baseURL: 'https://example.invalid/v1', model: 'test', timeoutMs: 1000, cacheDir: cacheDir4 };
+    const withBoundary = (count) => ({
+      roles: [{ id: 'traveler', label: '陈远', mood: '旅人' }],
+      first_person_role_id: 'traveler',
+      protagonist_display_name: '陈远',
+      ...(count === undefined ? {} : { opening_source_sentence_count: count }),
+      opening_events: [{ type: 'narration', text: '陈远推开诊室的门，雨水顺着衣角滴落。' }],
+    });
+    for (const bad of [undefined, 0, -1, 1000]) {
+      const fetchImpl = async () => ({ ok: true, json: async () => ({ choices: [{ message: { content: JSON.stringify(withBoundary(bad)) } }] }) });
+      const prepared = createPreparedStoryProvider({ name: 'real', getStory: async () => source }, { ...config, cacheDir: undefined }, { fetchImpl });
+      await assert.rejects(() => prepared.getStory('four'), /invalid story analysis/, `boundary ${String(bad)} must be rejected`);
+    }
+    console.log('Story preparation: an invalid opening boundary is rejected');
+  } finally { await rm(cacheDir4, { recursive: true, force: true }); }
+}
+
+// A rejected sample is retried rather than failing the whole import.
+{
+  const cacheDir5 = await mkdtemp(join(tmpdir(), 'story-preparation-retry-'));
+  try {
+    const source = { id: 'five', title: '原作五', hook: '简介', roles: [], beats: [{ index: 0, text: SOURCE_TEXT }] };
+    const config = { apiKey: 'test', baseURL: 'https://example.invalid/v1', model: 'test', timeoutMs: 1000, cacheDir: cacheDir5 };
+    const bad = {
+      roles: [{ id: 'traveler', label: '陈远', mood: '旅人' }],
+      first_person_role_id: 'traveler',
+      protagonist_display_name: '主角',
+      opening_source_sentence_count: 4,
+      opening_events: [{ type: 'narration', text: '主角推开了房门。' }],
+    };
+    const good = {
+      roles: [{ id: 'traveler', label: '陈远', mood: '旅人' }],
+      first_person_role_id: 'traveler',
+      protagonist_display_name: '陈远',
+      opening_source_sentence_count: 4,
+      opening_events: [{ type: 'narration', text: '陈远推开诊室的门，雨水顺着衣角滴落。' }],
+    };
+    let calls = 0;
+    const fetchImpl = async () => {
+      calls++;
+      const body = calls === 1 ? bad : good;
+      return { ok: true, json: async () => ({ choices: [{ message: { content: JSON.stringify(body) } }] }) };
+    };
+    const prepared = createPreparedStoryProvider({ name: 'real', getStory: async () => source }, config, { fetchImpl });
+    const story = await prepared.getStory('five');
+    assert.equal(calls, 2, 'a rejected sample must be retried once');
+    assert.ok(story.ai_opening_events[0].text.includes('陈远'));
+    console.log('Story preparation: a rejected sample is retried instead of failing the import');
+  } finally { await rm(cacheDir5, { recursive: true, force: true }); }
+}
+
+// Dialogue events render as speech bubbles, so they must not carry a prose
+// slice as their first-person track.
+{
+  const cacheDir6 = await mkdtemp(join(tmpdir(), 'story-preparation-dialogue-'));
+  try {
+    const source = { id: 'six', title: '原作六', hook: '简介', roles: [], beats: [{ index: 0, text: SOURCE_TEXT }] };
+    const config = { apiKey: 'test', baseURL: 'https://example.invalid/v1', model: 'test', timeoutMs: 1000, cacheDir: cacheDir6 };
+    const analysis = {
+      roles: [{ id: 'traveler', label: '陈远', mood: '旅人' }, { id: 'doctor', label: '林医生', mood: '医生' }],
+      first_person_role_id: 'traveler',
+      protagonist_display_name: '陈远',
+      opening_source_sentence_count: 4,
+      opening_events: [
+        { type: 'narration', text: '陈远推开诊室的门，雨水顺着衣角滴落。' },
+        { type: 'dialogue', speaker: 'doctor', text: '哪里不舒服？' },
+      ],
+    };
+    const fetchImpl = async () => ({ ok: true, json: async () => ({ choices: [{ message: { content: JSON.stringify(analysis) } }] }) });
+    const prepared = createPreparedStoryProvider({ name: 'real', getStory: async () => source }, config, { fetchImpl });
+    const story = await prepared.getStory('six');
+    assert.ok(
+      !story.ai_opening_events.some((event) => 'text_first_person' in event),
+      'an opening containing dialogue must not get a first-person track',
+    );
+    console.log('Story preparation: dialogue openings keep a single neutral track');
+  } finally { await rm(cacheDir6, { recursive: true, force: true }); }
+}
+
 // A third-person source has no first-person track at all, and keeps working.
 {
   const cacheDir3 = await mkdtemp(join(tmpdir(), 'story-preparation-third-'));

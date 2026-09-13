@@ -35,11 +35,24 @@
  *  not split away from its punctuation. */
 const SENTENCE_END = /([。！？…；\.!?;]+[」』”’）)\]】》]*)/;
 
-/** Minimum / maximum characters per rendered opening entry. These mirror the
- *  40–100 char guidance the analysis prompt gives for the third-person track,
- *  so the two tracks pace similarly during playback. */
+/** Target characters per rendered opening entry. These mirror the 40–100 char
+ *  guidance the analysis prompt gives for the third-person track, so the two
+ *  tracks pace similarly during playback. */
 const MIN_ENTRY_CHARS = 40;
 const MAX_ENTRY_CHARS = 100;
+
+/** Hard ceiling before an entry is considered pathological. Generous relative
+ *  to MAX_ENTRY_CHARS because a single source sentence can legitimately run
+ *  long; anything past this means the boundary estimate was wrong and the
+ *  track is dropped rather than shown. */
+const ENTRY_CHAR_HARD_LIMIT = MAX_ENTRY_CHARS * 3;
+
+/** The first-person track is verbatim source while the neutral track is a
+ *  condensed retelling of the same span, so the former is legitimately a few
+ *  times longer. This ratio only catches ORDER-OF-MAGNITUDE failures — e.g. a
+ *  boundary that slid to the end of the book — without punishing a normally
+ *  terse summary. */
+const MAX_LENGTH_RATIO = 6;
 
 /**
  * Split narrative prose into sentences, keeping terminal punctuation attached.
@@ -126,30 +139,44 @@ function partition(count, groups) {
  *
  * `sentenceCount` is the model-supplied boundary: how many leading source
  * sentences belong to the opening (i.e. everything before the first
- * meaningful choice). It is clamped to the available sentences, so a bad or
- * oversized estimate degrades into "use what exists" instead of throwing.
+ * meaningful choice).
+ *
+ * FAIL CLOSED. A missing, zero, negative or non-integer boundary does NOT
+ * mean "use the whole source": imported novels carry no `ask_player_choice`
+ * marker, so falling back to every sentence would slice the ENTIRE book into
+ * the opening and spoil it. Without a usable boundary there is no
+ * first-person track and the caller keeps the neutral one.
+ *
+ * `neutralChars` is the character count of the third-person track for the
+ * same span. When supplied it acts as a cross-check on the model's estimate:
+ * the two tracks describe the same span, so a first-person track several
+ * times longer means the boundary overshot into later plot.
  *
  * @param {object} input
  * @param {Array<string | { text?: string, type?: string }>} input.beats
- * @param {number} input.sentenceCount
- * @param {number} input.eventCount   Entry count of the third-person track.
+ * @param {number} input.sentenceCount  Required positive integer boundary.
+ * @param {number} input.eventCount     Entry count of the third-person track.
+ * @param {number} [input.neutralChars] Total characters of the neutral track.
  * @returns {string[] | null} One string per event, or null when unavailable.
  */
-export function firstPersonOpeningTexts({ beats, sentenceCount, eventCount }) {
+export function firstPersonOpeningTexts({ beats, sentenceCount, eventCount, neutralChars }) {
   if (!Number.isInteger(eventCount) || eventCount < 1) return null;
+  // Fail closed: no trustworthy boundary means no first-person track.
+  if (!Number.isInteger(sentenceCount) || sentenceCount < 1) return null;
   const sentences = sourceSentences(beats);
   if (sentences.length === 0) return null;
-  const limit = Number.isInteger(sentenceCount) && sentenceCount > 0
-    ? Math.min(sentenceCount, sentences.length)
-    : sentences.length;
-  const selected = sentences.slice(0, limit);
+  const selected = sentences.slice(0, Math.min(sentenceCount, sentences.length));
   const ranges = partition(selected.length, eventCount);
   if (!ranges) return null;
   const texts = ranges.map(([start, end]) => selected.slice(start, end).join(''));
-  // Guard against a pathological source (e.g. one 4000-char unpunctuated
-  // block) producing entries far outside the playback envelope. Callers treat
-  // null as "no first-person track" and fall back to the neutral text.
   if (texts.some((text) => !text.trim())) return null;
+  // A pathological source (e.g. one long unpunctuated block) or an overshot
+  // boundary would blow past the playback envelope; drop the track instead.
+  if (texts.some((text) => text.length > ENTRY_CHAR_HARD_LIMIT)) return null;
+  if (Number.isFinite(neutralChars) && neutralChars > 0) {
+    const total = texts.reduce((sum, text) => sum + text.length, 0);
+    if (total > neutralChars * MAX_LENGTH_RATIO) return null;
+  }
   return texts;
 }
 

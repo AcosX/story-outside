@@ -60,10 +60,51 @@ const SOURCE = '我推开诊室的门，雨水顺着衣角滴落。林医生正�
   assert.equal(firstPersonOpeningTexts({ beats, sentenceCount: 1, eventCount: 3 }), null);
   assert.equal(firstPersonOpeningTexts({ beats: [], sentenceCount: 3, eventCount: 1 }), null);
   assert.equal(firstPersonOpeningTexts({ beats, sentenceCount: 1, eventCount: 0 }), null);
-  // An oversized model estimate is clamped instead of throwing.
+  // An oversized estimate is clamped to the available sentences, and the
+  // short source keeps entries well inside the size ceiling.
   const clamped = firstPersonOpeningTexts({ beats: [{ text: SOURCE }], sentenceCount: 999, eventCount: 2 });
   assert.equal(clamped.length, 2);
   console.log('First-person opening: degenerate input yields no track instead of empty entries');
+}
+
+// A missing boundary must NOT mean "use the whole source". Imported novels
+// carry no ask_player_choice marker, so falling back to every sentence would
+// slice the entire book into the opening and spoil it.
+{
+  const novel = Array.from({ length: 120 }, (_, i) => `这是原作第${i}句正文内容，描述了一些情节。`).join('');
+  const beats = [{ index: 0, text: novel }];
+  for (const bad of [undefined, null, 0, -3, 2.5, '8', NaN]) {
+    assert.equal(
+      firstPersonOpeningTexts({ beats, sentenceCount: bad, eventCount: 3 }),
+      null,
+      `boundary ${String(bad)} must fail closed instead of slicing the whole novel`,
+    );
+  }
+  // A sane boundary still works on the same source and stays near the start.
+  const ok = firstPersonOpeningTexts({ beats, sentenceCount: 6, eventCount: 3 });
+  assert.equal(ok.length, 3);
+  assert.ok(novel.startsWith(ok.join('')));
+  assert.ok(!ok.join('').includes('第119句'), 'a valid boundary must not reach the end of the novel');
+  console.log('First-person opening: a missing boundary fails closed instead of spoiling the novel');
+}
+
+// Overshot boundaries are caught by the entry-size ceiling and by the
+// cross-check against the neutral track's length.
+{
+  const novel = Array.from({ length: 120 }, (_, i) => `这是原作第${i}句正文内容，描述了一些情节。`).join('');
+  const beats = [{ index: 0, text: novel }];
+  // 90 sentences over 3 events => ~600 chars per entry, past the hard limit.
+  assert.equal(firstPersonOpeningTexts({ beats, sentenceCount: 90, eventCount: 3 }), null);
+  // Within the size ceiling, but far longer than the neutral track describing
+  // the same span => the boundary overshot into later plot.
+  assert.equal(
+    firstPersonOpeningTexts({ beats, sentenceCount: 12, eventCount: 3, neutralChars: 20 }),
+    null,
+  );
+  // A verbatim track is legitimately a few times longer than a terse summary
+  // of the same span, so a normal ratio must still be accepted.
+  assert.ok(firstPersonOpeningTexts({ beats, sentenceCount: 12, eventCount: 3, neutralChars: 60 }));
+  console.log('First-person opening: overshot boundaries are rejected by size and ratio checks');
 }
 
 // ---------------------------------------------------------------------
