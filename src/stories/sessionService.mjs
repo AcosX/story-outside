@@ -83,6 +83,24 @@ import { randomUUID } from 'node:crypto';
 import { canonicalJsonStringify, canonicalSha256 } from './canonicalHash.mjs';
 import { SessionNotFoundError, SessionConflictError } from '../providers/dto.mjs';
 import { importStoryAndEnsureCache } from './storyService.mjs';
+import { renderOpeningEvents, renderOpeningText } from './openingFirstPerson.mjs';
+
+/**
+ * Read the pinned story version's canonical `first_person_role_id`.
+ * Returns null for third-person sources and for legacy versions imported
+ * before the field existed, which makes every caller fall back to the
+ * neutral narration track.
+ *
+ * @param {object} repository
+ * @param {string} story_version_uuid
+ * @returns {string|null}
+ */
+function firstPersonRoleIdOf(repository, story_version_uuid) {
+  const version = repository.findVersion(story_version_uuid);
+  const payload = version && version.content_payload;
+  const value = payload && payload.first_person_role_id;
+  return typeof value === 'string' && value ? value : null;
+}
 
 // ---------------------------------------------------------------------------
 // ClickUp 09 / issue #9 — public-session bootstrap helper
@@ -440,7 +458,7 @@ function normalizeCacheEvent(event, pinned, cache_uuid, session_uuid) {
   }
   const payload = event.payload && typeof event.payload === 'object'
     ? event.payload
-    : { type: eventType, ...progressMetadata(event), ...(event.text === undefined ? {} : { text: event.text }), ...(event.speaker === undefined ? {} : { speaker: event.speaker }) };
+    : { type: eventType, ...progressMetadata(event), ...(event.text === undefined ? {} : { text: event.text }), ...(event.speaker === undefined ? {} : { speaker: event.speaker }), ...(typeof event.text_first_person === 'string' && event.text_first_person ? { text_first_person: event.text_first_person } : {}) };
   if (!pinned || pinned.sequence !== event.sequence || pinned.type !== eventType) {
     throw new Error('commitOpeningEvent: event does not belong to pinned cache');
   }
@@ -1404,7 +1422,13 @@ export async function bootstrapSessionFromWork({ repository, provider, session_u
     throw new Error('sessionService: pinned cache must be valid');
   }
   const opening_events = Array.isArray(cache.content_payload && cache.content_payload.events)
-    ? cache.content_payload.events.map((ev) => clone(ev))
+    ? renderOpeningEvents(
+        cache.content_payload.events.map((ev) => clone(ev)),
+        {
+          role_id,
+          first_person_role_id: firstPersonRoleIdOf(repository, ensured.story_version_uuid),
+        },
+      )
     : [];
   // Step 3: defaults the public player API does NOT expose. They are
   // server-side identity/policy values the browser cannot influence.
@@ -1451,7 +1475,11 @@ export function getSession({ repository, session_uuid }) {
 export function listSessionEvents({ repository, session_uuid }) {
   if (!repository) throw new Error('listSessionEvents: repository required');
   assertUuid('session_uuid', session_uuid);
-  return clone(sessionForActive(repository, session_uuid).history);
+  const session = sessionForActive(repository, session_uuid);
+  // The runtime feeds this straight to the model as committed_history, so it
+  // must show the same narration track the player is reading; otherwise the
+  // player sees the original first person while the model sees third person.
+  return renderHistoryForSession(repository, session, clone(session.history));
 }
 
 /**
@@ -1471,10 +1499,41 @@ export function recoverSession({ repository, session_uuid }) {
   if (!repository) throw new Error('recoverSession: repository required');
   assertUuid('session_uuid', session_uuid);
   const session = sessionForActive(repository, session_uuid);
-  return {
+  const recovered = {
     ...publicSession(session, true),
     pending: publicPending(ensurePendingShape(session.pending)),
   };
+  // Canonical history stores BOTH narration tracks so commitOpeningEvent can
+  // keep comparing against the pinned cache byte for byte. Recovery is a read
+  // boundary, so project each opening event onto the track this session's
+  // role should actually read.
+  recovered.history = renderHistoryForSession(repository, session, recovered.history);
+  return recovered;
+}
+
+/**
+ * Project committed `story_opening` payloads onto the track matching the
+ * session's role. Non-opening events and legacy single-track payloads pass
+ * through untouched.
+ *
+ * @param {object} repository
+ * @param {{ role_id: string, story_version_uuid: string }} session
+ * @param {Array<object>} history
+ * @returns {Array<object>}
+ */
+function renderHistoryForSession(repository, session, history) {
+  if (!Array.isArray(history)) return history;
+  const perspective = {
+    role_id: session.role_id,
+    first_person_role_id: firstPersonRoleIdOf(repository, session.story_version_uuid),
+  };
+  if (!perspective.first_person_role_id) return history;
+  return history.map((event) => {
+    if (!event || event.event_type !== 'story_opening' || !event.payload) return event;
+    const text = renderOpeningText(event.payload, perspective);
+    if (text === event.payload.text) return event;
+    return { ...event, payload: { ...event.payload, text } };
+  });
 }
 
 // ---------------------------------------------------------------------------
