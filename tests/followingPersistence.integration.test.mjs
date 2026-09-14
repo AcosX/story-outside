@@ -1,7 +1,7 @@
 // Opt-in: run only against the named disposable database, migrated beforehand.
 import assert from 'node:assert/strict';
 import mysql from 'mysql2/promise';
-import { randomUUID } from 'node:crypto';
+import { createZhihuOAuth, ownerFromProfile } from '../src/auth/zhihuOAuth.mjs';
 import { createMariaDbRepositories } from '../src/db/mariaPersistence.mjs';
 import { createInMemoryStoryRepository } from '../src/stories/repository.mjs';
 import { createInMemoryCommunityProfileRepository } from '../src/community/repository.mjs';
@@ -14,9 +14,18 @@ const adapter=()=>createMariaDbRepositories({pool,storyRepository:createInMemory
 try {
  const [existing]=await pool.query('SELECT COUNT(*) AS n FROM ecosystem_account_preferences');
  assert.equal(Number(existing[0].n),0,'test starts with no account rows');
- const id=randomUUID();
+ const profile={uid:'1234567890123456789',hash_id:'0123456789abcdef0123456789abcdef',url:'https://openapi.zhihu.com/users/1234567890123456789'};
+ const id=ownerFromProfile(profile,'413').user_uuid;
  const first=await adapter();
- first.followingRepository.rememberAccount({user_uuid:id,url_token:'roundtrip-user'});
+ const config={appId:'413',appKey:'fixture-app-key',redirectUri:'https://story.example/auth/callback',origin:'https://story.example'};
+ const oauth=createZhihuOAuth(config,{onLogin:owner=>first.followingRepository.rememberAccount(owner),fetchImpl:async url=>Response.json(
+  url.endsWith('/access_token')?{access_token:'fixture-token',expires_in:3600}:url==='https://openapi.zhihu.com/user'?profile:{id:profile.hash_id,url_token:'roundtrip-user'}
+ )});
+ const makeResponse=()=>({headers:{},getHeader(k){return this.headers[k]},setHeader(k,v){this.headers[k]=v}});
+ const start=makeResponse();
+ const authorize=new URL(oauth.start({headers:{}},start,new URL('https://story.example/auth/login')));
+ await oauth.callback({headers:{cookie:start.headers['Set-Cookie'][0].split(';')[0]}},makeResponse(),new URL(config.redirectUri+'?code=fixture-code&state='+authorize.searchParams.get('state')));
+ assert.equal(first.followingRepository.resolveAccount('roundtrip-user'),id);
  first.followingRepository.setVisibility(id,false);
  await first.flush();
  const second=await adapter();

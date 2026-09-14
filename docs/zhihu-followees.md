@@ -17,6 +17,14 @@
 - 服务端复用现有 `loadZhihuAccessSecret`，环境变量优先，否则读取忽略文件 `secrets/secret`，无需新增或更换线上凭证。
 - 知乎令牌仍仅留在登录会话内，重启后需要重新登录。持久化的主页映射不包含令牌。
 
+## 登录账号与公开主页的对应
+
+OAuth `GET https://openapi.zhihu.com/user` 的 `url` 实际为 `/users/<数字 UID>`，不能将其当作 `/people/<url_token>`，也不能将数字 UID 直接用于关注列表匹配。
+
+当 OAuth 资料没有可用的公开主页地址时，使用该资料的 `hash_id` 查询 `GET https://www.zhihu.com/api/v4/members/<hash_id>?include=url_token`，核对响应 `id` 与 `hash_id` 完全一致后，才登记响应中的 `url_token`。此公开用户接口已于 2026-09-14 在 VM3 实测；请求不携带 OAuth token、Access Secret 或 Cookie，禁止重定向，并限制为 5 秒和 64 KiB。已有 `/people/` 资料继续直接使用。
+
+公开资料查询失败仍允许登录，但不猜测账号映射，并记录 `following.identity.unavailable`，便于区分没有活动与身份解析失败。旧版本未登记的玩家需要在修复后重新登录一次才能补齐映射；账号 UUID、已有游戏和可见性偏好保持不变。后续部署重启可从数据库恢复已登记的映射。
+
 ## 发布
 
 启动新版前执行迁移 `0009_following_account_preferences.sql`。这是新增表与迁移记录，旧版本不依赖此表，可回滚应用代码。数据库启动检查要求 migration 0009 已应用。
