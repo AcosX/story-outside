@@ -44,6 +44,7 @@ import {
   StoryNotFoundError,
   ValidationError,
 } from './dto.mjs';
+import { storyTransportFromEnv } from './storyTransport.mjs';
 import { BoundedMap } from '../util/boundedMap.mjs';
 import { warn as loggerWarn } from '../observability/logger.mjs';
 
@@ -706,7 +707,7 @@ function detailFromDetailEntry(raw) {
  * }}
  */
 export function createRealZhihuStoryProvider(opts = {}) {
-  const fetchImpl = opts.fetchImpl || globalThis.fetch;
+  const fetchImpl = opts.fetchImpl || storyTransportFromEnv(validateStoryTransportPayload);
   const baseUrl = (opts.baseUrl || DEFAULT_BASE_URL).replace(/\/+$/, '');
   const timeoutMs = readIntEnv(
     typeof process !== 'undefined' && process.env && process.env.STORY_OUTSIDE_ZHIHU_TIMEOUT_MS,
@@ -1011,4 +1012,14 @@ export function createRealZhihuStoryProvider(opts = {}) {
       return result;
     },
   });
+}
+// Validate with the same DTO contract before a transport result becomes durable.
+export function validateStoryTransportPayload(id, payload) {
+  if (id === 'list') {
+    if (!Array.isArray(payload)) throw new ValidationError('Story list must be an array');
+    for (const item of payload) summaryFromListEntry(item);
+  } else {
+    const detail = detailFromDetailEntry(payload);
+    if (detail.id !== id) throw new ValidationError('Story detail ID mismatch');
+  }
 }
