@@ -13,7 +13,7 @@ const state={sessionUuid:'s',lastRevision:1,lastPlayerRequestId:1,status:'playin
 const bodies=[];let mode='timeout';
 const api=async(path,options)=>{
  const b=JSON.parse(options.body);bodies.push(b);
- assert.equal(options.headers.prefer,'respond-async');
+ assert.equal(options.headers.prefer,'respond-async, persist-async');
  if(mode==='timeout')throw Object.assign(new Error('timeout'),{code:'request_timeout'});
  if(mode==='poll'){mode='done';return {status:'pending'};}
  return {revision:1,pending_id:'p',events:[{text:'result'}]};

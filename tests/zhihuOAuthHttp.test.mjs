@@ -102,6 +102,12 @@ try {
   for (const suffix of ['generate','interrupt','opening-events','narrative-events','first-choice','discard-pending']) assert.equal((await post('/api/sessions/' + uuid + '/' + suffix, {}, b)).status, 404, suffix);
   const shared = await post('/v1/ecosystem/sessions/' + uuid + '/share', undefined, b);
   assert.equal(shared.status, 400); assert.equal((await shared.json()).error, 'not_session_owner');
+  assert.equal((await get('/api/sessions/' + uuid + '/save-status')).status, 401);
+  assert.equal((await get('/api/sessions/' + uuid + '/save-status', b)).status, 404);
+  assert.equal((await get('/api/sessions/' + uuid + '/save-status', a)).status, 200);
+  assert.equal((await post('/api/sessions/' + uuid + '/save-status', {}, a, 'https://evil.example')).status, 403);
+  assert.equal((await post('/api/sessions/' + uuid + '/save-status', {}, b)).status, 404);
+  assert.equal((await post('/api/sessions/' + uuid + '/save-status', {}, a)).status, 200);
   assert.equal((await post('/auth/logout', {}, a, 'https://evil.example')).status, 403);
   assert.equal((await post('/auth/logout', {}, a)).status, 200);
   assert.equal((await get('/api/sessions/' + uuid + '/recover', a)).status, 401);

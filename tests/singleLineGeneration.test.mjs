@@ -127,4 +127,16 @@ function harness() {
   assert.equal(h.commits.length, 0, 'queued playback cannot race a player interrupt');
   assert.equal(h.generations.length, 0);
 }
+{
+  const h = harness();
+  const first = h.player.startNextBatch();
+  h.resolveGeneration(0, choice); await first; await h.tick();
+  h.state.status = 'paused';
+  h.resolveCommit(0, choice); await h.settle();
+  assert.equal(h.timers.size, 0, 'pause/save failure during acceptance must not reveal a tool in the background');
+  assert.equal(h.state.queuedToolCall.name, 'ask_player_choice');
+  h.state.status = 'playing'; await h.player.runStep();
+  assert.equal(h.surfaced.length, 1);
+  assert.equal(h.generations.length, 1);
+}
 console.log('Single-line generation: schema enforcement, legacy replay, immediate display/commit/continuation, pause and choice ordering PASS');
