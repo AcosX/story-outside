@@ -44,6 +44,7 @@ import {
   StoryNotFoundError,
   ValidationError,
 } from './dto.mjs';
+import { storyTransportFromEnv } from './storyTransport.mjs';
 import { BoundedMap } from '../util/boundedMap.mjs';
 import { warn as loggerWarn } from '../observability/logger.mjs';
 
@@ -288,6 +289,12 @@ function shallowDefensiveCopy(value) {
     out[k] = shallowDefensiveCopy(/** @type {any} */ (value)[k]);
   }
   return /** @type {T} */ (/** @type {unknown} */ (out));
+}
+
+// Retained from 391464a: the catalog column is VARCHAR(500), while
+// original introduction/content remain intact in their dedicated fields.
+function catalogHook(value, fallback) {
+  return Array.from(value || fallback).slice(0, 500).join('');
 }
 
 /**
@@ -550,7 +557,7 @@ function summaryFromListEntry(raw) {
   // description to be missing — fall back to a short, attributable
   // placeholder so the route layer never sees an empty hook. We do
   // NOT fabricate story content; the placeholder is metadata only.
-  const hook = description || `来自知乎黑客松参赛作品（${work_id}）`;
+  const hook = catalogHook(description, `来自知乎黑客松参赛作品（${work_id}）`);
   /** @type {{ id: string, label: string, mood: string }[]} */
   const roles = [
     {
@@ -625,7 +632,7 @@ function detailFromDetailEntry(raw) {
   const introduction = typeof entry.introduction === 'string' ? entry.introduction : '';
   const description = typeof entry.description === 'string' ? entry.description : '';
   const hookSource = introduction || description || '';
-  const hook = hookSource || `来自知乎黑客松参赛作品（${work_id}）`;
+  const hook = catalogHook(hookSource, `来自知乎黑客松参赛作品（${work_id}）`);
   const author_name = typeof entry.author_name === 'string' ? entry.author_name : '';
   const author_avatar = typeof entry.author_avatar === 'string' ? entry.author_avatar : '';
   const roles = [{
@@ -706,7 +713,7 @@ function detailFromDetailEntry(raw) {
  * }}
  */
 export function createRealZhihuStoryProvider(opts = {}) {
-  const fetchImpl = opts.fetchImpl || globalThis.fetch;
+  const fetchImpl = opts.fetchImpl || storyTransportFromEnv(validateStoryTransportPayload);
   const baseUrl = (opts.baseUrl || DEFAULT_BASE_URL).replace(/\/+$/, '');
   const timeoutMs = readIntEnv(
     typeof process !== 'undefined' && process.env && process.env.STORY_OUTSIDE_ZHIHU_TIMEOUT_MS,
@@ -1011,4 +1018,14 @@ export function createRealZhihuStoryProvider(opts = {}) {
       return result;
     },
   });
+}
+// Validate with the same DTO contract before a transport result becomes durable.
+export function validateStoryTransportPayload(id, payload) {
+  if (id === 'list') {
+    if (!Array.isArray(payload)) throw new ValidationError('Story list must be an array');
+    for (const item of payload) summaryFromListEntry(item);
+  } else {
+    const detail = detailFromDetailEntry(payload);
+    if (detail.id !== id) throw new ValidationError('Story detail ID mismatch');
+  }
 }
