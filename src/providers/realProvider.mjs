@@ -45,6 +45,7 @@ import {
   ValidationError,
 } from './dto.mjs';
 import { BoundedMap } from '../util/boundedMap.mjs';
+import { warn as loggerWarn } from '../observability/logger.mjs';
 
 const DEFAULT_BASE_URL = 'https://api.zhihu.com';
 const STORY_LIST_PATH = '/km-indep-home/hackathon/v2/story/list';
@@ -53,19 +54,33 @@ const DEFAULT_TIMEOUT_MS = 5000;
 
 // The story list is the homepage's critical path and changes rarely. On
 // 2026-09-14 the upstream edge returned transient 4xx to this host for
-// ~22 minutes, which turned the whole homepage into an error page. Two
-// bounded mitigations live here (list only, never per-work detail):
+// ~22 minutes, which turned the whole homepage into an error page. The
+// same edge glitch also broke per-work detail loads (character / opening
+// preparation reads a story's detail), so the same two bounded
+// mitigations now protect BOTH the list and per-work detail:
 //   1. ONE retry with a short backoff for transient failures.
-//   2. A cache that serves the last good list while it is at most
-//      LIST_TTL_MS old, and keeps serving it as an unbounded stale
-//      fallback whenever a refresh fails — no matter how old it is.
-// The TTL therefore only decides WHEN we re-request, never whether a
-// cached list is still servable: once a good list has been seen, the
-// homepage never hard-fails on an upstream error again. Neither
-// mitigation relaxes the hard rules: no fabricated content, no echoing
-// upstream error bodies, no unbounded retry loops.
-const LIST_RETRY_BACKOFF_MS = 250;
+//   2. A cache that serves the last good value as a stale fallback
+//      whenever a refresh fails — for the list this is an unbounded
+//      single-entry cache (with an additional LIST_TTL_MS freshness
+//      window that skips the network); for detail it is the existing
+//      per-work detailCache (bounded LRU) reused as a failure fallback.
+// The list TTL only decides WHEN we re-request, never whether a cached
+// value is still servable: once a good value has been seen, that surface
+// never hard-fails on a transient upstream error again. Detail has no
+// TTL — a cached entry is always served on hit, and only consulted as a
+// fallback when a refresh fails. Neither mitigation relaxes the hard
+// rules: no fabricated content, no echoing upstream error bodies, no
+// unbounded retry loops.
+const RETRY_BACKOFF_MS = 250;
 const LIST_TTL_MS = 60_000;
+// Per-work detail freshness window. Within DETAIL_TTL_MS of the last
+// successful fetch a cached detail is served without touching the
+// network; past it, getStory re-requests and — if the refresh fails
+// transiently — serves the cached detail as a stale fallback. Detail
+// bodies for a given work are effectively immutable for the contract
+// window, so a generous TTL keeps character/opening preparation working
+// even while the upstream edge is throwing transient 4xx.
+const DETAIL_TTL_MS = 5 * 60_000;
 
 // Per the official contract the upstream is an unauthenticated JSON API
 // for the duration of zhihu_hackathon_2026_p2. We do NOT set
@@ -716,6 +731,14 @@ export function createRealZhihuStoryProvider(opts = {}) {
   /** @type {Map<string, ReturnType<typeof normaliseStoryDetail>>} */
   const detailCache = new BoundedMap({ max: 256, name: 'realProvider.detailCache' });
 
+  // Per-work timestamp of the last successful detail fetch, kept in a
+  // parallel bounded map so detailCache itself still stores plain detail
+  // objects (its existing eviction / defensive-copy tests are unaffected).
+  // Used only to decide freshness: a work missing here (evicted or never
+  // fetched) is simply treated as stale and re-requested.
+  /** @type {Map<string, number>} */
+  const detailFetchedAt = new BoundedMap({ max: 256, name: 'realProvider.detailFetchedAt' });
+
   // Last successful list result + when it was fetched. `listStories`
   // serves this without the network while fresh (<= LIST_TTL_MS) and as
   // an unbounded stale fallback whenever a refresh fails. Plain
@@ -724,21 +747,37 @@ export function createRealZhihuStoryProvider(opts = {}) {
   let listCache = null;
 
   /**
-   * Whether a failed list attempt is worth one immediate retry. Only
-   * transient-looking failures qualify; a 404 (endpoint gone), 429
-   * (rate limit — retrying makes it worse) or a validation error (our
-   * own bug) must fail fast exactly as before.
+   * Whether a failed upstream attempt is worth one immediate retry.
+   * Shared by both listStories and getStory. Only transient-looking
+   * failures qualify; a 404 (endpoint gone / unknown work), 429 (rate
+   * limit — retrying makes it worse) or a validation error (our own bug)
+   * must fail fast exactly as before.
    *
    * @param {unknown} err
    * @returns {boolean}
    */
-  function isTransientListError(err) {
+  function isTransientUpstreamError(err) {
     return err instanceof ProviderError && (
       err.code === 'upstream_4xx'
       || err.code === 'upstream_5xx'
       || err.code === 'upstream_timeout'
       || err.code === 'upstream_network_error'
     );
+  }
+
+  /**
+   * Best-effort upstream HTTP status for structured logs. Returns null
+   * when the error is not a ProviderError carrying a numeric status.
+   *
+   * @param {unknown} err
+   * @returns {number | null}
+   */
+  function upstreamStatusOf(err) {
+    return err instanceof ProviderError
+      && err.details
+      && typeof err.details.status === 'number'
+      ? err.details.status
+      : null;
   }
 
   /**
@@ -815,6 +854,19 @@ export function createRealZhihuStoryProvider(opts = {}) {
         // is still thrown when we have NEVER seen a good list — we never
         // fabricate one.
         if (listCache) {
+          // The refresh failed but a cached list shielded the homepage.
+          // Log it so a recurring "silent" upstream outage is visible in
+          // journald instead of only surfacing as a stale homepage.
+          loggerWarn('stories.list.stale_served', {
+            component: 'realProvider',
+            error_code: err instanceof ProviderError ? err.code : 'unknown',
+            from_cache: true,
+            extra: {
+              route: 'stories',
+              upstream_status: upstreamStatusOf(err),
+              cache_age_ms: Date.now() - listCache.at,
+            },
+          });
           return listCache.value.map((summary) => shallowDefensiveCopy(summary));
         }
         throw err;
@@ -824,7 +876,7 @@ export function createRealZhihuStoryProvider(opts = {}) {
       try {
         payload = await fetchJson(STORY_LIST_PATH);
       } catch (err) {
-        if (!isTransientListError(err)) {
+        if (!isTransientUpstreamError(err)) {
           // Non-transient (404 endpoint gone, 429 rate limit, our own
           // validation) — no retry, but a cached list still shields the
           // homepage.
@@ -833,8 +885,14 @@ export function createRealZhihuStoryProvider(opts = {}) {
         // One bounded retry with a short backoff. The transient failures
         // observed in production were per-request edge glitches, so a
         // single immediate retry recovered most of them.
+        loggerWarn('stories.list.retry', {
+          component: 'realProvider',
+          error_code: err instanceof ProviderError ? err.code : 'unknown',
+          retried: true,
+          extra: { route: 'stories', upstream_status: upstreamStatusOf(err) },
+        });
         try {
-          await new Promise((resolve) => setTimeout(resolve, LIST_RETRY_BACKOFF_MS));
+          await new Promise((resolve) => setTimeout(resolve, RETRY_BACKOFF_MS));
           payload = await fetchJson(STORY_LIST_PATH);
         } catch (retryErr) {
           return staleFallback(retryErr instanceof ProviderError ? retryErr : err);
@@ -858,17 +916,73 @@ export function createRealZhihuStoryProvider(opts = {}) {
     },
     async getStory(id) {
       const work_id = assertWorkId(id);
-      if (detailCache.has(work_id)) {
-        // Defensive copy so callers cannot mutate the cached object.
-        // We use shallowDefensiveCopy rather than a JSON round-trip so
-        // a multi-KiB content string is not cloned three times (raw →
-        // string → parse → object) on every hit.
-        const cached = detailCache.get(work_id);
-        return shallowDefensiveCopy(cached);
+
+      // Fresh cache: within DETAIL_TTL_MS of the last good fetch, serve
+      // the cached detail without touching the network. Defensive copy so
+      // callers cannot mutate the cached object; shallowDefensiveCopy
+      // avoids cloning a multi-KiB content string three times (raw →
+      // string → parse → object) on every hit.
+      const now = Date.now();
+      const fetchedAt = detailFetchedAt.get(work_id);
+      if (detailCache.has(work_id) && typeof fetchedAt === 'number' && now - fetchedAt <= DETAIL_TTL_MS) {
+        return shallowDefensiveCopy(detailCache.get(work_id));
       }
-      const payload = await fetchJson(STORY_DETAIL_PATH(work_id));
+
+      /** @param {unknown} err */
+      const staleFallback = (err) => {
+        // The refresh failed, but a previously fetched detail for this
+        // work beats an error page. Serve it regardless of age (the TTL
+        // only decides WHEN we re-request). The typed error is still
+        // thrown when we have NEVER cached this work — we never fabricate
+        // a story. This shields character / opening preparation, which
+        // reads getStory, from the same transient upstream 4xx that the
+        // 2026-09-14 incident showed on the list path.
+        if (detailCache.has(work_id)) {
+          const cached = detailCache.get(work_id);
+          loggerWarn('stories.detail.stale_served', {
+            component: 'realProvider',
+            error_code: err instanceof ProviderError ? err.code : 'unknown',
+            from_cache: true,
+            extra: {
+              route: 'story_detail',
+              work_id,
+              upstream_status: upstreamStatusOf(err),
+              cache_age_ms: typeof fetchedAt === 'number' ? now - fetchedAt : null,
+            },
+          });
+          return shallowDefensiveCopy(cached);
+        }
+        throw err;
+      };
+
+      let payload;
+      try {
+        payload = await fetchJson(STORY_DETAIL_PATH(work_id));
+      } catch (err) {
+        if (!isTransientUpstreamError(err)) {
+          // Non-transient (404 unknown work / endpoint gone, 429 rate
+          // limit, our own validation) — no retry. A cached detail still
+          // shields the reader; otherwise the typed error propagates
+          // exactly as before (e.g. StoryNotFoundError stays fail-fast).
+          return staleFallback(err);
+        }
+        // One bounded retry with a short backoff, mirroring listStories.
+        loggerWarn('stories.detail.retry', {
+          component: 'realProvider',
+          error_code: err instanceof ProviderError ? err.code : 'unknown',
+          retried: true,
+          extra: { route: 'story_detail', work_id, upstream_status: upstreamStatusOf(err) },
+        });
+        try {
+          await new Promise((resolve) => setTimeout(resolve, RETRY_BACKOFF_MS));
+          payload = await fetchJson(STORY_DETAIL_PATH(work_id));
+        } catch (retryErr) {
+          return staleFallback(retryErr instanceof ProviderError ? retryErr : err);
+        }
+      }
       const detail = detailFromDetailEntry(payload);
       detailCache.set(work_id, detail);
+      detailFetchedAt.set(work_id, Date.now());
       return shallowDefensiveCopy(detail);
     },
     async advanceStory(input) {
