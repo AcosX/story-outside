@@ -7,6 +7,7 @@ const tests = [
   "tests/followeeFileCredentialsHttp.test.mjs",
   "tests/onlineFixes.test.mjs",
   "tests/zhihuOAuth.test.mjs",
+  "tests/zhihuPublicProfile.test.mjs",
   "tests/zhihuOAuthHttp.test.mjs",
   "tests/mariadbConfig.test.mjs",
   "tests/mariaPersistenceQueue.test.mjs",

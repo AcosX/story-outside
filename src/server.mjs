@@ -143,7 +143,11 @@ import { createZhihuOAuth, loadOAuthConfig } from './auth/zhihuOAuth.mjs';
 // 知乎账号目录：登录成功时登记「本人的 url_token → 本站业务 UUID」，「故事里的
 // 相遇」靠它把知乎关注列表反查成本站账号。账号映射随业务仓库持久化。
 const oauth = createZhihuOAuth(loadOAuthConfig(), {
-  onLogin: (owner) => { followingRepo.rememberAccount(owner); },
+  onLogin: (owner) => {
+    if (!followingRepo.rememberAccount(owner)) {
+      loggerWarn('following.identity.unavailable', { component: 'auth', error_code: 'public_profile_unresolved' });
+    }
+  },
 });
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));

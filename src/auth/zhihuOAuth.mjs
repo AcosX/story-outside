@@ -1,5 +1,6 @@
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import { readFileSync } from 'node:fs';
+import { fetchPublicUrlToken } from './zhihuPublicProfile.mjs';
 
 const COOKIE = '__Host-story_outside_session';
 const FLOW_COOKIE = '__Host-story_outside_oauth';
@@ -187,7 +188,16 @@ export function createZhihuOAuth(config, { fetchImpl = (...args) => fetch(...arg
       const profile = await request('https://openapi.zhihu.com/user', {
         headers: { Authorization: `Bearer ${data.access_token}`, 'content-type': 'application/json' },
       });
-      const owner = ownerFromProfile(profile, config.appId);
+      let owner = ownerFromProfile(profile, config.appId);
+      if (!owner.url_token) {
+        const source = profile?.uid !== undefined ? profile : profile?.data;
+        // This public request carries neither the OAuth token nor the app secret.
+        // A failure must not prevent login or invent a profile mapping.
+        try {
+          const urlToken = await fetchPublicUrlToken(source?.hash_id, { fetchImpl });
+          if (urlToken) owner = Object.freeze({ ...owner, url_token: urlToken });
+        } catch { /* onLogin reports the missing mapping without upstream data */ }
+      }
       if (expiresAt <= now()) throw fail('oauth_token_invalid', 502);
       if (flows.get(id) !== flow || flow.expiresAt <= now()) throw fail('oauth_state_invalid');
       reserve(sessions);

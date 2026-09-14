@@ -4,6 +4,7 @@ process.env.STORY_OUTSIDE_OAUTH_SECRET_FILE = '/nonexistent-oauth-test';
 process.env.ZHIHU_OAUTH_APP_ID = '413';
 process.env.ZHIHU_OAUTH_APP_KEY = 'test-app-key';
 process.env.ZHIHU_OAUTH_REDIRECT_URI = 'https://story.example/auth/callback';
+process.env.ZHIHU_ACCESS_SECRET = 'fixture-app-access-secret';
 process.env.STORY_OUTSIDE_PROVIDER = 'mock';
 process.env.STORY_OUTSIDE_AI_PROVIDER = 'mock';
 const realFetch = globalThis.fetch;
@@ -16,7 +17,16 @@ globalThis.fetch = async (url, options) => {
   }
   if (url === 'https://openapi.zhihu.com/user') {
     assert.equal(options.headers.Authorization, 'Bearer fixture-user-token');
-    return Response.json({ uid: userId, fullname: `用户${userId}` });
+    return Response.json({ uid: userId, fullname: `用户${userId}`, url: `https://openapi.zhihu.com/users/${userId}`, hash_id: userId.toString(16).padStart(32, '0') });
+  }
+  if (String(url).startsWith('https://www.zhihu.com/api/v4/members/')) {
+    assert.deepEqual(options.headers, { accept: 'application/json' });
+    const id = new URL(url).pathname.split('/').pop();
+    return Response.json({ id, url_token: `player-${parseInt(id, 16)}` });
+  }
+  if (String(url).startsWith('https://developer.zhihu.com/api/v1/user/followees')) {
+    assert.equal(options.headers['x-oauth-token'], 'fixture-user-token');
+    return Response.json({ Code: 0, Data: { Items: [{ UrlToken: 'player-100', Fullname: '用户100' }], Paging: { IsEnd: true } } });
   }
   return realFetch(url, options);
 };
@@ -71,6 +81,18 @@ try {
   const session = await create.json();
   const uuid = session.session_uuid;
   assert.ok(uuid);
+  // A real-shaped OAuth /user response must become an actual visible activity,
+  // not just a successful login or an entry in an isolated directory.
+  assert.equal((await (await get('/v1/ecosystem/friend-timelines', b)).json()).items.length, 0, 'hidden activity stays hidden');
+  await putVisibility(a, { visible: true });
+  const feed = await (await get('/v1/ecosystem/friend-timelines', b)).json();
+  assert.equal(feed.status, 'ok');
+  assert.equal(feed.matched_count, 1);
+  assert.ok(feed.items.some(item => item.session_uuid === uuid));
+  const publicFeed = JSON.stringify(feed);
+  for (const privateValue of ['fixture-user-token', 'fixture-app-access-secret', '00000000000000000000000000000064']) assert.ok(!publicFeed.includes(privateValue));
+  await putVisibility(a, { visible: false });
+  assert.equal((await (await get('/v1/ecosystem/friend-timelines', b)).json()).items.length, 0, 'visibility still applies after mapping repair');
   for (const suffix of ['', '/recover', '/ending', '/replay', '/original-timeline']) {
     const route = '/api/sessions/' + uuid + suffix;
     assert.equal((await get(route)).status, 401);
