@@ -3228,6 +3228,8 @@ async function handleRequest(req, res) {
         oauthToken: oauth.enabled ? oauth.accessToken(req) : null,
         storyRepository: storyRepo,
         since: sinceRaw,
+        storySlug: url.searchParams.get('story') || null,
+        finishedOnly: url.searchParams.get('state') === 'finished',
         limit: Number.isInteger(limit) && limit > 0 ? limit : 50,
       });
       return jsonResponse(res, 200, { ...publicDecorate(), ...payload });

@@ -80,7 +80,8 @@ function setText(sel, text) {
 
 function showScreen(name) {
   document.body.dataset.view = name;
-  $('#nav-stories')?.classList.toggle('active', name !== 'mine');
+  $('#nav-stories')?.classList.toggle('active', !['mine', 'following'].includes(name));
+  $('#nav-following')?.classList.toggle('active', name === 'following');
   $('#nav-mine')?.classList.toggle('active', name === 'mine');
   $$('.screen').forEach((s) => {
     const isActive = s.dataset.screen === name;
@@ -334,6 +335,7 @@ async function selectStory(storyId) {
   state.story = story; state.role = null;
   setText('#story-name', story.title); setText('#role-name', '故事详情');
   showScreen('detail'); renderStoryDetail(story);
+  void communitySectionModule?.refreshStoryEndings?.(storyId);
   $('#start-story-btn').disabled = true; setText('#detail-status', '正在寻找故事中的角色…'); $('#role-list').innerHTML = '';
   const request = ++state.detailRequest || (state.detailRequest = 1);
   try {
@@ -410,6 +412,7 @@ async function hasCommittedEnding(sessionUuid) {
 async function resumeSavedReading(saved) {
   if (!saved?.story || !saved.sessionUuid) return;
   const navigationToken = state.navigationToken = (state.navigationToken || 0) + 1;
+  setGenerationStatus(false);
   state.generationEpoch = (state.generationEpoch || 0) + 1;
   state.startNextBatchInFlight = null;
   clearAutoplayTimer();
@@ -438,7 +441,7 @@ async function resumeSavedReading(saved) {
     setStatus('error');
   }
 }
-// 「故事里的相遇」区块模块：进入「我的」页面时重新拉取，避免登录或会话变化后
+// 「故事里的相遇」区块模块：进入关注页面时重新拉取，避免登录或会话变化后
 // 仍显示旧内容。模块加载失败时保持 null，该区块静默缺席。
 let communitySectionModule = null;
 async function refreshCommunitySection() {
@@ -478,6 +481,7 @@ async function bootstrapSession({ story, role }) {
   const requestToken = (state.bootstrapRequestToken || 0) + 1;
   state.bootstrapRequestToken = requestToken;
   state.bootstrapInFlight = true;
+  setGenerationStatus(false);
   state.generationEpoch = (state.generationEpoch || 0) + 1;
   state.startNextBatchInFlight = null;
   clearAutoplayTimer();
@@ -860,10 +864,10 @@ async function recoverAndStart() {
   }
 }
 
-function scheduleOpeningStep() {
+function scheduleOpeningStep(elapsedMs = 0) {
   if (state.status !== 'playing' || state.finished) return;
   if (state.autoplayTimer) clearTimeout(state.autoplayTimer);
-  state.autoplayTimer = setTimeout(() => { void runOpeningStep(); }, STEP_DELAY_MS);
+  state.autoplayTimer = setTimeout(() => { void runOpeningStep(); }, Math.max(0, STEP_DELAY_MS - elapsedMs));
 }
 
 // Single entry point that dispatches to the right step based on the
@@ -911,6 +915,7 @@ async function performrunOpeningStep() {
     }
     return;
   }
+  const displayedAt = performance.now();
   const sequence = state.openingCursor;
   const event = state.openingEvents[sequence];
   if (!event) {
@@ -952,7 +957,7 @@ async function performrunOpeningStep() {
     setProgress(computeProgress());
     if (state.status === 'playing' && !state.finished) {
       // Stay on the opening path until the opening is fully committed.
-      scheduleOpeningStep();
+      scheduleOpeningStep(performance.now() - displayedAt);
     }
   } catch (err) {
     if (err?.code === 'stale_session') return null;
@@ -1231,6 +1236,21 @@ async function performcommitNextPendingItem() {
 //   * this must never throw into performstartNextBatch's catch, or a
 //     cleanup failure would surface as a bogus "请求失败" toast for a
 //     turn the player abandoned on purpose.
+function setGenerationStatus(visible) {
+  let indicator = $('#player-generation');
+  if (!visible) { indicator?.remove(); return; }
+  if (!indicator) {
+    indicator = document.createElement('li');
+    indicator.id = 'player-generation';
+    indicator.className = 'generation-status';
+    indicator.setAttribute('role', 'status');
+    indicator.setAttribute('aria-live', 'polite');
+    indicator.textContent = '故事正在继续…';
+  }
+  $('#story-log').appendChild(indicator);
+  scrollLogToEnd();
+}
+
 async function discardSupersededPending(sessionUuid, pendingId) {
   if (!sessionUuid || !pendingId) return;
   try {
@@ -1266,7 +1286,7 @@ async function performstartNextBatch() {
     if (state.status === 'playing' && !state.finished) scheduleOpeningStep();
     return;
   }
-  setText('#player-help', '故事正在继续…');
+  setGenerationStatus(true);
   const expectedRevision = state.lastRevision || 0;
   // Keep the identity AND input after a lost response. A manual retry must
   // replay the first turn, not buy another completion over its pending slot.
@@ -1326,6 +1346,7 @@ async function performstartNextBatch() {
       committed_count: turn.pending_committed_count || 0,
     };
     state.pendingIdx = state.pending.committed_count;
+    setGenerationStatus(false);
     setText('#player-help', '');
     // Render the new pending lines as placeholders; track each node
     // by (pending_id, sequence) so commitNextPendingItem can clear
@@ -1347,6 +1368,7 @@ async function performstartNextBatch() {
   } catch (err) {
     if (err?.code === 'stale_session') return null;
     if (generationEpoch !== (state.generationEpoch || 0) || supersededSession !== state.sessionUuid) return;
+    setGenerationStatus(false);
     setText('#player-help', '');
     if (state.inputInFlight) return;
     if (err?.code === 'pending_conflict') {
@@ -1586,6 +1608,7 @@ async function interruptWithPlayerText(text, { input = null, failLabel = '打断
   // disable the form so the UI matches.
   if (state.inputInFlight) return null;
   state.inputInFlight = true;
+  setGenerationStatus(false);
   state.generationEpoch = (state.generationEpoch || 0) + 1;
   state.startNextBatchInFlight = null;
   setInputsDisabled(true);
@@ -1804,7 +1827,17 @@ function legacyCopy(text) {
 
 // -------- Navigation --------
 
+function showFollowing() {
+  state.navigationToken = (state.navigationToken || 0) + 1;
+  if (state.status === 'playing') togglePause();
+  showScreen('following');
+  setText('#story-name', '关注');
+  setText('#role-name', '故事之外');
+  void refreshCommunitySection();
+}
+
 function backToPicker() {
+  setGenerationStatus(false);
   state.generationEpoch = (state.generationEpoch || 0) + 1;
   state.startNextBatchInFlight = null;
   state.navigationToken = (state.navigationToken || 0) + 1;
@@ -1856,7 +1889,8 @@ function bindEvents() {
   });
   window.addEventListener?.('story:home', backToPicker);
   $('#nav-stories')?.addEventListener('click', backToPicker);
-  $('#nav-mine')?.addEventListener('click', () => { state.navigationToken = (state.navigationToken || 0) + 1; if (state.status === 'playing') togglePause(); showScreen('mine'); setText('#story-name', '我的'); setText('#role-name', '故事之外'); renderMine(); void refreshCommunitySection(); });
+  $('#nav-following')?.addEventListener('click', showFollowing);
+  $('#nav-mine')?.addEventListener('click', () => { state.navigationToken = (state.navigationToken || 0) + 1; if (state.status === 'playing') togglePause(); showScreen('mine'); setText('#story-name', '我的'); setText('#role-name', '故事之外'); renderMine(); });
   $('#story-search')?.addEventListener('input', renderStories);
   window.addEventListener?.('story:open', e => {
     if (e.detail?.storyId) void selectStory(e.detail.storyId);
@@ -1961,19 +1995,16 @@ async function initializeAccount() {
 
 async function bootstrap() {
   const linkedStoryId = new URLSearchParams(window.location.search).get('story');
+  const linkedScreen = new URLSearchParams(window.location.search).get('s');
   await initializeAccount();
   bindEvents();
-  // 「故事里的相遇」区块（2026-09-13 转正）：以前它是 socialPanel.js 挂在
-  // document.body 上的悬浮 demo 卡片，再被搬进 #community-section。现在它就是
-  // 「我的」页面里的一个正常区块，直接渲染进 #community-section，不再有悬浮
-  // 宿主、关闭按钮和内联样式。它同样不携带调用者身份 —— 见
-  // public/scripts/communitySection.js 顶部的边界说明。
+  // Load the following view without holding up the story library on upstream requests.
   try {
     await loadSessionContext();
     const communityMod = await import('/scripts/communitySection.js');
     if (communityMod && typeof communityMod.mount === 'function') {
       communitySectionModule = communityMod;
-      await communityMod.mount();
+      void communityMod.mount();
     }
   } catch { /* 区块是增强项 —— 核心故事流程必须照常运行 */ }
   setStatus('loading');
@@ -2029,7 +2060,9 @@ async function bootstrap() {
   } else {
     setStatus('picker');
     showScreen('picker');
-    if (linkedStoryId) {
+    if (linkedScreen === 'following') showFollowing();
+    else if (linkedScreen === 'mine') { showScreen('mine'); setText('#story-name', '我的'); renderMine(); }
+    else if (linkedStoryId) {
       if (state.stories.some(story => story.id === linkedStoryId)) await selectStory(linkedStoryId);
       else showToast('这本小说暂时不可用，请选择其他故事。');
     }

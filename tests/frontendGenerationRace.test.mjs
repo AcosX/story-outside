@@ -47,6 +47,7 @@ const bind = new Function(
   "$",
   "notices",
   `
+const setGenerationStatus = () => {};
 const setText = () => {};
 const setStatus = s => { state.status = s; };
 const setInputsDisabled = () => {};

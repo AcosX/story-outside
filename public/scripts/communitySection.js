@@ -144,8 +144,7 @@ async function changeVisibility() {
   finally { if (revision === visibilityRevision) toggle.disabled = false; }
 }
 
-function renderFeedItems(items) {
-  const feed = document.getElementById(FEED_ID);
+function renderFeedItems(items, feed = document.getElementById(FEED_ID)) {
   if (!feed) return;
   clear(feed);
   for (const item of items) {
@@ -183,6 +182,12 @@ function renderFeedItems(items) {
     if (slug) title.href = `/?story=${encodeURIComponent(slug)}`;
     storyLine.appendChild(title);
     body.appendChild(storyLine);
+    if (item?.state === 'finished' && item.ending?.ending) {
+      const ending = el('details', 'community-ending');
+      ending.appendChild(el('summary', null, `达成结局 · ${item.ending.ending}`));
+      if (item.ending.summary) ending.appendChild(el('p', 'community-ending-summary', item.ending.summary));
+      body.appendChild(ending);
+    }
 
     const meta = [];
     if (author && author.headline) meta.push(author.headline);
@@ -228,6 +233,33 @@ async function refreshFeed() {
   setStatus(`${items.length} 段来自你关注的人的故事`);
 }
 
+let storyEndingRequest = 0;
+async function refreshStoryEndings(storySlug) {
+  const host = document.getElementById('story-following-content');
+  if (!host) return;
+  const request = ++storyEndingRequest;
+  clear(host);
+  host.appendChild(el('p', 'community-status', COPY.loading));
+  try {
+    const { status, data } = await fetchJson(`${FEED_ENDPOINT}&story=${encodeURIComponent(storySlug)}&state=finished`);
+    if (request !== storyEndingRequest) return;
+    clear(host);
+    let message = '';
+    if (status === 401 || data?.status === 'login_required') message = '登录知乎后，看看关注的人在这本作品中达成了什么结局。';
+    else if (status !== 200 || !data || data.status !== 'ok') message = COPY.unavailable;
+    else if (!Array.isArray(data.items) || data.items.length === 0) message = '你关注的人还没有公开这本作品的结局。';
+    if (message) { host.appendChild(el('p', 'community-status', message)); return; }
+    const feed = el('ul', 'community-feed');
+    feed.setAttribute('aria-label', '关注的人在此作品达成的结局');
+    host.appendChild(feed);
+    renderFeedItems(data.items, feed);
+  } catch {
+    if (request !== storyEndingRequest) return;
+    clear(host);
+    host.appendChild(el('p', 'community-status', COPY.unavailable));
+  }
+}
+
 // mount() 每个生命周期只跑一次：不轮询、不重建 DOM。会话变化通过
 // `session:changed` 事件驱动设置刷新。
 async function mount() {
@@ -265,6 +297,7 @@ export {
   start,
   mount,
   refreshFeed,
+  refreshStoryEndings,
   refreshShareAction,
   refreshAuthStatus,
 };

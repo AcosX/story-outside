@@ -1452,3 +1452,31 @@ body > #social-panel-host {
 .community-visibility-toggle[aria-checked="true"]::before { transform: translateX(18px); }
 .community-visibility-toggle:disabled { opacity: .5; cursor: wait; }
 .community-visibility-toggle:focus-visible { outline: 3px solid #9eb2ff; outline-offset: 3px; }
+
+/* Inline continuation status stays with the last narrative line. */
+.generation-status {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 16px 0 20px;
+  color: #8593ac;
+  font-size: 12px;
+  letter-spacing: .04em;
+}
+.generation-status::before {
+  content: '';
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #92abea;
+  box-shadow: 0 0 0 4px #edf2fc;
+  animation: continuation-pulse 1.6s ease-in-out infinite;
+}
+@keyframes continuation-pulse { 50% { opacity: .35; } }
+@media (prefers-reduced-motion: reduce) { .generation-status::before { animation: none; } }
+.story-following { margin: 32px 0; border-top: 1px solid #e8edf5; padding-top: 28px; }
+.story-following h2 { font-size: 20px; }
+.community-item-body { min-width: 0; overflow-wrap: anywhere; }
+.community-ending { margin-top: 12px; border-radius: 10px; background: #f5f7fc; padding: 12px 14px; }
+.community-ending summary { cursor: pointer; color: #52698f; font-size: 13px; line-height: 1.8; }
+.community-ending-summary { color: #718099; font-size: 13px; line-height: 1.9; white-space: pre-wrap; }
