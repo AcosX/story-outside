@@ -274,7 +274,7 @@ const NORMALISED = [
   // cafe-wanderer 在知乎被关注，但没在本站登录过 → 不该出现。
 
   const storyRepository = {
-    findStoryByUuid: () => ({ title: '兜底书名' }),
+    findStoryByUuid: () => ({ title: '兜底书名', slug: 'cafe-rain' }),
   };
   // findOwnShare 走 findCanonicalOwnerBySession（真实 sessionService），归属
   // 存在 symbol 键的会话状态里；用真实导出的 repositoryState 播种，不伪造形状。
@@ -298,6 +298,7 @@ const NORMALISED = [
   assert.equal(feed.items.length, 1, '只展示匹配上且已公开的世界线');
   assert.equal(feed.items[0].session_uuid, friendSession);
   assert.equal(feed.items[0].story_title, '雨夜咖啡馆');
+  assert.equal(feed.items[0].story_slug, 'cafe-rain', 'canonical story slug is included even when the activity already has a title');
   assert.equal(feed.items[0].author.fullname, '夜读人');
   assert.equal(feed.items[0].author.url, 'https://www.zhihu.com/people/night-reader');
   // 公开投影不得带对方的本站内部账号标识。

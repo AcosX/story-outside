@@ -177,7 +177,12 @@ function renderFeedItems(items) {
     const storyTitle = item && typeof item.story_title === 'string' && item.story_title
       ? item.story_title
       : '一个故事';
-    body.appendChild(el('p', 'community-item-story', `${item?.state === 'finished' ? '已完成' : '在玩'}《${storyTitle}》`));
+    const storyLine = el('p', 'community-item-story', item?.state === 'finished' ? '已完成' : '在玩');
+    const slug = typeof item?.story_slug === 'string' && /^[a-z0-9-]+$/.test(item.story_slug) ? item.story_slug : null;
+    const title = el(slug ? 'a' : 'span', null, `《${storyTitle}》`);
+    if (slug) title.href = `/?story=${encodeURIComponent(slug)}`;
+    storyLine.appendChild(title);
+    body.appendChild(storyLine);
 
     const meta = [];
     if (author && author.headline) meta.push(author.headline);

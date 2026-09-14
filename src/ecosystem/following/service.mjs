@@ -180,10 +180,11 @@ export function createFollowingService({ repository, accountDirectory = null, fe
             headline: profile.headline,
           };
         }
-        if (!item.story_title && storyRepository && item.story_uuid) {
+        if (storyRepository && item.story_uuid) {
           try {
             const story = storyRepository.findStoryByUuid(item.story_uuid);
-            if (story && typeof story.title === 'string') item.story_title = story.title;
+            if (!item.story_title && story && typeof story.title === 'string') item.story_title = story.title;
+            if (typeof story?.slug === 'string' && /^[a-z0-9-]+$/.test(story.slug)) item.story_slug = story.slug;
           } catch { /* 标题只是展示增强，取不到就留空 */ }
         }
         return item;
