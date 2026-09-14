@@ -56,13 +56,16 @@ const DEFAULT_TIMEOUT_MS = 5000;
 // ~22 minutes, which turned the whole homepage into an error page. Two
 // bounded mitigations live here (list only, never per-work detail):
 //   1. ONE retry with a short backoff for transient failures.
-//   2. A short-TTL cache that keeps serving the last good list while it
-//      is at most LIST_CACHE_STALE_MS old.
-// Neither mitigation relaxes the hard rules: no fabricated content, no
-// echoing upstream error bodies, no unbounded retry loops.
+//   2. A cache that serves the last good list while it is at most
+//      LIST_TTL_MS old, and keeps serving it as an unbounded stale
+//      fallback whenever a refresh fails — no matter how old it is.
+// The TTL therefore only decides WHEN we re-request, never whether a
+// cached list is still servable: once a good list has been seen, the
+// homepage never hard-fails on an upstream error again. Neither
+// mitigation relaxes the hard rules: no fabricated content, no echoing
+// upstream error bodies, no unbounded retry loops.
 const LIST_RETRY_BACKOFF_MS = 250;
 const LIST_TTL_MS = 60_000;
-const LIST_STALE_MAX_MS = 10 * 60_000;
 
 // Per the official contract the upstream is an unauthenticated JSON API
 // for the duration of zhihu_hackathon_2026_p2. We do NOT set
@@ -714,9 +717,9 @@ export function createRealZhihuStoryProvider(opts = {}) {
   const detailCache = new BoundedMap({ max: 256, name: 'realProvider.detailCache' });
 
   // Last successful list result + when it was fetched. `listStories`
-  // serves this while fresh (<= LIST_TTL_MS) and as a stale fallback
-  // (<= LIST_STALE_MAX_MS) when the upstream is transiently failing.
-  // Plain variables, not a BoundedMap — there is exactly one entry.
+  // serves this without the network while fresh (<= LIST_TTL_MS) and as
+  // an unbounded stale fallback whenever a refresh fails. Plain
+  // variables, not a BoundedMap — there is exactly one entry.
   /** @type {{ at: number, value: ReturnType<typeof normaliseStorySummary>[] } | null} */
   let listCache = null;
 
@@ -806,12 +809,12 @@ export function createRealZhihuStoryProvider(opts = {}) {
 
       /** @param {unknown} err */
       const staleFallback = (err) => {
-        // Serve the last good list while it is at most LIST_STALE_MAX_MS
-        // old, so a transient upstream outage (observed 2026-09-14: the
-        // upstream edge returned 4xx for ~22 minutes) does not take the
-        // homepage down. The error is still re-thrown once the cache is
-        // too old — we never fabricate a list.
-        if (listCache && Date.now() - listCache.at <= LIST_STALE_MAX_MS) {
+        // Serve the last good list no matter how old it is. The TTL only
+        // decides when we re-request; if the refresh fails (any upstream
+        // error), a once-good list beats an error page. The typed error
+        // is still thrown when we have NEVER seen a good list — we never
+        // fabricate one.
+        if (listCache) {
           return listCache.value.map((summary) => shallowDefensiveCopy(summary));
         }
         throw err;
@@ -821,7 +824,12 @@ export function createRealZhihuStoryProvider(opts = {}) {
       try {
         payload = await fetchJson(STORY_LIST_PATH);
       } catch (err) {
-        if (!isTransientListError(err)) throw err;
+        if (!isTransientListError(err)) {
+          // Non-transient (404 endpoint gone, 429 rate limit, our own
+          // validation) — no retry, but a cached list still shields the
+          // homepage.
+          return staleFallback(err);
+        }
         // One bounded retry with a short backoff. The transient failures
         // observed in production were per-request edge glitches, so a
         // single immediate retry recovered most of them.
@@ -834,15 +842,12 @@ export function createRealZhihuStoryProvider(opts = {}) {
       }
       if (!Array.isArray(payload)) {
         // Shape mismatch is not retried (retrying a deterministic
-        // response wastes the timeout budget) but a recent good list
-        // still shields the homepage.
-        if (listCache && Date.now() - listCache.at <= LIST_STALE_MAX_MS) {
-          return listCache.value.map((summary) => shallowDefensiveCopy(summary));
-        }
-        throw new ProviderError(
+        // response wastes the timeout budget) but the cache still
+        // shields the homepage.
+        return staleFallback(new ProviderError(
           'upstream_shape_mismatch',
           'Story list payload was not an array.',
-        );
+        ));
       }
       const out = [];
       for (const entry of payload) {

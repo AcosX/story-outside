@@ -808,18 +808,29 @@ async function run() {
     assert.equal(calls, 2, 'exactly one retry after a transient 4xx');
   });
 
-  await test('23.1 list 429 is NOT retried (rate limit must fail fast)', async () => {
+  await test('23.1 list 429 is NOT retried but a cached list still shields the homepage', async () => {
     let calls = 0;
     const fakeFetch = async () => {
       calls += 1;
+      if (calls === 1) {
+        return new Response(JSON.stringify(LIST_PAYLOAD), { status: 200, headers: { 'content-type': 'application/json' } });
+      }
       return new Response('', { status: 429 });
     };
     const provider = createRealZhihuStoryProvider({ fetchImpl: fakeFetch });
-    await assert.rejects(
-      () => provider.listStories(),
-      (err) => err instanceof ProviderError && err.code === 'upstream_rate_limited',
-    );
-    assert.equal(calls, 1, '429 must NOT trigger a retry');
+    const first = await provider.listStories();
+    assert.equal(first.length, 2);
+    const realNow = Date.now.bind(Date);
+    let fakeNow = realNow();
+    Date.now = () => fakeNow;
+    try {
+      fakeNow += 90_000; // past TTL, so the second call re-requests
+      const second = await provider.listStories();
+      assert.equal(second.length, 2, '429 on refresh must still serve the cached list');
+    } finally {
+      Date.now = realNow;
+    }
+    assert.equal(calls, 2, '429 must NOT trigger a retry (one refresh attempt only)');
   });
 
   await test('23.2 fresh list cache is served without touching the network', async () => {
@@ -835,7 +846,7 @@ async function run() {
     assert.equal(calls, 1, 'second listStories within TTL must not re-fetch');
   });
 
-  await test('23.3 sustained list failure falls back to the recent good list', async () => {
+  await test('23.3 sustained list failure falls back to the cached list regardless of age', async () => {
     let calls = 0;
     const fakeFetch = async () => {
       calls += 1;
@@ -852,11 +863,11 @@ async function run() {
       const provider = createRealZhihuStoryProvider({ fetchImpl: fakeFetch });
       const first = await provider.listStories();
       assert.equal(first.length, 2);
-      // Jump past the fresh-TTL window so the second call must hit the
-      // wire, fail, retry once, then serve the stale list.
-      fakeNow += 90_000;
+      // Jump far past the TTL (hours) — a refresh is attempted, fails,
+      // retries once, then serves the cached list anyway.
+      fakeNow += 6 * 60 * 60_000;
       const second = await provider.listStories();
-      assert.equal(second.length, 2, 'stale-but-recent list must shield the homepage');
+      assert.equal(second.length, 2, 'cached list must be served no matter how old');
       // 1 initial success + initial attempt + one bounded retry.
       assert.equal(calls, 3, `expected 1 success + 2 failed attempts, saw ${calls}`);
     } finally {
@@ -864,18 +875,16 @@ async function run() {
     }
   });
 
-  await test('23.3b stale fallback survives beyond the TTL window', async () => {
-    // The fresh-TTL window (60s) must not cut off the stale-fallback
-    // window (10min): a failure arriving 61s after the last good list
-    // still serves the stale list rather than an error page. We fake
-    // time by monkey-patching Date.now for the duration of the test.
+  await test('23.3b list 404 on refresh still serves the cached list', async () => {
+    // Even a "the endpoint is gone" 404 during a refresh must not break
+    // the homepage while we hold a good list. The 404 is not retried.
     let calls = 0;
     const fakeFetch = async () => {
       calls += 1;
       if (calls === 1) {
         return new Response(JSON.stringify(LIST_PAYLOAD), { status: 200, headers: { 'content-type': 'application/json' } });
       }
-      return new Response('{"error":"forbidden"}', { status: 403 });
+      return new Response('', { status: 404 });
     };
     const realNow = Date.now.bind(Date);
     let fakeNow = realNow();
@@ -883,10 +892,10 @@ async function run() {
     try {
       const provider = createRealZhihuStoryProvider({ fetchImpl: fakeFetch });
       await provider.listStories();
-      // Jump past LIST_TTL_MS (60s) but stay inside LIST_STALE_MAX_MS (10min).
       fakeNow += 90_000;
       const list = await provider.listStories();
-      assert.equal(list.length, 2, 'list older than TTL but within stale window must still be served');
+      assert.equal(list.length, 2, '404 on refresh must still serve the cached list');
+      assert.equal(calls, 2, '404 must NOT trigger a retry');
     } finally {
       Date.now = realNow;
     }
