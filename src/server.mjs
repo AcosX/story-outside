@@ -1,3 +1,4 @@
+import { createAsyncSessionPersistence } from './db/asyncSessionPersistence.mjs';
 import { analyzeEnding, createEndingAnalysisTasks } from './agent/endingAnalysis.mjs';
 import { createOfficialSearchSource, createOfficialKnowledgeSource } from './providers/ecosystem/officialSources.mjs';
 import { warn as loggerWarn, info as loggerInfo } from './observability/logger.mjs';
@@ -158,6 +159,18 @@ const PORT = Number(process.env.PORT || 4173);
 const HOST = process.env.HOST || '127.0.0.1';
 let databasePersistence = null;
 let databaseBootstrapError = null;
+const asyncSessionSaves = createAsyncSessionPersistence({
+  enabled: () => Boolean(databasePersistence),
+  flush: () => databasePersistence?.flush(),
+  onError: error => console.error('[story-outside] asynchronous persistence failure:', String(error?.message || error)),
+});
+function prefersAsyncSave(req) {
+  return /(?:^|,)\s*persist-async\s*(?:,|$)/i.test(req.headers.prefer || '');
+}
+function sessionMutationResponse(req, res, sessionUuid, payload) {
+  if (!prefersAsyncSave(req)) return jsonResponse(res, 200, payload);
+  return jsonResponse(res, 200, { ...payload, persistence: asyncSessionSaves.enqueue(sessionUuid) }, { persist: false });
+}
 
 /**
  * Build a deterministic, story-aware mock provider that satisfies the
@@ -2233,6 +2246,20 @@ async function handleRequest(req, res) {
     }
   }
 
+  // Read/retry only this session's save status, under the normal ownership
+  // and Origin guards. Never acknowledge a pending write as durable.
+  const saveStatusMatch = pathname.match(/^\/api\/sessions\/([^/]+)\/save-status$/);
+  if (['GET', 'POST'].includes(method) && saveStatusMatch) {
+    const sessionUuid = saveStatusMatch[1];
+    if (rejectInvalidSessionUuid(res, sessionUuid)) return;
+    try {
+      getSession({ repository: storyRepo, session_uuid: sessionUuid });
+      if (method === 'POST') await readJsonBody(req);
+      const persistence = method === 'POST' ? asyncSessionSaves.retry(sessionUuid) : asyncSessionSaves.status(sessionUuid);
+      return jsonResponse(res, 200, { persistence }, { persist: false });
+    } catch (err) { return sessionErrorResponse(res, err); }
+  }
+
   // GET /api/sessions/:uuid/recover — read-only recovery projection.
   const publicRecover = pathname.match(/^\/api\/sessions\/([^/]+)\/recover$/);
   if (method === 'GET' && publicRecover) {
@@ -2248,7 +2275,8 @@ async function handleRequest(req, res) {
         community_profile_version: cv.community_profile_version,
         community_profile_queries: cv.community_profile_queries,
         pinned: pinnedMetadataForSession(publicRecover[1], { publicSurface: true }),
-      });
+        persistence: asyncSessionSaves.status(publicRecover[1]),
+      }, { persist: !prefersAsyncSave(req) });
     } catch (err) {
       return sessionErrorResponse(res, err);
     }
@@ -2296,7 +2324,7 @@ async function handleRequest(req, res) {
         event: body.event,
         latency_ms: Date.now() - openingCommitStartedAt,
       });
-      return jsonResponse(res, 200, { ...PUBLIC_DECORATE(), ...result });
+      return sessionMutationResponse(req, res, publicOpening[1], { ...PUBLIC_DECORATE(), ...result });
     } catch (err) {
       return sessionErrorResponse(res, err);
     }
@@ -2333,7 +2361,7 @@ async function handleRequest(req, res) {
         expected_revision: body.expected_revision,
         ...(body.client_request_id ? { client_request_id: body.client_request_id } : {}),
       });
-      return jsonResponse(res, 200, { ...PUBLIC_DECORATE(), ...result });
+      return sessionMutationResponse(req, res, sessionUuid, { ...PUBLIC_DECORATE(), ...result });
     } catch (err) {
       return sessionErrorResponse(res, err);
     }
@@ -2415,6 +2443,7 @@ async function handleRequest(req, res) {
       });
     }
     const asynchronous = /(?:^|,)\s*respond-async\s*(?:,|$)/i.test(req.headers.prefer || '') && Boolean(body.request_id);
+    const deferredPersistence = asynchronous && prefersAsyncSave(req);
     let runtime;
     try {
       const recovered = recoverSession({ repository: storyRepo, session_uuid: sessionUuid });
@@ -2449,10 +2478,13 @@ async function handleRequest(req, res) {
         const outcome = await generationTasks.poll(key, async () => {
           const startedAt = performance.now();
           let generated = false;
-          try { const result = await runTurn(runtime, args); generated = true; return result; }
+          try { const result = await runTurn(runtime, args); generated = true; return { result, deferredPersistence }; }
           finally {
             const persistenceStart = performance.now();
-            try { if (databasePersistence) await databasePersistence.flush(); }
+            try {
+              if (deferredPersistence) asyncSessionSaves.enqueue(sessionUuid);
+              else if (databasePersistence) await databasePersistence.flush();
+            }
             finally { loggerInfo('generation.task', { component: 'agent', session_uuid: sessionUuid,
               latency_ms: Math.round(performance.now() - startedAt),
               extra: { generated, generation_ms: Math.round(persistenceStart - startedAt), persist_ms: Math.round(performance.now() - persistenceStart) } }); }
@@ -2466,7 +2498,10 @@ async function handleRequest(req, res) {
           }, { persist: false }); // An acknowledgement, never a claim of saved progress.
         }
         if (outcome.kind === 'failed') throw outcome.error;
-        result = outcome.value;
+        result = outcome.value.result;
+        // Mixed old/new clients still share one model invocation. A caller
+        // that requested durable acknowledgement must honor that contract.
+        if (!deferredPersistence && outcome.value.deferredPersistence && databasePersistence) await databasePersistence.flush();
       } else result = await runTurn(runtime, args);
       return jsonResponse(res, 200, {
         ...PUBLIC_DECORATE(),
@@ -2476,6 +2511,7 @@ async function handleRequest(req, res) {
         events: result.items,
         revision: result.base_revision,
         pending_remaining: result.pending_total - result.pending_committed_count,
+        ...(deferredPersistence ? { persistence: asyncSessionSaves.status(sessionUuid) } : {}),
       }, { persist: !asynchronous });
     } catch (err) {
       if (err instanceof AgentRuntimeError) {
@@ -3609,7 +3645,9 @@ if (isMainModule) {
   });
 
   const shutdown = async () => {
-    server.close();
+    await new Promise(resolve => server.close(resolve));
+    await asyncSessionSaves.drain();
+    if (databasePersistence) await databasePersistence.flush();
     await closeDatabase();
   };
   process.once('SIGINT', shutdown);

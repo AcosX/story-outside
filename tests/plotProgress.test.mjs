@@ -12,7 +12,7 @@ import { latestStoryProgress } from '../src/stories/plotProgress.mjs';
 // Run the real browser calculation/rendering against committed server history.
 const player = await readFile(new URL('../public/scripts/player.js', import.meta.url), 'utf8');
 const fill = { style: {}, setAttribute() {} };
-const context = vm.createContext({ state: { canonicalHistory: [] }, $: () => fill, setText() {}, clearTimeout() {}, STATUS_LABEL: {} });
+const context = vm.createContext({ state: { canonicalHistory: [] }, $: () => fill, setText() {}, setGenerationStatus() {}, clearTimeout() {}, STATUS_LABEL: {} });
 vm.runInContext(player.slice(player.indexOf('function setStatus('), player.indexOf('function showToast(')), context);
 function checkProgress(history, expected) {
   context.state.canonicalHistory = history;

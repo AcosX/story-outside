@@ -1,4 +1,4 @@
-// Short HTTP polls share one task, including its durable commit. Completed
+// Short HTTP polls share one task, including any requested persistence work. Completed
 // outcomes stay available after the original HTTP connection has gone away.
 export function createGenerationTasks({ waitMs = 1000, retentionMs = 300000, maxEntries = 128, now = Date.now } = {}) {
   const tasks = new Map();
@@ -23,7 +23,7 @@ export function createGenerationTasks({ waitMs = 1000, retentionMs = 300000, max
           task.promise,
           new Promise(resolve => { timer = setTimeout(() => resolve({ kind: 'pending' }), waitMs); }),
         ]);
-        // Successes remain replayable durably through runTurn. Errors may be
+        // Successes remain replayable through runTurn (durable after saving). Errors may be
         // retried after delivery; undelivered errors remain until a later poll.
         if (outcome.kind === 'done' || outcome.kind === 'failed') tasks.delete(key);
         return outcome;

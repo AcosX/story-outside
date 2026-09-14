@@ -13,8 +13,8 @@
 // The state machine guarantees:
 //   * displayed lines come ONLY from canonical history; pending items are
 //     rendered with a "pending" hint and never counted in committed events;
-//   * each displayed pending line triggers a /narrative-events commit, and
-//     the next line is NOT scheduled until that commit returns 200;
+//   * each displayed line is accepted in revision order; the next model
+//     request overlaps its background database save; autosave tracks durability;
 //   * pausing freezes the scheduler; resuming re-runs it from where it
 //     stopped (without re-displaying already-committed lines);
 //   * /interrupt drops the pending tail and switches to realtime;
@@ -97,6 +97,7 @@ function showScreen(name) {
 }
 
 function setStatus(next) {
+  if (next === 'playing' && state.saveTracking?.sessionUuid === state.sessionUuid && state.saveTracking?.status === 'failed') next = 'paused';
   state.status = next;
   setText('#status-label', STATUS_LABEL[next] || next);
   // When the session reaches a terminal state (finished), the progress
@@ -131,6 +132,7 @@ function setStatus(next) {
     state.autoplayTimer = null;
     state.toolCallTimer = null;
   }
+  setGenerationStatus();
 }
 
 function setProgress(fraction) {
@@ -201,7 +203,10 @@ async function api(path, options = {}) {
   if (savesProgress) setText('#autosave-status', '正在保存…');
   try {
     const result = await requestApi(path, options);
-    if (savesProgress && state.sessionUuid === sessionUuid) rememberReading();
+    if (state.sessionUuid === sessionUuid) {
+      if (result.persistence) trackSessionSave(result.persistence, sessionUuid);
+      if (savesProgress) rememberReading();
+    }
     return result;
   } catch (error) {
     if (savesProgress && state.sessionUuid === sessionUuid) setText('#autosave-status', '保存未完成，请重试');
@@ -352,6 +357,79 @@ async function selectStory(storyId) {
 function renderStoryDetail(story) {
   $('#story-detail').innerHTML = `<div class="detail-hero">${storyCover(story, 'detail-cover')}<div class="detail-meta"><p class="eyebrow">${escapeHtml(storyCategories(story).join(' / ') || 'BEYOND THE STORY')}</p><h1>${escapeHtml(story.title)}</h1><div class="detail-byline">${story.author_avatar ? `<img class="author-avatar" src="${escapeHtml(story.author_avatar)}" alt="" referrerpolicy="no-referrer">` : ''}${story.author ? `<span>${escapeHtml(story.author)}</span>` : ''}${story.word_count ? `<span>${Number(story.word_count).toLocaleString()} 字</span>` : ''}</div><p class="detail-description">${escapeHtml(story.description || story.summary || story.hook || '')}</p></div></div>`;
 }
+// -------- Background save acknowledgement --------
+function updateSaveStatus() {
+  const save = state.saveTracking;
+  if (!save || save.sessionUuid !== state.sessionUuid) return;
+  setText('#autosave-status', save.needsReload ? '保存状态已失效，请重新打开故事' : save.status === 'failed' ? '保存未完成，请重试'
+    : save.status === 'pending' ? '正在保存…' : '已自动保存');
+  const retry = $('#autosave-retry');
+  if (retry) { retry.hidden = save.status !== 'failed'; retry.textContent = save.needsReload ? '重新载入' : '重试保存'; }
+}
+function failSessionSave(save) {
+  if (state.saveTracking !== save || state.sessionUuid !== save.sessionUuid) return;
+  save.status = 'failed';
+  if (state.status === 'playing' || state.status === 'loading') setStatus('paused');
+  updateSaveStatus();
+}
+function trackSessionSave(snapshot, sessionUuid) {
+  if (sessionUuid !== state.sessionUuid) return;
+  let save = state.saveTracking;
+  if (save?.sessionUuid === sessionUuid && save.epoch !== snapshot.epoch) {
+    // The previous process may have stopped before its writes completed.
+    // A new process's zero watermark is never proof that they were saved.
+    save.needsReload = true;
+    failSessionSave(save);
+    return;
+  }
+  if (!save || save.sessionUuid !== sessionUuid) {
+    save = { sessionUuid, epoch: snapshot.epoch, target: 0, saved: 0, status: 'saved', monitor: null };
+    state.saveTracking = save;
+  }
+  save.target = Math.max(save.target, snapshot.requested_version);
+  save.saved = Math.max(save.saved, snapshot.saved_version);
+  if (save.saved >= save.target) save.status = 'saved';
+  else if (snapshot.status === 'failed' && snapshot.requested_version >= save.target) failSessionSave(save);
+  else save.status = 'pending';
+  updateSaveStatus();
+  if (save.status === 'pending') monitorSessionSave(save);
+}
+function monitorSessionSave(save) {
+  if (save.monitor) return;
+  save.monitor = (async () => {
+    try {
+      while (state.saveTracking === save && state.sessionUuid === save.sessionUuid && save.status === 'pending') {
+        await new Promise(resolve => setTimeout(resolve, 500));
+        if (state.saveTracking !== save || state.sessionUuid !== save.sessionUuid) return;
+        const targetAtRequest = save.target;
+        const result = await requestApi(`/api/sessions/${save.sessionUuid}/save-status`);
+        if (state.saveTracking !== save || state.sessionUuid !== save.sessionUuid) return;
+        if (result.persistence.epoch !== save.epoch || result.persistence.requested_version < targetAtRequest) {
+          save.needsReload = true;
+          failSessionSave(save); return;
+        }
+        trackSessionSave(result.persistence, save.sessionUuid);
+      }
+    } catch { failSessionSave(save); }
+    finally {
+      save.monitor = null;
+      if (state.saveTracking === save && state.sessionUuid === save.sessionUuid && save.status === 'pending') monitorSessionSave(save);
+    }
+  })();
+}
+async function retrySessionSave() {
+  const save = state.saveTracking;
+  if (!save || save.sessionUuid !== state.sessionUuid || save.status !== 'failed') return;
+  if (save.needsReload) { window.location.reload(); return; }
+  save.status = 'pending'; updateSaveStatus();
+  try {
+    const result = await requestApi(`/api/sessions/${save.sessionUuid}/save-status`, {
+      method: 'POST', body: JSON.stringify({ request_id: `save-${save.epoch}-${save.target}` }),
+    });
+    if (state.saveTracking === save) trackSessionSave(result.persistence, save.sessionUuid);
+  } catch { failSessionSave(save); }
+}
+
 const READING_HISTORY_PREFIX = 'story-outside:reading-session:';
 const READING_PAGE_SIZE = 9;
 
@@ -362,8 +440,9 @@ function rememberReading() {
     migrateReading();
     localStorage.setItem(READING_HISTORY_PREFIX + saved.sessionUuid, JSON.stringify(saved));
     localStorage.setItem('story-outside:reading', JSON.stringify(saved));
-    setText('#autosave-status', '已自动保存');
-  } catch { setText('#autosave-status', '进度已提交，本机续读记录未保存'); }
+    const save = state.saveTracking?.sessionUuid === state.sessionUuid ? state.saveTracking : null;
+    setText('#autosave-status', save?.needsReload ? '保存状态已失效，请重新打开故事' : save?.status === 'failed' ? '保存未完成，请重试' : save?.status === 'pending' ? '正在保存…' : '已自动保存');
+  } catch { setText('#autosave-status', '本机续读记录未保存'); }
 }
 function ownsReading(saved) { return !state.authConfigured || Boolean(state.ownerUuid && saved?.ownerUuid === state.ownerUuid); }
 function readReading() { try { const saved = JSON.parse(localStorage.getItem('story-outside:reading') || 'null'); return ownsReading(saved) ? saved : null; } catch { return null; } }
@@ -784,7 +863,7 @@ async function recoverAndStart() {
   setStatus('loading');
   clearAllPendingNodes();
   try {
-    const recovered = await api(`/api/sessions/${sessionUuid}/recover`);
+    const recovered = await api(`/api/sessions/${sessionUuid}/recover`, { headers: { prefer: 'persist-async' } });
     if (sessionUuid !== state.sessionUuid || recoveryEpoch !== (state.generationEpoch || 0)) return;
     state.lastRevision = recovered.revision || 0;
     state.openingCursor = recovered.opening_cursor || 0;
@@ -942,6 +1021,7 @@ async function performrunOpeningStep() {
   try {
     const result = await api(`/api/sessions/${state.sessionUuid}/opening-events`, {
       method: 'POST',
+      headers: { 'content-type': 'application/json', prefer: 'persist-async' },
       body: JSON.stringify({
         cache_uuid: state.cacheUuid,
         event: { ...event, displayed: true },
@@ -1086,9 +1166,10 @@ function clearAllPendingNodes() {
 const STEP_DELAY_MS = 1100;
 
 function scheduleNextStep(delayMs) {
+  setGenerationStatus();
   if (state.status !== 'playing' || state.finished || state.inputInFlight) return;
-  // Live turns carry one line. Once it is durably committed, start the
-  // next generation without an extra reading delay. Keep legacy pending
+  // Live turns carry one line. Once the server accepts it, start the
+  // next generation while its database save runs. Keep legacy pending
   // batches paced, and use a timer to let in-flight guards settle first.
   const hasUnread = state.pending && state.pendingIdx < state.pending.events.length;
   const delay = delayMs ?? (hasUnread ? STEP_DELAY_MS : 0);
@@ -1168,6 +1249,7 @@ async function performcommitNextPendingItem() {
   try {
     const result = await api(`/api/sessions/${state.sessionUuid}/narrative-events`, {
       method: 'POST',
+      headers: { 'content-type': 'application/json', prefer: 'persist-async' },
       body: JSON.stringify({
         pending_id: state.pending.pending_id,
         sequence,
@@ -1212,6 +1294,10 @@ async function performcommitNextPendingItem() {
       state.autoplayTimer = null;
       if (state.toolCallTimer) clearTimeout(state.toolCallTimer);
       state.queuedToolCall = finalToolCall;
+      setGenerationStatus();
+      // A pause or save failure may arrive while acceptance is in flight.
+      // Keep the node queued until playback resumes.
+      if (state.status !== 'playing' || state.inputInFlight) return;
       state.toolCallTimer = setTimeout(() => {
         state.toolCallTimer = null;
         void surfaceToolCall(finalToolCall);
@@ -1241,7 +1327,14 @@ async function performcommitNextPendingItem() {
 //   * this must never throw into performstartNextBatch's catch, or a
 //     cleanup failure would surface as a bogus "请求失败" toast for a
 //     turn the player abandoned on purpose.
-function setGenerationStatus(visible) {
+function setGenerationStatus(requested) {
+  if (typeof requested === 'boolean') state.generating = requested;
+  // Keep the cue through response -> accepted commit -> next generation.
+  // A final line carrying a decision/ending is already a stopping node.
+  const remaining = state.pending ? state.pending.events.length - state.pendingIdx : 0;
+  const atNode = Boolean(state.queuedToolCall || (state.pending?.tool_call && remaining <= 1));
+  const visible = Boolean(state.sessionUuid) && !state.finished && !atNode && !state.inputInFlight
+    && (state.status === 'playing' || (state.status === 'loading' && (state.generating || remaining > 0)));
   let indicator = $('#player-generation');
   if (!visible) { indicator?.remove(); return; }
   if (!indicator) {
@@ -1275,7 +1368,7 @@ function startNextBatch() {
 }
 async function performstartNextBatch() {
   const generationEpoch = state.generationEpoch || 0;
-  if (state.finished) return;
+  if (state.finished || (state.saveTracking?.sessionUuid === state.sessionUuid && state.saveTracking?.status === 'failed')) return;
   // Same guard as runStep: never /generate over an undelivered tool
   // call envelope.
   if (state.queuedToolCall) {
@@ -1316,7 +1409,7 @@ async function performstartNextBatch() {
         expected_revision: expectedRevision,
         request_id: request.id,
       }),
-      headers: { 'content-type': 'application/json', prefer: 'respond-async' },
+      headers: { 'content-type': 'application/json', prefer: 'respond-async, persist-async' },
       allowStaleSession: true,
     };
     let turn;
@@ -1907,6 +2000,7 @@ function bindEvents() {
   $('#story-log').addEventListener('click', e => { if (e.target?.closest('button, a')) return; void advanceStory(); });
   $('#share-btn').addEventListener('click', () => { void share(); });
   $('#pause-btn').addEventListener('click', togglePause);
+  $('#autosave-retry')?.addEventListener('click', () => { void retrySessionSave(); });
   $('#skip-btn').addEventListener('click', skipCurrent);
   $('#player-input-form').addEventListener('submit', (e) => {
     e.preventDefault();
