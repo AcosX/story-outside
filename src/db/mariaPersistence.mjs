@@ -489,10 +489,30 @@ export async function createMariaDbRepositories({
         [row.story_uuid, row.slug, row.title, row.hook, row.locale || 'zh-CN', row.status || 'published', dateValue(row.published_at), dateValue(row.created_at), dateValue(row.updated_at)],
       );
     }
-    const [storyIds] = await connection.query('SELECT id, story_uuid FROM stories');
+    const [storyIds] = await connection.query('SELECT id, story_uuid, slug FROM stories');
     const storyIdByUuid = new Map(storyIds.map((row) => [row.story_uuid, Number(row.id)]));
+    // slug is UNIQUE in `stories`, so it is a stable fallback key when the
+    // in-memory story_uuid never landed a row of its own. This happens when
+    // a process starts with an un-hydrated story repo (e.g. an upstream
+    // outage during boot) and allocates a fresh randomUUID() for a slug that
+    // already exists under a different uuid: the `ON DUPLICATE KEY (slug)`
+    // upsert updates the existing row, so `storyIdByUuid.get(newUuid)` misses.
+    // Without this fallback the version write throws forever and wedges every
+    // subsequent flush (see the 2026-09-14 uuid-split persistence incident).
+    const storyIdBySlug = new Map(storyIds.map((row) => [row.slug, Number(row.id)]));
+    const slugByStoryUuid = new Map(
+      (snapshot.stories?.stories || []).map((row) => [row.story_uuid, row.slug]),
+    );
     for (const row of snapshot.stories?.versions || []) {
-      const storyId = storyIdByUuid.get(row.story_uuid);
+      let storyId = storyIdByUuid.get(row.story_uuid);
+      if (!storyId) {
+        const slug = slugByStoryUuid.get(row.story_uuid);
+        storyId = slug ? storyIdBySlug.get(slug) : undefined;
+        if (storyId) {
+          // eslint-disable-next-line no-console
+          console.warn(`[story-outside] MariaDB persistence: story_uuid ${row.story_uuid} split from persisted slug '${slug}'; binding version ${row.version_uuid} to the existing story row.`);
+        }
+      }
       if (!storyId) throw new Error(`MariaDB persistence: story ${row.story_uuid} is missing before version ${row.version_uuid}`);
       await connection.query(
         `INSERT INTO story_versions
@@ -511,7 +531,12 @@ export async function createMariaDbRepositories({
     const versionIdByUuid = new Map(versionIds.map((row) => [row.version_uuid, Number(row.id)]));
     const cacheRows = snapshot.stories?.openingCaches || [];
     for (const row of cacheRows) {
-      const storyId = storyIdByUuid.get(row.story_uuid);
+      let storyId = storyIdByUuid.get(row.story_uuid);
+      if (!storyId) {
+        // Same uuid-split fallback as the version write above.
+        const slug = slugByStoryUuid.get(row.story_uuid);
+        storyId = slug ? storyIdBySlug.get(slug) : undefined;
+      }
       const versionId = versionIdByUuid.get(row.story_version_uuid);
       if (!storyId || !versionId) throw new Error(`MariaDB persistence: cache ${row.cache_uuid} has missing story/version`);
       const contentHash = /^[0-9a-f]{64}$/i.test(String(row.content_hash || ''))

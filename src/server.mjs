@@ -968,7 +968,11 @@ async function handleRequest(req, res) {
     }
   }
   if (method === 'GET' && pathname === '/api/auth/status' && oauth.enabled) {
-    return jsonResponse(res, 200, oauth.status(req));
+    // Read-only, side-effect-free identity probe. It MUST NOT wait on
+    // databasePersistence.flush(): a stuck/failed business write must not
+    // be able to turn login-status checks into 503s (see the 2026-09-14
+    // uuid-split persistence incident).
+    return jsonResponse(res, 200, oauth.status(req), { persist: false });
   }
   if (oauth.enabled) {
     // The old development APIs accept caller-provided identities; never expose
@@ -2012,6 +2016,9 @@ async function handleRequest(req, res) {
   // minting, and no Set-Cookie header is emitted.
   if (method === 'GET' && pathname === '/api/auth/status') {
     const auth = currentUserProvider(req);
+    // Read-only identity surface: never gate it on the persistence flush
+    // (see the /api/auth/status OAuth branch above and the 2026-09-14
+    // persistence incident).
     return jsonResponse(res, 200, {
       ...PUBLIC_DECORATE(),
       authenticated: auth.auth_source !== 'oauth_pending' ? true : false,
@@ -2020,7 +2027,7 @@ async function handleRequest(req, res) {
         display_name: auth.display_name,
         auth_source: auth.auth_source,
       },
-    });
+    }, { persist: false });
   }
 
   // POST /api/sessions — atomic session bootstrap from a story + role.
