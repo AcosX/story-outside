@@ -992,6 +992,12 @@ body[data-view="player"] .story-name {
   font-size: 12px;
   color: var(--muted);
 }
+.community-item-story a {
+  color: var(--primary, #2563eb);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+.community-item-story a:hover { text-decoration-thickness: 2px; }
 .community-status {
   padding: 20px 0 0;
   color: #909bad;

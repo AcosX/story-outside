@@ -88,6 +88,8 @@ function showScreen(name) {
     s.hidden = !isActive;
   });
   const url = new URL(window.location.href);
+  if (name === 'detail' && state.story?.id) url.searchParams.set('story', state.story.id);
+  else url.searchParams.delete('story');
   if (name === 'picker') url.searchParams.delete('s');
   else url.searchParams.set('s', name);
   history.replaceState(null, '', url);
@@ -1958,6 +1960,7 @@ async function initializeAccount() {
 }
 
 async function bootstrap() {
+  const linkedStoryId = new URLSearchParams(window.location.search).get('story');
   await initializeAccount();
   bindEvents();
   // 「故事里的相遇」区块（2026-09-13 转正）：以前它是 socialPanel.js 挂在
@@ -2026,6 +2029,10 @@ async function bootstrap() {
   } else {
     setStatus('picker');
     showScreen('picker');
+    if (linkedStoryId) {
+      if (state.stories.some(story => story.id === linkedStoryId)) await selectStory(linkedStoryId);
+      else showToast('这本小说暂时不可用，请选择其他故事。');
+    }
   }
   // Wire role chips once stories are loaded. Guarded so re-running
   // bootstrap (e.g. harness re-entry) never stacks a second handler —
