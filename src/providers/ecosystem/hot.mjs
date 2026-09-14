@@ -79,15 +79,16 @@
 //     'profile_missing', response }` and the route returns 400
 //     `community_profile_missing`.
 //
-// Cache strategy (rebuilt per Story 16.4 spec):
+// Cache strategy:
 //
-//   * Key = (category, fetched_at_bucket) — NEVER a single global
-//     entry. A→B→A within the bucket still hits A's cache row.
-//   * TTL = 5 min, SWR = 30 min, BUCKET = 1 min.
-//   * Upstream failure degrades to a 200 with `hot: []` +
-//     `cached: false` so the home-page module can render the
-//     "暂时无法获取知乎热议" placeholder without taking down the
-//     picker / player / ending flow.
+//   * One stable key is shared by the entire site. Story identity and
+//     relevance are request-scoped and never participate in this key.
+//   * The upstream total hot list is fresh for 15 minutes. A request made
+//     inside that window never reaches the upstream, including requests for
+//     another category or from another story page.
+//   * The row may be served as stale fallback for another 30 minutes when
+//     the upstream is unavailable. The cache is persisted by the server's
+//     MariaDB adapter when configured.
 
 import {
   fetchMockHotList,
@@ -113,18 +114,15 @@ import { getCommunityProfile } from '../../community/service.mjs';
 import { createRealZhihuHotSource } from './zhihuHotSource.mjs';
 
 /**
- * Categories the orchestrator forwards to the upstream. Anything
- * else clamps to `total` so the query string cannot be smuggled into
- * the URL verbatim.
+ * Categories retained by the legacy public shape. The official source only
+ * exposes `total`; the orchestrator always refreshes that one dataset so a
+ * category query cannot create another site-wide cache entry.
  */
 export const KNOWN_CATEGORIES = MOCK_KNOWN_CATEGORIES;
 
-// TTL = 5 min, SWR window = 30 min. Past 30 min the cache is dropped
-// entirely UNLESS the upstream is failing AND a past-SWR entry is
-// still in the pair-key map (graceful degradation).
-const TTL_MS = 5 * 60 * 1000;
-const SWR_MS = 30 * 60 * 1000;
-const BUCKET_MS = 60 * 1000;
+export const ECOSYSTEM_HOT_CACHE_KEY = 'hot_list:global';
+export const ECOSYSTEM_HOT_DEFAULT_TTL_MS = 15 * 60 * 1000;
+export const ECOSYSTEM_HOT_DEFAULT_SWR_MS = 30 * 60 * 1000;
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -151,10 +149,6 @@ function nowIso() {
 // local copy of `deriveExternalCommunityProfileVersion` or
 // `computeProfileContentHash` here — the import above is the single
 // source.
-
-function bucketStart(nowMs) {
-  return Math.floor(nowMs / BUCKET_MS) * BUCKET_MS;
-}
 
 /**
  * @typedef {Object} EcosystemHotEntry
@@ -196,7 +190,7 @@ function bucketStart(nowMs) {
  * @typedef {Object} EcosystemHotList
  * @property {EcosystemHotEntry[]} hot
  * @property {{ source: 'mock' | 'real', endpoint?: string }} provenance
- * @property {boolean} cached     True iff served from the pair-key cache.
+ * @property {boolean} cached     True iff served from the site-wide cache.
  * @property {string}  fetched_at ISO timestamp of the cache entry.
  * @property {string}  category   Echoed category (clamped to KNOWN_CATEGORIES).
  * @property {RelevantToStory} [relevant_to_story]
@@ -538,16 +532,119 @@ function projectEntry(row, rank) {
 }
 
 /**
- * Create a fresh in-memory hot-list orchestrator. Pure factory. The
- * pair-key cache lives for the lifetime of the orchestrator instance.
+ * In-memory repository for the single site-wide hot-list row. The server
+ * wraps this repository with MariaDB persistence when a database is enabled;
+ * keeping the repository small also lets a newly-started process hydrate it
+ * before the first public request.
+ */
+export function createInMemoryEcosystemHotCacheRepository(opts = {}) {
+  const ttlMs = Number.isInteger(opts.ttlMs) && opts.ttlMs > 0
+    ? opts.ttlMs
+    : ECOSYSTEM_HOT_DEFAULT_TTL_MS;
+  const swrMs = Number.isInteger(opts.swrMs) && opts.swrMs >= ttlMs
+    ? opts.swrMs
+    : Math.max(ttlMs, ECOSYSTEM_HOT_DEFAULT_SWR_MS);
+  const store = new Map();
+  const inflight = new Map();
+
+  function get(key = ECOSYSTEM_HOT_CACHE_KEY) {
+    return store.get(key) || null;
+  }
+
+  function put(key, value, now = Date.now(), metadata = {}) {
+    const fetchedAt = Number(now);
+    if (!Number.isFinite(fetchedAt)) throw new Error('ecosystemHotCache: fetched_at must be finite');
+    store.set(key, {
+      value: Array.isArray(value) ? value.slice() : [],
+      fetchedAt,
+      expiresAt: fetchedAt + ttlMs,
+      swrExpiresAt: fetchedAt + swrMs,
+      source: typeof metadata.source === 'string' && metadata.source ? metadata.source : null,
+    });
+  }
+
+  function isFresh(row, now = Date.now()) {
+    return !!row && row.expiresAt >= now;
+  }
+
+  function isStaleButUsable(row, now = Date.now()) {
+    return !!row && row.expiresAt < now && row.swrExpiresAt >= now;
+  }
+
+  function isExpired(row, now = Date.now()) {
+    return !row || row.swrExpiresAt < now;
+  }
+
+  function _exportSnapshot() {
+    return [...store.entries()].map(([cacheKey, row]) => ({
+      cache_key: cacheKey,
+      value: Array.isArray(row.value) ? row.value.slice() : [],
+      fetched_at_ms: row.fetchedAt,
+      expires_at_ms: row.expiresAt,
+      swr_expires_at_ms: row.swrExpiresAt,
+      source: row.source,
+    }));
+  }
+
+  function _hydrateSnapshot(rows) {
+    if (!Array.isArray(rows)) throw new Error('ecosystemHotCache: rows snapshot required');
+    store.clear();
+    inflight.clear();
+    for (const row of rows) {
+      if (!row || typeof row.cache_key !== 'string' || !Array.isArray(row.value)) continue;
+      const fetchedAt = Number(row.fetched_at_ms);
+      if (!Number.isFinite(fetchedAt)) continue;
+      const expiresAt = Number(row.expires_at_ms);
+      const swrExpiresAt = Number(row.swr_expires_at_ms);
+      store.set(row.cache_key, {
+        value: row.value.slice(),
+        fetchedAt,
+        expiresAt: Number.isFinite(expiresAt) ? expiresAt : fetchedAt + ttlMs,
+        swrExpiresAt: Number.isFinite(swrExpiresAt) ? swrExpiresAt : fetchedAt + swrMs,
+        source: typeof row.source === 'string' && row.source ? row.source : null,
+      });
+    }
+  }
+
+  function _clear() {
+    store.clear();
+    inflight.clear();
+  }
+
+  return Object.freeze({
+    name: 'in-memory-ecosystem-hot-cache',
+    ttlMs,
+    swrMs,
+    get,
+    put,
+    isFresh,
+    isStaleButUsable,
+    isExpired,
+    hasInflight: (key) => inflight.has(key),
+    getInflight: (key) => inflight.get(key) || null,
+    setInflight: (key, promise) => inflight.set(key, promise),
+    clearInflight: (key) => inflight.delete(key),
+    _size: () => store.size,
+    _clear,
+    _exportSnapshot,
+    _hydrateSnapshot,
+  });
+}
+
+/**
+ * Create a hot-list orchestrator. The cache repository is site-wide: all
+ * callers share one stable row, while relevance is attached later per
+ * request.
  *
  * @param {object} [opts]
  * @param {HotSource} [opts.source]      Default = mock fixture. Real
  *                                       provider (Zhihu hackathon v1)
  *                                       can be wired later.
- * @param {number} [opts.ttlMs]          Override the fresh TTL (ms).
- * @param {number} [opts.swrMs]          Override the SWR window (ms).
- * @param {number} [opts.bucketMs]       Override the bucket size (ms).
+ * @param {object} [opts.cache]          Site-wide cache repository.
+ * @param {number} [opts.ttlMs]          Override the fresh TTL when creating
+ *                                       the default repository (ms).
+ * @param {number} [opts.swrMs]          Override the SWR window when creating
+ *                                       the default repository (ms).
  * @returns {object}
  */
 export function createEcosystemHotOrchestrator(opts) {
@@ -558,86 +655,100 @@ export function createEcosystemHotOrchestrator(opts) {
     fetchHotList: async (input) => fetchMockHotList(input || {}),
     endpoint: () => '',
   });
-  const ttlMs = Number.isFinite(options.ttlMs) ? options.ttlMs : TTL_MS;
-  const swrMs = Number.isFinite(options.swrMs) ? options.swrMs : SWR_MS;
-  const bucketMs = Number.isFinite(options.bucketMs) ? options.bucketMs : BUCKET_MS;
-
-  /** @type {Map<string, { at: number, list: ReadonlyArray<object> }>} */
-  const pairKeyCache = new Map();
-
-  function cacheKey(category, bucket) {
-    return `${category}|${bucket}`;
+  const cache = options.cache || createInMemoryEcosystemHotCacheRepository({
+    ttlMs: options.ttlMs,
+    swrMs: options.swrMs,
+  });
+  function cacheRow() {
+    const row = cache.get(ECOSYSTEM_HOT_CACHE_KEY);
+    // A cache written by another provider mode must not masquerade as the
+    // current source, but old/injected rows without source metadata remain
+    // usable for backwards-compatible tests and local adapters.
+    if (row?.source && row.source !== 'unknown' && row.source !== source.name) return null;
+    return row;
   }
 
   function cacheStatus(entry, nowMs) {
     if (!entry) return { state: 'miss', age_ms: Infinity };
-    const age = nowMs - entry.at;
-    if (age <= ttlMs) return { state: 'fresh', age_ms: age };
-    if (age <= swrMs) return { state: 'stale', age_ms: age };
+    const age = nowMs - entry.fetchedAt;
+    if (entry.expiresAt >= nowMs) return { state: 'fresh', age_ms: age };
+    if (entry.swrExpiresAt >= nowMs) return { state: 'stale', age_ms: age };
     return { state: 'expired', age_ms: age };
+  }
+
+  async function refreshFromUpstream() {
+    // The official endpoint is a total-list endpoint. Keeping this argument
+    // fixed is what makes the cache genuinely site-wide even if a caller
+    // includes a legacy category query parameter.
+    const upstreamList = await source.fetchHotList({ category: 'total' });
+    if (!Array.isArray(upstreamList)) {
+      const error = new Error('hot upstream returned a non-array list');
+      error.code = 'hot_invalid_response';
+      throw error;
+    }
+    const fetchedAt = Date.now();
+    cache.put(ECOSYSTEM_HOT_CACHE_KEY, upstreamList, fetchedAt, { source: source.name });
+    return { list: upstreamList, fetchedAt };
+  }
+
+  function startRefresh() {
+    const existing = typeof cache.getInflight === 'function'
+      ? cache.getInflight(ECOSYSTEM_HOT_CACHE_KEY)
+      : null;
+    if (existing) return { promise: existing, shared: true };
+    const promise = refreshFromUpstream();
+    if (typeof cache.setInflight === 'function') cache.setInflight(ECOSYSTEM_HOT_CACHE_KEY, promise);
+    promise.finally(() => {
+      if (typeof cache.clearInflight === 'function') cache.clearInflight(ECOSYSTEM_HOT_CACHE_KEY);
+    }).catch(() => {});
+    return { promise, shared: false };
   }
 
   /**
    * Fetch the hot list (cache-first, upstream-fallback). When the
-   * upstream fails AND a past-SWR cache entry is still in the pair-key
-   * map, the past-SWR entry is returned as `cached: true` so the home
+   * upstream fails AND a past-SWR cache entry is still in the repository,
+   * the past-SWR entry is returned as `cached: true` so the home
    * page module can render the placeholder gracefully.
    *
    * @param {object} [input]
-   * @param {string} [input.category]   Clamped to KNOWN_CATEGORIES.
+   * @param {string} [input.category]   Retained for wire compatibility; the
+   *                                    shared snapshot is always `total`.
    * @returns {Promise<EcosystemHotList>}
    */
   async function fetchHot(input) {
-    const raw = input && typeof input.category === 'string' ? input.category.trim() : '';
-    const category = raw && KNOWN_CATEGORIES.includes(raw) ? raw : 'total';
+    void input;
+    const category = 'total';
     const nowMs = Date.now();
-    const bucket = bucketStart(nowMs);
-    const key = cacheKey(category, bucket);
-    const cached = pairKeyCache.get(key);
+    const cached = cacheRow();
     const status = cacheStatus(cached, nowMs);
     if (status.state === 'fresh') {
-      return shapeResponse(cached.list, {
+      return shapeResponse(cached.value, {
         category,
         cached: true,
-        fetchedAt: new Date(cached.at).toISOString(),
+        fetchedAt: new Date(cached.fetchedAt).toISOString(),
       });
     }
-    let upstreamList;
     let upstreamErr;
     try {
-      upstreamList = await source.fetchHotList({ category });
+      const refresh = startRefresh();
+      const result = await refresh.promise;
+      return shapeResponse(result.list, {
+        category,
+        cached: refresh.shared,
+        fetchedAt: new Date(result.fetchedAt).toISOString(),
+        swrRefreshed: status.state === 'stale' && !refresh.shared,
+      });
     } catch (err) {
       upstreamErr = err;
-      upstreamList = null;
     }
-    if (upstreamList && Array.isArray(upstreamList) && upstreamList.length > 0) {
-      pairKeyCache.set(key, { at: nowMs, list: upstreamList });
-      if (status.state === 'stale') {
-        // SWR background refresh: caller still gets fresh data here
-        // because we just successfully refreshed. Mark `cached: false`
-        // so observability can spot the SWR background path.
-        return shapeResponse(upstreamList, {
-          category,
-          cached: false,
-          fetchedAt: new Date(nowMs).toISOString(),
-          swrRefreshed: true,
-        });
-      }
-      return shapeResponse(upstreamList, {
-        category,
-        cached: false,
-        fetchedAt: new Date(nowMs).toISOString(),
-      });
-    }
-    // Upstream failure path. If we have a past-SWR row (graceful
-    // degradation), serve it with `cached: true`. Otherwise return an
-    // empty list with `cached: false` so the route layer can surface
-    // the placeholder.
-    if (cached) {
-      return shapeResponse(cached.list, {
+    // Re-read after a failed refresh so a concurrent request that completed
+    // just before this one still wins over the stale local snapshot.
+    const latest = cacheRow() || cached;
+    if (latest) {
+      return shapeResponse(latest.value, {
         category,
         cached: true,
-        fetchedAt: new Date(cached.at).toISOString(),
+        fetchedAt: new Date(latest.fetchedAt).toISOString(),
         degraded: true,
       });
     }
@@ -660,7 +771,7 @@ export function createEcosystemHotOrchestrator(opts) {
    * @returns {EcosystemHotList}
    */
   function shapeResponse(list, meta) {
-    const projected = list.map((row, i) => projectEntry(row, i + 1));
+    const projected = (Array.isArray(list) ? list : []).map((row, i) => projectEntry(row, i + 1));
     return {
       hot: projected,
       provenance: {
@@ -677,18 +788,21 @@ export function createEcosystemHotOrchestrator(opts) {
   }
 
   /**
-   * Read the cache directly for tests. Returns the pair-key map's
-   * snapshot; mutations leak into the live cache.
+   * Read the cache directly for tests. Returns the repository's snapshot;
+   * mutations leak into the live cache.
    *
-   * @returns {Map<string, { at: number, list: ReadonlyArray<object> }>}
+   * @returns {Map<string, object>}
    */
   function _pairKeyCacheForTests() {
-    return pairKeyCache;
+    return typeof cache._exportSnapshot === 'function'
+      ? new Map(cache._exportSnapshot().map((row) => [row.cache_key, row]))
+      : new Map();
   }
 
   return {
     name: source.name,
     fetchHot,
+    cache,
     _pairKeyCacheForTests,
   };
 }

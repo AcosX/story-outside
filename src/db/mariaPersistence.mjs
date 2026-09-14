@@ -154,6 +154,7 @@ export async function createMariaDbRepositories({
   communityProfileRepository,
   followingRepository,
   ecosystemSearchCacheRepository,
+  ecosystemHotCacheRepository = null,
 }) {
   if (!pool) throw new Error('createMariaDbRepositories: pool required');
   if (!storyRepository || !communityProfileRepository || !followingRepository || !ecosystemSearchCacheRepository) {
@@ -225,6 +226,33 @@ export async function createMariaDbRepositories({
     _hydrateSnapshot: (...args) => ecosystemSearchCacheRepository._hydrateSnapshot(...args),
   };
 
+  const hot = ecosystemHotCacheRepository ? {
+    name: 'mariadb-ecosystem-hot-cache',
+    ttlMs: ecosystemHotCacheRepository.ttlMs,
+    swrMs: ecosystemHotCacheRepository.swrMs,
+    get: (...args) => ecosystemHotCacheRepository.get(...args),
+    put: (...args) => {
+      const result = ecosystemHotCacheRepository.put(...args);
+      persistence.markDirty();
+      return result;
+    },
+    isFresh: (...args) => ecosystemHotCacheRepository.isFresh(...args),
+    isStaleButUsable: (...args) => ecosystemHotCacheRepository.isStaleButUsable(...args),
+    isExpired: (...args) => ecosystemHotCacheRepository.isExpired(...args),
+    hasInflight: (...args) => ecosystemHotCacheRepository.hasInflight(...args),
+    getInflight: (...args) => ecosystemHotCacheRepository.getInflight(...args),
+    setInflight: (...args) => ecosystemHotCacheRepository.setInflight(...args),
+    clearInflight: (...args) => ecosystemHotCacheRepository.clearInflight(...args),
+    _size: (...args) => ecosystemHotCacheRepository._size(...args),
+    _clear: (...args) => {
+      const result = ecosystemHotCacheRepository._clear(...args);
+      persistence.markDirty();
+      return result;
+    },
+    _exportSnapshot: (...args) => ecosystemHotCacheRepository._exportSnapshot(...args),
+    _hydrateSnapshot: (...args) => ecosystemHotCacheRepository._hydrateSnapshot(...args),
+  } : null;
+
   function captureSnapshot() {
     return {
       stories: typeof story._exportSnapshot === 'function' ? story._exportSnapshot() : null,
@@ -232,6 +260,7 @@ export async function createMariaDbRepositories({
       community: typeof community._exportSnapshot === 'function' ? community._exportSnapshot() : [],
       following: typeof following._exportSnapshot === 'function' ? following._exportSnapshot() : null,
       search: typeof search._exportSnapshot === 'function' ? search._exportSnapshot() : [],
+      hot: hot ? hot._exportSnapshot() : null,
     };
   }
 
@@ -374,6 +403,24 @@ export async function createMariaDbRepositories({
           expires_at_ms: Number(row.expires_at_ms),
           swr_expires_at_ms: Number(row.swr_expires_at_ms),
         })));
+      }
+
+      if (hot) {
+        const [hotRows] = await pool.query(
+          `SELECT cache_key, value, fetched_at_ms, expires_at_ms,
+                  swr_expires_at_ms, source
+             FROM ecosystem_hot_cache`,
+        );
+        if (hotRows.length > 0) {
+          hot._hydrateSnapshot(hotRows.map((row) => ({
+            cache_key: row.cache_key,
+            value: parseJson(row.value, []),
+            fetched_at_ms: Number(row.fetched_at_ms),
+            expires_at_ms: Number(row.expires_at_ms),
+            swr_expires_at_ms: Number(row.swr_expires_at_ms),
+            source: row.source || null,
+          })));
+        }
       }
 
       const [sessionRows] = await pool.query(
@@ -870,6 +917,20 @@ export async function createMariaDbRepositories({
     }
   }
 
+  async function syncHot(connection, snapshot) {
+    await connection.query('DELETE FROM ecosystem_hot_cache');
+    for (const row of snapshot.hot || []) {
+      if (!row.cache_key || !Number.isFinite(Number(row.fetched_at_ms))) continue;
+      await connection.query(
+        `INSERT INTO ecosystem_hot_cache
+          (cache_key, value, fetched_at_ms, expires_at_ms, swr_expires_at_ms, source)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+        [row.cache_key, json(row.value || []), row.fetched_at_ms, row.expires_at_ms,
+          row.swr_expires_at_ms, row.source || 'unknown'],
+      );
+    }
+  }
+
   async function flush() {
     const queuedAt = performance.now();
     const write = writeChain.then(async () => {
@@ -907,6 +968,9 @@ export async function createMariaDbRepositories({
         if (JSON.stringify(snapshot.search) !== JSON.stringify(previous?.search)) {
           await syncSearch(connection, snapshot);
         }
+        if (hot && JSON.stringify(snapshot.hot) !== JSON.stringify(previous?.hot)) {
+          await syncHot(connection, snapshot);
+        }
         sqlMs = performance.now() - sqlStart;
         const commitStart = performance.now();
         await connection.commit();
@@ -923,7 +987,8 @@ export async function createMariaDbRepositories({
         logInfo('database.flush', { component: 'database', latency_ms: Math.round(performance.now() - startedAt),
           extra: { queue_ms: Math.round(startedAt - queuedAt), sql_ms: Math.round(sqlMs),
             commit_ms: Math.round(commitMs), committed, sessions: delta.sessions.length,
-            stories: delta.stories.stories.length, versions: delta.stories.versions.length } });
+            stories: delta.stories.stories.length, versions: delta.stories.versions.length,
+            hot_cache_rows: snapshot.hot?.length || 0 } });
       }
     });
     // A failed transaction must reject its caller, but must not poison the
@@ -940,6 +1005,7 @@ export async function createMariaDbRepositories({
     communityProfileRepository: community,
     followingRepository: following,
     ecosystemSearchCacheRepository: search,
+    ecosystemHotCacheRepository: hot,
     hydrate,
     flush,
     captureSnapshot,

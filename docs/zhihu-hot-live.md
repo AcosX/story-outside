@@ -6,8 +6,14 @@
 - 服务端使用 `Authorization: Bearer <Access Secret>` 和秒级 `X-Request-Timestamp`。
 - 凭证优先来自 `ZHIHU_ACCESS_SECRET`，其次来自已忽略的 `secrets/secret` 的 `Access Secret` 标签；仅在真实热榜源初始化时读取，不发送到浏览器。
 - `STORY_OUTSIDE_PROVIDER=real`（或兼容别名 `ZHIHU_PROVIDER=real`）选择真实热榜；mock 模式仍使用测试数据。真实调用失败不会回退 mock，响应明确 `unavailable: true` 和稳定错误码。
-- 官方只提供有序的 `Title`、`Url`、`ThumbnailUrl`、`Summary`。对外保留 `title`、`url`、`thumbnail_url`、`excerpt`，不编造分类或数值热度；兼容字段 `heat` 为 0，UI 应隐藏它。非 total 分类明确不可用。
+- 官方只提供有序的 `Title`、`Url`、`ThumbnailUrl`、`Summary`。对外保留 `title`、`url`、`thumbnail_url`、`excerpt`，不编造分类或数值热度；兼容字段 `heat` 为 0，UI 应隐藏它。真实适配器本身不支持非 `total` 分类，公共热榜入口统一读取 `total` 快照。
 - 仅接受 HTTPS 知乎内容链接和 zhimg 图片；不跟随重定向。请求超时 10 秒，响应最多 1 MiB，上游错误正文不回显。
+
+## 热榜缓存
+
+- `/v1/ecosystem/hot` 使用固定键 `hot_list:global`，故事 identity、相关性和请求参数不进入缓存键；上游请求始终使用官方 `total` 热榜。
+- 单条快照默认 freshness 为 15 分钟。15 分钟内的所有站内请求直接返回同一快照，不向热榜上游发起请求；并发 miss 也只允许一个刷新请求。
+- 快照通过 MariaDB 的 `ecosystem_hot_cache` 持久化，迁移文件为 `db/migrations/0011_ecosystem_hot_cache.sql`。服务重启时先 hydrate，再接受请求；上游失败时最多使用后续 30 分钟的旧快照兜底。
 
 2026-09-07 本地真实只读请求成功返回 30 条，其中 28 条有图片、25 条有摘要。首条链接为 `https://www.zhihu.com/question/2080237961358963743`。热榜会实时变化，此处仅记录该次验证。
 
