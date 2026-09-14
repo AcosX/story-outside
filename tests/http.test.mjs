@@ -6,6 +6,7 @@
 import http from 'node:http';
 
 import { server } from '../src/server.mjs';
+import { setSink } from '../src/observability/logger.mjs';
 
 const PICK = await new Promise((resolve, reject) => {
   const probe = http.createServer();
@@ -119,6 +120,32 @@ try {
     const data = await res.json();
     check('POST /api/chat 200', res.status === 200);
     check('/api/chat demo flag', data?.demo?.official_zhihu_api === false);
+  }
+
+  // Catalog failures must leave a warn trace in the structured log.
+  // Regression for the 2026-09-14 incident: /api/stories returned
+  // upstream_4xx for ~22 minutes with zero journald evidence because the
+  // route never logged provider errors. The mock provider's unknown-id
+  // 404 exercises the same catch block.
+  {
+    const logLines = [];
+    const previousSink = setSink((line) => logLines.push(line));
+    let detailRes;
+    try {
+      detailRes = await fetch(`${baseUrl}/api/stories/does-not-exist`);
+    } finally {
+      setSink(previousSink);
+    }
+    check('GET unknown story still 404 (log test)', detailRes.status === 404, `status=${detailRes.status}`);
+    const warnLine = logLines
+      .map((line) => { try { return JSON.parse(line); } catch { return null; } })
+      .find((record) => record && record.event === 'stories.request.failed');
+    check('stories.request.failed warn emitted on provider error', Boolean(warnLine));
+    check('warn carries error_code', warnLine && warnLine.error_code === 'story_not_found');
+    check('warn carries route + upstream status in extra', warnLine
+      && warnLine.extra && warnLine.extra.route === 'story_detail'
+      && warnLine.extra.http_status === 404
+      && warnLine.extra.upstream_status === null);
   }
 } finally {
   await new Promise((resolve) => server.close(resolve));

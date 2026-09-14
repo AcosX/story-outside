@@ -787,6 +787,161 @@ async function run() {
       (err) => err instanceof StoryNotFoundError,
     );
   });
+
+  // ----- 23. list resilience: bounded retry + TTL cache + stale fallback --
+  // Regression coverage for the 2026-09-14 incident: the upstream edge
+  // returned transient 4xx for ~22 minutes and the homepage failed hard.
+  // listStories now (a) retries a transient failure once, (b) serves a
+  // fresh cache without network, (c) falls back to a recent good list
+  // while the upstream is failing, (d) still surfaces the typed error
+  // when there is nothing cached. Detail requests keep fail-fast.
+  await test('23. transient list 4xx is retried once and then succeeds', async () => {
+    let calls = 0;
+    const fakeFetch = async () => {
+      calls += 1;
+      if (calls === 1) return new Response('{"error":"edge glitch"}', { status: 403 });
+      return new Response(JSON.stringify(LIST_PAYLOAD), { status: 200, headers: { 'content-type': 'application/json' } });
+    };
+    const provider = createRealZhihuStoryProvider({ fetchImpl: fakeFetch });
+    const list = await provider.listStories();
+    assert.equal(list.length, 2);
+    assert.equal(calls, 2, 'exactly one retry after a transient 4xx');
+  });
+
+  await test('23.1 list 429 is NOT retried but a cached list still shields the homepage', async () => {
+    let calls = 0;
+    const fakeFetch = async () => {
+      calls += 1;
+      if (calls === 1) {
+        return new Response(JSON.stringify(LIST_PAYLOAD), { status: 200, headers: { 'content-type': 'application/json' } });
+      }
+      return new Response('', { status: 429 });
+    };
+    const provider = createRealZhihuStoryProvider({ fetchImpl: fakeFetch });
+    const first = await provider.listStories();
+    assert.equal(first.length, 2);
+    const realNow = Date.now.bind(Date);
+    let fakeNow = realNow();
+    Date.now = () => fakeNow;
+    try {
+      fakeNow += 90_000; // past TTL, so the second call re-requests
+      const second = await provider.listStories();
+      assert.equal(second.length, 2, '429 on refresh must still serve the cached list');
+    } finally {
+      Date.now = realNow;
+    }
+    assert.equal(calls, 2, '429 must NOT trigger a retry (one refresh attempt only)');
+  });
+
+  await test('23.2 fresh list cache is served without touching the network', async () => {
+    let calls = 0;
+    const fakeFetch = async () => {
+      calls += 1;
+      return new Response(JSON.stringify(LIST_PAYLOAD), { status: 200, headers: { 'content-type': 'application/json' } });
+    };
+    const provider = createRealZhihuStoryProvider({ fetchImpl: fakeFetch });
+    await provider.listStories();
+    const again = await provider.listStories();
+    assert.equal(again.length, 2);
+    assert.equal(calls, 1, 'second listStories within TTL must not re-fetch');
+  });
+
+  await test('23.3 sustained list failure falls back to the cached list regardless of age', async () => {
+    let calls = 0;
+    const fakeFetch = async () => {
+      calls += 1;
+      if (calls === 1) {
+        return new Response(JSON.stringify(LIST_PAYLOAD), { status: 200, headers: { 'content-type': 'application/json' } });
+      }
+      // Every subsequent attempt fails with the incident's signature.
+      return new Response('{"error":"forbidden"}', { status: 403 });
+    };
+    const realNow = Date.now.bind(Date);
+    let fakeNow = realNow();
+    Date.now = () => fakeNow;
+    try {
+      const provider = createRealZhihuStoryProvider({ fetchImpl: fakeFetch });
+      const first = await provider.listStories();
+      assert.equal(first.length, 2);
+      // Jump far past the TTL (hours) — a refresh is attempted, fails,
+      // retries once, then serves the cached list anyway.
+      fakeNow += 6 * 60 * 60_000;
+      const second = await provider.listStories();
+      assert.equal(second.length, 2, 'cached list must be served no matter how old');
+      // 1 initial success + initial attempt + one bounded retry.
+      assert.equal(calls, 3, `expected 1 success + 2 failed attempts, saw ${calls}`);
+    } finally {
+      Date.now = realNow;
+    }
+  });
+
+  await test('23.3b list 404 on refresh still serves the cached list', async () => {
+    // Even a "the endpoint is gone" 404 during a refresh must not break
+    // the homepage while we hold a good list. The 404 is not retried.
+    let calls = 0;
+    const fakeFetch = async () => {
+      calls += 1;
+      if (calls === 1) {
+        return new Response(JSON.stringify(LIST_PAYLOAD), { status: 200, headers: { 'content-type': 'application/json' } });
+      }
+      return new Response('', { status: 404 });
+    };
+    const realNow = Date.now.bind(Date);
+    let fakeNow = realNow();
+    Date.now = () => fakeNow;
+    try {
+      const provider = createRealZhihuStoryProvider({ fetchImpl: fakeFetch });
+      await provider.listStories();
+      fakeNow += 90_000;
+      const list = await provider.listStories();
+      assert.equal(list.length, 2, '404 on refresh must still serve the cached list');
+      assert.equal(calls, 2, '404 must NOT trigger a retry');
+    } finally {
+      Date.now = realNow;
+    }
+  });
+
+  await test('23.4 list failure with NO cached value still raises the typed error', async () => {
+    let calls = 0;
+    const fakeFetch = async () => {
+      calls += 1;
+      return new Response('{"error":"forbidden"}', { status: 403 });
+    };
+    const provider = createRealZhihuStoryProvider({ fetchImpl: fakeFetch });
+    await assert.rejects(
+      () => provider.listStories(),
+      (err) => err instanceof ProviderError && err.code === 'upstream_4xx',
+    );
+    // One initial attempt + one bounded retry, never more.
+    assert.equal(calls, 2);
+  });
+
+  await test('23.5 list results are defensive copies (cache cannot be mutated)', async () => {
+    const fakeFetch = makeFakeFetch({
+      '/km-indep-home/hackathon/v2/story/list': { status: 200, body: LIST_PAYLOAD },
+    });
+    const provider = createRealZhihuStoryProvider({ fetchImpl: fakeFetch });
+    const a = await provider.listStories();
+    a[0].title = 'mutated';
+    a[0].source.labels = ['mutated'];
+    const b = await provider.listStories();
+    assert.notEqual(b[0].title, 'mutated');
+    assert.notEqual(b[0].source.labels[0], 'mutated');
+  });
+
+  await test('23.6 detail 4xx is still fail-fast (no retry, no stale fallback)', async () => {
+    let calls = 0;
+    const fakeFetch = async () => {
+      calls += 1;
+      return new Response('{"error":"forbidden"}', { status: 403 });
+    };
+    const provider = createRealZhihuStoryProvider({ fetchImpl: fakeFetch });
+    await assert.rejects(
+      () => provider.getStory('1747681485547843585'),
+      (err) => err instanceof ProviderError && err.code === 'upstream_4xx',
+    );
+    assert.equal(calls, 1, 'detail requests keep the fail-fast contract');
+  });
 }
 
 run()

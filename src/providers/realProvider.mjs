@@ -51,6 +51,22 @@ const STORY_LIST_PATH = '/km-indep-home/hackathon/v2/story/list';
 const STORY_DETAIL_PATH = (workId) => `/km-indep-home/hackathon/v2/story/${encodeURIComponent(workId)}`;
 const DEFAULT_TIMEOUT_MS = 5000;
 
+// The story list is the homepage's critical path and changes rarely. On
+// 2026-09-14 the upstream edge returned transient 4xx to this host for
+// ~22 minutes, which turned the whole homepage into an error page. Two
+// bounded mitigations live here (list only, never per-work detail):
+//   1. ONE retry with a short backoff for transient failures.
+//   2. A cache that serves the last good list while it is at most
+//      LIST_TTL_MS old, and keeps serving it as an unbounded stale
+//      fallback whenever a refresh fails — no matter how old it is.
+// The TTL therefore only decides WHEN we re-request, never whether a
+// cached list is still servable: once a good list has been seen, the
+// homepage never hard-fails on an upstream error again. Neither
+// mitigation relaxes the hard rules: no fabricated content, no echoing
+// upstream error bodies, no unbounded retry loops.
+const LIST_RETRY_BACKOFF_MS = 250;
+const LIST_TTL_MS = 60_000;
+
 // Per the official contract the upstream is an unauthenticated JSON API
 // for the duration of zhihu_hackathon_2026_p2. We do NOT set
 // Authorization / X-OAuth-Token; doing so would invite credential leaks
@@ -700,6 +716,31 @@ export function createRealZhihuStoryProvider(opts = {}) {
   /** @type {Map<string, ReturnType<typeof normaliseStoryDetail>>} */
   const detailCache = new BoundedMap({ max: 256, name: 'realProvider.detailCache' });
 
+  // Last successful list result + when it was fetched. `listStories`
+  // serves this without the network while fresh (<= LIST_TTL_MS) and as
+  // an unbounded stale fallback whenever a refresh fails. Plain
+  // variables, not a BoundedMap — there is exactly one entry.
+  /** @type {{ at: number, value: ReturnType<typeof normaliseStorySummary>[] } | null} */
+  let listCache = null;
+
+  /**
+   * Whether a failed list attempt is worth one immediate retry. Only
+   * transient-looking failures qualify; a 404 (endpoint gone), 429
+   * (rate limit — retrying makes it worse) or a validation error (our
+   * own bug) must fail fast exactly as before.
+   *
+   * @param {unknown} err
+   * @returns {boolean}
+   */
+  function isTransientListError(err) {
+    return err instanceof ProviderError && (
+      err.code === 'upstream_4xx'
+      || err.code === 'upstream_5xx'
+      || err.code === 'upstream_timeout'
+      || err.code === 'upstream_network_error'
+    );
+  }
+
   /**
    * @returns {Promise<unknown>}
    */
@@ -758,18 +799,62 @@ export function createRealZhihuStoryProvider(opts = {}) {
       hostAllowList: Object.freeze(['api.zhihu.com']),
     }),
     async listStories() {
-      const payload = await fetchJson(STORY_LIST_PATH);
+      // Fresh cache: serve without touching the network. The list is
+      // small metadata and changes rarely; a 60s TTL removes the
+      // homepage's dependence on the upstream being up at all.
+      const now = Date.now();
+      if (listCache && now - listCache.at <= LIST_TTL_MS) {
+        return listCache.value.map((summary) => shallowDefensiveCopy(summary));
+      }
+
+      /** @param {unknown} err */
+      const staleFallback = (err) => {
+        // Serve the last good list no matter how old it is. The TTL only
+        // decides when we re-request; if the refresh fails (any upstream
+        // error), a once-good list beats an error page. The typed error
+        // is still thrown when we have NEVER seen a good list — we never
+        // fabricate one.
+        if (listCache) {
+          return listCache.value.map((summary) => shallowDefensiveCopy(summary));
+        }
+        throw err;
+      };
+
+      let payload;
+      try {
+        payload = await fetchJson(STORY_LIST_PATH);
+      } catch (err) {
+        if (!isTransientListError(err)) {
+          // Non-transient (404 endpoint gone, 429 rate limit, our own
+          // validation) — no retry, but a cached list still shields the
+          // homepage.
+          return staleFallback(err);
+        }
+        // One bounded retry with a short backoff. The transient failures
+        // observed in production were per-request edge glitches, so a
+        // single immediate retry recovered most of them.
+        try {
+          await new Promise((resolve) => setTimeout(resolve, LIST_RETRY_BACKOFF_MS));
+          payload = await fetchJson(STORY_LIST_PATH);
+        } catch (retryErr) {
+          return staleFallback(retryErr instanceof ProviderError ? retryErr : err);
+        }
+      }
       if (!Array.isArray(payload)) {
-        throw new ProviderError(
+        // Shape mismatch is not retried (retrying a deterministic
+        // response wastes the timeout budget) but the cache still
+        // shields the homepage.
+        return staleFallback(new ProviderError(
           'upstream_shape_mismatch',
           'Story list payload was not an array.',
-        );
+        ));
       }
       const out = [];
       for (const entry of payload) {
         out.push(summaryFromListEntry(entry));
       }
-      return out;
+      listCache = { at: Date.now(), value: out };
+      return out.map((summary) => shallowDefensiveCopy(summary));
     },
     async getStory(id) {
       const work_id = assertWorkId(id);

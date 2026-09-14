@@ -1031,6 +1031,20 @@ async function handleRequest(req, res) {
       return jsonResponse(res, 200, { demo: currentDemoFlag(), stories });
     } catch (err) {
       const { status, code } = classifyProviderError(err);
+      // The catalog routes historically returned the typed error without
+      // logging, which made the 2026-09-14 upstream_4xx incident
+      // invisible in journald (only the Apache access log showed it).
+      // Emit one warn line with the upstream status when we have it.
+      loggerWarn('stories.request.failed', {
+        component: 'http',
+        error_code: code,
+        extra: {
+          route: 'stories',
+          method,
+          http_status: status,
+          upstream_status: err instanceof ProviderError && err.details && typeof err.details.status === 'number' ? err.details.status : null,
+        },
+      });
       return jsonResponse(res, status, { error: code, demo: currentDemoFlag() });
     }
   }
@@ -1043,6 +1057,16 @@ async function handleRequest(req, res) {
       return jsonResponse(res, 200, { demo: currentDemoFlag(), story });
     } catch (err) {
       const { status, code } = classifyProviderError(err);
+      loggerWarn('stories.request.failed', {
+        component: 'http',
+        error_code: code,
+        extra: {
+          route: 'story_detail',
+          method,
+          http_status: status,
+          upstream_status: err instanceof ProviderError && err.details && typeof err.details.status === 'number' ? err.details.status : null,
+        },
+      });
       return jsonResponse(res, status, { error: code, demo: currentDemoFlag() });
     }
   }
