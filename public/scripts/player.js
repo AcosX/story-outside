@@ -1831,7 +1831,7 @@ function showFollowing() {
   state.navigationToken = (state.navigationToken || 0) + 1;
   if (state.status === 'playing') togglePause();
   showScreen('following');
-  setText('#story-name', '我关注的人');
+  setText('#story-name', '关注');
   setText('#role-name', '故事之外');
   void refreshCommunitySection();
 }
