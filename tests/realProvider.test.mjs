@@ -32,6 +32,7 @@ import {
   ValidationError,
   getStoryProvider,
 } from '../src/providers/index.mjs';
+import { setSink } from '../src/observability/logger.mjs';
 
 let casesRun = 0;
 let casesFailed = 0;
@@ -247,7 +248,11 @@ async function run() {
         // Upstream error bodies MUST NOT leak into the message.
         && !/trace_id/.test(err.message),
     );
-    assert.equal(calls, 1, '5xx must NOT trigger a retry');
+    // Detail resilience change (see suite 24): a transient 5xx is now
+    // retried exactly once before the typed error surfaces. With no
+    // cached detail to fall back to, the typed upstream_5xx still
+    // propagates — the mapping and no-leak guarantees are unchanged.
+    assert.equal(calls, 2, '5xx is retried exactly once, then fails typed');
   });
 
   // ----- 7. timeout -> typed upstream_timeout --------------------------
@@ -929,7 +934,15 @@ async function run() {
     assert.notEqual(b[0].source.labels[0], 'mutated');
   });
 
-  await test('23.6 detail 4xx is still fail-fast (no retry, no stale fallback)', async () => {
+  // ----- 24. detail resilience: bounded retry + TTL cache + stale fallback ----
+  // The 2026-09-14 transient upstream 4xx also broke per-work detail
+  // loads (character / opening preparation reads getStory). getStory now
+  // mirrors the list path: (a) retries a transient failure once, (b)
+  // serves a fresh cached detail without network, (c) falls back to a
+  // previously fetched detail while a refresh fails, (d) still surfaces
+  // the typed error when nothing is cached, and (e) keeps 404 (unknown
+  // work) fail-fast when there is no cache.
+  await test('24. transient detail 4xx with NO cache is retried once then raises typed error', async () => {
     let calls = 0;
     const fakeFetch = async () => {
       calls += 1;
@@ -940,7 +953,143 @@ async function run() {
       () => provider.getStory('1747681485547843585'),
       (err) => err instanceof ProviderError && err.code === 'upstream_4xx',
     );
-    assert.equal(calls, 1, 'detail requests keep the fail-fast contract');
+    // One initial attempt + one bounded retry, never more; no cache to fall back to.
+    assert.equal(calls, 2, 'detail transient failure is retried exactly once');
+  });
+
+  await test('24.1 transient detail 4xx is retried once and then succeeds', async () => {
+    let calls = 0;
+    const fakeFetch = async () => {
+      calls += 1;
+      if (calls === 1) return new Response('{"error":"edge glitch"}', { status: 403 });
+      return new Response(JSON.stringify(DETAIL_PAYLOAD), { status: 200, headers: { 'content-type': 'application/json' } });
+    };
+    const provider = createRealZhihuStoryProvider({ fetchImpl: fakeFetch });
+    const detail = await provider.getStory('1747681485547843585');
+    assert.equal(detail.id, '1747681485547843585');
+    assert.equal(calls, 2, 'exactly one retry after a transient 4xx');
+  });
+
+  await test('24.2 fresh detail cache is served without touching the network', async () => {
+    let calls = 0;
+    const fakeFetch = async () => {
+      calls += 1;
+      return new Response(JSON.stringify(DETAIL_PAYLOAD), { status: 200, headers: { 'content-type': 'application/json' } });
+    };
+    const provider = createRealZhihuStoryProvider({ fetchImpl: fakeFetch });
+    await provider.getStory('1747681485547843585');
+    const again = await provider.getStory('1747681485547843585');
+    assert.equal(again.id, '1747681485547843585');
+    assert.equal(calls, 1, 'second getStory within TTL must not re-fetch');
+  });
+
+  await test('24.3 sustained detail failure falls back to the cached detail regardless of age', async () => {
+    let calls = 0;
+    const fakeFetch = async () => {
+      calls += 1;
+      if (calls === 1) {
+        return new Response(JSON.stringify(DETAIL_PAYLOAD), { status: 200, headers: { 'content-type': 'application/json' } });
+      }
+      // Every subsequent attempt fails with the incident's signature.
+      return new Response('{"error":"forbidden"}', { status: 403 });
+    };
+    const realNow = Date.now.bind(Date);
+    let fakeNow = realNow();
+    Date.now = () => fakeNow;
+    try {
+      const provider = createRealZhihuStoryProvider({ fetchImpl: fakeFetch });
+      const first = await provider.getStory('1747681485547843585');
+      assert.equal(first.id, '1747681485547843585');
+      // Jump far past the TTL (hours) — a refresh is attempted, fails,
+      // retries once, then serves the cached detail anyway.
+      fakeNow += 6 * 60 * 60_000;
+      const second = await provider.getStory('1747681485547843585');
+      assert.equal(second.id, '1747681485547843585', 'cached detail must be served no matter how old');
+      // 1 initial success + initial refresh attempt + one bounded retry.
+      assert.equal(calls, 3, `expected 1 success + 2 failed attempts, saw ${calls}`);
+    } finally {
+      Date.now = realNow;
+    }
+  });
+
+  await test('24.4 detail 404 on refresh is NOT retried but a cached detail still shields the reader', async () => {
+    let calls = 0;
+    const fakeFetch = async () => {
+      calls += 1;
+      if (calls === 1) {
+        return new Response(JSON.stringify(DETAIL_PAYLOAD), { status: 200, headers: { 'content-type': 'application/json' } });
+      }
+      return new Response('', { status: 404 });
+    };
+    const realNow = Date.now.bind(Date);
+    let fakeNow = realNow();
+    Date.now = () => fakeNow;
+    try {
+      const provider = createRealZhihuStoryProvider({ fetchImpl: fakeFetch });
+      await provider.getStory('1747681485547843585');
+      fakeNow += 6 * 60_000; // past DETAIL_TTL_MS
+      const detail = await provider.getStory('1747681485547843585');
+      assert.equal(detail.id, '1747681485547843585', '404 on refresh must still serve the cached detail');
+      assert.equal(calls, 2, '404 must NOT trigger a retry');
+    } finally {
+      Date.now = realNow;
+    }
+  });
+
+  await test('24.5 detail 404 with NO cache stays fail-fast as StoryNotFoundError', async () => {
+    let calls = 0;
+    const fakeFetch = async () => {
+      calls += 1;
+      return new Response('', { status: 404 });
+    };
+    const provider = createRealZhihuStoryProvider({ fetchImpl: fakeFetch });
+    await assert.rejects(
+      () => provider.getStory('does-not-exist'),
+      (err) => err instanceof StoryNotFoundError,
+    );
+    assert.equal(calls, 1, 'a 404 with no cached detail is not retried and stays fail-fast');
+  });
+
+  await test('24.6 detail retry + stale fallback emit structured warn logs', async () => {
+    let calls = 0;
+    const fakeFetch = async () => {
+      calls += 1;
+      if (calls === 1) {
+        return new Response(JSON.stringify(DETAIL_PAYLOAD), { status: 200, headers: { 'content-type': 'application/json' } });
+      }
+      return new Response('{"error":"forbidden"}', { status: 403 });
+    };
+    const realNow = Date.now.bind(Date);
+    let fakeNow = realNow();
+    Date.now = () => fakeNow;
+    const logLines = [];
+    const previousSink = setSink((line) => logLines.push(line));
+    try {
+      const provider = createRealZhihuStoryProvider({ fetchImpl: fakeFetch });
+      await provider.getStory('1747681485547843585');
+      fakeNow += 6 * 60_000; // past DETAIL_TTL_MS so the refresh runs and fails
+      await provider.getStory('1747681485547843585');
+    } finally {
+      setSink(previousSink);
+      Date.now = realNow;
+    }
+    const records = logLines
+      .map((line) => { try { return JSON.parse(line); } catch { return null; } })
+      .filter(Boolean);
+    const retryLine = records.find((r) => r.event === 'stories.detail.retry');
+    const staleLine = records.find((r) => r.event === 'stories.detail.stale_served');
+    assert.ok(retryLine, 'a stories.detail.retry warn must be emitted on transient failure');
+    assert.equal(retryLine.error_code, 'upstream_4xx');
+    assert.equal(retryLine.retried, true);
+    assert.equal(retryLine.extra.route, 'story_detail');
+    assert.equal(retryLine.extra.work_id, '1747681485547843585');
+    assert.equal(retryLine.extra.upstream_status, 403);
+    assert.ok(staleLine, 'a stories.detail.stale_served warn must be emitted when the cache shields the reader');
+    assert.equal(staleLine.error_code, 'upstream_4xx');
+    assert.equal(staleLine.from_cache, true);
+    assert.equal(staleLine.extra.route, 'story_detail');
+    assert.equal(staleLine.extra.work_id, '1747681485547843585');
+    assert.equal(staleLine.extra.upstream_status, 403);
   });
 }
 
