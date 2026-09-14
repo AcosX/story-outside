@@ -43,6 +43,7 @@ function ai(handler) {
     const payload = JSON.parse(messages[1].content);
     requests.push({ compact, payload });
     const result = handler ? await handler({ compact, payload }) : compact ? { summary: '保留玩家选择，event_seq=1' } : { items: [{ text: '继续剧情' }] };
+    if (!compact && payload.story_pacing?.must_finish && result.items) result.tool_call = { name: 'finish_story', arguments: { summary: '旅程结束', ending: '重逢', original_difference: '留下', key_choices: ['留下'], character_outcomes: [{ character: '友人', fate: '重逢' }] } };
     return { ok: true, json: async () => ({ choices: [{ message: { content: JSON.stringify(result) }, finish_reason: 'stop' }] }) };
   } });
   return { provider, requests };

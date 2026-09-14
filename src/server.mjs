@@ -1,3 +1,5 @@
+import { analyzeEnding, createEndingAnalysisTasks } from './agent/endingAnalysis.mjs';
+import { createOfficialSearchSource, createOfficialKnowledgeSource } from './providers/ecosystem/officialSources.mjs';
 import { warn as loggerWarn, info as loggerInfo } from './observability/logger.mjs';
 // Story Outside — minimal Node HTTP server (no framework).
 // Serves static files from ./public and exposes a few JSON endpoints
@@ -654,9 +656,10 @@ function sendFollowingError(res, err) {
 // a row. The adapter is selected by STORY_OUTSIDE_ECOSYSTEM_SEARCH
 // (`mock` default; `real` requires hasRealSearchCredentials()).
 // ---------------------------------------------------------------------
-const ecosystemSearchAdapter = (process.env.STORY_OUTSIDE_ECOSYSTEM_SEARCH === 'real' && hasRealSearchCredentials())
-  ? createRealZhihuSearchSource()
-  : createMockZhihuSearchSource();
+const ecosystemSearchAdapter = (process.env.STORY_OUTSIDE_ECOSYSTEM_SEARCH || process.env.STORY_OUTSIDE_PROVIDER) === 'real'
+  ? createOfficialSearchSource() : createMockZhihuSearchSource();
+const officialKnowledge = createOfficialKnowledgeSource();
+const endingAnalysisTasks = createEndingAnalysisTasks();
 
 /**
  * Resolve the canonical `community_profile_version` string for a
@@ -714,6 +717,7 @@ function resolveCommunityProfileVersion(story_version_uuid) {
 // resolves via its external version.
 const knowledgeProvider = createEcosystemKnowledgeProvider({
   communityProfileRepo,
+  ...(process.env.STORY_OUTSIDE_PROVIDER === 'real' ? { realProvider: officialKnowledge } : {}),
 });
 
 // Thin in-process service namespace. The route layer never imports
@@ -2550,6 +2554,30 @@ async function handleRequest(req, res) {
     }
   }
 
+  const endingAnalysisMatch = pathname.match(/^\/api\/sessions\/([^/]+)\/ending-analysis$/);
+  if (method === 'GET' && endingAnalysisMatch) {
+    const sessionUuid = endingAnalysisMatch[1];
+    if (rejectInvalidSessionUuid(res, sessionUuid)) return;
+    try {
+      buildEnding({ repository: storyRepo, session_uuid: sessionUuid });
+      const config = loadAIConfig();
+      if (!config) return jsonResponse(res, 200, { status: 'unavailable' }, { persist: false });
+      const task = endingAnalysisTasks.read(sessionUuid, () => analyzeEnding({ config, repository: storyRepo, session_uuid: sessionUuid }));
+      return jsonResponse(res, task.status === 'pending' || task.status === 'busy' ? 202 : 200, task, { persist: false });
+    } catch (error) { return sessionErrorResponse(res, error); }
+  }
+
+  const knowledgeDetail = pathname.match(/^\/api\/knowledge\/([0-9]+)$/);
+  if (method === 'GET' && knowledgeDetail) {
+    try {
+      const detail = await officialKnowledge.detail(knowledgeDetail[1]);
+      if (!detail) return jsonResponse(res, 404, { error: 'not_found' }, { persist: false });
+      const escape = value => String(value || '').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
+      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'content-security-policy': "default-src 'none'; style-src 'unsafe-inline'" });
+      return res.end(`<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>${escape(detail.chapter_name)}</title><style>body{max-width:760px;margin:48px auto;padding:0 24px;font:18px/1.9 system-ui;background:#faf7f1;color:#292923}article{white-space:pre-wrap}</style><h1>${escape(detail.chapter_name)}</h1><p>来源：知乎 · ${escape(detail.author_name)}</p><article>${escape(detail.content)}</article></html>`);
+    } catch { return jsonResponse(res, 503, { error: 'knowledge_unavailable' }, { persist: false }); }
+  }
+
   // GET /api/sessions/:uuid/ending — read-only finish_story projection.
   const publicEnding = pathname.match(/^\/api\/sessions\/([^/]+)\/ending$/);
   if (method === 'GET' && publicEnding) {
@@ -2853,8 +2881,7 @@ async function handleRequest(req, res) {
     // the seam lives in the route handler so a single HTTP request
     // resolves the profile ONCE and reuses the row across every
     // canonical knowledge_query.
-    const results = [];
-    for (const q of canonicalQueries) {
+    const results = await Promise.all(canonicalQueries.map(async q => {
       const matchResult = await knowledgeProvider.match({
         story_version_uuid: body.story_version_uuid,
         community_profile_version: body.community_profile_version,
@@ -2866,7 +2893,7 @@ async function handleRequest(req, res) {
         limit: limitPerQuery,
         profile: canonicalProfile,
       });
-      results.push({
+      return {
         id: typeof q.id === 'string' && q.id ? q.id : null,
         // P1.v2: response echoes `query` (the string), NOT `id`.
         query: q.query,
@@ -2878,8 +2905,8 @@ async function handleRequest(req, res) {
         cache_key: matchResult.cache_key,
         degraded: matchResult.degraded,
         degradation: matchResult.degradation,
-      });
-    }
+      };
+    }));
 
     // Flat, deduped knowledge bundle — useful for clients that want
     // a single list. We dedupe on entry.id so the same upstream

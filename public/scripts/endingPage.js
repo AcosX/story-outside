@@ -35,6 +35,7 @@ const STATE = {
   replay: null,
   replayIndex: 0,
   mounted: false,
+  mountGeneration: 0,
   relatedKnowledge: null,
 };
 
@@ -302,14 +303,14 @@ function renderFirstDeviationSection(ending) {
       el('p', {}, el('strong', {}, '原作的选择'), el('span', {}, `　${deviation.original_choice || ''}`)),
       el('p', {}, el('strong', {}, '你的选择'), el('span', {}, `　${deviation.player_choice || ''}`)),
       deviation.original_evidence ? el('blockquote', { class: 'original-evidence' }, deviation.original_evidence) : null,
-      deviation.basis ? el('p', { class: 'deviation-meta' }, deviation.basis) : null));
+      deviation.basis ? el('p', { class: 'deviation-meta' }, '根据原作来源与本次选择对照') : null));
 }
 function renderEndingComparisonSection(ending) {
   const verdict = ending.same_as_original === true ? '殊途，同归。' : ending.same_as_original === false ? '你写下了不一样的结局。' : '原作与这一次的结局';
   return el('section', { class:'ending-section ending-verdict', dataset:{section:'ending-verdict'} },
     el('h2', {}, verdict),
     ending.original_ending ? el('p', {}, el('strong', {}, '原作结局'), el('span', {}, `　${ending.original_ending}`)) : null,
-    ending.original_ending_evidence ? el('blockquote', {class:'original-evidence'}, ending.original_ending_evidence) : null,
+    ending.original_ending_evidence ? el('blockquote', {class:'original-evidence'}, `${ending.original_ending_source || '原作正文'}：${ending.original_ending_evidence}`) : null,
     el('p', {}, ending.ending_comparison_reason || (ending.same_as_original == null ? '目前的原作信息还不足以判断两个结局是否相同。' : '')));
 }
 
@@ -516,10 +517,10 @@ function renderRelatedKnowledgeSection(knowledgeState) {
     '以下内容属于现实/知乎知识延伸，不是原作设定或 AI 世界线事实。');
   const banner = state.provisional === true
     ? el('p', { class: 'related-knowledge-banner', id: 'ending-related-knowledge-banner', dataset: { flag: 'provisional' } },
-        '知识延伸为临时来源，不代表作品事实')
+        '延伸阅读，不代表作品事实')
     : null;
   let body;
-  if (degraded) {
+  if (degraded && entries.length === 0) {
     // Real provider not configured (or upstream failed). We never
     // surface the error code on the DOM — only the stable disabled
     // hint — so a regression that exposes the upstream error does
@@ -701,6 +702,7 @@ async function fetchEcosystemDiscussions(sessionMeta) {
 }
 
 async function mount({ sessionUuid, sessionMeta } = {}) {
+  const generation = ++STATE.mountGeneration;
   // A missing session uuid is tolerated (deep link with no stored
   // session context): the render falls through to the "未提交" empty
   // state instead of throwing, so the user is never stranded.
@@ -736,28 +738,42 @@ async function mount({ sessionUuid, sessionMeta } = {}) {
   const projections = sessionUuid
     ? await fetchProjections(sessionUuid)
     : { ending: { error: new Error('no session context') }, originalTimeline: null, replay: null };
+  if (generation !== STATE.mountGeneration) return;
   STATE.ending = projections.ending && !projections.ending.error ? projections.ending : null;
   STATE.originalTimeline = projections.originalTimeline && !projections.originalTimeline.error ? projections.originalTimeline : null;
   STATE.replay = projections.replay && !projections.replay.error ? projections.replay : null;
   STATE.replayIndex = 0;
-  // ClickUp 16.2 P1.v2 (2026-09-07): also fetch ecosystem
-  // discussions using the server-authoritative pointer triple from
-  // sessionMeta. Failures are surfaced on STATE.ecosystemError so the
-  // render layer can show them; we never throw out of mount().
-  const ecosystem = await fetchEcosystemDiscussions(sessionMeta || {});
-  STATE.ecosystem = ecosystem && !ecosystem.error ? ecosystem : null;
-  STATE.ecosystemError = ecosystem && ecosystem.error ? ecosystem : null;
-  // ClickUp 16.5 — fetch the public 知乎知识区 (Knowledge 区)
-  // extension for this ending. The fetch is best-effort: a failure
-  // degrades to a disabled state and never blocks the render.
-  STATE.relatedKnowledge = await fetchRelatedKnowledge(sessionMeta || {});
-  // ClickUp 16.3 P1 v1-6 (merge of origin/main ea992690 into
-  // fix/clickup16-3-p1-auth): keep the OAuth-pending owner display
-  // name alongside the new sessionMeta spread. The player reads
-  // `ownerDisplayName` to render the canonical author label even
-  // when the server returns a different `display_name`.
-  render(screen, { ...(sessionMeta || {}), ownerDisplayName });
+  const meta = { ...(sessionMeta || {}), ownerDisplayName };
+  render(screen, meta);
   STATE.mounted = true;
+  const mountedSession = sessionUuid;
+  const stillMounted = () => STATE.mounted && STATE.sessionUuid === mountedSession && STATE.mountGeneration === generation;
+  await Promise.all([fetchEcosystemDiscussions(sessionMeta || {}), fetchRelatedKnowledge(sessionMeta || {})]).then(([ecosystem, knowledge]) => {
+    if (!stillMounted()) return;
+    STATE.ecosystem = ecosystem && !ecosystem.error ? ecosystem : null;
+    STATE.ecosystemError = ecosystem?.error ? ecosystem : null;
+    STATE.relatedKnowledge = knowledge;
+    render(screen, meta);
+  });
+  if (sessionUuid) {
+    (async () => {
+      for (let attempt = 0; attempt < 60 && stillMounted(); attempt += 1) {
+        try {
+          const result = await api(`/api/sessions/${sessionUuid}/ending-analysis`);
+          if (!stillMounted()) return;
+          if (result.status === 'ready') {
+            STATE.ending = { ...STATE.ending, ...result.comparison, total_analysis: result.comparison.first_divergence
+              ? '本次关键选择改变了故事走向，可结合原作引文和世界线回放查看。'
+              : result.comparison.ending_comparison_reason };
+            render(screen, meta);
+            return;
+          }
+          if (result.status !== 'pending' && result.status !== 'busy') return;
+        } catch { return; }
+        await new Promise(resolve => setTimeout(resolve, 2000));
+      }
+    })();
+  }
 }
 
 function render(screen, sessionMeta) {
@@ -813,6 +829,7 @@ function teardown() {
   const screen = $('#screen-ending');
   if (screen) clear(screen);
   STATE.mounted = false;
+  STATE.mountGeneration += 1;
   STATE.sessionUuid = null;
   STATE.ending = null;
   STATE.originalTimeline = null;

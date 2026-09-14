@@ -382,6 +382,7 @@ async function runTurnOnce(runtime, { request_id, input, expected_revision } = {
       return existing.result;
     }
   }
+  if (session.state === 'finished') fail('session_finished', 'story has already ended');
   if (expected_revision !== state.base_revision) fail('revision_mismatch', 'revision mismatch');
   if (session.revision !== state.base_revision) fail('revision_mismatch', 'revision mismatch');
   if (key && recoverSession({ repository: state.repository, session_uuid: state.session_uuid }).pending) {

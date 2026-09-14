@@ -495,6 +495,8 @@ try {
     items: [], expected_revision: 0,
   }), /at least one narrative item or a tool_call/);
 
+  const legacySession = '00000000-0000-4000-8000-080808080809';
+  await post('/api/dev/sessions', { session_uuid: legacySession, story_uuid: fixture.story_uuid, story_version_uuid: fixture.story_version_uuid, user_ref: 'legacy-normalization', role_id: 'stranger', model: 'mock-08', prompt: '08 prompt', generation_profile: generationProfile });
   // ----- P1.3: runtime rejects tool-only batches and 5-item batches at the normalize layer -----
   const recoveredForRuntime = await request(`/api/dev/sessions/${sessionUuid}/recover`);
   const baseProvider = createMockAgentProvider();
@@ -507,7 +509,7 @@ try {
     }] });
     const runtime = createAgentRuntime({
       repository: storyRepo,
-      session_uuid: sessionUuid,
+      session_uuid: legacySession,
       provider,
       system_prompt: { kind: 'system', text: 'p1.3 test' },
       tool_definitions: [{ name: 'ask_player_choice' }, { name: 'finish_story' }],
@@ -533,7 +535,7 @@ try {
     }] });
     const runtime = createAgentRuntime({
       repository: storyRepo,
-      session_uuid: sessionUuid,
+      session_uuid: legacySession,
       provider,
       system_prompt: { kind: 'system', text: 'p1.3 test' },
       tool_definitions: [{ name: 'ask_player_choice' }, { name: 'finish_story' }],
@@ -557,7 +559,7 @@ try {
     }] });
     const runtime = createAgentRuntime({
       repository: storyRepo,
-      session_uuid: sessionUuid,
+      session_uuid: legacySession,
       provider,
       system_prompt: { kind: 'system', text: 'p1.3 test' },
       tool_definitions: [{ name: 'ask_player_choice' }, { name: 'finish_story' }],

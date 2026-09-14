@@ -187,9 +187,17 @@ function findFirstDeviation({ canonicalHistory, openingEvents, roles = [] }) {
 // event. Unsupported model claims become explicit unknowns rather than a
 // fabricated original ending. Quote matching establishes provenance; the
 // comparison reasoning remains an attributed AI interpretation.
-function groundedComparison(payload, version, events) {
+export function groundedComparison(payload, version, events) {
   const original = (version?.content_payload?.beats || []).map(beat => typeof beat === 'string' ? beat : beat.text || '').join('\n');
-  const supportedQuote = quote => typeof quote === 'string' && quote.trim().length >= 4 && original.includes(quote.trim());
+  const normalize = value => String(value || '').replace(/\s+/g, '');
+  const introduction = version?.content_payload?.hook || version?.hook || '';
+  const quoteSource = quote => {
+    if (typeof quote !== 'string' || normalize(quote).length < 4) return null;
+    if (normalize(original).includes(normalize(quote))) return '原作正文';
+    if (normalize(introduction).includes(normalize(quote))) return '官方导语';
+    return null;
+  };
+  const supportedQuote = quote => !!quoteSource(quote);
   const candidate = payload.first_divergence;
   const playerEvent = candidate && events.find(event => event.event_seq === candidate.player_event_seq && event.event_type === 'player_input');
   const playerText = playerEvent?.payload?.text;
@@ -204,11 +212,12 @@ function groundedComparison(payload, version, events) {
       player_event_seq: playerEvent.event_seq,
       basis: 'original_quote_and_committed_player_input',
     } : null,
-    first_divergence_reason: divergenceSupported ? '根据原作引文与已提交的玩家选择进行对照。' : '暂无可核实的原作节点与玩家选择对照，不能确定首次重大偏离。',
+    first_divergence_reason: divergenceSupported ? '根据原作引文与已提交的玩家选择进行对照。' : payload.first_divergence_reason || '暂无可核实的原作节点与玩家选择对照，不能确定首次重大偏离。',
     original_ending: endingSupported ? payload.original_ending : null,
     original_ending_evidence: endingSupported ? payload.original_ending_evidence : null,
+    original_ending_source: endingSupported ? quoteSource(payload.original_ending_evidence) : null,
     same_as_original: same,
-    ending_comparison_reason: endingSupported && typeof payload.ending_comparison_reason === 'string'
+    ending_comparison_reason: typeof payload.ending_comparison_reason === 'string'
       ? payload.ending_comparison_reason
       : '现有原文或结局证据不足，暂不能判断与原作结局是否相同。',
     comparison_source: 'ai_analysis_with_verified_original_quotes',
