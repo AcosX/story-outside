@@ -72,7 +72,7 @@ console.log('Ending activation: terminal durability/replay, legacy recovery, pac
 const { createAIProvider } = await import('../src/agent/aiProvider.mjs');
 const resolvedOutput = {
   arc_status: 'resolved', items: [{ type: 'narration', text: '列车驶离小镇。' }],
-  tool_call: { name: 'ask_player_choice', arguments: { question: '接下来呢？', options: [{ id: 'a', label: '继续' }, { id: 'b', label: '等候' }] } },
+  tool_call: { name: 'ask_player_choice', arguments: { question: '接下来，你想怎么做？', options: [{ id: 'a', label: '继续' }, { id: 'b', label: '等候' }] } },
 };
 const resolvedProvider = createAIProvider({
   story: {}, config: { apiKey: 'test', baseURL: 'https://example.invalid/v1', model: 'test', timeoutMs: 1000, maxRetries: 0 },

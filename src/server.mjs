@@ -206,7 +206,7 @@ function buildDemoMockAgentProvider(input, sessionUuid = null) {
   // ('hello' — see public/scripts/player.js). Explicit 08-contract inputs
   // ('default' / 'short' / 'long' / …) must keep their documented batch
   // shapes regardless of the turn index.
-  const isAutoArcInput = text === 'hello' || text === '';
+  const isAutoArcInput = input?.kind === 'continue' || text === '继续' || text === 'hello' || text === '';
   const autoTool = isAutoArcInput && !isChoice && !isFinish && turnIndex > 0 && turnIndex % CHOICE_EVERY === 0;
   const autoFinish = isAutoArcInput && !isChoice && !isFinish && turnIndex === FINISH_AFTER;
   const count = isChoice || isFinish || autoTool || autoFinish ? MIN_BATCH
