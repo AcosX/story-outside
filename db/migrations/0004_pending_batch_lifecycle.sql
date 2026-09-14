@@ -1,4 +1,4 @@
--- Story Outside - ClickUp 08 pending batch lifecycle.
+-- Story Outside - Story 08 pending batch lifecycle.
 --
 -- Compatibility: MariaDB 10.6+ / 11.x, InnoDB, utf8mb4.
 -- This migration extends pending_batches with the fields the application
@@ -61,7 +61,7 @@ ALTER TABLE pending_batches
   ADD UNIQUE INDEX IF NOT EXISTS uq_pending_batches_fingerprint (request_fingerprint),
   ADD KEY IF NOT EXISTS idx_pending_batches_fingerprint (request_fingerprint);
 
--- ClickUp 08 P1.4: provenance + counts guards on pending_batches. These
+-- Story 08 P1.4: provenance + counts guards on pending_batches. These
 -- mirror db/schema.sql exactly so a 0001→0004 upgrade ends up equivalent to
 -- a fresh install. Re-runnable: drop-by-name then recreate.
 ALTER TABLE pending_batches
@@ -72,7 +72,7 @@ ALTER TABLE pending_batches
   ADD CONSTRAINT chk_pending_batches_source CHECK (CHAR_LENGTH(source) > 0),
   ADD CONSTRAINT chk_pending_batches_counts CHECK (committed_count <= item_count);
 
--- Composite session-scoped index/FK (ClickUp 08 P1.4): a promoted event
+-- Composite session-scoped index/FK (Story 08 P1.4): a promoted event
 -- must belong to the SAME session as the pending batch. session_events gets
 -- a (session_id, event_id) index so pending_batches and pending_batch_items
 -- can reference the pair, and pending_batches gains a composite FK from
@@ -159,7 +159,7 @@ ALTER TABLE pending_batch_items
     (status = 'discarded' AND occurred_at IS NULL AND promoted_event_id IS NULL) OR status IN ('pending', 'committed')
   );
 
--- ClickUp 08 P1.4 item-state guards:
+-- Story 08 P1.4 item-state guards:
 --   * chk_pending_batch_items_pending: a pending row must NOT carry a
 --     promoted_event_id / occurred_at (only committed rows may).
 --   * chk_pending_batch_items_tool_commit: a tool_call item can never be

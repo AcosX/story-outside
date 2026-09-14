@@ -1,5 +1,5 @@
-// tests/chatgptReviewFixes.test.mjs — regression tests for the three
-// blockers raised during the ChatGPT 2026-09-05 independent re-review of
+// tests/codeReviewFixes2.test.mjs — regression tests for the three
+// blockers raised during the code review 2026-09-05 independent re-review of
 // PR #7 (comment id 5550989950). Each test exercises the exact
 // reproduction the reviewer flagged and pins down the new behaviour so
 // a future refactor cannot silently regress.
@@ -387,7 +387,7 @@ test('B3: clientRequestIndex is a bounded per-process window; ids are reusable a
     story_version_uuid: fixture.story_version_uuid,
     options: { profile: defaultGenerationProfile() },
   })).cache;
-  const REUSED_ID = 'req-pr7-chatgpt-reused-001';
+  const REUSED_ID = 'req-pr7-review-reused-001';
   // ---- session A ----
   const sessionA = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1';
   createSession({
@@ -479,7 +479,7 @@ test('B3: same-session replay with the same id still works (idempotency is per-s
     options: { profile: defaultGenerationProfile() },
   })).cache;
   const session_uuid = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa2';
-  const REPLAY_ID = 'req-pr7-chatgpt-replay-002';
+  const REPLAY_ID = 'req-pr7-review-replay-002';
   createSession({
     repository,
     session_uuid,
@@ -524,7 +524,7 @@ test('B3: same-session replay with mismatched payload still fails closed', async
     options: { profile: defaultGenerationProfile() },
   })).cache;
   const session_uuid = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa3';
-  const REPLAY_ID = 'req-pr7-chatgpt-mismatch-003';
+  const REPLAY_ID = 'req-pr7-review-mismatch-003';
   createSession({
     repository,
     session_uuid,
@@ -571,7 +571,7 @@ test('B3: a NEW session reusing an id that is still in the cross-session window 
     story_version_uuid: fixture.story_version_uuid,
     options: { profile: defaultGenerationProfile() },
   })).cache;
-  const REUSED_ID = 'req-pr7-chatgpt-direct-reuse-004';
+  const REUSED_ID = 'req-pr7-review-direct-reuse-004';
   const sessionA = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa4';
   createSession({
     repository,

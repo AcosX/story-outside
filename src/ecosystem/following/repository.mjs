@@ -1,7 +1,7 @@
 // src/ecosystem/following/repository.mjs — in-memory store for the
-// follow / share surface (ClickUp 16.3 P1 rebuild on `44343b2`).
+// follow / share surface (Story 16.3 P1 rebuild on `44343b2`).
 //
-// ClickUp 16.3 P1 invariants:
+// Story 16.3 P1 invariants:
 //   * Follow relation is keyed by (follower_uuid, target_user_uuid). Same
 //     pair can only be set once; a second `POST /follow` is idempotent
 //     (returns the existing row, never a duplicate).
@@ -200,7 +200,7 @@ export function createInMemoryFollowingRepository() {
       assertUuid('session_uuid', input.session_uuid);
       assertUuid('owner_user_uuid', input.owner_user_uuid);
       const existing = sharedSessions.get(input.session_uuid);
-      // ClickUp 16.3 P1.2 owner invariant (ChatGPT 2026-09-07 review):
+      // Story 16.3 P1.2 owner invariant (code review 2026-09-07 review):
       // the canonical owner_user_uuid comes from sessionService internal
       // state, NOT from the request. The repository refuses to silently
       // rebind an existing row to a different owner — the service layer

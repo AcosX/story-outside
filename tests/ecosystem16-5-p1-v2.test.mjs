@@ -1,9 +1,9 @@
-// tests/clickup16-5-p1-v2.test.mjs
+// tests/ecosystem16-5-p1-v2.test.mjs
 //
-// ClickUp 16.5 P1 v2 regression — server-authoritative canonical
+// Story 16.5 P1 v2 regression — server-authoritative canonical
 // queries + q.query truly drives retrieval.
 //
-// Owner巡检 + ChatGPT independent review (2026-09-07 02:23) flagged
+// Owner review + independent review (2026-09-07 02:23) flagged
 // PR #25 (a54aebd) for two P1 blockers:
 //
 //   P1.v2-1 — POST /v1/ecosystem/knowledge still read
@@ -521,7 +521,7 @@ test('communityProfileService.findCanonicalByIdentity resolves the seeded profil
   const profileRepo = createInMemoryCommunityProfileRepository();
   seedCommunityProfiles(repository, profileRepo);
   // Re-resolve by identity tuple; this is what the handler does.
-  // ClickUp 16.2 P1.v1-5 (PR #24, origin/main): the active
+  // Story 16.2 P1.v1-5 (PR #24, origin/main): the active
   // `findCanonicalByIdentity` returns `{ ok:true, profile }` for the
   // success path so the /discussions route can differentiate error
   // codes. The PR #25 P1.v1-5 fixture was originally written for
@@ -547,7 +547,7 @@ test('communityProfileRepo.findCanonicalByIdentity: mismatch on community_profil
   const { repository } = createSeededRepository();
   const profileRepo = createInMemoryCommunityProfileRepository();
   seedCommunityProfiles(repository, profileRepo);
-  // ClickUp 16.2 P1.v1-5 (PR #24, origin/main): the active
+  // Story 16.2 P1.v1-5 (PR #24, origin/main): the active
   // `findCanonicalByIdentity` returns `{ ok:false, code, message }`
   // for the not-found path so the /discussions route can map it
   // onto a specific 400 (`community_profile_not_found` here). The

@@ -1,7 +1,7 @@
 // src/stories/repository.mjs — in-memory, credential-free repository for
 // story import, versioned content, and opening-cache state.
 //
-// ClickUp 04 contract:
+// Story 04 contract:
 //   * findVersionByChecksum / createVersion are the version-import seam:
 //     same checksum → reuse; different checksum → new version_no on the
 //     same story; old versions are kept (no UPDATE on content/checksum).
@@ -91,7 +91,7 @@ const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{
 // openingCaches map could still grow without limit (each rebuild attempt
 // under a fresh generation_profile / scope produces a new cache row).
 //
-// Eviction policy (PR #7 follow-up, ChatGPT re-review fix 2026-09-05,
+// Eviction policy (PR #7 follow-up, code review re-review fix 2026-09-05,
 // Blocker 1 + Blocker 2):
 //   1. Drop rows whose status is 'failed' or 'invalidated' first; those
 //      are useless for future lookups and the scope index is pruned so
@@ -225,7 +225,7 @@ export function makeOpeningScopeKey(story_uuid, story_version_uuid, opening_key,
  * eviction so pinned valid rows are NEVER dropped. Without this hook the
  * eviction loop would happily drop the very cache a live session needs
  * for `commitOpeningEvent`, surfacing as `pinned cache is no longer
- * valid` mid-stream (the ChatGPT 2026-09-05 re-review flagged this).
+ * valid` mid-stream (the code review 2026-09-05 re-review flagged this).
  */
 function defaultPinnedCacheResolver() {
   // Resolver set per-repository inside createInMemoryStoryRepository; the
@@ -240,7 +240,7 @@ function defaultPinnedCacheResolver() {
  * remaining candidates are pinned and the caller cannot make progress
  * (so the caller can refuse the insert with a stable error code).
  *
- * Eviction policy (PR #7 follow-up, ChatGPT 2026-09-05):
+ * Eviction policy (PR #7 follow-up, code review 2026-09-05):
  *   1. Drop rows whose status is 'failed' or 'invalidated' first; those
  *      are useless for future lookups and the scope index is pruned so
  *      a rebuild can republish under the same scope key.
@@ -301,7 +301,7 @@ function evictOpeningCachesIfFull(state) {
  * store is at the cap and we cannot evict a single row (every row is
  * pinned), refuse with a stable `too_many_pinned_caches` error so the
  * caller never sees a "ghost row" — an inserted row that the very next
- * eviction pass removes (PR #7 ChatGPT 2026-09-05 re-review, Blocker 2).
+ * eviction pass removes (PR #7 code review 2026-09-05 re-review, Blocker 2).
  *
  * The reservation runs `evictOpeningCacheOnce` — a one-shot eviction
  * that drops AT MOST ONE row even when the store is at exactly the
@@ -616,7 +616,7 @@ export function createInMemoryStoryRepository() {
         created_at: now,
         updated_at: now,
       };
-      // PR #7 ChatGPT follow-up (2026-09-05, B2): reserve the slot BEFORE
+      // PR #7 code review follow-up (2026-09-05, B2): reserve the slot BEFORE
       // insertion so a freshly inserted row can never be evicted by the
       // very same call. If the cap cannot be freed (every row is
       // pinned), reserveOpeningCacheSlot throws a stable

@@ -1,6 +1,6 @@
 # 测试策略（Task 12）
 
-> 适用: ClickUp 12 — 自动测试、回归 Fixture 与故障场景。本文件描述 `story-outside` 在 main 上的测试分层、固定测试故事契约、以及 CI 跑法。
+> 适用: Story 12 — 自动测试、回归 Fixture 与故障场景。本文件描述 `story-outside` 在 main 上的测试分层、固定测试故事契约、以及 CI 跑法。
 >
 > **08/09/10 合编后的契约适配（已完成）**: 本清单中的 5 个套件最初针对 08 合并前的旧契约编写，现已全部适配到 08（pending 批次硬化 + 统一 cursor）/ 09（单屏播放器别名）/ 10（compact）合并后的统一契约，并已接入 `package.json` 的 `npm test` 链（追加在 `storyOutside09` 之后）。适配要点：
 >
@@ -145,7 +145,7 @@ npm run check
 git diff --check
 ```
 
-> Task 12 的 5 个套件与 PR #10 的 3 个 compact 套件现已全部接入 `package.json` 的 `npm test` 链（追加在 `storyOutside09` 之后）——"合编时统一收编"已完成，`npm test` 即用户日常跑法。
+> 各测试套件均已接入 `package.json` 的 `npm test` 链，`npm test` 为日常统一跑法。
 
 ## 6. 真实边界声明
 
@@ -186,5 +186,5 @@ STORY_OUTSIDE_PROVIDER=mock PORT=4175 npm start
 * 不要 mutate `tests/fixtures/seed-stories/cafe-rain.mjs` — 用新 slug / 新 fixture 文件。
 * 不要让 suite 依赖网络 / 真实 LLM / MariaDB。
 * 不要在 suite 里 echo `process.env.STORY_OUTSIDE_PROVIDER` 或 `process.env.ZHIHU_PROVIDER` 之外的任何 env key。
-* 新增套件时同步追加到 `package.json` 的 `test` 链尾（"合编时统一收编"已完成，链内现有 26 个套件）。
-* 4–8 个 commit 粒度，每个 commit 末尾加 `Co-authored-by: OpenClaw <claw@acosx.top>`。
+* 新增套件时同步追加到 `package.json` 的 `test` 链尾（链内现有 26 个套件）。
+* 建议按 4–8 个 commit 的粒度提交，保持每个 commit 聚焦单一改动。

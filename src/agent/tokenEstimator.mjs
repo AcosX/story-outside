@@ -1,5 +1,5 @@
 // src/agent/tokenEstimator.mjs — pluggable token estimator used by the
-// long-context compact pipeline (ClickUp 10).
+// long-context compact pipeline (Story 10).
 //
 // DEPENDENCY NOTE — in-memory vs SQL boundary:
 // This module is pure and stateless; it does not know about repositories

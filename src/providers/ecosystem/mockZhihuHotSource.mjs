@@ -1,7 +1,7 @@
-// src/providers/ecosystem/mockZhihuHotSource.mjs — ClickUp 16.4 mock fixture
+// src/providers/ecosystem/mockZhihuHotSource.mjs — Story 16.4 mock fixture
 // for the home-page 知乎热榜 module.
 //
-// Contract (ClickUp 16.4 P1 fix, 2026-09-07):
+// Contract (Story 16.4 P1 fix, 2026-09-07):
 //   * Pure in-memory fixture; no network, no env var, no clock.
 //   * Stable UUIDs and titles so regression tests can pin every row.
 //   * Categories clamp to KNOWN_CATEGORIES so the query string cannot
@@ -11,7 +11,7 @@
 //     so the "相关才关联" matcher has at least one positive case in
 //     the regression suite without depending on a curated seed.
 //
-// Reuses nothing from `ee5217b` (PR #20). ClickUp 16.4 P1 fix rebuilds
+// Reuses nothing from `ee5217b` (PR #20). Story 16.4 P1 fix rebuilds
 // the fixture on top of the current main `44343b2` from the public
 // shape contract; the fixture here is hand-curated for the new test
 // surface (relevant_to_story scoring).

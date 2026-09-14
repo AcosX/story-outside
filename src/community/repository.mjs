@@ -1,5 +1,5 @@
 // src/community/repository.mjs — in-memory store for story_version-scoped
-// community profiles (ClickUp 16.1).
+// community profiles (Story 16.1).
 //
 // Hard contract:
 //   * One community profile is bound to ONE story_version. When the
@@ -23,7 +23,7 @@
 //     with two checksums (rare, but possible when content_payload is
 //     corrected) keeps separate profiles.
 //
-// ClickUp 16.5 P1.v1-3 fix (2026-09-07 owner review): the handler
+// Story 16.5 P1.v1-3 fix (2026-09-07 owner review): the handler
 // identity is the DERIVED external
 // `community_profile_version = <generator_version>-<content_hash_short>`,
 // NOT the raw `generator_version`. `findCanonicalByIdentity` walks
@@ -35,7 +35,7 @@
 // external-version lookup either returns the matching row or returns
 // `null` so the route layer can report `community_profile_not_found`.
 //
-// ClickUp 16.5 P1.v1-5 fix (2026-09-07 owner review, ChatGPT 复核):
+// Story 16.5 P1.v1-5 fix (2026-09-07 owner review, code review):
 // `Map.set(existing key)` does NOT change the key's iteration
 // position — so the v1-4 "last insertion wins" walk over
 // `activeByStoryVersion.entries()` was still deterministically
@@ -172,13 +172,13 @@ function rejectForbiddenKeys(value, path) {
  * @property {(story_version_uuid: string, externalVersion: string) => StoryCommunityProfile | null} findByExternalVersion
  * @property {(input: { story_version_uuid: string }) => StoryCommunityProfile[]} listByStoryVersion
  * @property {(input: { story_uuid?: string, story_version_uuid: string, community_profile_version?: string | null }) => StoryCommunityProfile | null} findCanonicalByIdentity
- *          ClickUp 16.5 P1.v2 — server-authoritative lookup that joins
+ *          Story 16.5 P1.v2 — server-authoritative lookup that joins
  *          (story_uuid, story_version_uuid, community_profile_version)
  *          into one canonical row. Caller-supplied knowledge_queries /
  *          topic_id / topic_label / topic / theme / subject are NEVER
  *          consulted; the route layer only ever picks a single row.
  * @property {(external_version: string) => StoryCommunityProfile | null} findByExternalVersion
- *          ClickUp 16.5 P1.v1-4 — pure exact-match by the EXTERNAL
+ *          Story 16.5 P1.v1-4 — pure exact-match by the EXTERNAL
  *          community_profile_version string. Walks every preserved
  *          row in the store, computes each row's external version
  *          via `deriveExternalCommunityProfileVersion`, and returns
@@ -201,7 +201,7 @@ function rejectForbiddenKeys(value, path) {
  * @returns {{
  *   profiles: Map<string, StoryCommunityProfile>,                 // keyed by profile_uuid
  *   activeByStoryVersion: Map<string, string>,                    // story_version_uuid|generator_version → profile_uuid
- *   latestByStoryVersion: Map<string, string>,                    // ClickUp 16.5 P1.v1-5 — explicit latest pointer, story_version_uuid → profile_uuid (NO Map iteration)
+ *   latestByStoryVersion: Map<string, string>,                    // Story 16.5 P1.v1-5 — explicit latest pointer, story_version_uuid → profile_uuid (NO Map iteration)
  *   byUuid: Map<string, StoryCommunityProfile>,
  *   byExternalVersion: Map<string, string>,                        // `${story_version_uuid}::${externalVersion}` → profile_uuid (P1.v1-5 SCOPED)
  *   latestByStoryVersion: Map<string, string>,                    // story_version_uuid → profile_uuid of the most recently inserted row (PRIVATE; not a row field)
@@ -214,11 +214,11 @@ function createEmptyState() {
     latestByStoryVersion: new Map(),
     byUuid: new Map(),
     byExternalVersion: new Map(),
-    // ClickUp 16.2 P1.v1-5 fix (2026-09-07): the monotonic/latest
+    // Story 16.2 P1.v1-5 fix (2026-09-07): the monotonic/latest
     // metadata that drives active-row selection lives in PRIVATE
     // repository state. The previous v1-4 implementation stamped a
     // numeric `insert_seq` onto every row and made it part of the
-    // canonical schema (which is owned by ClickUp 16.1 / main), turning
+    // canonical schema (which is owned by Story 16.1 / main), turning
     // the 13-field strict allowlist into 14 fields. v1-5 reverts
     // that schema change: this Map is the SINGLE source of truth for
     // "which row is currently active under this story_version_uuid".
@@ -260,7 +260,7 @@ function isPlainObject(value) {
  * hash. The prefix length matches what the handler in server.mjs
  * surfaces to the player (and what the player echoes back).
  *
- * ClickUp 16.2 P1.v2 fix (2026-09-07): this helper is the SINGLE
+ * Story 16.2 P1.v2 fix (2026-09-07): this helper is the SINGLE
  * authority for the version-string format. Both the producer (POST
  * /api/sessions response) and the consumer (POST
  * /v1/ecosystem/discussions) MUST derive the string through this
@@ -310,7 +310,7 @@ export function createInMemoryCommunityProfileRepository() {
   const repo = {
     findActiveByStoryVersion(story_version_uuid) {
       assertUuid('story_version_uuid', story_version_uuid);
-      // P1.v1-5 (2026-09-07 owner review, ChatGPT 复核) — direct
+      // P1.v1-5 (2026-09-07 owner review, code review) — direct
       // lookup against the explicit `latestByStoryVersion` pointer.
       // We previously walked `activeByStoryVersion.entries()` and
       // trusted Map insertion order, but `Map.set(existing key)`
@@ -339,8 +339,8 @@ export function createInMemoryCommunityProfileRepository() {
       return state.profiles.get(uuid) || null;
     },
     /**
-     * ClickUp 16.2 P1.v2 fix (2026-09-07) — REVISED 2026-09-07 04:21
-     * (主人巡检): server-authoritative, IMMUTABLE lookup of a
+     * Story 16.2 P1.v2 fix (2026-09-07) — REVISED 2026-09-07 04:21
+     * (review): server-authoritative, IMMUTABLE lookup of a
      * `StoryCommunityProfile` row.
      *
      * The store retains EVERY profile row ever written (the
@@ -412,7 +412,7 @@ export function createInMemoryCommunityProfileRepository() {
           message: 'story_version_uuid is required and must be a valid UUID',
         };
       }
-      // P1.v1-5 fallback (ClickUp 16.5 PR #25): when the caller
+      // P1.v1-5 fallback (Story 16.5 PR #25): when the caller
       // omits `community_profile_version`, return the active row
       // for `story_version_uuid`. This preserves the v1-5 contract
       // where the in-memory repository acts as a fallback to
@@ -540,7 +540,7 @@ export function createInMemoryCommunityProfileRepository() {
       if (typeof profile_uuid !== 'string') return null;
       return state.profiles.get(profile_uuid) || null;
     },
-    // ClickUp 16.5 P1.v1-4 — PR #25 single-arg exact-match by the
+    // Story 16.5 P1.v1-4 — PR #25 single-arg exact-match by the
     // EXTERNAL community_profile_version string. Kept here verbatim
     // (per merge-of-conflict instruction "保留 main 的所有方法并在
     // 合适位置插入 HEAD 的 findByExternalVersion") so the call
@@ -550,7 +550,7 @@ export function createInMemoryCommunityProfileRepository() {
     // server.mjs's /knowledge route has been updated to call the
     // two-arg signature.
     findByExternalVersion(external_version) {
-      // ClickUp 16.5 P1.v1-4 — pure exact-match lookup. The orchestrator
+      // Story 16.5 P1.v1-4 — pure exact-match lookup. The orchestrator
       // and the route layer carry the EXTERNAL community_profile_version
       // string (`<generator_version>@<content_hash_prefix>`) supplied
       // by the client; this method walks every preserved row in the
@@ -590,7 +590,7 @@ export function createInMemoryCommunityProfileRepository() {
     // `findByExternalVersion` (above) — NOT `findCanonicalByIdentity`
     // — for the server-side canonical lookup, so HEAD's method body
     // is genuinely redundant.
-    // ClickUp 16.2 P1.v1-5 — PR #24 SCOPED two-arg exact-match. This
+    // Story 16.2 P1.v1-5 — PR #24 SCOPED two-arg exact-match. This
     // definition OVERRIDES the one-arg `findByExternalVersion` above
     // at runtime (object-literal semantics); server.mjs has been
     // updated to call this signature with both
@@ -659,7 +659,7 @@ export function createInMemoryCommunityProfileRepository() {
       //    content_hash). When the caller regenerates with the same
       //    content, we MUST NOT create a duplicate active row — we
       //    return the existing one instead. Critically (P1.v1-5,
-      //    2026-09-07 ChatGPT 复核): an idempotent hit MUST NOT move
+      //    2026-09-07 code review): an idempotent hit MUST NOT move
       //    the `latestByStoryVersion` pointer — the active row stays
       //    on whatever the latest FRESH insert was. This prevents a
       //    stale re-insert of an older row from regressing the active
@@ -678,7 +678,7 @@ export function createInMemoryCommunityProfileRepository() {
       state.profiles.set(profile.profile_uuid, profile);
       state.byUuid.set(profile.profile_uuid, profile);
       state.activeByStoryVersion.set(key, profile.profile_uuid);
-      // 5. ClickUp 16.5 P1.v1-5 — update the explicit
+      // 5. Story 16.5 P1.v1-5 — update the explicit
       //    `latestByStoryVersion` pointer ONLY on a fresh insert
       //    (the idempotency hit above short-circuited, so we are by
       //    construction inserting a NEW row here, possibly with a

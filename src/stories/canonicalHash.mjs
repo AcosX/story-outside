@@ -1,7 +1,7 @@
 import { progressMetadata } from './plotProgress.mjs';
 // src/stories/canonicalHash.mjs — deterministic canonicalisation + hashing.
 //
-// ClickUp 04 contract:
+// Story 04 contract:
 //   * Two story DTOs with the same authored content (after normalisation)
 //     MUST yield the same canonical hash, regardless of object key order.
 //   * Two story DTOs with any content difference MUST yield different

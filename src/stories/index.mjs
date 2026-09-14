@@ -3,7 +3,7 @@
 // Other modules should import from here, not from the individual files.
 // This indirection lets us reorganise internals without breaking call sites.
 //
-// ClickUp 08 contract:
+// Story 08 contract:
 //
 //   * The canonical session store lives in src/stories/sessionService.mjs.
 //     It owns history, revision, cursor, state, requestIds, and the
@@ -39,8 +39,8 @@ export {
 export { createSeededRepository, FIXTURE_UUIDS } from './fixture.mjs';
 
 // sessionService — the canonical store. `commitNarrativeEvent` is the
-// authoritative commit hook (ClickUp 08 contract name); pendingLifecycle
-// exposes `commitDisplayedEvent` as an alias. The ClickUp 10 compact
+// authoritative commit hook (Story 08 contract name); pendingLifecycle
+// exposes `commitDisplayedEvent` as an alias. The Story 10 compact
 // functions are re-exported here too so callers of the application layer
 // do not have to reach into sessionService.mjs directly.
 export {
@@ -64,7 +64,7 @@ export {
 } from './sessionService.mjs';
 
 // pendingLifecycle — strict facade. `stageNarrativeBatch` accepts both
-// `items:` (ClickUp 08) and `events:` (legacy) so existing callers do not
+// `items:` (Story 08) and `events:` (legacy) so existing callers do not
 // have to change.
 export {
   commitDisplayedEvent,

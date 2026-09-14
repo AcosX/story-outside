@@ -1,14 +1,14 @@
-// src/providers/ecosystem/zhihuKnowledgeSource.mjs — ClickUp 16.5 (v2
+// src/providers/ecosystem/zhihuKnowledgeSource.mjs — Story 16.5 (v2
 // rebuild on current main, NOT a54aebd).
 //
 // Real knowledge provider for the public POST /v1/ecosystem/knowledge
-// façade. Per the ClickUp 16.5 task notes:
+// façade. Per the Story 16.5 task notes:
 //
 //   "**当前没完整 endpoint/字段契约**" — the upstream URL and the
 //   response shape are NOT finalised. The provider MUST NOT hard-code
 //   any endpoint or pretend to honour a contract we do not have.
 //
-// ChatGPT review P1.v2 (2026-09-07 02:23) explicitly flagged the old
+// code review P1.v2 (2026-09-07 02:23) explicitly flagged the old
 // PR #25 (a54aebd) for using `query_id` (a stable identifier inside
 // the canonical profile) as the upstream subject — meaning two
 // completely different canonical queries with two completely
@@ -22,7 +22,7 @@
 //     `topic_label` / `theme` / `subject`. Those free-form surface
 //     fields are explicitly banned by the P1.v2 whitelist.
 //
-// ChatGPT review P1 also flagged the old PR #15 for pre-baking a
+// code review P1 also flagged the old PR #15 for pre-baking a
 // fake URL into the source code. We respect that constraint at three
 // layers:
 //

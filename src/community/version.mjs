@@ -1,6 +1,6 @@
 // src/community/version.mjs — community-layer PUBLIC helper for the
 // EXTERNAL `community_profile_version` string used on the wire
-// contract (ClickUp 16.4 P1.v1-6, 2026-09-07).
+// contract (Story 16.4 P1.v1-6, 2026-09-07).
 //
 // Hard contract (P1.v1-6):
 //   * This module is the SINGLE place that knows the external-version
@@ -20,7 +20,7 @@
 //     `buildCanonicalCommunityProfileVersion` from
 //     `src/community/repository.mjs`. The previous v1-5 implementation
 //     re-hashed content via the in-module content-hash function
-//     (since deleted), which ChatGPT
+//     (since deleted), which code review
 //     review (2026-09-07 09:19) flagged as a second source of truth:
 //     the seeded cafe-rain row then yielded
 //     `1.0.0@e2faabf0b55c9794` instead of the main-canonical

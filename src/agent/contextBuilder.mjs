@@ -1,6 +1,6 @@
 // src/agent/contextBuilder.mjs — assemble the request context the agent
 // runtime hands to the provider, including the long-context compact
-// decision (ClickUp 10).
+// decision (Story 10).
 //
 // DEPENDENCY NOTE — projection vs SQL boundary:
 // This module is pure: it reads the synchronous session projection returned

@@ -1,4 +1,4 @@
-// src/stories/endingService.mjs — ClickUp 11 ending-page service.
+// src/stories/endingService.mjs — Story 11 ending-page service.
 //
 // Derives three read-only projections from a session + its story version:
 //

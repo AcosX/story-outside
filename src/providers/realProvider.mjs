@@ -2,7 +2,7 @@
 // Zhihu Hackathon 2026 (Phase 2) story content API.
 //
 // Contract reference:
-//   /root/.openclaw/workspace/skills/zhihu/references/hackathon-content-api.md
+//   the official Zhihu Hackathon content API reference
 //
 // Hard rules taken from that contract (verbatim, do not relax):
 //   * No Access Secret. No OAuth App ID / App Key. No access_token.
@@ -22,7 +22,7 @@
 //     `source.raw` so attribution and forensic context survive. We do
 //     not pretend original content was authored by this app.
 //
-// Scope (ClickUp 13):
+// Scope (Story 13):
 //   * This provider is bound to zhihu_hackathon_2026_p2. The contract
 //     document explicitly warns the endpoints may change after the
 //     event. We surface that as a metadata flag on the provider so the
@@ -355,7 +355,7 @@ async function followRedirect(fn, url, ctx) {
       { hostname: target.hostname },
     );
   }
-  // B1 (PR #8 ChatGPT follow-up): the host allow-list is necessary but
+  // B1 (PR #8 code review follow-up): the host allow-list is necessary but
   // NOT sufficient. A redirect to `http://api.zhihu.com/...` (downgrade
   // to cleartext) or to `https://api.zhihu.com:8080/...` (port the
   // contract does not specify) must be refused even though the host

@@ -1,7 +1,7 @@
-// src/providers/ecosystem/search.mjs — ClickUp 16.2 P1.v2 知乎搜索 cache 与
+// src/providers/ecosystem/search.mjs — Story 16.2 P1.v2 知乎搜索 cache 与
 // orchestrator.
 //
-// 关键 P1.v2 修复（主人 + ChatGPT 2026-09-07 巡检）：
+// 关键 P1.v2 修复（code review）：
 //   * Search queries **必须**来自服务端解析出的 canonical
 //     `StoryCommunityProfile.queries[]`，**不**由 client 拼。
 //     handler 接 `story_uuid + story_version_uuid +
@@ -390,7 +390,7 @@ function scheduleBackgroundRefresh(input) {
 }
 
 /**
- * Orchestrator. ClickUp 16.2 P1.v2 fix (2026-09-07):
+ * Orchestrator. Story 16.2 P1.v2 fix (2026-09-07):
  *   Input is the **resolved canonical profile** + identity triple,
  *   NOT the raw client body. The route layer resolves
  *   `communityProfileRepo.findCanonicalByIdentity(...)` and passes

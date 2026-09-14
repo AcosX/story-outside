@@ -199,7 +199,7 @@ async function run() {
       expected_revision: revision,
     });
     assert.equal(interrupt.state, 'realtime');
-    // ClickUp 08 P1.1 unified cursor semantics: `cursor` is the CANONICAL
+    // Story 08 P1.1 unified cursor semantics: `cursor` is the CANONICAL
     // cursor (2 opening commits + 1 player_input commit = 3) and always
     // equals revision / history.length; the OPENING playback position is
     // the separate `opening_cursor`, which stays frozen at 2 — the
@@ -340,7 +340,7 @@ async function run() {
   });
 
   await test('6. client_request_id uniqueness is a bounded per-process window (B3 downgrade)', async () => {
-    // B3 follow-up (PR #7 ChatGPT 2026-09-05 re-review): the in-memory
+    // B3 follow-up (PR #7 code review 2026-09-05 re-review): the in-memory
     // demo no longer mirrors the SQL GLOBAL UNIQUE constraint on
     // session_events.client_request_id. Once the previous owning
     // session is evicted, a fresh session MAY reuse the id. Within the
@@ -351,7 +351,7 @@ async function run() {
     // contract; the SQL UNIQUE constraint is owned by the production DAO,
     // not by the in-memory demo. See the comment on
     // `MAX_TRACKED_CLIENT_REQUEST_IDS` in sessionService.mjs and the
-    // dedicated `chatgptReviewFixes.test.mjs` regression tests.
+    // dedicated `codeReviewFixes2.test.mjs` regression tests.
     const sessionA = '00000000-0000-4000-8000-0000000a0006';
     const sessionB = '00000000-0000-4000-8000-0000000a0007';
     const { repository, cache, profile } = await sessionFixture({ session_uuid: sessionA });
@@ -412,7 +412,7 @@ async function run() {
   });
 
   await test('7. final-commit retry with the same client_request_id replays the prior result (response-lost regression)', async () => {
-    // Regression lock for the ClickUp 08 P1.5 final-commit idempotency: the
+    // Regression lock for the Story 08 P1.5 final-commit idempotency: the
     // last commit clears session.pending; a retry of that same commit
     // (client never got the response) must return the ORIGINAL result
     // instead of failing the pending_id check with a 400.

@@ -1,5 +1,5 @@
-// src/providers/ecosystem/hot.mjs — ClickUp 16.4 P1.v1-4 知乎热榜 orchestrator
-// (2026-09-07), continued on fix/clickup16-4-p1-hot-relevance branch.
+// src/providers/ecosystem/hot.mjs — Story 16.4 P1.v1-4 知乎热榜 orchestrator
+// (2026-09-07), continued on the hot-relevance fix branch.
 //
 // P1.v1-4 fix — single community-layer helper + direct external-version
 // lookup (no active-row concept):
@@ -11,7 +11,7 @@
 //   That coupling meant v1-3 depended on whatever the repository
 //   considered "active" for the story_version — a coupling that
 //   silently broke when an unrelated refactor changed which row was
-//   active (the active-row bug observed in the ChatGPT independent
+//   active (the active-row bug observed in the code review independent
 //   review of `npm test` exit 1 at 2026-09-07 06:24).
 //
 //   v1-4 unwinds that coupling on the #23 branch WITHOUT copying the
@@ -49,7 +49,7 @@
 //   sorted to the top (and within the related band, by hotness desc);
 //   entries with score === 0 fall back to the regular hotness rank.
 //
-// Identity contract (ClickUp 16.4 P1.v1-2 → P1.v1-3):
+// Identity contract (Story 16.4 P1.v1-2 → P1.v1-3):
 //
 //   GET /v1/ecosystem/hot accepts optional identity triple:
 //     story_uuid, story_version_uuid, community_profile_version
@@ -79,7 +79,7 @@
 //     'profile_missing', response }` and the route returns 400
 //     `community_profile_missing`.
 //
-// Cache strategy (rebuilt per ClickUp 16.4 spec):
+// Cache strategy (rebuilt per Story 16.4 spec):
 //
 //   * Key = (category, fetched_at_bucket) — NEVER a single global
 //     entry. A→B→A within the bucket still hits A's cache row.
@@ -815,7 +815,7 @@ export function attachRelevance(response, identity, options) {
   // `community_profile_story_uuid_mismatch` (NOT `attached: true`).
   // A wrong but format-legal story_uuid must NEVER silently produce
   // `attached: true` for a profile that belongs to a different
-  // story — that was the ChatGPT independent review P1 finding.
+  // story — that was the independent review P1 finding.
   //
   // Cross-check contract: `story_uuid === profile.story_uuid`. If
   // the helper above set `storyUuidMismatch`, the caller's

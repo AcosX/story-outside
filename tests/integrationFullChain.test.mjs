@@ -190,7 +190,7 @@ async function run() {
     assert.equal(stillValid.status, 'valid', 'shared cache must NOT be invalidated by first-choice');
 
     // 8. Player submits free text → agent.runTurn → ask_player_choice.
-    //    ClickUp 08 unified contract: the tool call rides as the OPTIONAL
+    //    Story 08 unified contract: the tool call rides as the OPTIONAL
     //    FINAL item on a 1..4 narrative-item batch (tool-only batches are
     //    rejected by the runtime).
     const agentProvider = createMockAgentProvider({
@@ -412,7 +412,7 @@ async function run() {
       provider: createMockAgentProvider({
         responses: [
           {
-            // ClickUp 08: the tool rides on a narrative batch, so the tool
+            // Story 08: the tool rides on a narrative batch, so the tool
             // schema validation (options needs 2..6 items) is what rejects
             // this turn — not the tool-only-batch guard.
             items: [{ type: 'narration', text: '她等你回答。' }],

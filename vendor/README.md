@@ -5,7 +5,7 @@
 ## zhihu-hackathon/
 
 知乎黑客松官方编排 Skill 的解压副本（来自
-`/root/.openclaw/workspace/artifacts/zhihu-hackathon-official-2026/zhihu-hackathon-skill_s2_v260815.zip`）。
+官方发布的 `zhihu-hackathon-skill` ZIP 包）。
 
 - 用途：阅读官方 API 边界、OAuth 流程、部署约束。
 - **不要**在仓库内 `npm install` 它；**不要**让 Node 把它当作模块加载。

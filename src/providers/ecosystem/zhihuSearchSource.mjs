@@ -1,12 +1,12 @@
-// src/providers/ecosystem/zhihuSearchSource.mjs — ClickUp 16.2 P1.v2
+// src/providers/ecosystem/zhihuSearchSource.mjs — Story 16.2 P1.v2
 // real 知乎搜索 source（直接 HTTP，**不**复用 CLI）。
 //
-// 契约 (ClickUp 16.2 — 2026-09-06 22:21 / 2026-09-07 P1.v2 review):
+// 契约 (Story 16.2 — 2026-09-06 22:21 / 2026-09-07 P1.v2 review):
 //   * 仅在 STORY_OUTSIDE_ECOSYSTEM_SEARCH=real 且
 //     ZHIHU_OAUTH_APP_KEY / ZHIHU_ACCESS_SECRET / ZHIHU_OAUTH_USER
 //     配置完整时启用。
 //   * 调用官方 endpoint: https://api.zhihu.com/api/v1/content/search
-//     （按 ClickUp 16.2 记录的官方契约）。**不**伪造成 /openapi/feed/search。
+//     （按 Story 16.2 记录的官方契约）。**不**伪造成 /openapi/feed/search。
 //   * host allowlist 仅 `https://api.zhihu.com` (default port only)。
 //   * 30x 重定向手动处理（每次 Location 重新校验 host allowlist）。
 //   * timeout / 非 2xx / 网络异常 → 抛 `EcosystemUpstreamError`，

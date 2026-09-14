@@ -4,7 +4,7 @@
 // and the Zhihu Hackathon 2026 P2 story content API. Every test runs
 // against a stubbed `fetch` so the suite has zero network dependency
 // and is deterministic. The contract reference is
-// /root/.openclaw/workspace/skills/zhihu/references/hackathon-content-api.md.
+// the official Zhihu Hackathon content API reference.
 //
 // What this suite pins:
 //   1. listStories / getStory happy path returns the right DTO shape
@@ -379,7 +379,7 @@ async function run() {
     // fetch exercise the factory directly (see cases 1\u201312). For this
     // case we only need /api/health to advertise the real provider.
     // The data routes are exercised against the live upstream by the
-    // clickup-13 live-smoke step described in the report, never from
+    // story-13 live-smoke step described in the report, never from
     // CI.
     __resetStoryProviderForTests();
     process.env.STORY_OUTSIDE_PROVIDER = 'real';
@@ -530,7 +530,7 @@ async function run() {
   });
 
   // ----- 17.3 redirect scheme/port lockdown (B1) ----------------------
-  // PR #8 ChatGPT follow-up: the previous allow-list only checked the
+  // PR #8 code review follow-up: the previous allow-list only checked the
   // hostname. A redirect to `http://api.zhihu.com/...` (downgrade) or
   // `https://api.zhihu.com:8080/...` (non-default port) slipped through.
   // The fix pins scheme=https AND port='' (or '443') on every hop.

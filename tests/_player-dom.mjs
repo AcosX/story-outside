@@ -58,7 +58,7 @@ async function importEndingPageForHarness() {
     .replace(/export\s+default\s+\{[^}]*\}\s*;?\s*$/m, '');
   const fn = new Function(`${stripped}\nreturn { mount, teardown, STATE };`);
   const mod = fn();
-  // ClickUp 16.3 P1 v1-7: wrap `mount` with a recorder so the
+  // Story 16.3 P1 v1-7: wrap `mount` with a recorder so the
   // ?s=ending deep-link regression can assert the canonical meta
   // actually reaches `endingPage.mount({ sessionUuid, sessionMeta })`.
   const realMount = mod.mount;
@@ -76,7 +76,7 @@ async function importEndingPageForHarness() {
 }
 
 // The player lazy-loads the community section via `import('/scripts/communitySection.js')`
-// (ClickUp 16.3 P1 v1-3). The harness rewrites that dynamic import to a
+// (Story 16.3 P1 v1-3). The harness rewrites that dynamic import to a
 // hook that evaluates the REAL communitySection.js source — the section renders
 // its own DOM and the player's lazy-import wiring stays under test.
 const PLAYER_COMMUNITY_SECTION_IMPORT = "import('/scripts/communitySection.js')";
@@ -102,7 +102,7 @@ async function importSessionContextForHarness() {
   const stripped = patched
     .replace(/export\s*\{[^}]*\}\s*;?\s*$/m, '')
     .replace(/export\s+default\s+\{[^}]*\}\s*;?\s*$/m, '');
-  // ClickUp 16.3 P1 v1-7: expose `getCurrentShareTargetMeta` so the
+  // Story 16.3 P1 v1-7: expose `getCurrentShareTargetMeta` so the
   // deep-link regression test can assert the helper round-trips the
   // canonical triple (storyUuid / storyVersionUuid /
   // communityProfileVersion / communityProfileQueries) on reload.
@@ -112,7 +112,7 @@ async function importSessionContextForHarness() {
 
 function applyHarnessPatches(source) {
   let patched = source;
-  // ClickUp 16.3 P1 v1-4: the player AND the community section both
+  // Story 16.3 P1 v1-4: the player AND the community section both
   // lazy-import the session-context helper. Rewrite that import to
   // a harness hook that evaluates the REAL sessionContext.js source
   // — same pattern as the panel and ending-page hooks above.
@@ -127,7 +127,7 @@ function applyHarnessPatches(source) {
   if (patched.includes(PLAYER_ENDING_IMPORT)) {
     patched = patched.replaceAll(PLAYER_ENDING_IMPORT, PLAYER_ENDING_HOOK);
   }
-  // The community section import is OPTIONAL: it was added by ClickUp 16.3
+  // The community section import is OPTIONAL: it was added by Story 16.3
   // P1 v1-3. Older player.js source (before the panel wiring) does
   // not include the import, so we tolerate that.
   if (patched.includes(PLAYER_COMMUNITY_SECTION_IMPORT)) {
@@ -390,7 +390,7 @@ const document = {
   body: new Element('body'),
   head: new Element('head'),
   createElement(tag) { return new Element(tag); },
-  // getElementById: ClickUp 16.3 P1 v1-3 — the communitySection module
+  // getElementById: Story 16.3 P1 v1-3 — the communitySection module
   // looks up its own host / status / feed elements by id. We map an
   // id selector onto the existing querySelector path so the panel
   // can mount under the harness without an extra polyfill surface.
@@ -675,7 +675,7 @@ export function createPlayerDom({ baseUrl, viewport = null, stepDelayMs = null, 
     // stands for a fresh tab, so the player's persisted last-session
     // context never leaks across harnesses.
     //
-    // ClickUp 16.3 P1 v1-7: callers that want to model a
+    // Story 16.3 P1 v1-7: callers that want to model a
     // `location.reload()` (where the storage backing store survives
     // the reload) can pre-seed both stores via the
     // `preservedSessionStorage` / `preservedLocalStorage` options.
@@ -719,7 +719,7 @@ export function createPlayerDom({ baseUrl, viewport = null, stepDelayMs = null, 
     // The viewport option lets a test simulate mobile widths by
     // overriding the inner clientWidth used by `layoutOverflow`.
     const search = startScreen ? `?s=${startScreen}` : '';
-    // ClickUp 16.3 P1 v1-4: give the harness window addEventListener /
+    // Story 16.3 P1 v1-4: give the harness window addEventListener /
     // dispatchEvent / CustomEvent support so the community section can
     // subscribe to the session-context helper's `session:changed`
     // CustomEvent. Without this surface the harness would silently
@@ -759,9 +759,9 @@ export function createPlayerDom({ baseUrl, viewport = null, stepDelayMs = null, 
     globalThis.fetch = fetchStub;
     // Lazy ending-page import hook (see importEndingPageForHarness).
     globalThis.__HARNESS_IMPORT_ENDING_PAGE__ = importEndingPageForHarness;
-    // ClickUp 16.3 P1 v1-3: same hook pattern for the community section.
+    // Story 16.3 P1 v1-3: same hook pattern for the community section.
     globalThis.__HARNESS_IMPORT_COMMUNITY_SECTION__ = importCommunitySectionForHarness;
-    // ClickUp 16.3 P1 v1-4: same hook pattern for the session-context
+    // Story 16.3 P1 v1-4: same hook pattern for the session-context
     // helper (loaded by player.js AND by communitySection.js).
     globalThis.__HARNESS_IMPORT_SESSION_CONTEXT__ = importSessionContextForHarness;
     if (!globalThis.crypto) globalThis.crypto = {};

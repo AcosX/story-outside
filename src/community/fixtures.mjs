@@ -2,7 +2,7 @@
 // catalog. CI uses these as the canonical assertion surface; any change
 // here changes what tests/communityProfile.test.mjs expects.
 //
-// ClickUp 16.1 contract:
+// Story 16.1 contract:
 //   * 3-5 discussion topics about the ORIGINAL story itself (no
 //     references to AI parallel-world lines, no session/user/role).
 //   * 3-5 Zhihu search queries about the original story.

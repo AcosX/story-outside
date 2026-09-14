@@ -1,6 +1,6 @@
 // src/observability/metrics.mjs — In-memory counter / histogram store.
 //
-// ClickUp 14 contract:
+// Story 14 contract:
 //   * Metrics live in a process-local Map. Restart resets everything —
 //     this is documented in docs/observability.md so the eventual
 //     Prometheus/StatsD bridge is a drop-in replacement.

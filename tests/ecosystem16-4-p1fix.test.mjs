@@ -1,6 +1,6 @@
-// tests/clickup16-4-p1fix.test.mjs — ClickUp 16.4 P1 fix regression suite.
+// tests/ecosystem16-4-p1fix.test.mjs — Story 16.4 P1 fix regression suite.
 //
-// What this test guards (owner-supervised inspection + ChatGPT independent
+// What this test guards (owner-supervised inspection + code review independent
 // review, 2026-09-07):
 //
 //   1. The home-page 知乎热榜 orchestrator reads
@@ -91,7 +91,7 @@ await new Promise((resolveListen) => server.listen(PICK, '127.0.0.1', resolveLis
 
 async function runAllChecks() {
   try {
-  console.log('ClickUp 16.4 P1 fix — home-page 知乎热榜 relevance matching');
+  console.log('Story 16.4 P1 fix — home-page 知乎热榜 relevance matching');
 
   // ----- A. pure-function relevance ------------------------------------------------
   await check('computeRelevance: title-only hit, term in title', () => {
@@ -456,7 +456,7 @@ async function runAllChecks() {
   });
 
   // ----- E'. P1.v1-9 (2026-09-07) — story_uuid triple-check -----------------------
-  // ChatGPT independent review of PR #23 (#5127997067) flagged that
+  // independent review of PR #23 (#5127997067) flagged that
   // the hot-relevance path resolved profiles by
   // `story_version_uuid + community_profile_version` only; a wrong
   // but format-legal `story_uuid` would still produce
@@ -821,10 +821,10 @@ runAllChecks().then(
       console.log(`\n${failures} check(s) failed`);
       process.exit(1);
     }
-    console.log('\nAll ClickUp 16.4 P1 fix checks passed.');
+    console.log('\nAll Story 16.4 P1 fix checks passed.');
   },
   (err) => {
-    console.log('\nclickup16-4-p1fix crashed:');
+    console.log('\necosystem16-4-p1fix crashed:');
     console.log(err && err.stack ? err.stack : err);
     process.exit(1);
   },

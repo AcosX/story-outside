@@ -102,7 +102,7 @@ await test('external session revision advance fails closed and provider is not c
 });
 
 await test('tool calls validate options, summary, and classify as tool_call', async () => {
-  // ClickUp 08 P1.3: a tool_call MUST ride on a batch that already
+  // Story 08 P1.3: a tool_call MUST ride on a batch that already
   // carries at least one narrative item. The runtime normalises the
   // explicit items + tool_call shape into the same wire form as a
   // batched narrative turn.
@@ -123,7 +123,7 @@ await test('tool calls validate options, summary, and classify as tool_call', as
 });
 
 await test('tool envelope carries session turn and revision metadata', async () => {
-  // ClickUp 08 P1.3: tool_call rides on a batch with at least one
+  // Story 08 P1.3: tool_call rides on a batch with at least one
   // narrative item.
   const provider = createMockAgentProvider({ responses: [{
     items: [{ role: 'assistant', type: 'narration', text: 'closing line' }],
@@ -143,7 +143,7 @@ await test('tool envelope carries session turn and revision metadata', async () 
 });
 
 await test('provider tool calls reject unknown fields, duplicates, and missing ids', async () => {
-  // ClickUp 08 P1.3: a tool_call must ride on a batch with at least one
+  // Story 08 P1.3: a tool_call must ride on a batch with at least one
   // narrative item, so each case below ships a minimal items[] alongside
   // the bad tool_call envelope.
   const narrative = [{ role: 'assistant', type: 'narration', text: 'before tool' }];
@@ -166,7 +166,7 @@ await test('provider tool calls reject unknown fields, duplicates, and missing i
 });
 
 await test('provider results reject empty, mixed, multi-tool, unknown, and bad payloads', async () => {
-  // ClickUp 08 P1.3: tool-only batches (tool_calls without messages/items)
+  // Story 08 P1.3: tool-only batches (tool_calls without messages/items)
   // are explicitly rejected. The legacy messages + tool_calls mixed shape
   // is also rejected; the legacy multi-tool_calls array is rejected;
   // unknown tool names / bad payloads fail closed; a 5-item batch is
@@ -189,7 +189,7 @@ await test('provider results reject empty, mixed, multi-tool, unknown, and bad p
 });
 
 await test('provider tool calls reject empty optional fields', async () => {
-  // ClickUp 08 P1.3: tool_call rides on a batch with at least one
+  // Story 08 P1.3: tool_call rides on a batch with at least one
   // narrative item.
   const badProvider = createMockAgentProvider({ responses: [{
     items: [{ role: 'assistant', type: 'narration', text: 'closing' }],
@@ -200,7 +200,7 @@ await test('provider tool calls reject empty optional fields', async () => {
 });
 
 await test('legacy messages + single tool_call normalises unambiguously to items + final tool', async () => {
-  // ClickUp 08 P1.3: the legacy { messages: 1..4, tool_calls: [<one>] }
+  // Story 08 P1.3: the legacy { messages: 1..4, tool_calls: [<one>] }
   // shape is unambiguous — messages are the ordered narrative items and
   // the single tool call rides the batch as the optional FINAL item.
   const provider = createMockAgentProvider({ responses: [{
@@ -305,7 +305,7 @@ await test('runtime does not alter canonical history', async () => {
 });
 
 await test('tool envelopes carry normalized tool results and preserve canonical history', async () => {
-  // ClickUp 08 P1.3: tool_call rides on a batch with at least one narrative item.
+  // Story 08 P1.3: tool_call rides on a batch with at least one narrative item.
   const provider = createMockAgentProvider({ responses: [{
     items: [{ role: 'assistant', type: 'narration', text: 'preamble' }],
     tool_call: { id: 'tool-123', name: 'ask_player_choice', arguments: { question: 'choose', options: [{ id: 'a', label: 'A' }, { id: 'b', text: 'B' }] } },
@@ -323,7 +323,7 @@ await test('tool envelopes carry normalized tool results and preserve canonical 
 });
 
 await test('tool calls reject unknown fields and duplicate ids through runtime', async () => {
-  // ClickUp 08 P1.3: tool_call rides on a batch with at least one narrative item.
+  // Story 08 P1.3: tool_call rides on a batch with at least one narrative item.
   const badProvider = createMockAgentProvider({ responses: [{
     items: [{ role: 'assistant', type: 'narration', text: 'bad prelude' }],
     tool_call: { name: 'ask_player_choice', arguments: { question: 'q', options: [{ id: 'a', label: 'A' }, { id: 'a', label: 'B' }], extra: 1 } },
@@ -333,7 +333,7 @@ await test('tool calls reject unknown fields and duplicate ids through runtime',
 });
 
 await test('finish_story tool result marks terminal', async () => {
-  // ClickUp 08 P1.3: tool_call rides on a batch with at least one narrative item.
+  // Story 08 P1.3: tool_call rides on a batch with at least one narrative item.
   const provider = createMockAgentProvider({ responses: [{
     items: [{ role: 'assistant', type: 'narration', text: 'final beat' }],
     tool_call: { id: 'tool-finish', name: 'finish_story', arguments: { summary: 'done', ending: 'ending', original_difference: 'diff', key_choices: ['x'], character_outcomes: [{ character: 'A', fate: 'B' }] } },

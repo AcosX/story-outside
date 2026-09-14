@@ -1,6 +1,6 @@
 // src/community/service.mjs — application-layer facade for community profiles.
 //
-// ClickUp 16.1 contract:
+// Story 16.1 contract:
 //   * `ensureCommunityProfile({ repository, profileRepository, story,
 //     story_version, options })` is the single import-time entry point.
 //     When called for a story_version that already has an active
@@ -178,7 +178,7 @@ export function ensureCommunityProfile({
       story,
       generator_version,
       locale: options && options.locale,
-      // ClickUp 16.1 P2 fix (2026-09-06): propagate the caller's
+      // Story 16.1 P2 fix (2026-09-06): propagate the caller's
       // `options.source` to the stub builder so a real-provider
       // import surfaces as `source: 'real-generated'`, not the
       // hard-coded 'mock-generated' default.
@@ -212,7 +212,7 @@ export function setCommunityProfile({ profileRepository, profile }) {
 }
 
 /**
- * ClickUp 16.5 P1.v2 server-authoritative canonical lookup. The route
+ * Story 16.5 P1.v2 server-authoritative canonical lookup. The route
  * layer must resolve a single profile row from the
  * (story_uuid, story_version_uuid, community_profile_version) tuple
  * and use that profile's `knowledge_queries` to drive the matcher.

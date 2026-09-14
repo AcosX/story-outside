@@ -1,11 +1,11 @@
-// src/providers/ecosystem/knowledge.mjs — ClickUp 16.5 (v2 rebuild on
+// src/providers/ecosystem/knowledge.mjs — Story 16.5 (v2 rebuild on
 // current main, NOT a54aebd).
 //
 // Knowledge orchestrator. Single public method `match()` that
 // resolves one canonical query into a fully decorated
 // `EcosystemKnowledgeResponse`.
 //
-// v2 design — two P1 fixes per ChatGPT review 2026-09-07 02:23:
+// v2 design — two P1 fixes per code review 2026-09-07 02:23:
 //
 //   P1.v2-1 — Server-side canonical lookup. The orchestrator accepts
 //   ONLY an identity tuple
@@ -41,7 +41,7 @@
 //     documentation paragraph that names them, and that paragraph is
 //     deliberately worded to avoid matching the guard.
 //
-// Cache strategy (per ClickUp 16.5):
+// Cache strategy (per Story 16.5):
 //   * `Map<cache_key, { value, expires_at, swr_at, source,
 //     refreshed_at, refreshing }>` — pair-key map, NEVER a single
 //     `let cache = null`. Two requests with different
@@ -70,7 +70,7 @@ import {
   REAL_KNOWLEDGE_SOURCE_CONFIG,
 } from './zhihuKnowledgeSource.mjs';
 
-// ClickUp 16.5 P1.v1-4 fix (2026-09-07 owner review): the orchestrator
+// Story 16.5 P1.v1-4 fix (2026-09-07 owner review): the orchestrator
 // imports the community-layer helper that derives / parses the EXTERNAL
 // `community_profile_version` string. The format is
 // `<generator_version>@<content_hash_prefix>` (16 hex chars) and is the

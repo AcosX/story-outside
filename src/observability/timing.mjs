@@ -1,6 +1,6 @@
 // src/observability/timing.mjs — Latency tracker for slow-point triage.
 //
-// ClickUp 14 contract:
+// Story 14 contract:
 //   * Five timing categories match the slow-point triage columns:
 //
 //        | category   | source                                                  |

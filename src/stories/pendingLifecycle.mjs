@@ -1,6 +1,6 @@
 // src/stories/pendingLifecycle.mjs — thin facade over sessionService.
 //
-// ClickUp 08 keeps this module as a strict, narrow API on top of the
+// Story 08 keeps this module as a strict, narrow API on top of the
 // canonical sessionService. It MUST NOT own a parallel history, revision
 // counter, or pending snapshot — the canonical store is sessionService.
 //
@@ -35,7 +35,7 @@ import {
  * (fail-closed by revision check) so a stale or duplicated stage call
  * cannot reintroduce dropped content.
  *
- * The facade accepts both `items:` (ClickUp 08 contract) and `events:`
+ * The facade accepts both `items:` (Story 08 contract) and `events:`
  * (legacy 06/07 naming) so callers that already use the latter shape do
  * not need to change.
  */

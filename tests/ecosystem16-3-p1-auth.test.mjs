@@ -1,5 +1,5 @@
-// tests/clickup16-3-p1-auth.test.mjs — ClickUp 16.3 P1 v1-2
-// rebuild (主人 2026-09-07 04:21 巡检).
+// tests/ecosystem16-3-p1-auth.test.mjs — Story 16.3 P1 v1-2
+// rebuild (2026-09-07 review).
 //
 // What this test verifies (OAuth-pending contract):
 //
@@ -98,7 +98,7 @@ async function shareRequest({ cookieHeader = '', sessionUuid, body }) {
   return fetch(`${baseUrl}/v1/ecosystem/sessions/${sessionUuid}/share`, init);
 }
 
-console.log('ClickUp 16.3 P1 v1-2 — currentUserProvider auth');
+console.log('Story 16.3 P1 v1-2 — currentUserProvider auth');
 
 // ---------------------------------------------------------------------------
 // P1.1 — currentUserProvider seam is fixed, pure, and OAuth-pending.
@@ -225,6 +225,6 @@ const session2 = await bootstrapSession({ body: { work_id: workId, role_id: role
   check('P1.1: repeated bootstrap → distinct session_uuids', d1.session_uuid !== d2.session_uuid, JSON.stringify({ d1: d1.session_uuid, d2: d2.session_uuid }));
 }
 
-console.log(`\nClickUp 16.3 P1 v1-2 — currentUserProvider auth: ${failures === 0 ? 'PASS' : `FAIL (${failures})`}`);
+console.log(`\nStory 16.3 P1 v1-2 — currentUserProvider auth: ${failures === 0 ? 'PASS' : `FAIL (${failures})`}`);
 if (failures > 0) process.exit(1);
 process.exit(0);

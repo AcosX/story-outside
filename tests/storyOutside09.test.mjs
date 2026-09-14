@@ -1,4 +1,4 @@
-// tests/storyOutside09.test.mjs — ClickUp 09 contract coverage.
+// tests/storyOutside09.test.mjs — Story 09 contract coverage.
 //
 // Validates the 09 player flow end-to-end through the live HTTP server:
 //   * initial recover (canonical + active pending projection)
@@ -223,7 +223,7 @@ try {
   // After interrupt, history is committed_prefix + player_input.
   const rec3 = await request(`/api/dev/sessions/${sessionUuid}/recover`);
 
-  // ----- ClickUp 09 AC2: a second interrupt while the session is in
+  // ----- Story 09 AC2: a second interrupt while the session is in
   // realtime state must also be accepted. Previously the server
   // refused interrupts outside {opening, awaiting_first_choice}, which
   // meant the player could not interrupt their own typed text after the
@@ -342,7 +342,7 @@ check('recover after two interrupts: history grew by 2', rec4.data?.history?.len
   // ----- agentRuntime integration: provider fail-closed -----
   // The runtime must fail closed on a malformed provider result. A payload
   // with NEITHER messages NOR tool_calls (nor items) falls into the
-  // `provider_failure` arm of normalizeProviderResult (ClickUp 08 runtime
+  // `provider_failure` arm of normalizeProviderResult (Story 08 runtime
   // contract; the empty-messages payload is classified as
   // invalid_tool_call there and covered by the 08 suite).
   const recovered = rec4.data;  // post-second-interrupt so expected_revision matches the live session

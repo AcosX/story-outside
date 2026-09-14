@@ -1,6 +1,6 @@
-# 《故事之外》Observability (ClickUp 14)
+# 《故事之外》Observability (Story 14)
 
-This document is the field contract for ClickUp 14 — performance, model
+This document is the field contract for Story 14 — performance, model
 cost, and observability. It covers:
 
 1. The structured-log schema the runtime emits.
@@ -272,7 +272,7 @@ Both routes are demo/dev-only (no auth), carry the standard `demo` and
 - **Logging**: structured JSON Lines to stdout. Operators pipe to any
   log sink (`journald`, Loki, Cloud Logging, etc.).
 - **Metrics**: process-local `Map`. Restart zeros everything. Bridge
-  to Prometheus / StatsD is a future ClickUp story (likely 14.x or
+  to Prometheus / StatsD is a future iteration (likely 14.x or
   15+).
 - **Tokens**: when the upstream provider exposes
   `cache_read_input_tokens` we surface it; if the field is missing
@@ -281,7 +281,7 @@ Both routes are demo/dev-only (no auth), carry the standard `demo` and
   behaviour, not a bug.
 - **Rate-limit fields**: the mock provider does not emit 429s or
   `Retry-After`. The `providerRateLimits` counter will stay at zero
-  until the real provider lands (ClickUp 13). Documented in
+  until the real provider lands (Story 13). Documented in
   `docs/official-zhihu-skill.md` and the route layer.
 - **Frontend playback**: not measured server-side. Operators compute
   the diff per commit using the helper in §3.
@@ -311,4 +311,4 @@ the public API for warming.
 - Replace `setSink` to forward JSON Lines to a structured log shipper.
 - Replace `snapshotAll` consumers with a Prometheus exporter.
 - Extend `recordProviderRequest` to surface real 429 / 5xx fields
-  once the real provider is wired (ClickUp 13).
+  once the real provider is wired (Story 13).

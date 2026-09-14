@@ -1,7 +1,7 @@
-// src/providers/ecosystem/mockZhihuSearchSource.mjs — ClickUp 16.2 P1.v2
+// src/providers/ecosystem/mockZhihuSearchSource.mjs — Story 16.2 P1.v2
 // mock 知乎搜索 source（默认 fallback）。
 //
-// 行为契约 (ClickUp 16.2 P1.v2 — 2026-09-07 ChatGPT review):
+// 行为契约 (Story 16.2 P1.v2 — 2026-09-07 code review):
 //   * 永远可用：不读网络、不读 env、不读 secrets。
 //   * 决定性输出：相同 (query, community_profile_version,
 //     story_version_uuid) 在同一进程内多次调用得到完全相同的结果，

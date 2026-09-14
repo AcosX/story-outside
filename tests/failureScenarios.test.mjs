@@ -24,7 +24,7 @@
 //   14. Compact + model failure       → see case #14 (documented limitation)
 //   15. Player interrupt before finish_story commit → see case #15
 //
-// Cases #13 and #14 reference the ClickUp 10 compact seam (tokenEstimator +
+// Cases #13 and #14 reference the Story 10 compact seam (tokenEstimator +
 // contextBuilder + recordCompact / recordCompactFailure / getSessionCompact /
 // rebuildCompactFromHistory on sessionService). That seam is now MERGED, so
 // both cases assert the real surface positively — see §4 of
@@ -162,7 +162,7 @@ async function run() {
   // -- 3. Agent returns invalid structured output --------------------------
   await test('3. Agent returns invalid structured output → invalid_tool_call', async () => {
     const { runtime } = await runtimeFixture({
-      // ClickUp 08: the tool call rides on a 1..4 narrative-item batch, so
+      // Story 08: the tool call rides on a 1..4 narrative-item batch, so
       // we attach one narrative message; TWO tool_calls on the same batch
       // then hit the "exactly one tool call" rule → invalid_tool_call.
       responses: [
@@ -185,7 +185,7 @@ async function run() {
   // -- 4. Tool schema illegal (agent returns unknown field) ---------------
   await test('4. Tool schema illegal: agent returns unknown field on ask_player_choice', async () => {
     const { runtime } = await runtimeFixture({
-      // ClickUp 08: the tool rides on a narrative batch so the tool schema
+      // Story 08: the tool rides on a narrative batch so the tool schema
       // validation (not the tool-only-batch guard) is what fires here.
       responses: [
         {
@@ -445,7 +445,7 @@ async function run() {
     assert.equal(recovered.revision, 2);
   });
 
-  // -- 13. Compact + service restart (ClickUp 10 seam, merged) -------------
+  // -- 13. Compact + service restart (Story 10 seam, merged) -------------
   await test('13. Compact trigger during service restart: rebuild from canonical history alone', async () => {
     // The compact seam IS merged now: recordCompact / recordCompactFailure /
     // getSessionCompact / rebuildCompactFromHistory live on
@@ -549,7 +549,7 @@ async function run() {
     assert.equal(listSessionEvents({ repository: restarted.repository, session_uuid }).length, 2, 'rebuild is read-only against canonical history');
   });
 
-  // -- 14. Compact + model failure (ClickUp 10 seam, merged) ---------------
+  // -- 14. Compact + model failure (Story 10 seam, merged) ---------------
   await test('14. Compact trigger during model failure: recordCompactFailure marker; retry not polluted', async () => {
     // With the seam merged, the case asserts the recordCompactFailure
     // contract positively:

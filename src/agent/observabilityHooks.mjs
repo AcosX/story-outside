@@ -1,6 +1,6 @@
 // src/agent/observabilityHooks.mjs — Sidecar hooks for the agent runtime.
 //
-// ClickUp 14 contract:
+// Story 14 contract:
 //   * Non-invasive: this file never modifies the runtime; it exposes
 //     helpers that the runtime / tests can call at known points.
 //   * Side-effects-only: every helper records metrics + emits a

@@ -1,4 +1,4 @@
-// public/scripts/endingPage.js — ClickUp 11 ending page (browser).
+// public/scripts/endingPage.js — Story 11 ending page (browser).
 //
 // Loaded lazily from public/scripts/player.js after the player state
 // machine reaches `finished`. The module fetches three read-only
@@ -62,7 +62,7 @@ function waitForRetry(response, attempt) {
 }
 
 async function api(path, options = {}) {
-  // ClickUp 16.2 P1.v2 (2026-09-07): accept an optional options bag
+  // Story 16.2 P1.v2 (2026-09-07): accept an optional options bag
   // so callers can submit POST bodies (the previous helper always
   // used GET, which silently dropped the body and is the regression
   // the new helper exists to prevent).
@@ -133,7 +133,7 @@ async function fetchProjections(sessionUuid) {
   };
 }
 
-// ClickUp 16.5 — fetch the public 知乎知识区 (Knowledge 区) extension
+// Story 16.5 — fetch the public 知乎知识区 (Knowledge 区) extension
 // for this ending. The Knowledge surface is INDEPENDENT from the
 // 16.2 / 16.4 Discussion 区 (queries/topics/hot_keywords); a failure
 // here MUST NOT block the ending page. Returns either a normalised
@@ -226,7 +226,7 @@ function renderHeader(ending, sessionMeta) {
       sessionMeta && sessionMeta.storyTitle ? `${sessionMeta.storyTitle} · ${sessionMeta.roleLabel || ''}` : ''),
     el('span', { class: 'ending-tag ending-tag-ai', id: 'ending-ai-tag', title: '本页 AI 生成的时间线仅供平行体验，不视为原作' },
       'AI 生成平行时间线'),
-    // ClickUp 16.3 P1 v1-2 (主人 2026-09-07 04:21 巡检): the
+    // Story 16.3 P1 v1-2 (2026-09-07 review): the
     // canonical owner is rendered on the ending page so the player
     // can see who they played as. In the OAuth-pending build this is
     // always "待接入用户 (OAuth pending)". The server resolves the
@@ -406,7 +406,7 @@ function buildAiTimelineEntries(replay, ending) {
   });
 }
 
-// ClickUp 16.2 P1.v2 (2026-09-07): render the canonical
+// Story 16.2 P1.v2 (2026-09-07): render the canonical
 // profile.queries[] results from /v1/ecosystem/discussions. We render
 // each query group separately so the user can see which canonical
 // query produced which discussions. When the route returns a 4xx, we
@@ -492,7 +492,7 @@ function renderAttribution(originalTimeline) {
   );
 }
 
-// ClickUp 16.5 — Knowledge 区 (现实/知乎知识延伸) section. The
+// Story 16.5 — Knowledge 区 (现实/知乎知识延伸) section. The
 // Knowledge surface is INDEPENDENT from the 16.2 / 16.4 Discussion 区
 // surface; this DOM block NEVER mutates or replaces
 // `relatedDiscussions` and shares no class names with it.
@@ -652,7 +652,7 @@ function updateReplayView() {
   if (progress) progress.textContent = replayProgressText(STATE.replayIndex, events.length);
 }
 
-// ClickUp 16.2 P1.v2 (2026-09-07): fetch ecosystem discussions with
+// Story 16.2 P1.v2 (2026-09-07): fetch ecosystem discussions with
 // the **server-authoritative pointer triple** — we send ONLY
 // story_uuid / story_version_uuid / community_profile_version. The
 // server resolves the canonical StoryCommunityProfile (with its
@@ -713,7 +713,7 @@ async function mount({ sessionUuid, sessionMeta } = {}) {
   if (!screen) {
     throw new Error('endingPage.mount: #screen-ending not found in DOM');
   }
-// ClickUp 16.4 P1.v1-2 fix (2026-09-07): when the ending page is
+// Story 16.4 P1.v1-2 fix (2026-09-07): when the ending page is
   // mounted from a deep-link or session-rehydrate path, republish the
   // canonical triple so the home-page relevance path keeps working
   // when the user navigates back. sessionMeta carries the canonical
@@ -722,7 +722,7 @@ async function mount({ sessionUuid, sessionMeta } = {}) {
   if (sessionMeta && typeof sessionMeta === 'object') {
     publishEndingIdentity(sessionMeta);
   }
-  // ClickUp 16.3 P1 v1-2: fetch the canonical owner from
+  // Story 16.3 P1 v1-2: fetch the canonical owner from
   // /api/auth/status so the ending header can render the
   // OAuth-pending display name. The sessionMeta fallback covers the
   // case where the bootstrap path already cached the value and
@@ -800,12 +800,12 @@ function render(screen, sessionMeta) {
   const outcomes = renderCharacterOutcomesSection(STATE.ending, sessionMeta); if (outcomes) blocks.push(outcomes);
   const analysis = renderAnalysisSection(STATE.ending); if (analysis) blocks.push(analysis);
   const comparison = renderComparisonSection(STATE.originalTimeline, STATE.ending, STATE.replay); if (comparison) blocks.push(comparison);
-  // ClickUp 16.2 P1.v2 (2026-09-07): ecosystem discussions from
+  // Story 16.2 P1.v2 (2026-09-07): ecosystem discussions from
   // server-authoritative canonical profile.queries[]. Render below
   // the comparison and above the replay timeline.
   const ecosystemBlock = renderEcosystemDiscussionsSection(STATE.ecosystem, STATE.ecosystemError);
   if (ecosystemBlock) blocks.push(ecosystemBlock);
-  // ClickUp 16.5 — Knowledge 区. Always rendered (even when degraded)
+  // Story 16.5 — Knowledge 区. Always rendered (even when degraded)
   // so a DOM-test can assert its presence deterministically. The
   // surface is independent from `relatedDiscussions` (16.2 / 16.4).
   blocks.push(renderRelatedKnowledgeSection(STATE.relatedKnowledge || { degraded: true, knowledge: [] }));
@@ -842,7 +842,7 @@ function teardown() {
 export { mount, teardown, STATE as __state__ };
 
 /**
- * ClickUp 16.4 P1.v1-2 fix (2026-09-07): republish the canonical
+ * Story 16.4 P1.v1-2 fix (2026-09-07): republish the canonical
  * triple when the ending page mounts so the home-page relevance path
  * stays active across the navigation `/play.html → /?s=ending → /`.
  * The producer is a separate module loaded synchronously before

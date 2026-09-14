@@ -1,4 +1,4 @@
-// src/providers/ecosystem/dto.mjs — ClickUp 16.2 P1.v2 知乎搜索 DTO 与契约守卫。
+// src/providers/ecosystem/dto.mjs — Story 16.2 P1.v2 知乎搜索 DTO 与契约守卫。
 //
 // 公共契约（POST /v1/ecosystem/discussions）:
 //
@@ -30,7 +30,7 @@
 //       ecosystem_status: 'ok' | 'unavailable',
 //     }
 //
-// 安全契约 (ClickUp 16.2 P1.v2 — 2026-09-07 ChatGPT review):
+// 安全契约 (Story 16.2 P1.v2 — 2026-09-07 code review):
 //   * **不**接受 body.search_queries (handler must take identity only and
 //     resolve canonical queries server-side). 拒绝 → 400 'forbidden_field'.
 //   * **不**接受任何 AI-derived 字段 (ending_title / key_choices /
@@ -54,7 +54,7 @@ const VALID_KINDS = Object.freeze(['web', 'knowledge', 'hot', 'mixed']);
 export { VALID_KINDS };
 
 /**
- * ClickUp 16.2 P1.v2 fix (2026-09-07):
+ * Story 16.2 P1.v2 fix (2026-09-07):
  *   The handler MUST stay server-authoritative. The body MUST NOT
  *   carry any client-picked search query — every one of these fields
  *   is a regression vector that lets a future caller smuggle a
@@ -96,7 +96,7 @@ export const ECOSYSTEM_FORBIDDEN_KEYS = Object.freeze([
 ]);
 
 /**
- * ClickUp 16.2 P1.v2 fix (2026-09-07):
+ * Story 16.2 P1.v2 fix (2026-09-07):
  *   The handler is allowed ONLY these top-level body keys. The body
  *   must be a plain object; any other key — including ones we have
  *   not yet enumerated — is a regression vector. The handler refuses
@@ -187,7 +187,7 @@ export function normaliseSearchQueryRecord(raw, index) {
 }
 
 /**
- * ClickUp 16.2 P1.v2 fix (2026-09-07):
+ * Story 16.2 P1.v2 fix (2026-09-07):
  *   Normalise the inbound identity-only body for
  *   POST /v1/ecosystem/discussions.
  *
@@ -348,7 +348,7 @@ export function normaliseCanonicalSearchQueries(raw) {
  * Build a deterministic pair-key cache key for one
  * `(story_version_uuid, community_profile_version, query_id, query)`.
  *
- * ClickUp 16.2 P1.v2 fix (2026-09-07): identity is ALWAYS resolved
+ * Story 16.2 P1.v2 fix (2026-09-07): identity is ALWAYS resolved
  * by the handler before this function is called, so the sentinel
  * fallback is gone — keys are always anchored to a real
  * story_version_uuid + community_profile_version pair.

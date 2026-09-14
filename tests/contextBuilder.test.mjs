@@ -1,5 +1,5 @@
 // tests/contextBuilder.test.mjs — unit tests for the long-context compact
-// pipeline introduced for ClickUp 10.
+// pipeline introduced for Story 10.
 //
 // DEPENDENCY NOTE: pure module. No DB, no sessionService, no provider.
 // Asserts the public contract of `contextBuilder.mjs` as it actually is.

@@ -1,6 +1,6 @@
 // src/observability/cacheStats.mjs — opening_cache hit/miss tracking.
 //
-// ClickUp 14 contract:
+// Story 14 contract:
 //   * Fixed test stories (cafe-rain, night-shift) replay from the cache.
 //     Every cache hit MUST show up in metrics so "the demo does not make
 //     real-time model calls" is provable from the admin endpoint.

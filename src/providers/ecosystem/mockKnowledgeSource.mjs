@@ -1,11 +1,11 @@
-// src/providers/ecosystem/mockKnowledgeSource.mjs — ClickUp 16.5 (v2
+// src/providers/ecosystem/mockKnowledgeSource.mjs — Story 16.5 (v2
 // rebuild on current main, NOT a54aebd).
 //
 // Mock knowledge provider. Default fallback for the public
 // POST /v1/ecosystem/knowledge façade. The v2 contract changes from
 // PR #25 / a54aebd in two ways:
 //
-//   P1.v2-1 (ChatGPT review 2026-09-07 02:23): the orchestrator's
+//   P1.v2-1 (code review 2026-09-07 02:23): the orchestrator's
 //   `match()` NO LONGER accepts a caller-supplied `knowledge_queries[]`.
 //   It only takes a single canonical `query` string + its derived
 //   `query_hash`. This module therefore treats the input as a single
@@ -13,7 +13,7 @@
 //   that query — two different query strings MUST return different
 //   results (different entries, not the same set with a different id).
 //
-//   P1.v2-2 (ChatGPT review 2026-09-07 02:23): the cache key MUST
+//   P1.v2-2 (code review 2026-09-07 02:23): the cache key MUST
 //   include `query_hash = sha256(query)`, NOT just `query.id`. This
 //   module does not own the cache key — see knowledge.mjs — but the
 //   mock returns a deterministic bundle per query string so the cache
