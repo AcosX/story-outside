@@ -24,6 +24,7 @@ const api = (_path, options) => new Promise((resolve, reject) => {
 const bind = new Function('state', 'api', '$', 'remembered', `
 const clearAutoplayTimer = () => {};
 const setStatus = () => {};
+const setGenerationStatus = () => {};
 const setText = () => {};
 const publishBootstrapIdentity = () => {};
 const persistSessionContext = () => {};

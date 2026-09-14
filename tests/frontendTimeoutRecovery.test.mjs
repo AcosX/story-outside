@@ -19,6 +19,7 @@ const api=async(path,options)=>{
  return {revision:1,pending_id:'p',events:[{text:'result'}]};
 };
 const player=new Function('state','api','setTimeout',`
+const setGenerationStatus=()=>{};
 const setText=()=>{},setStatus=s=>{state.status=s},inOpeningPhase=()=>false,showToast=()=>{},scheduleNextStep=()=>{},scheduleOpeningStep=()=>{},renderPendingPlaceholder=()=>({}),registerPendingNode=()=>{},surfaceToolCall=()=>{};
 ${generation};return {startNextBatch};`)(state,api,fn=>{fn();return 0;});
 await player.startNextBatch();

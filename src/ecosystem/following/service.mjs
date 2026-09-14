@@ -46,6 +46,8 @@ export function computeFriendTimelines({
   since = null,
   limit = 50,
   listActivities = null,
+  storySlug = null,
+  finishedOnly = false,
 }) {
   assertUuid('followerUuid', followerUuid);
   /** @type {Array<Record<string, unknown>>} */
@@ -64,7 +66,10 @@ export function computeFriendTimelines({
       if (repository.findBlock(share.owner_user_uuid, followerUuid)) continue;
       if (repository.findBlock(followerUuid, share.owner_user_uuid)) continue;
       if (since && share.updated_at <= since) continue;
-      items.push(decorate ? decorate({ ...share }) : { ...share });
+      const item = decorate ? decorate({ ...share }) : { ...share };
+      if (storySlug && item.story_slug !== storySlug) continue;
+      if (finishedOnly && (item.state !== 'finished' || !item.ending?.ending)) continue;
+      items.push(item);
     }
   }
   items.sort((a, b) => (a.updated_at < b.updated_at ? 1 : a.updated_at > b.updated_at ? -1 : 0));
@@ -115,12 +120,12 @@ export function createFollowingService({ repository, accountDirectory = null, fe
      * 任何失败都降级：返回空列表 + 明确的 `status`，让前端说清为什么空，
      * 而不是抛 5xx 或假装有数据。
      */
-    async friendTimelinesSafe({ followerUuid, oauthToken = null, storyRepository = null, since = null, limit = 50 }) {
+    async friendTimelinesSafe({ followerUuid, oauthToken = null, storyRepository = null, since = null, limit = 50, storySlug = null, finishedOnly = false }) {
       assertUuid('followerUuid', followerUuid);
       // 缓存键必须区分登录态：同一账号「已登录」与「会话已过期」的结果不同，
       // 混用会让退出后仍看到上一次的关注流。token 本身是凭据，不能进键，
       // 因此只用「有/无」这一位。
-      const cacheKey = `${followerUuid}\u0000${typeof oauthToken === 'string' && oauthToken ? '1' : '0'}\u0000${since || ''}\u0000${limit}`;
+      const cacheKey = `${followerUuid}\u0000${typeof oauthToken === 'string' && oauthToken ? '1' : '0'}\u0000${since || ''}\u0000${limit}\u0000${storySlug || ''}\u0000${finishedOnly}`;
       const cached = feedCache.get(cacheKey);
       if (!listActivities && cached && cached.expiresAt > Date.now()) return cached.payload;
 
@@ -165,6 +170,8 @@ export function createFollowingService({ repository, accountDirectory = null, fe
         const item = {
           session_uuid: share.session_uuid,
           state: share.state || null,
+          ...(share.state === 'finished' && typeof share.ending?.ending === 'string' && share.ending.ending
+            ? { ending: { ending: share.ending.ending, summary: typeof share.ending.summary === 'string' ? share.ending.summary : '' } } : {}),
           shared_at: share.updated_at,
           updated_at: share.updated_at,
           created_at: share.created_at,
@@ -197,6 +204,8 @@ export function createFollowingService({ repository, accountDirectory = null, fe
           followerUuid,
           ownerUuids,
           listActivities,
+          storySlug,
+          finishedOnly,
           decorate,
           since,
           limit,

@@ -26,7 +26,7 @@
             data-lucide="chevron-right"
             class="nav-chevron"
           ></i></button
-        ><button id="nav-mine" class="nav-item">
+        ><button id="nav-following" class="nav-item"><i data-lucide="users-round"></i>我关注的人<i data-lucide="chevron-right" class="nav-chevron"></i></button><button id="nav-mine" class="nav-item">
           <i data-lucide="user-round"></i>我的<i
             data-lucide="chevron-right"
             class="nav-chevron"
@@ -160,6 +160,11 @@
               </button>
               <p id="detail-status" role="status"></p>
             </div>
+            <section id="story-following" class="recent-section story-following" aria-labelledby="story-following-title">
+              <p class="eyebrow">THEIR ENDINGS</p>
+              <h2 id="story-following-title">我关注的人，在这里的结局</h2>
+              <div id="story-following-content" aria-live="polite"></div>
+            </section>
           </div>
         </section>
         <section
@@ -250,9 +255,14 @@
               <h2>阅读历史</h2>
               <div id="recent-session"></div>
             </section>
-            <section id="community-section" class="recent-section">
-              <h2>我关注的人</h2>
-            </section>
+
+          </div>
+        </section>
+        <section class="screen screen-following" id="screen-following" data-screen="following" aria-label="我关注的人" hidden>
+          <div class="mine-shell">
+            <p class="eyebrow">STORIES WE SHARE</p>
+            <h1>我关注的人</h1>
+            <section id="community-section" class="recent-section" aria-label="关注动态"></section>
           </div>
         </section>
       </main>

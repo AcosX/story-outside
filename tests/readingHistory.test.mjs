@@ -31,6 +31,7 @@ const resumed = [];
 const resumeState = {};
 const resume = new Function('state', 'probes', 'resumed', `
 const clearAutoplayTimer = () => {};
+const setGenerationStatus = () => {};
 const showScreen = () => {};
 const setText = () => {};
 const persistSessionContext = () => {};

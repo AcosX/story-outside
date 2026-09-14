@@ -704,7 +704,10 @@ export function listOwnerActivities(repository, ownerUuid) {
     .filter(session => session.user_uuid === ownerUuid)
     .map(session => ({ session_uuid: session.session_uuid, owner_user_uuid: ownerUuid,
       story_uuid: session.story_uuid, updated_at: session.lastTouchedAt || '',
-      state: session.state, role_id: session.role_id }));
+      state: session.state, role_id: session.role_id,
+      ending: session.state === 'finished' && session.finish_envelope?.tool_call?.name === 'finish_story'
+        ? { ending: session.finish_envelope.tool_call.payload?.ending || '',
+            summary: session.finish_envelope.tool_call.payload?.summary || '' } : null }));
 }
 
 export function exportSessionPersistenceSnapshot(repository) {
