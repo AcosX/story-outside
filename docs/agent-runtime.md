@@ -13,3 +13,11 @@
 - Story 08 P1.5：HTTP 层每次请求新建 runtime，但 request_id 幂等状态归属 **session**（`sessionService.turnRequests`）：相同 `request_id + input + expected_revision` 跨请求返回完全相同的 result（turn_id / items / tool / pending_id）且不再调用 provider；同 request_id 不同 input/revision 拒绝（`duplicate_request`）；active pending 下不同 request_id 不能覆盖（stage fail closed）。`commitNarrativeEvent` 的 client_request_id 幂等在 pending 清空后仍可重放（final-commit 幂等）。
 - Story 08 P1.6：未配置数据库时 runtime / sessionService 使用内存 repository，只提供本进程 recover；配置 MariaDB 后，server 在启动时 hydrate projection，`recoverSession` 可跨进程恢复 canonical history、revision、cursor、pending 与 compact state，且仍不调用 provider、不重放、不追加。
 - Story 08 P1.4/P2.6：`interruptWithPlayerInput` 接受 `opening` / `awaiting_first_choice` / `realtime`；realtime 会话可再次打断（丢弃 pending tail、追加 player_input、保持 `realtime`），同 client_request_id 幂等。
+
+## 实时逐句续写
+
+真实 AI 每次 `narrate.items` 恰好一条简短叙事（建议 20～80 字），schema 与返回校验同时限制数量；违规结果走现有有界重试，禁止截断多条结果以免丢失选择或结局的前置情节。只有有意义的分岔才附带选择，核心冲突解决时继续要求结局。
+
+前端收到即显示，自动播放中立即提交这一条；持久化确认后以新 revision 请求下一句，不再额外等待 1100ms。暂停停止自动推进，插话仍等待已开始的提交并作废旧生成。选择/结局先展示，不能越过它们生成。兼容旧会话 1～4 条 pending 与回放，公共开场缓存仍按原有阅读节奏播放。
+
+每句独立调用会增加请求次数及重复输入成本；消除了等待同批后续叙事和多余播放定时器的延迟，但首句仍依赖模型响应、网络与持久化耗时。

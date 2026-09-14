@@ -1085,15 +1085,20 @@ function clearAllPendingNodes() {
 
 const STEP_DELAY_MS = 1100;
 
-function scheduleNextStep() {
-  if (state.status !== 'playing' || state.finished) return;
+function scheduleNextStep(delayMs) {
+  if (state.status !== 'playing' || state.finished || state.inputInFlight) return;
+  // Live turns carry one line. Once it is durably committed, start the
+  // next generation without an extra reading delay. Keep legacy pending
+  // batches paced, and use a timer to let in-flight guards settle first.
+  const hasUnread = state.pending && state.pendingIdx < state.pending.events.length;
+  const delay = delayMs ?? (hasUnread ? STEP_DELAY_MS : 0);
   if (state.autoplayTimer) clearTimeout(state.autoplayTimer);
-  state.autoplayTimer = setTimeout(() => { void runStep(); }, STEP_DELAY_MS);
+  state.autoplayTimer = setTimeout(() => { void runStep(); }, delay);
 }
 
 async function runStep() {
   state.autoplayTimer = null;
-  if (state.status !== 'playing' || state.finished) return;
+  if (state.status !== 'playing' || state.finished || state.inputInFlight) return;
   // Guard: a tool call envelope whose deferred render was interrupted
   // (pause inside the ~STEP_DELAY/2 window, explicit skip) must surface
   // BEFORE any new batch is generated — the world line cannot skip its
@@ -1363,7 +1368,9 @@ async function performstartNextBatch() {
     }
     if (state.status === 'playing' && !state.finished) {
       if (inOpeningPhase()) scheduleOpeningStep();
-      else scheduleNextStep();
+      // The line is already visible; commit immediately so the next
+      // model request can overlap the player's reading time.
+      else scheduleNextStep(0);
     }
   } catch (err) {
     if (err?.code === 'stale_session') return null;

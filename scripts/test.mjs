@@ -1,5 +1,6 @@
 import { spawnSync } from 'node:child_process';
 const tests = [
+  "tests/singleLineGeneration.test.mjs",
   "tests/storyTransport.test.mjs",
   "tests/storyUpstreamCache.integration.test.mjs",
   "tests/followingStoryEndings.test.mjs",
