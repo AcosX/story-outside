@@ -90,6 +90,7 @@ import { snapshotAll as snapshotMetricsAll, snapshotSession as snapshotMetricsSe
 import { snapshotAll as snapshotCacheStatsAll } from './observability/cacheStats.mjs';
 import {
   attachRelevance,
+  createInMemoryEcosystemHotCacheRepository,
   createEcosystemHotOrchestrator,
 } from './providers/ecosystem/hot.mjs';
 import { matchHotToStoryCatalog, projectProfileMatchedHot } from './providers/ecosystem/hotStoryMatch.mjs';
@@ -541,6 +542,7 @@ let communityProfileRepo = createInMemoryCommunityProfileRepository();
 let followingRepo = createInMemoryFollowingRepository();
 let followingService;
 let ecosystemSearchCacheRepo = createInMemoryEcosystemSearchCacheRepository();
+let ecosystemHotCacheRepo = createInMemoryEcosystemHotCacheRepository();
 
 try {
   const pool = await connectDatabase();
@@ -551,12 +553,14 @@ try {
       communityProfileRepository: communityProfileRepo,
       followingRepository: followingRepo,
       ecosystemSearchCacheRepository: ecosystemSearchCacheRepo,
+      ecosystemHotCacheRepository: ecosystemHotCacheRepo,
     });
     databasePersistence = persisted;
     storyRepo = persisted.storyRepository;
     communityProfileRepo = persisted.communityProfileRepository;
     followingRepo = persisted.followingRepository;
     ecosystemSearchCacheRepo = persisted.ecosystemSearchCacheRepository;
+    ecosystemHotCacheRepo = persisted.ecosystemHotCacheRepository;
   }
 } catch (error) {
   databaseBootstrapError = error;
@@ -572,12 +576,10 @@ if (typeof globalThis !== 'undefined') {
   /** @type {any} */ (globalThis).__storyOutsideCommunityRepoForTests = communityProfileRepo;
 }
 
-// Story 16.4 P1 fix (2026-09-07): home-page 知乎热榜 orchestrator.
-// Owns its own pair-key cache so two callers with different identity
-// triples share the upstream data but see distinct relevance
-// projections. The orchestrator is created once per process so its
-// cache survives across requests; tests can build a fresh one.
-const ecosystemHotOrchestrator = createEcosystemHotOrchestrator();
+// Story 16.4: the home-page 知乎热榜 orchestrator uses one site-wide
+// cache row. The repository has already been hydrated from MariaDB above,
+// so a process restart does not immediately spend another upstream quota.
+const ecosystemHotOrchestrator = createEcosystemHotOrchestrator({ cache: ecosystemHotCacheRepo });
 
 // 「故事里的相遇」的关注关系来自知乎官方 `/api/v1/user/followees`，不由本站
 // 维护（见 src/ecosystem/following/service.mjs 顶部说明）。这里把三样东西装

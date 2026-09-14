@@ -30,6 +30,13 @@ export {
 } from './search.mjs';
 
 export {
+  createInMemoryEcosystemHotCacheRepository,
+  ECOSYSTEM_HOT_CACHE_KEY,
+  ECOSYSTEM_HOT_DEFAULT_SWR_MS,
+  ECOSYSTEM_HOT_DEFAULT_TTL_MS,
+} from './hot.mjs';
+
+export {
   buildMockDiscussions,
   createMockZhihuSearchSource,
 } from './mockZhihuSearchSource.mjs';

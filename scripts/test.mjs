@@ -15,6 +15,7 @@ const tests = [
   "tests/zhihuOAuthHttp.test.mjs",
   "tests/mariadbConfig.test.mjs",
   "tests/mariaPersistenceQueue.test.mjs",
+  "tests/mariaPersistenceHotCache.test.mjs",
   "tests/mariaPersistenceIdentity.test.mjs",
   "tests/mariaPersistenceRetention.test.mjs",
   "tests/health.test.mjs",
