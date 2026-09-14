@@ -1,4 +1,4 @@
-// tests/communityProfile.test.mjs — ClickUp 16.1 community-profile contract.
+// tests/communityProfile.test.mjs — Story 16.1 community-profile contract.
 //
 // The test asserts:
 //   * A pre-baked fixture story produces a community profile that
@@ -72,7 +72,7 @@ function uuidv4() {
 }
 
 async function runChecks() {
-  console.log('ClickUp 16.1 community-profile contract');
+  console.log('Story 16.1 community-profile contract');
 
   // ----- shape ---------------------------------------------------------
 
@@ -267,11 +267,11 @@ async function runChecks() {
       story_version_uuid: FIXTURE_UUIDS['cafe-rain'].story_version_uuid,
     });
     assert.ok(profile);
-    // Top-level keys. ClickUp 16.2 P1.v1-5 (2026-09-07): the
+    // Top-level keys. Story 16.2 P1.v1-5 (2026-09-07): the
     // previous v1-4 surface stamped `insert_seq` onto every row
     // (turning the canonical 13-field schema into 14 fields). v1-5
     // reverts the schema. `insert_seq` is NOT a row field; the
-    // allowed set is exactly the 13 fields ClickUp 16.1 / main ship.
+    // allowed set is exactly the 13 fields Story 16.1 / main ship.
     const allowed = new Set([
       'profile_uuid', 'story_uuid', 'story_version_uuid',
       'story_version_checksum', 'generator_version', 'generated_at',
@@ -323,7 +323,7 @@ async function runChecks() {
       setCommunityProfile({ profileRepository: profileRepo, profile: bad });
     } catch (err) {
       threw = true;
-      // ClickUp 16.1 P1.2 fix (2026-09-06): strict allowlist now
+      // Story 16.1 P1.2 fix (2026-09-06): strict allowlist now
       // rejects unknown nested keys with this message. The legacy
       // black-list path is also still active as a defence-in-depth
       // check, so the message contains the offending key.
@@ -360,7 +360,7 @@ async function runChecks() {
       setCommunityProfile({ profileRepository: profileRepo, profile: bad3 });
     } catch (err) {
       threw = true;
-      // ClickUp 16.1 P1.2 fix (2026-09-06): see note above — the
+      // Story 16.1 P1.2 fix (2026-09-06): see note above — the
       // strict allowlist now produces a 'unknown key at hot_keywords[N]'
       // message that still contains the offending field name.
       assert.match(String(err && err.message), /model_output/);
@@ -457,7 +457,7 @@ async function runChecks() {
     assert.equal(profileRepo.stats().profile_count, 1);
   });
 
-  // ----- ClickUp 16.2 P1.v1-3 / P1.v1-4 --------------------------
+  // ----- Story 16.2 P1.v1-3 / P1.v1-4 --------------------------
   //
   // Regression guards for the active-row deterministic-order fix.
   // P1.v1-2 closed the immutable-lookup bug (findCanonicalByIdentity
@@ -469,7 +469,7 @@ async function runChecks() {
   // "active" row MUST be deterministic AND MUST NOT depend on the
   // caller-supplied `generator_version` string. v1-3 used
   // `profile_uuid` (lexicographic UUID v4 comparison) as the
-  // tie-break. ChatGPT independently re-ran `communityProfile.test`
+  // tie-break. code review independently re-ran `communityProfile.test`
   // consecutively and found that v1-3 still flakes on the second
   // consecutive run because UUID v4 comparison is a total order
   // UNCORRELATED with insertion order.
@@ -544,7 +544,7 @@ async function runChecks() {
     //
     // v1-3 fixed the case where the active-row decision depended on
     // lexicographic comparison of caller-supplied `generator_version`.
-    // v1-4 closes the residual flake ChatGPT caught on the SECOND
+    // v1-4 closes the residual flake code review caught on the SECOND
     // consecutive run: v1-3 used `profile_uuid` (random UUID v4) as
     // the tie-break, which is a total order but UNCORRELATED with
     // insertion order — two runs can produce different UUID v4
@@ -736,7 +736,7 @@ async function runChecks() {
     assert.equal(exact.profile.generated_at, old_ts);
   });
 
-  // ----- ClickUp 16.2 P1.v1-4 specific fixtures ---------------------
+  // ----- Story 16.2 P1.v1-4 specific fixtures ---------------------
 
   // helper: build a fresh profile whose only difference from a
   // fixture row is the `generator_version` string + the content
@@ -917,7 +917,7 @@ async function runChecks() {
   });
 
   await check('repeat-run stability: same-timestamp active row is identical across 5 consecutive iterations (P1.v1-5)', () => {
-    // ChatGPT independently re-ran `communityProfile.test`
+    // code review independently re-ran `communityProfile.test`
     // consecutively and found that v1-3 still flakes on the second
     // consecutive run. v1-4 must NOT flake.
     //

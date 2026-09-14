@@ -1,4 +1,4 @@
-// tests/observabilityHttp.test.mjs — HTTP-level proof that the ClickUp 14
+// tests/observabilityHttp.test.mjs — HTTP-level proof that the Story 14
 // observability sidecar is actually wired into the route layer.
 //
 // sessionHttp.test.mjs covers the session contract; this file drives the

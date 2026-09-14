@@ -1,4 +1,4 @@
-// tests/pendingLifecycle.test.mjs — ClickUp 08 minimum slice.
+// tests/pendingLifecycle.test.mjs — Story 08 minimum slice.
 //
 // Verifies:
 //   1. normal one-at-a-time commit: pending -> history grows by one
@@ -144,7 +144,7 @@ await test('commitDisplayedEvent appends exactly one canonical event per call', 
 
 await test('un-displayed events never reach canonical history', async () => {
   const { repository, session_uuid } = await buildSession();
-  // Stage a 4-event batch (the maximum allowed by ClickUp 08).
+  // Stage a 4-event batch (the maximum allowed by Story 08).
   const staged = stageNarrativeBatch({
     repository, session_uuid, events: makeBatch(4), source: 'runtime', expected_revision: 0,
   });
@@ -314,7 +314,7 @@ await test('stale pending_id after a fresh stage is rejected', async () => {
   });
   assert.equal(sameReplay.pending_id, first.pending_id);
   // Re-stage with a DIFFERENT payload → fail closed. The active pending
-  // must NOT be silently overwritten (ClickUp 08 P1.2).
+  // must NOT be silently overwritten (Story 08 P1.2).
   assert.throws(() => stageNarrativeBatch({
     repository, session_uuid, events: [
       { type: 'narration', sequence: 0, text: 'different line 1' },
@@ -354,7 +354,7 @@ await test('stage rejects non-contiguous sequences', async () => {
 });
 
 await test('P1.2: stageNarrativeBatch rejects a different payload while a pending is unconsumed', async () => {
-  // ClickUp 08 P1.2 — active pending concurrency. With an unconsumed
+  // Story 08 P1.2 — active pending concurrency. With an unconsumed
   // pending batch, a fresh stage MUST NOT silently overwrite it. Same
   // payload returns the existing pending (idempotent); different payload
   // fails closed.
@@ -529,7 +529,7 @@ await test('discardPendingTail wipes speculative state without appending', async
 });
 
 await test('sessionService commitOpeningEvent + pending commit share the same canonical history', async () => {
-  // ClickUp 08 contract: there is exactly ONE canonical history per
+  // Story 08 contract: there is exactly ONE canonical history per
   // session. Opening commits (cache-backed) and narrative commits
   // (runtime-backed) both append to the same array; revision is shared.
   const { repository, session_uuid, cache } = await buildSession();
@@ -556,7 +556,7 @@ await test('sessionService commitOpeningEvent + pending commit share the same ca
 });
 
 await test('legacy interrupt path leaves the lifecycle coherent by itself', async () => {
-  // ClickUp 08 contract: there is ONE canonical history. The legacy
+  // Story 08 contract: there is ONE canonical history. The legacy
   // sessionService interrupt path already drops the speculative pending
   // tail atomically with appending the player_input event, so no extra
   // "dropPendingAfterLegacyInterrupt" hook is needed.

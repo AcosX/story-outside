@@ -70,7 +70,7 @@
 - `session_events` 是唯一 canonical history；`event_seq` 在会话内从 1 开始递增且唯一。
 - `prev_event_seq` 自引用前一条事件，形成会话内链；`hash` 固定事件内容。
 - `(session_id, client_request_id)` 唯一，用于会话内幂等去重；不同会话可以复用请求 ID。`client_request_id` 是最多 255 字符的 opaque key，不要求是 UUID；例如公开播放链路会使用 `opening-<session UUID>-<sequence>`。事件写入只接受完全一致的重放，其他冲突使事务失败。
-- `event_type` 覆盖 `player_input` / `narrative_beat` / `ask_player_choice` / `player_choice` / `story_opening` / `session_started` / `role_selected` / `chat_message` / `ending_reached` / `session_ended` / `system_event`，`origin` 保留 `user` / `system` / `llm` 并允许 `imported`。ClickUp 08 的 runtime narrative beat 使用 `event_type='narrative_beat'`、`origin='llm'`、`source='runtime'`（与 0003 SQL 枚举对齐；不要使用旧的 `event_type='narrative'` 或 `origin='runtime'`，它们不会通过 `session_events` 的 ENUM 约束）。
+- `event_type` 覆盖 `player_input` / `narrative_beat` / `ask_player_choice` / `player_choice` / `story_opening` / `session_started` / `role_selected` / `chat_message` / `ending_reached` / `session_ended` / `system_event`，`origin` 保留 `user` / `system` / `llm` 并允许 `imported`。Story 08 的 runtime narrative beat 使用 `event_type='narrative_beat'`、`origin='llm'`、`source='runtime'`（与 0003 SQL 枚举对齐；不要使用旧的 `event_type='narrative'` 或 `origin='runtime'`，它们不会通过 `session_events` 的 ENUM 约束）。
 - `source` 是事件生产来源标签（例如 `opening_cache`、`user`、`llm`、`runtime`），`source_sequence` 是该来源自己的序号（开场缓存事件可保持 0-based 序号）；`(session_id, source, source_sequence)` 唯一，便于 MariaDB adapter 幂等 flush 与回放定位。
 - 对用户可见的内容只有在写入 `session_events` 后才算 canonical；speculative response、缓存 payload 或内存中的预览不能直接当作历史展示。展示层应按 canonical `event_seq` 回放，并用 `session_revision` 做乐观并发检查。
 - 两个 trigger 禁止对 `session_events` 执行 `UPDATE` / `DELETE`：
@@ -85,7 +85,7 @@
 - `request_uuid` 唯一做幂等；`base_event_id` 指向生成所基于的 canonical 事件。
 - 提正成功后由应用把 `promoted_event_id` 指向对应 `session_events.event_id`，完成 speculative → canonical 的对应关系。
 - `priority`、`available_at`、`expires_at`、`attempts` 支持简单队列调度与重试。
-- ClickUp 08 在 `pending_batches` 上额外约束：`expected_revision`（乐观并发，默认 0，与 `db/schema.sql` 一致）、`request_fingerprint`（64 字符，唯一，请求 id 复用不同负载时由应用层做 fail-closed；数据库通过唯一键作为最后防线）、`committed_count <= item_count`（`chk_pending_batches_counts`）、`source` 非空（`chk_pending_batches_source`）。0004 与 schema.sql 同步补齐这两个 CHECK。
+- Story 08 在 `pending_batches` 上额外约束：`expected_revision`（乐观并发，默认 0，与 `db/schema.sql` 一致）、`request_fingerprint`（64 字符，唯一，请求 id 复用不同负载时由应用层做 fail-closed；数据库通过唯一键作为最后防线）、`committed_count <= item_count`（`chk_pending_batches_counts`）、`source` 非空（`chk_pending_batches_source`）。0004 与 schema.sql 同步补齐这两个 CHECK。
 - `pending_batch_items` 是 08 新增的逐项表：每个 staged item 一行，`(batch_id, item_seq)` 唯一，`item_type` 区分 narrative_beat 与 tool_call；`status` 在 pending/committed/discarded 三态机内流转，`chk_pending_batch_items_committed` / `chk_pending_batch_items_discarded` 保证 committed 必须有 `promoted_event_id` 与 `occurred_at`，discarded 必须两者为 NULL；`chk_pending_batch_items_pending` 进一步保证 pending 状态也不得携带 `promoted_event_id` / `occurred_at`（只有 committed 行可以有）。
 - `chk_pending_batch_items_tool_commit`：tool_call 行永远不能是 `committed` —— tool 从不进入 canonical `session_events`，因此不存在可指向的 promoted event。
 - 同 session 完整性由数据库强制，而非仅文档声明：`pending_batch_items.session_id` 冗余自 `pending_batches.session_id`，`(session_id, batch_id) → pending_batches(session_id, id)` 复合外键保证 item 归属其 batch 的 session；`(session_id, promoted_event_id) → session_events(session_id, event_id)` 复合外键保证 committed item 的 promoted event 属于同一 session（跨 session promotion 被 MariaDB 拒绝）。`pending_batches.promoted_event_id` 同样受 `(session_id, promoted_event_id)` 复合外键约束。
@@ -93,7 +93,7 @@
 ### 3.5 会话 playback 游标与状态
 
 - `game_sessions.model`、`prompt`、`generation_profile` 是创建会话时的生成快照；MariaDB adapter 与会话一同写入，不能从后来变化的全局配置回读。
-- `cursor`（canonical cursor，ClickUp 08 P1.1）等于已提交 canonical 事件总数，恒等于 `session_revision` 与最后一条 `session_events.event_seq`；每次 commit（opening / narrative / player_input）都 +1，单调不回退。
+- `cursor`（canonical cursor，Story 08 P1.1）等于已提交 canonical 事件总数，恒等于 `session_revision` 与最后一条 `session_events.event_seq`；每次 commit（opening / narrative / player_input）都 +1，单调不回退。
 - `opening_cursor` 是独立的 opening 播放位置（内部语义），只随 `story_opening` commit 递增；`commitOpeningEvent` 用它与 `event.sequence` 比对来强制开场顺序，开场放完（`opening_cursor >= event_count`）后 `opening_state` 进入 `awaiting_first_choice`。对外只读暴露，供客户端继续驱动开场播放。
 - `opening_state` 只允许 `opening`、`awaiting_first_choice`、`realtime`。`stageNarrativeBatch` 接受三种状态；`interruptWithPlayerInput` 接受 `opening` / `awaiting_first_choice` / `realtime`，realtime 会话可再次打断（丢弃 pending tail、追加 player_input、状态保持 `realtime`）。
 - `session_revision` 是会话边界的单调修订号，供 `expected_revision` 乐观锁使用；adapter 在 flush 事务中保存它，并以 canonical history 为准恢复。
@@ -182,7 +182,7 @@ mariadb --no-defaults story_outside -e "SHOW CREATE TABLE session_events\G"
 mariadb --no-defaults story_outside -e "SHOW CREATE TABLE pending_batches\G; SHOW CREATE TABLE pending_batch_items\G; SHOW CREATE TABLE compact_compacted_events\G; SHOW CREATE TABLE ecosystem_search_cache\G; SELECT COUNT(*) AS model_context_windows FROM model_context_windows;"
 ```
 
-### 6.1 负面约束探针（ClickUp 08 P1.4 / P1.7）
+### 6.1 负面约束探针（Story 08 P1.4 / P1.7）
 
 仓库提供一键脚本 `scripts/mariadb-probes.sh`，在 scratch 库上验证：0001→0008 每步重复 3 次幂等 + 额外重复 0008 + 全新 `schema.sql` 独立可建 + 下列负面约束确实拒绝非法行（用两 session 探针证明跨 session promotion 被拒）。脚本只使用唯一命名的 scratch 库（进程号后缀）：验证 `schema.sql` 时把文件内的 `CREATE DATABASE story_outside` / `USE story_outside` 两条语句替换成 scratch 库名再执行，**从不创建或 DROP 固定名的 `story_outside` 库**；临时文件走 `mktemp`，EXIT trap 保证失败路径也清理 scratch 库与临时文件：
 
@@ -237,11 +237,11 @@ Node 应用在 `src/stories/` 保持同步 service/repository contract；配置�
 - `src/stories/openingGenerator.mjs` — 纯函数：`story_version` 内容 → 逐句事件序列。结构化 `type: 'ask_player_choice'` beat（或文本标记）之前截断；输出中**不允许**出现 choice tool call / `ask_player_choice` 事件。结构化 dialogue/action 与说话人保留在公开开场中。
 - `src/stories/repository.mjs` — 内存仓库，实现与 MariaDB 表对齐的方法集合：`upsertStory` / `findVersionByChecksum` / `importVersion` / `upsertOpeningCache` / `recordCacheInvalidation` / `recordSessionFirstChoice` 等。
 - `src/stories/storyService.mjs` — 应用层 facade：`importStory` / `ensureOpeningCache` / `rebuildOpeningCache` / `startSessionSnapshot` / `markFirstChoiceConsumed`。
-- `src/stories/sessionService.mjs` — **ClickUp 05 + 08 的唯一 canonical session store**。同一会话只存在一份 history、revision、cursor、state、idempotency map、active pending。Opening 事件走 `commitOpeningEvent`（受缓存事件约束）；narrative 事件走 `stageNarrativeBatch` + `commitNarrativeEvent` 序列（每 commit 仅追加 1 条已展示 narrative_beat）；可选 final tool call 随 batch 一起 staged，但绝不写入 canonical history；`interruptWithPlayerInput` 在同一原子状态机内丢弃 pending tail、追加 player_input 并切换 state='realtime'；`recoverSession` 只读返回 history + revision + cursor + pending，不调用 provider、不重放、不追加。
+- `src/stories/sessionService.mjs` — **Story 05 + 08 的唯一 canonical session store**。同一会话只存在一份 history、revision、cursor、state、idempotency map、active pending。Opening 事件走 `commitOpeningEvent`（受缓存事件约束）；narrative 事件走 `stageNarrativeBatch` + `commitNarrativeEvent` 序列（每 commit 仅追加 1 条已展示 narrative_beat）；可选 final tool call 随 batch 一起 staged，但绝不写入 canonical history；`interruptWithPlayerInput` 在同一原子状态机内丢弃 pending tail、追加 player_input 并切换 state='realtime'；`recoverSession` 只读返回 history + revision + cursor + pending，不调用 provider、不重放、不追加。
 - `src/db/mariaPersistence.mjs` — MariaDB adapter：启动时读取故事、版本、opening cache、社区 profile、生态关系、搜索缓存、session_events、pending batch、checkpoint 和 compact 审计，hydrate 同步 projection；每次 flush 在一个事务中 upsert 业务快照，并把已提交 narrative 与 pending item 对齐。
-- `src/stories/pendingLifecycle.mjs` — ClickUp 08 的 strict facade。所有函数透传到 sessionService，不拥有独立的 history / revision / pending。可以被替换为更薄的别名层。`stageNarrativeBatch` 同时接受 `items:`（08 契约）与 `events:`（legacy 06/07 命名）以保留向后兼容。
+- `src/stories/pendingLifecycle.mjs` — Story 08 的 strict facade。所有函数透传到 sessionService，不拥有独立的 history / revision / pending。可以被替换为更薄的别名层。`stageNarrativeBatch` 同时接受 `items:`（08 契约）与 `events:`（legacy 06/07 命名）以保留向后兼容。
 - `src/agent/runtime.mjs` — Provider adapter。Provider 返回的 messages（1..4）或 items（1..4）被归一化为有序 narrative items + 可选 final tool_call，然后 staged 到 sessionService。provider 不再保存自己的 `state.pending`；所有 speculative 状态都在 session.pending。
-- `src/server.mjs` — ClickUp 08 新增 `/api/dev/sessions/:uuid/generate` / `.../narrative-events` / `.../recover` 三个路由，原 `.../interrupt` 仍走统一的 `interruptWithPlayerInput`。
+- `src/server.mjs` — Story 08 新增 `/api/dev/sessions/:uuid/generate` / `.../narrative-events` / `.../recover` 三个路由，原 `.../interrupt` 仍走统一的 `interruptWithPlayerInput`。
 - `src/stories/fixture.mjs` — 用 mock provider 的内容预填仓库，保证 admin/dev 路由能拿到稳定的 `story_uuid` / `story_version_uuid`。
 
 ### 9.2 SQL 表 ↔ 仓库 / 服务映射

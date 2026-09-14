@@ -1,6 +1,6 @@
 // src/stories/cacheKey.mjs — story-level opening cache key derivation.
 //
-// Hard contract (ClickUp 04):
+// Hard contract (Story 04):
 //   * The opening cache key is the SAME for every (user, role, session)
 //     that reads a given (story, story_version) at a given generation profile.
 //   * The key MUST be derived only from PUBLIC generation dimensions:

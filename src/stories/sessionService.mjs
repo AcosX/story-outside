@@ -1,7 +1,7 @@
 import { progressMetadata } from './plotProgress.mjs';
 // src/stories/sessionService.mjs — canonical session store.
 //
-// ClickUp 05 / 08 / 09 contract (unified):
+// Story 05 / 08 / 09 contract (unified):
 //
 //   The sessionService IS the canonical store. It owns the per-session
 //   history, revision, cursor, state, idempotency map, and the active
@@ -13,7 +13,7 @@ import { progressMetadata } from './plotProgress.mjs';
 //     history, opening order is enforced against session.opening_cursor,
 //     and the revision check MUST pass.
 //
-//   * Cursor semantics (ClickUp 08 P1.1): `cursor` is the CANONICAL
+//   * Cursor semantics (Story 08 P1.1): `cursor` is the CANONICAL
 //     cursor — the count of committed canonical events. It equals
 //     session.revision and the last committed event_seq, and advances on
 //     EVERY commit (opening, narrative, player_input). The opening
@@ -66,7 +66,7 @@ import { progressMetadata } from './plotProgress.mjs';
 // payloads / unknown event types fail closed.
 //
 //
-// DEPENDENCY NOTE — in-memory vs SQL boundary (ClickUp 10 compact):
+// DEPENDENCY NOTE — in-memory vs SQL boundary (Story 10 compact):
 // `recordCompact` / `rebuildCompactFromHistory` / `getSessionCompact` add
 // a compact cursor + summary onto the session object. They NEVER mutate
 // the canonical history (`session.history`, the in-memory mirror of
@@ -103,7 +103,7 @@ function firstPersonRoleIdOf(repository, story_version_uuid) {
 }
 
 // ---------------------------------------------------------------------------
-// ClickUp 09 / issue #9 — public-session bootstrap helper
+// Story 09 / issue #9 — public-session bootstrap helper
 //
 // `bootstrapSessionFromWork` is the application-layer seam the issue-9
 // /api/sessions POST façade needs. The helper takes the ONLY two fields
@@ -135,7 +135,7 @@ const NARRATIVE_EVENT_TYPES = new Set(['narration', 'dialogue', 'action', 'beat'
 const NARRATIVE_ORIGIN = 'llm';
 const NARRATIVE_SOURCE = 'runtime';
 
-// Hard limits from ClickUp 08: a staged batch may carry 1..4 narrative
+// Hard limits from Story 08: a staged batch may carry 1..4 narrative
 // items plus an OPTIONAL final tool call.
 const MAX_NARRATIVE_ITEMS = 4;
 
@@ -214,7 +214,7 @@ export function registerPersistentSessionRepository(repository) {
 
 /**
  * Wire the repository's pinned-cache resolver to the canonical session
- * store so the opening-cache eviction loop (PR #7 ChatGPT 2026-09-05
+ * store so the opening-cache eviction loop (PR #7 code review 2026-09-05
  * follow-up) knows which cache_uuids are still pinned by an active
  * session. Without this hook the eviction loop happily drops the very
  * cache `commitOpeningEvent` needs, surfacing as
@@ -355,7 +355,7 @@ function rememberRequest(session, id, entry) {
  * Enforce the bounded cross-session tracking window on canonical
  * events. Called from append() — the only writer of canonical events.
  *
- * Contract (PR #7 follow-up, ChatGPT 2026-09-05 re-review, Blocker 3):
+ * Contract (PR #7 follow-up, code review 2026-09-05 re-review, Blocker 3):
  *   * A cross-session reuse of an id that is ALREADY in the window IS
  *     ALLOWED. The index is a bounded sliding window per process, not a
  *     SQL uniqueness check. Any session may reuse the id, including
@@ -503,7 +503,7 @@ function append(state, session, canonical, clientRequestId = null) {
   session.history.push(committed);
   // Every committed canonical event advances the canonical cursor by 1:
   // cursor === revision === max(event_seq) === history.length. This is the
-  // ClickUp 08 P1.1 invariant — the opening playback position is tracked
+  // Story 08 P1.1 invariant — the opening playback position is tracked
   // separately in session.opening_cursor.
   session.cursor += 1;
   session.revision += 1;
@@ -621,7 +621,7 @@ export function createSession({ repository, session_uuid, story_uuid, story_vers
   validateProfile(generation_profile, story_uuid, story_version_uuid, cache);
   const state = repositoryState(repository);
   if (state.sessions.has(session_uuid)) throw new Error('createSession: session already exists');
-  // ClickUp 16.3 P1.2 (ChatGPT 2026-09-07 review): canonical session
+  // Story 16.3 P1.2 (code review 2026-09-07 review): canonical session
   // owner identity is `user_uuid`, persisted in the canonical session
   // record so share / unshare handlers can verify ownership from
   // internal state. The field is OPTIONAL to keep the historical
@@ -657,11 +657,11 @@ export function createSession({ repository, session_uuid, story_uuid, story_vers
     requestIds: new Map(),
     turnRequests: new Map(),
     sourceSeq: new Map(),
-    // ClickUp 11 ending page: direct reference to the terminal finish_story
+    // Story 11 ending page: direct reference to the terminal finish_story
     // envelope set by the FINAL narrative commit (see commitNarrativeEvent).
     // Null until the story finishes; never cleared afterwards.
     finish_envelope: null,
-    // ClickUp 10 compact state. See DEPENDENCY NOTE at top of file.
+    // Story 10 compact state. See DEPENDENCY NOTE at top of file.
     context_compact_text: null,
     context_compact_payload: null,
     compacted_through_seq: null,
@@ -814,7 +814,7 @@ export function hydrateSessionPersistence({ repository, row, history = [], runti
  * are gone, and every entry the session contributed to the cross-session
  * clientRequestIndex is removed.
  *
- * B3 follow-up (ChatGPT 2026-09-05 re-review): the previous contract
+ * B3 follow-up (code review 2026-09-05 re-review): the previous contract
  * claimed that cross-session id uniqueness survived eviction. In
  * practice `evictSession` already cleared the per-owner entries, so the
  * claim was internally inconsistent. The new contract explicitly
@@ -864,7 +864,7 @@ function touchSessionRecord(session) {
   session.lastTouchedAt = nowIso();
 }
 
-// ClickUp 16.3 P1.2 owner binding (ChatGPT 2026-09-07 review):
+// Story 16.3 P1.2 owner binding (code review 2026-09-07 review):
 //   * `findOwnerBySession` returns the canonical session owner persisted
 //     at session creation. The repository is the single source of truth —
 //     the HTTP layer never trusts the request body for the caller
@@ -883,7 +883,7 @@ export function findOwnerBySession({ repository, session_uuid }) {
   return session.user_uuid || null;
 }
 
-// ClickUp 16.3 P1.2 owner binding: persist the canonical owner on a
+// Story 16.3 P1.2 owner binding: persist the canonical owner on a
 // session that was created without one. Used by the public `/api/sessions`
 // bootstrap route AFTER reading the (or minting a fresh) cookie-scoped
 // user_uuid. Fail-closed: rejects re-binding an owner that does not match
@@ -1004,7 +1004,7 @@ export function stageNarrativeBatch({ repository, session_uuid, items, tool_call
   if (session.state !== 'opening' && session.state !== 'awaiting_first_choice' && session.state !== 'realtime') {
     throw new Error(`stageNarrativeBatch: session is not accepting narrative batches (state=${session.state})`);
   }
-  // Active-pending concurrency guard (ClickUp 08 P1.2): if there is an
+  // Active-pending concurrency guard (Story 08 P1.2): if there is an
   // unconsumed pending batch (some items committed, but the final commit
   // has not landed), a fresh stage MUST NOT silently overwrite it. The
   // payload either matches the active pending (idempotent return) or it
@@ -1119,7 +1119,7 @@ export function commitNarrativeEvent({ repository, session_uuid, pending_id, seq
   const id = requestId(client_request_id);
   // Idempotency lookup comes FIRST: after the final commit clears
   // session.pending, a replay of that same commit must still return the
-  // original result instead of failing the pending_id check (ClickUp 08
+  // original result instead of failing the pending_id check (Story 08
   // P1.5 final-commit idempotency). A reused id with a different
   // pending_id/sequence still fails closed via the fingerprint.
   if (id) {
@@ -1162,7 +1162,7 @@ export function commitNarrativeEvent({ repository, session_uuid, pending_id, seq
   const toolCallSurface = cleared ? clone(session.pending.tool_call) : null;
   if (cleared && toolCallSurface && toolCallSurface.name === 'finish_story') {
     // Keep a DIRECT reference to the terminal envelope on the session
-    // (ClickUp 11 ending page). session.pending is cleared right after the
+    // (Story 11 ending page). session.pending is cleared right after the
     // final commit, and callers that omit client_request_id leave no trace
     // in the idempotency map — without this reference the finish_story
     // envelope would be unreachable and GET /ending would 404 forever.
@@ -1215,7 +1215,7 @@ export function interruptWithPlayerInput({ repository, session_uuid, text, clien
   const prior = idempotentResult(session, id, 'interrupt', { text });
   if (prior) return prior;
   validateRevision(session, expected_revision);
-  // ClickUp 09 acceptance criterion: "用户在任意普通消息之间都能打断".
+  // Story 09 acceptance criterion: "用户在任意普通消息之间都能打断".
   // Opening, awaiting_first_choice, and realtime are all interruptible.
   // stageNarrativeBatch already accepts all three; mirrors it here so the
   // input bar is never silently swallowed mid-narration.
@@ -1254,7 +1254,7 @@ export function interruptWithPlayerInput({ repository, session_uuid, text, clien
 }
 
 /**
- * Session-owned turn-level idempotency store (ClickUp 08 P1.5 HTTP
+ * Session-owned turn-level idempotency store (Story 08 P1.5 HTTP
  * cross-request idempotency). The HTTP layer creates a fresh runtime per
  * request, so request_id dedup MUST live on the session, not on a
  * transient runtime instance. The runtime registers the full turn result
@@ -1379,7 +1379,7 @@ export function discardPendingTail({ repository, session_uuid, pending_id }) {
  * @param {string} [input.identity.model]
  * @param {string} [input.identity.prompt]
  * @param {import('../community/repository.mjs').CommunityProfileRepository} [input.profileRepository]
- *        ClickUp 16.1 server.mjs wiring fix (2026-09-06): when the
+ *        Story 16.1 server.mjs wiring fix (2026-09-06): when the
  *        public real-provider path supplies a community-profile repo,
  *        the underlying `importStoryAndEnsureCache` call ensures a
  *        profile for the freshly imported story_version, tagged with
@@ -1403,7 +1403,7 @@ export async function bootstrapSessionFromWork({ repository, provider, session_u
   if (typeof role_id !== 'string' || !role_id) {
     throw new Error('bootstrapSessionFromWork: role_id required');
   }
-  // ClickUp 16.3 P1.2 (ChatGPT 2026-09-07 review): accept the canonical
+  // Story 16.3 P1.2 (code review 2026-09-07 review): accept the canonical
   // owner identity from the auth layer (cookie-derived `user_uuid`),
   // NEVER from the request body. The HTTP route layer is responsible
   // for reading the cookie and passing the value through; this helper
@@ -1513,7 +1513,7 @@ export function listSessionEvents({ repository, session_uuid }) {
  * canonical history, and the active pending snapshot (if any). Never calls
  * the provider, never replays, never mutates state.
  *
- * ClickUp 08 P1.6 persistence boundary: this service keeps a synchronous
+ * Story 08 P1.6 persistence boundary: this service keeps a synchronous
  * in-memory projection and is intentionally unaware of the database. When
  * the server is configured with MariaDB, `src/db/mariaPersistence.mjs`
  * hydrates this projection before traffic and flushes it transactionally
@@ -1575,7 +1575,7 @@ function renderHistoryForSession(repository, session, history) {
 }
 
 // ---------------------------------------------------------------------------
-// ClickUp 10 — long-context compact
+// Story 10 — long-context compact
 // ---------------------------------------------------------------------------
 //
 // The functions below mutate ONLY the compact state on the session object

@@ -4,7 +4,7 @@ import { readFile } from 'node:fs/promises';
 const source = await readFile(new URL('../public/scripts/player.js', import.meta.url), 'utf8');
 const bootstrapSource = source.slice(
   source.indexOf('async function bootstrapSession('),
-  source.indexOf('/**\n * ClickUp 16.4 P1.v1-7 fix', source.indexOf('async function bootstrapSession(')),
+  source.indexOf('/**\n * Story 16.4 P1.v1-7 fix', source.indexOf('async function bootstrapSession(')),
 );
 
 const requests = [];

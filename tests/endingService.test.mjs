@@ -1,4 +1,4 @@
-// tests/endingService.test.mjs — ClickUp 11 ending service contract coverage.
+// tests/endingService.test.mjs — Story 11 ending service contract coverage.
 //
 // Validates that:
 //   * buildEnding rejects when finish_story has not committed

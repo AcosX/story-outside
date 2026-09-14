@@ -1,11 +1,11 @@
-// tests/clickup16-5-p1-v1-6-unify.test.mjs
+// tests/ecosystem16-5-p1-v1-6-unify.test.mjs
 //
-// ClickUp 16.5 P1 v1-6 regression — unify
+// Story 16.5 P1 v1-6 regression — unify
 // `deriveExternalCommunityProfileVersion` to a SINGLE source of truth
 // (src/community/version.mjs, main's verified soft-null delegate impl)
 // and re-establish historical-session pin exact lookup.
 //
-// ChatGPT review 5130773278 (2026-09-07) flagged that PR #25 landed
+// code review 5130773278 (2026-09-07) flagged that PR #25 landed
 // with TWO definitions of `deriveExternalCommunityProfileVersion`
 // (throw in profile.mjs, throw in version.mjs — the latter had been
 // mutated away from main's verified soft-null delegate) and the route
@@ -150,7 +150,7 @@ function installTwoGenerationsFixture() {
 // ----- 1. unique derive authority (source-level) ------------------------
 
 test('deriveExternalCommunityProfileVersion: single source of truth (only version.mjs exports it)', () => {
-  // ChatGPT review 5130773278: PR #25 had two definitions
+  // code review 5130773278: PR #25 had two definitions
   // (profile.mjs + version.mjs). v1-6 deletes the profile.mjs
   // duplicate so the wire format lives in exactly ONE module.
   const out = execFileSync('grep', [
@@ -170,7 +170,7 @@ test('deriveExternalCommunityProfileVersion: single source of truth (only versio
 // ----- 2. byte-identical community_profile_version across 4 callers ----
 
 test('deriveExternalCommunityProfileVersion: byte-identical across bootstrap / hot / knowledge / discussions callers', async () => {
-  // ChatGPT review 5130773278: the four public-surface entry points
+  // code review 5130773278: the four public-surface entry points
   // must produce IDENTICAL `community_profile_version` strings from
   // the SAME canonical profile row. If any path re-derives locally
   // (e.g. a different hash slice length or delimiter), the bytes
@@ -226,7 +226,7 @@ test('deriveExternalCommunityProfileVersion: byte-identical across bootstrap / h
 // ----- 3. historical profile exact lookup -------------------------------
 
 test('repository.findByExternalVersion(story_version_uuid, external): historical session pin resolves OLD row even when newer row is active', () => {
-  // ChatGPT review 5130773278: the route + bootstrap + hot + knowledge
+  // code review 5130773278: the route + bootstrap + hot + knowledge
   // surfaces call `findByExternalVersion` to resolve the row whose
   // external version EXACTLY matches the supplied string, even when
   // a newer row has taken the active slot for the same
@@ -250,7 +250,7 @@ test('repository.findByExternalVersion(story_version_uuid, external): historical
 
   // OLD session pinned to A's external version → A (the preserved row,
   // NOT B, NOT null). This is the historical regression fix that
-  // ChatGPT review 5130773278 demanded.
+  // code review 5130773278 demanded.
   assert.strictEqual(
     repo.findByExternalVersion(story_version_uuid, externalA),
     profileA,

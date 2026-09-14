@@ -19,7 +19,7 @@
 //   5. Timeout: a provider that hangs past the deadline raises; the
 //      runtime maps it to provider_failure without leaking the underlying
 //      timer.
-//   6. Empty body: under the ClickUp 08 unified contract the two "empty
+//   6. Empty body: under the Story 08 unified contract the two "empty
 //      body" shapes fail closed with DIFFERENT codes — {} (no messages /
 //      tool_calls / items at all) is provider_failure, while a present
 //      but empty messages array is invalid_tool_call (batch-size guard).
@@ -384,7 +384,7 @@ async function run() {
 
   // -------- 6. Empty body ---------------------------------------------------
   await test('6. provider empty body: {} → provider_failure; empty messages [] → invalid_tool_call', async () => {
-    // ClickUp 08 unified contract — the two "empty body" shapes the
+    // Story 08 unified contract — the two "empty body" shapes the
     // runtime must reject, each with its own code:
     //   (a) {}                — neither messages nor tool_calls nor items
     //                           present → provider_failure

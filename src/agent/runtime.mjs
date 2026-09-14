@@ -9,7 +9,7 @@ const RUNTIME_STATE = Symbol('agentRuntimeState');
 const SENSITIVE_KEY_PATTERN = /^(password|token|access[_-]?token|secret|api[_-]?key|app[_-]?key|authorization|cookie|headers?)$/i;
 const ERROR_CODES = new Set(['pin_mismatch', 'invalid_input', 'provider_failure', 'unknown_tool', 'invalid_tool_call', 'pending_conflict', 'revision_mismatch', 'duplicate_request']);
 
-// ClickUp 08 contract: a provider turn MAY return 1..4 ordered narrative
+// Story 08 contract: a provider turn MAY return 1..4 ordered narrative
 // items and OPTIONALLY a single tool call as the FINAL item. The runtime
 // normalises both shapes into one canonical stage.
 const MIN_NARRATIVE = 1;
@@ -81,7 +81,7 @@ function sanitizeFiniteJson(value, label) {
 }
 
 /**
- * Normalise a provider result into the ClickUp 08 shape:
+ * Normalise a provider result into the Story 08 shape:
  *   * items    : array of 1..4 narrative items in order
  *   * tool_call: optional normalised tool call (the FINAL item)
  *
@@ -154,7 +154,7 @@ export function normalizeProviderResult(result) {
   // Legacy shape: { messages } and/or { tool_calls }.
   if (!hasMessages && !hasToolCalls) fail('provider_failure', 'provider result must include messages, items, or tool_calls');
   if (!hasMessages) {
-    // tool_calls without messages (or items): a "tool-only" batch. ClickUp 08
+    // tool_calls without messages (or items): a "tool-only" batch. Story 08
     // forbids this shape — a tool call must ride on a batch that already
     // carries at least one narrative item. Allowing a tool-only batch would
     // park an un-committable pending slot (no event_seq to commit) and leak
@@ -369,7 +369,7 @@ async function runTurnOnce(runtime, { request_id, input, expected_revision } = {
   // not by this runtime instance: the HTTP layer builds a fresh runtime per
   // request, so a same request_id + input + revision across requests must
   // replay the exact prior result (turn_id / items / tool / pending_id)
-  // without calling the provider again (ClickUp 08 P1.5 cross-request
+  // without calling the provider again (Story 08 P1.5 cross-request
   // idempotency).
   if (key) {
     const existing = lookupTurnRequest({
@@ -415,7 +415,7 @@ async function runTurnOnce(runtime, { request_id, input, expected_revision } = {
   const latest = getSession({ repository: state.repository, session_uuid: state.session_uuid });
   if (latest.revision !== state.base_revision) fail('revision_mismatch', 'generation was superseded by a newer player action');
   const providerResult = normalizeProviderResult(rawResult);
-  // ClickUp 08 contract: the runtime STAGES the provider result on the
+  // Story 08 contract: the runtime STAGES the provider result on the
   // canonical session pending slot. There is exactly one active pending
   // per session. The runtime does NOT keep a separate pending record.
   let staged;

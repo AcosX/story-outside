@@ -620,7 +620,7 @@ check(
   "0004 records its migration ledger entry",
   migration0004.includes("INSERT IGNORE INTO schema_migrations (migration_name, applied_by)")
 );
-// ClickUp 08 P1.4: the discarded CHECK constraint must reject any row
+// Story 08 P1.4: the discarded CHECK constraint must reject any row
 // where status='discarded' but promoted_event_id/occurred_at are set.
 check(
   "0004 discarded CHECK rejects promoted_event_id on discarded rows",

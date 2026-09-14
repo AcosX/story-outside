@@ -3,7 +3,7 @@
 // Other modules should import from here, not from the individual files.
 // Mirrors the indirection pattern used by src/stories/index.mjs.
 //
-// ClickUp 16.1 contract:
+// Story 16.1 contract:
 //   * `ensureCommunityProfile` is the import-time entry point; the
 //     four ecology capabilities call it via the application layer so
 //     the profile is generated exactly once per story_version.

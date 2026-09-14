@@ -1,4 +1,4 @@
-// tests/observability.test.mjs — ClickUp 14 observability suite.
+// tests/observability.test.mjs — Story 14 observability suite.
 //
 // Coverage matrix (mirrors the acceptance criteria):
 //   1. Structured log fields are stable (logger).

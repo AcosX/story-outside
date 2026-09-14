@@ -165,7 +165,7 @@ try {
 
   // -----------------------------------------------------------------
   // Validation: missing fields, bad uuid, unknown work_id
-  // ClickUp 16.3 P1 v1-2 (主人 2026-09-07 04:21 巡检): the public
+  // Story 16.3 P1 v1-2 (2026-09-07 review): the public
   // POST /api/sessions surface now accepts an empty body and falls
   // back to demo defaults for `work_id` / `role_id` because identity
   // is resolved server-side via `currentUserProvider(req)`. The
@@ -217,7 +217,7 @@ try {
   // prompt) via the public raw `session` snapshot.
   // -----------------------------------------------------------------
   {
-    // ClickUp 16.3 P1 v1-2: identity-shaped keys (`identity`,
+    // Story 16.3 P1 v1-2: identity-shaped keys (`identity`,
     // `user_ref`, `user_uuid`, ...) are explicitly forbidden and return
     // 400 `forbidden_field`. The whitelist itself now only allows
     // `work_id` + `role_id`; any other top-level key is rejected with

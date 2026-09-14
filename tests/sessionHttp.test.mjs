@@ -1,4 +1,4 @@
-// tests/sessionHttp.test.mjs — HTTP contract coverage for ClickUp 05 session playback.
+// tests/sessionHttp.test.mjs — HTTP contract coverage for Story 05 session playback.
 // The server and its seeded repository are process-local. Cache events are read
 // from the rebuild response so this test never depends on fixture prose.
 

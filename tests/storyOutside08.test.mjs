@@ -1,4 +1,4 @@
-// tests/storyOutside08.test.mjs — cross-layer ClickUp 08 contract.
+// tests/storyOutside08.test.mjs — cross-layer Story 08 contract.
 //
 // Validates the real integration between provider → runtime →
 // sessionService.pending → HTTP commit → next-turn context. Catches
@@ -288,7 +288,7 @@ try {
     pending_id: '00000000-0000-4000-8000-deadbeef0000', sequence: 0, expected_revision: 7,
   });
   check('wrong pending_id is rejected', wrong.response.status === 400);
-  // ClickUp 08 P1.2: drain gen4 so a fresh stage is allowed.
+  // Story 08 P1.2: drain gen4 so a fresh stage is allowed.
   await post(narrativePath, {
     pending_id: gen4.data.pending_id, sequence: 0, expected_revision: 7, client_request_id: 'gen4-c0',
   });
@@ -547,7 +547,7 @@ try {
     await runTurn(runtime, { input: { text: '5-item test' }, expected_revision: recoverRuntime(runtime).base_revision });
   } catch (err) { caught = err; }
   check('P1.3: 5-item batches are rejected by the runtime cap', !!caught && caught.code === 'invalid_tool_call');
-  // legacy messages + single tool_call → normalised (ClickUp 08 P1.3):
+  // legacy messages + single tool_call → normalised (Story 08 P1.3):
   // messages are the ordered narrative items and the single tool call
   // rides the batch as the optional FINAL item. It is NOT rejected.
   caught = null;

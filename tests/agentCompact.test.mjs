@@ -1,5 +1,5 @@
 // tests/agentCompact.test.mjs — integration tests for the long-context
-// compact pipeline introduced for ClickUp 10.
+// compact pipeline introduced for Story 10.
 //
 // DEPENDENCY NOTE: uses the same in-memory seeded repository as
 // tests/sessionService.test.mjs (08/09 boundary). Asserts the public
@@ -20,7 +20,7 @@ import {
   interruptWithPlayerInput,
   commitOpeningEvent,
   listSessionEvents,
-  // ClickUp 10 compact API — re-exported from the application-layer surface.
+  // Story 10 compact API — re-exported from the application-layer surface.
   recordCompact,
   recordCompactFailure,
   getSessionCompact,

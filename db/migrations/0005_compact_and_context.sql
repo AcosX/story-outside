@@ -1,5 +1,5 @@
 -- db/migrations/0005_compact_and_context.sql — long-context compact & agent
--- context state (ClickUp 10).
+-- context state (Story 10).
 --
 -- DEPENDENCY NOTE — in-memory vs SQL boundary:
 -- This migration is purely additive: it never truncates session_events and

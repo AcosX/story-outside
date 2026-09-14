@@ -1,6 +1,6 @@
 // src/stories/observabilityHooks.mjs — Sidecar hooks for the stories layer.
 //
-// ClickUp 14 contract:
+// Story 14 contract:
 //   * Non-invasive: this file never mutates the session state machine.
 //     It only emits structured logs and bumps metrics so the
 //     sessionService / pendingLifecycle / opening cache paths remain

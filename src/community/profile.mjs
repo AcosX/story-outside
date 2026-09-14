@@ -1,6 +1,6 @@
 // src/community/profile.mjs — story_version-scoped community-profile model.
 //
-// ClickUp 16.1 contract (作品社区画像与生态层公共基础):
+// Story 16.1 contract (作品社区画像与生态层公共基础):
 //   * One community profile per (story_version) so the four ecology
 //     capabilities (Zhihu search, hot-list matching, Zhihu Knowledge,
 //     ending-page search) share a single, stable, version-bound set
@@ -18,7 +18,7 @@
 //   * Profile is intended to be generated ONCE at story import / story_version
 //     creation; later reads are pure lookups by story_version_uuid.
 //
-// ClickUp 16.5 P1.v1-3 fix (2026-09-07 owner review): the handler
+// Story 16.5 P1.v1-3 fix (2026-09-07 owner review): the handler
 // identity uses a DERIVED `external community_profile_version` of the
 // shape `<generator_version>-<content_hash_short>` (first 8 hex chars
 // of the profile's `hash.content_hash`). The internal schema keeps
@@ -30,7 +30,7 @@
 // two different external versions → two preserved rows that an
 // old-session regression can resolve independently.
 //
-// ClickUp 16.5 P1.v1-4 fix (2026-09-07 owner review): the external
+// Story 16.5 P1.v1-4 fix (2026-09-07 owner review): the external
 // format is widened to `<generator_version>@<content_hash_prefix>`
 // where `content_hash_prefix` is the first 16 hex chars of
 // `profile.hash.content_hash` (was 8 hex chars under v1-3). The `@`
@@ -94,12 +94,12 @@ import { canonicalSha256 } from '../stories/canonicalHash.mjs';
  * @property {{ content_hash: string }} hash        Content hash of the profile (used to
  *                                                  dedupe identical profiles across regenerations).
  *
- * ClickUp 16.2 P1.v1-5 fix (2026-09-07): the monotonic/latest
+ * Story 16.2 P1.v1-5 fix (2026-09-07): the monotonic/latest
  * metadata used to pick the active row is NOT a canonical field on
  * the profile row. It lives in PRIVATE state on the repository
  * (`latestByStoryVersion: Map<story_version_uuid, profile_uuid>`)
  * so the canonical 13-field schema is preserved end-to-end (this is
- * the same 13-field schema ClickUp 16.1 / main ships, plus the v1-5
+ * the same 13-field schema Story 16.1 / main ships, plus the v1-5
  * zero-impact guarantee that no P1 metadata leaks into the row
  * surface).
  */
@@ -115,7 +115,7 @@ export const COMMUNITY_PROFILE_GENERATOR_VERSION = Object.freeze({
 });
 
 /**
- * Hard caps taken from the ClickUp 16.1 description. The mock fixture
+ * Hard caps taken from the Story 16.1 description. The mock fixture
  * AND any real-provider path MUST stay inside these bounds; the test
  * suite enforces them.
  */
@@ -131,7 +131,7 @@ export const COMMUNITY_PROFILE_BOUNDS = Object.freeze({
 });
 
 /**
- * ClickUp 16.1 P1.2 fix (2026-09-06): exact-allowlist of every
+ * Story 16.1 P1.2 fix (2026-09-06): exact-allowlist of every
  * known field on a StoryCommunityProfile (and on each nested
  * sub-record). `assertCommunityProfileShape` rejects any unknown
  * key at any depth so a session-derived dimension
@@ -155,14 +155,14 @@ export const PROFILE_TOP_LEVEL_KEYS = Object.freeze([
   'knowledge_queries',
   'hot_keywords',
   'hash',
-  // ClickUp 16.2 P1.v1-5 fix (2026-09-07): the previous v1-4 attempt
+  // Story 16.2 P1.v1-5 fix (2026-09-07): the previous v1-4 attempt
   // added `insert_seq` here to drive active-row selection. That made
   // the canonical 13-field schema 14 fields, which is a schema
-  // change to the surface that main / ClickUp 16.1 owns. v1-5
+  // change to the surface that main / Story 16.1 owns. v1-5
   // reverts the schema: monotonic/latest metadata is NOT a row
   // field. It lives in PRIVATE repository state
   // (`latestByStoryVersion: Map<story_version_uuid, profile_uuid>`)
-  // so this list stays exactly at the 13 fields ClickUp 16.1 /
+  // so this list stays exactly at the 13 fields Story 16.1 /
   // main ship.
 ]);
 export const PROFILE_TOPIC_KEYS = Object.freeze(['id', 'label', 'summary']);
@@ -305,7 +305,7 @@ export function assertCommunityProfileShape(profile) {
     throw new Error('communityProfile: profile must be an object');
   }
   const p = /** @type {any} */ (profile);
-  // ClickUp 16.1 P1.2 fix (2026-09-06): strict top-level allowlist
+  // Story 16.1 P1.2 fix (2026-09-06): strict top-level allowlist
   // BEFORE the per-field checks. Unknown keys at any depth are now
   // rejected so session-derived dimensions cannot leak in.
   assertRecordAllowlist('$', Object.keys(p), PROFILE_TOP_LEVEL_KEYS);
@@ -322,7 +322,7 @@ export function assertCommunityProfileShape(profile) {
       + `(allowed: ${JSON.stringify(PROFILE_SOURCES)})`,
     );
   }
-  // ClickUp 16.2 P1.v1-5 (2026-09-07): the previous v1-4 shape
+  // Story 16.2 P1.v1-5 (2026-09-07): the previous v1-4 shape
   // validator accepted `insert_seq` as a legacy optional field
   // (`null` for pre-migration rows, non-negative integer for new
   // rows). v1-5 REMOVES this field from the row entirely so the
@@ -330,7 +330,7 @@ export function assertCommunityProfileShape(profile) {
   // metadata lives in PRIVATE repository state. Any caller that
   // smuggles `insert_seq` is rejected by the strict top-level
   // allowlist above (line `assertRecordAllowlist('$', ...)` runs
-  // first), so the row surface is exactly the 13 keys ClickUp 16.1 /
+  // first), so the row surface is exactly the 13 keys Story 16.1 /
   // main ship.
   assertNonEmptyString('locale', p.locale);
   if (!Array.isArray(p.topics)) throw new Error('communityProfile: topics must be an array');
@@ -341,7 +341,7 @@ export function assertCommunityProfileShape(profile) {
   if (!Array.isArray(p.hot_keywords)) {
     throw new Error('communityProfile: hot_keywords must be an array');
   }
-  // ClickUp 16.1 P1.2 fix (2026-09-06): per-sub-record shape +
+  // Story 16.1 P1.2 fix (2026-09-06): per-sub-record shape +
   // strict allowlist. assertTopicShape / assertQueryShape /
   // assertHotKeywordShape still run, but the allowlist is the new
   // hard guarantee.
@@ -379,7 +379,7 @@ export function assertCommunityProfileShape(profile) {
 /**
  * Sanity-check the topic / query / knowledge / hot-keyword counts.
  * Returns the list of violations (empty list when valid). The bounds
- * come from the ClickUp 16.1 description and from the bounds module
+ * come from the Story 16.1 description and from the bounds module
  * exposed above.
  *
  * @param {StoryCommunityProfile} profile
@@ -641,7 +641,7 @@ export function buildStubCommunityProfile({ story_uuid, story_version_uuid, stor
   if (!story || typeof story !== 'object') {
     throw new Error('communityProfile.buildStubCommunityProfile: story required');
   }
-  // ClickUp 16.1 P2 fix (2026-09-06): resolve + validate the provenance
+  // Story 16.1 P2 fix (2026-09-06): resolve + validate the provenance
   // tag before we use it. The downstream `assertCommunityProfileShape`
   // also checks this, but we want a clear error here at the seam.
   const resolvedSource = typeof source === 'string' && source ? source : 'mock-generated';

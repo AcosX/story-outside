@@ -13,7 +13,7 @@ const RETRYABLE_HTTP_STATUSES = new Set([408, 425, 429, 500, 502, 503, 504]);
 const MAX_RESPONSE_BYTES = 2_000_000;
 const DEFAULT_MAX_RETRIES = 3;
 // Ceiling for the operator-configurable retry budget. Higher than the default
-// so a deployment behind a long proxy timeout (VM3 runs timeout=300) can trade
+// so a deployment behind a long proxy timeout (e.g. timeout=300) can trade
 // latency for success rate; the worst case is bounded by
 // MAX_CONFIGURABLE_RETRIES + 1 primary attempts plus the backup channel.
 const MAX_CONFIGURABLE_RETRIES = 5;
@@ -40,7 +40,7 @@ export const STORY_SYSTEM_PROMPT = `你是「故事之外」互动小说导演�
 // Structured output rides the provider's function-calling channel: tool
 // arguments are schema-constrained at decode time, where free-text "return
 // JSON" instructions were ignored by the production upstream (5 of 6 calls
-// answered with prose). The narrate tool's parameters mirror the ClickUp 08
+// answered with prose). The narrate tool's parameters mirror the Story 08
 // contract so its arguments map 1:1 onto { items, tool_call }.
 export const NARRATE_TOOL = {
   name: 'narrate',

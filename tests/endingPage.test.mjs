@@ -1,4 +1,4 @@
-// tests/endingPage.test.mjs — ClickUp 11 ending page DOM coverage.
+// tests/endingPage.test.mjs — Story 11 ending page DOM coverage.
 //
 // Validates that the dedicated ending screen renders the documented
 // sections after finish_story commits:

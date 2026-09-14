@@ -1,4 +1,4 @@
-// src/providers/ecosystem/index.mjs — ClickUp 16.2 P1.v2 知乎搜索公共面。
+// src/providers/ecosystem/index.mjs — Story 16.2 P1.v2 知乎搜索公共面。
 //
 // 其他模块（route 层、测试、CLI）应该 import 这个，而不是单个文件。
 // 模拟 src/community/index.mjs 的间接导出模式。

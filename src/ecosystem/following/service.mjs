@@ -13,7 +13,7 @@ function assertUuid(label, value) {
 }
 
 /**
- * ClickUp 16.3 P1 domain error. The route layer maps `code` to an HTTP
+ * Story 16.3 P1 domain error. The route layer maps `code` to an HTTP
  * status; the message is safe for player-facing responses.
  */
 export class FollowingError extends Error {
@@ -231,7 +231,7 @@ export function createFollowingService({ repository, accountDirectory = null, fe
       if (!storyRepository) {
         throw new FollowingError('invalid_input', 'storyRepository required.', null);
       }
-      // ClickUp 16.3 P1.2 canonical owner binding (ChatGPT 2026-09-07
+      // Story 16.3 P1.2 canonical owner binding (code review 2026-09-07
       // re-review). The handler passes the cookie-derived `ownerUuid`
       // and we compare it to the canonical owner persisted by
       // sessionService.createSession. The body NEVER carries the owner.

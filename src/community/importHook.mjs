@@ -1,7 +1,7 @@
 // src/community/importHook.mjs — glue between the story import flow and
 // the community-profile module.
 //
-// ClickUp 16.1 contract:
+// Story 16.1 contract:
 //   * `seedCommunityProfiles(repository, profileRepository)` is the
 //     mock-import-time entry point: it iterates over every seeded
 //     story_version and ensures an active community profile exists

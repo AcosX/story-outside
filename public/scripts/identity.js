@@ -1,6 +1,6 @@
-// public/scripts/identity.js — ClickUp 16.4 P1.v1-2 fix (2026-09-07).
+// public/scripts/identity.js — Story 16.4 P1.v1-2 fix (2026-09-07).
 //
-// Global identity producer + cross-page persistence layer. ClickUp
+// Global identity producer + cross-page persistence layer. Story
 // 16.4 home-page relevance matching requires a stable identity triple
 // `{ story_uuid, story_version_uuid, community_profile_version }` to
 // read the community profile for the active story and decide which
@@ -232,7 +232,7 @@
   }
 
   // Expose the producer + reader on window for downstream scripts.
-  // ClickUp 16.4 P1.v1-2 contract:
+  // Story 16.4 P1.v1-2 contract:
   //   * homeHotModule.js calls `getActiveIdentity()` (no closure
   //     dependency) so the function can be unit-tested in isolation.
   //   * player.js / endingPage.js call `setActiveIdentity(...)` when

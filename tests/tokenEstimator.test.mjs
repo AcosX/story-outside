@@ -1,5 +1,5 @@
 // tests/tokenEstimator.test.mjs — unit tests for the pluggable token
-// estimator introduced for ClickUp 10 (long-context compact).
+// estimator introduced for Story 10 (long-context compact).
 //
 // DEPENDENCY NOTE: pure module, no DB, no session. Asserts the public
 // contract of `tokenEstimator.mjs` only.

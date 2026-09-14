@@ -1,6 +1,6 @@
 // src/observability/logger.mjs — Structured JSON Lines logger.
 //
-// ClickUp 14 contract:
+// Story 14 contract:
 //   * Every line is one JSON object, terminated by '\n'.
 //   * Stable field set so downstream sinks (log shippers, grep, jq) can
 //     trust the schema. New optional fields may be added; existing field

@@ -115,7 +115,7 @@ async function run() {
     const { runtime, repository, session_uuid } = await pinnedRuntimeFixture({
       responses: [
         {
-          // ClickUp 08 unified contract: the tool call rides as the OPTIONAL
+          // Story 08 unified contract: the tool call rides as the OPTIONAL
           // FINAL item on a 1..4 narrative-item batch (tool-only batches are
           // rejected by the runtime).
           items: [{ type: 'narration', text: '她把杯沿又朝你推近了一点。' }],
@@ -230,7 +230,7 @@ async function run() {
     // The agent MUST be read-only against session_events regardless of how
     // many turns it runs. The canonical history only grows when the
     // player commits an opening event or a player input.
-    // ClickUp 08 pending hardening: there is exactly ONE active pending
+    // Story 08 pending hardening: there is exactly ONE active pending
     // per session, so the application layer must drain (commit) or drop
     // (discardPendingTail) the staged batch before the next turn can be
     // staged. We drop it here — discarding appends nothing, which keeps

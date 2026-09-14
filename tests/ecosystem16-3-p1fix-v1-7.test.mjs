@@ -1,5 +1,5 @@
-// tests/clickup16-3-p1fix-v1-7.test.mjs — ClickUp 16.3 P1 v1-7
-// regression (主人 2026-09-07 10:18 巡检 + ChatGPT 独立复核).
+// tests/ecosystem16-3-p1fix-v1-7.test.mjs — Story 16.3 P1 v1-7
+// regression (2026-09-07 review + independent review).
 //
 // What this test verifies (canonical-identity preservation across
 // the player bootstrap → helper write → reload / ?s=ending deep
@@ -81,7 +81,7 @@ const baseUrl = await new Promise((resolve, reject) => {
 
 await new Promise((resolve) => server.listen(Number(new URL(baseUrl).port), '127.0.0.1', resolve));
 
-console.log('ClickUp 16.3 P1 v1-7 — sessionContext canonical-meta preservation');
+console.log('Story 16.3 P1 v1-7 — sessionContext canonical-meta preservation');
 
 // ---------------------------------------------------------------------------
 // P1.v1-7-1 — helper source / static contracts.
@@ -447,6 +447,6 @@ let reloadCanonical = null;
   );
 }
 
-console.log(`\nClickUp 16.3 P1 v1-7 — sessionContext canonical-meta preservation: ${failures === 0 ? 'PASS' : `FAIL (${failures})`}`);
+console.log(`\nStory 16.3 P1 v1-7 — sessionContext canonical-meta preservation: ${failures === 0 ? 'PASS' : `FAIL (${failures})`}`);
 server.close();
 if (failures > 0) process.exit(1);

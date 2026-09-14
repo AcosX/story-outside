@@ -1,8 +1,8 @@
-// tests/clickup16-5-p1-v1-5.test.mjs
+// tests/ecosystem16-5-p1-v1-5.test.mjs
 //
-// ClickUp 16.5 P1 v1-5 regression — Map iteration-order bug fix.
+// Story 16.5 P1 v1-5 regression — Map iteration-order bug fix.
 //
-// Background (2026-09-07 owner review + ChatGPT 复核):
+// Background (2026-09-07 owner review + code review):
 //
 // The v1-4 implementation of `findActiveByStoryVersion` walked
 // `state.activeByStoryVersion.entries()` and trusted Map insertion
@@ -324,7 +324,7 @@ test('P1.v1-5-2 findCanonicalByIdentity fallback also returns C', () => {
   // findActiveByStoryVersion. Under v1-4 the fallback walked
   // activeByStoryVersion.entries() and was subject to the same
   // Map iteration-order trap.
-  // ClickUp 16.2 P1.v1-5 (PR #24, origin/main): the active
+  // Story 16.2 P1.v1-5 (PR #24, origin/main): the active
   // `findCanonicalByIdentity` returns `{ ok:true, profile }` for
   // the success path so the /discussions route can differentiate
   // error codes. The PR #25 P1.v1-5 fixture was originally written

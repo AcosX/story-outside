@@ -1,11 +1,11 @@
-// tests/clickup16-4-p1-v1-6-byteIdentity.test.mjs — ClickUp 16.4 P1.v1-6
+// tests/ecosystem16-4-p1-v1-6-byteIdentity.test.mjs — Story 16.4 P1.v1-6
 // byte-level identity regression (2026-09-07).
 //
-// What this test guards (owner-supervised inspection + ChatGPT
+// What this test guards (owner-supervised inspection + code review
 // independent review at 2026-09-07 09:19):
 //
-//   1. P1.v1-6-1: merge current main ea992690 (PR #24, ChatGPT
-//      squash-merged) into fix/clickup16-4-p1-hot-relevance (PR #23).
+//   1. P1.v1-6-1: merge current main ea992690 (PR #24, code review
+//      squash-merged) into fix/ecosystem16-4-p1-hot-relevance (PR #23).
 //      The merge commit has BOTH `b7d7876` (HEAD before merge) AND
 //      `ea992690` as parents. History is append-only — no rebase,
 //      no force-push, no amend, no cherry-pick from main.
@@ -419,11 +419,11 @@ async function run() {
 
   if (failed > 0) {
     // eslint-disable-next-line no-console
-    console.error(`\n[clickup16-4-p1-v1-6-byteIdentity] ${failed}/${checks.length} FAILED`);
+    console.error(`\n[ecosystem16-4-p1-v1-6-byteIdentity] ${failed}/${checks.length} FAILED`);
     process.exit(1);
   }
   // eslint-disable-next-line no-console
-  console.log(`\n[clickup16-4-p1-v1-6-byteIdentity] ${checks.length}/${checks.length} passed`);
+  console.log(`\n[ecosystem16-4-p1-v1-6-byteIdentity] ${checks.length}/${checks.length} passed`);
 }
 
 await run();

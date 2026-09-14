@@ -210,7 +210,7 @@ async function run() {
   // At this point only one interrupt has succeeded (the idempotent replay
   // reuses cached result, and the throw-on-conflict case throws).
   assert.equal(beforeInterrupt.history.length + 1, recoverSession({ repository, session_uuid: SESSION }).history.length);
-  // ClickUp 08 P2.6 / ClickUp 09 AC2: a realtime session IS interruptible
+  // Story 08 P2.6 / Story 09 AC2: a realtime session IS interruptible
   // again — the second interrupt stays realtime and appends another
   // player_input (source_sequence 1, the per-(session, source) counter).
   const reInterrupt = interruptWithPlayerInput({ repository, session_uuid: SESSION, text: 'again', client_request_id: 'input-2' });

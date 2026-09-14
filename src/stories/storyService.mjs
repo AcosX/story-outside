@@ -1,7 +1,7 @@
 // src/stories/storyService.mjs — application-layer facade for story import,
 // version creation, opening-cache generation, and session snapshot pinning.
 //
-// ClickUp 04 contract:
+// Story 04 contract:
 //   * importStoryFromProvider takes a provider DTO, normalises it, computes
 //     the canonical hash, and creates a new story_version only when the
 //     hash differs from any existing row for that story. Old versions stay.
@@ -190,7 +190,7 @@ export async function importStory({ repository, provider, slug, story_uuid, prof
  * @param {string} input.story_uuid
  * @param {GenerationProfile} [input.profile]
  * @param {import('../community/repository.mjs').CommunityProfileRepository} [input.profileRepository]
- *        ClickUp 16.1 P1.1 fix (2026-09-06): when supplied, the
+ *        Story 16.1 P1.1 fix (2026-09-06): when supplied, the
  *        community-profile module's `ensureCommunityProfile` runs
  *        immediately after the opening cache is created, so a fresh
  *        import automatically materialises a profile for any new
@@ -199,7 +199,7 @@ export async function importStory({ repository, provider, slug, story_uuid, prof
  *        routes that don't wire the community layer), the call is
  *        silently skipped — import semantics are unchanged.
  * @param {{ source?: string, locale?: string, seed?: object }} [input.profileOptions]
- *        ClickUp 16.1 server.mjs wiring fix (2026-09-06): forwarded
+ *        Story 16.1 server.mjs wiring fix (2026-09-06): forwarded
  *        to `ensureCommunityProfile` so the public real-provider
  *        path can tag the freshly-built profile with
  *        `source: 'real-generated'` instead of the hook's historical
@@ -239,7 +239,7 @@ export async function importStoryAndEnsureCache({
     story_version_uuid: imported.story_version_uuid,
     options: { profile: profile || defaultGenerationProfile() },
   });
-  // ClickUp 16.1 P1.1 fix (2026-09-06): when the caller wires a
+  // Story 16.1 P1.1 fix (2026-09-06): when the caller wires a
   // profileRepository, also ensure a community profile for the newly
   // imported story_version. This is the integration point that
   // `seedCommunityProfiles` (in community/importHook.mjs) previously
@@ -281,7 +281,7 @@ export async function importStoryAndEnsureCache({
     opening_cache_status: ensured.cache.status,
     cache_reused: ensured.reused,
   };
-  // ClickUp 16.5 P1.1 + P1.v1-3 (2026-09-07, PR #25): surface the
+  // Story 16.5 P1.1 + P1.v1-3 (2026-09-07, PR #25): surface the
   // canonical external `community_profile_version` so the public
   // /api/sessions bootstrap response can echo it to the browser.
   // The external form is `<generator_version>-<content_hash_short>`

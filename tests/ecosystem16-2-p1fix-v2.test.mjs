@@ -1,5 +1,5 @@
-// tests/clickup16-2-p1fix-v2.test.mjs — ClickUp 16.2 P1.v2 fix regression
-// (主人 + ChatGPT 2026-09-07 02:23 巡检)。
+// tests/ecosystem16-2-p1fix-v2.test.mjs — Story 16.2 P1.v2 fix regression
+// (code review)。
 //
 // P1.v2 blocker closed:
 //   POST /v1/ecosystem/discussions is now SERVER-AUTHORITATIVE.
@@ -764,7 +764,7 @@ async function runCafeRainRegression() {
 await runCafeRainRegression();
 
 // ---------------------------------------------------------------------
-// 7) IMMUTABLE LOOKUP regression (v1-2 / 2026-09-07 04:21 主人巡检
+// 7) IMMUTABLE LOOKUP regression (v1-2 / 2026-09-07 04:21 review
 //    修复): `findCanonicalByIdentity` MUST resolve an OLD
 //    `community_profile_version` (one that has been SUPERSEDED by a
 //    newer row in the same `story_version_uuid`). v2 #28 walked only
@@ -927,7 +927,7 @@ async function runImmutableLookupRegression() {
 await runImmutableLookupRegression();
 
 // ---------------------------------------------------------------------
-// 8) WIRE regression (v1-2 / 2026-09-07 04:21 主人巡检修复): spin up
+// 8) WIRE regression (v1-2 / 2026-09-07 04:21 review): spin up
 //    the server, build a multi-generation fixture via
 //    `setCommunityProfile`, and exercise the full
 //    POST /v1/ecosystem/discussions route with the OLD
@@ -1054,5 +1054,5 @@ if (failures > 0) {
   console.error(`\nFAILURES=${failures}`);
   process.exit(1);
 } else {
-  console.log('\nALL_OK clickup16-2-p1fix-v2.test.mjs');
+  console.log('\nALL_OK ecosystem16-2-p1fix-v2.test.mjs');
 }

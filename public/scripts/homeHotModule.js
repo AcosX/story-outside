@@ -1,4 +1,4 @@
-// public/scripts/homeHotModule.js — ClickUp 16.4 P1.v1-2 fix (2026-09-07).
+// public/scripts/homeHotModule.js — Story 16.4 P1.v1-2 fix (2026-09-07).
 //
 // Home-page 知乎热榜 module. Independent `<script type="module">` so
 // it cannot drag player.js / endingPage.js with it; loads its own DOM
@@ -256,7 +256,7 @@ async function loadInitial() {
     setState(root, hot.length ? (hasIdentity ? 'identity' : 'plain') : 'empty');
   } catch (err) {
     if (request !== latestRequest) return;
-    // ClickUp 16.4 graceful degradation: a 5xx / network error must
+    // Story 16.4 graceful degradation: a 5xx / network error must
     // NEVER break the home page. Render an empty list and a soft hint
     // so the user can still pick a story and play.
     setState(root, 'error');

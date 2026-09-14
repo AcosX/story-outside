@@ -18,9 +18,9 @@
 服务从被 Git 忽略的 `secrets/secret` 读取以下字段：
 
 ```text
-OAuth App ID: 413
+OAuth App ID: <由平台分配的应用 ID>
 OAuth App Key: <由部署环境安全写入>
-OAuth Redirect URI: https://storyoutside.acosx.top/auth/callback
+OAuth Redirect URI: https://<你的部署域名>/auth/callback
 ```
 
 环境变量 `ZHIHU_OAUTH_APP_ID`、`ZHIHU_OAUTH_APP_KEY`、`ZHIHU_OAUTH_REDIRECT_URI` 优先于文件；`STORY_OUTSIDE_OAUTH_SECRET_FILE` 可指定其他私有文件。必须保留原有 AI 和 Access Secret 字段，不把密钥填进本文件。文件应为 `0600`，父目录为 `0700`。

@@ -1,6 +1,6 @@
 // Story Outside — public session-context helper
-// (ClickUp 16.3 P1 v1-4 rebuild, 主人 2026-09-07 06:24 巡检 + ChatGPT 复核;
-//  v1-7 扩 meta 字段 主人 2026-09-07 10:18 巡检 + ChatGPT 复核).
+// (Story 16.3 P1 v1-4 rebuild, 2026-09-07 review;
+//  v1-7 扩 meta 字段 2026-09-07 review).
 //
 // Single source of truth for "what session is the panel / share /
 // unshare buttons targeting". Every reader and writer in the page goes
@@ -8,7 +8,7 @@
 // `story-outside:last-session`, and exactly ONE event,
 // `session:changed`.
 //
-// Hard rules (ClickUp 16.3 P1 v1-4 + v1-7):
+// Hard rules (Story 16.3 P1 v1-4 + v1-7):
 //
 //   * The single storage key is `story-outside:last-session`. The
 //     previous bogus session-context global on `window` and the
@@ -26,7 +26,7 @@
 //     is unavailable (private browsing) the helper still returns the
 //     in-memory cached value so the panel survives a reload in the
 //     same tab session.
-//   * v1-7 (ClickUp 16.3 P1 主人 10:18 巡检 + ChatGPT 复核):
+//   * v1-7 (Story 16.3 P1 review):
 //     `setCurrentShareTargetUuid(uuid, meta)` accepts a full meta
 //     object and persists EVERY canonical field —
 //     `storyUuid`, `storyVersionUuid`, `communityProfileVersion`,
@@ -55,7 +55,7 @@ const LAST_SESSION_KEY = 'story-outside:last-session';
 let inMemoryCache = null;
 
 function readStorageValue() {
-  // ClickUp 16.3 P1 v1-7: the in-memory cache and the storage
+  // Story 16.3 P1 v1-7: the in-memory cache and the storage
   // payload now hold the full canonical triple (storyUuid /
   // storyVersionUuid / communityProfileVersion /
   // communityProfileQueries). The cache is a tuple:
@@ -104,7 +104,7 @@ function readStorageValue() {
   return inMemoryCache;
 }
 
-// ClickUp 16.3 P1 v1-7: every canonical meta field is preserved on
+// Story 16.3 P1 v1-7: every canonical meta field is preserved on
 // the way out. The helper writes the FULL meta — not just storyTitle
 // / roleLabel — so the `?s=ending` deep link can rebuild its
 // `/v1/ecosystem/knowledge` payload after `location.reload()`.
@@ -177,7 +177,7 @@ function dispatchSessionChanged(uuid, source) {
 }
 
 function getCurrentShareTargetUuid() {
-  // ClickUp 16.3 P1 v1-7: cache is now `{ sessionUuid, meta }` so
+  // Story 16.3 P1 v1-7: cache is now `{ sessionUuid, meta }` so
   // the legacy `inMemoryCache = uuid` short-circuit becomes a
   // uuid-only short-circuit. New code that needs the full canonical
   // triple uses `getCurrentShareTargetMeta()`.
@@ -194,7 +194,7 @@ function getCurrentShareTargetUuid() {
   return null;
 }
 
-// ClickUp 16.3 P1 v1-7: returns the FULL canonical meta written by
+// Story 16.3 P1 v1-7: returns the FULL canonical meta written by
 // the last `setCurrentShareTargetUuid` call (storyUuid /
 // storyVersionUuid / communityProfileVersion /
 // communityProfileQueries + storyTitle / roleLabel / source). The

@@ -1,8 +1,8 @@
-// tests/clickup16-1-integration.test.mjs
+// tests/ecosystem16-1-integration.test.mjs
 //
-// ClickUp 16.1 P1.1 + P1.2 + P2 integration tests (2026-09-06).
+// Story 16.1 P1.1 + P1.2 + P2 integration tests (2026-09-06).
 // These are the regression tests for the three review findings
-// ChatGPT raised in the 2026-09-06 code review of PR #11.
+// code review raised in the 2026-09-06 code review of PR #11.
 //
 //   P1.1: `importStoryAndEnsureCache` must auto-ensure a community
 //          profile when the caller supplies a profileRepository —
@@ -43,7 +43,7 @@ function makeRepositoryAndProfileRepo() {
   return { repository, profileRepository };
 }
 
-// ClickUp 16.1 tests pass a real UUID-shaped `story_uuid` because
+// Story 16.1 tests pass a real UUID-shaped `story_uuid` because
 // StoryRepository.upsertStory requires it (the real-provider path
 // auto-generates one; the mock fixture happens to expose slugs that
 // already have a valid UUID in the catalog).
@@ -96,7 +96,7 @@ test('P1.1: importStoryAndEnsureCache with profileRepository auto-ensures a prof
   );
   // P2 contract: the default P1.1 path must NOT silently rewrite an
   // existing profile to a different source. (Real-provider switch is
-  // ClickUp 16.7+.)
+  // Story 16.7+.)
   assert.equal(profile.source, 'mock-generated');
 });
 
@@ -293,7 +293,7 @@ test('P1.1 + P2 together: importStoryAndEnsureCache with profileRepository produ
 });
 
 test('P1.1 + P2 wiring: importStoryAndEnsureCache honours profileOptions.source (real-generated)', async () => {
-  // ClickUp 16.1 server.mjs wiring fix (2026-09-06): when the caller
+  // Story 16.1 server.mjs wiring fix (2026-09-06): when the caller
   // passes `profileOptions: { source: 'real-generated' }`, the
   // freshly built profile must be tagged with that provenance instead
   // of being silently downgraded to `mock-generated`.

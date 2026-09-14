@@ -1,12 +1,12 @@
-// tests/clickup16-5-p1-v1-3.test.mjs
+// tests/ecosystem16-5-p1-v1-3.test.mjs
 //
-// ClickUp 16.5 P1 v1-3 + v1-4 regression — canonical external
+// Story 16.5 P1 v1-3 + v1-4 regression — canonical external
 // community_profile_version + historical exact lookup + two-generation
 // knowledge old-session regression.
 //
-// Owner巡检 (2026-09-07) flagged PR #25 / ff86cfb for the remaining P1
+// Owner review (2026-09-07) flagged PR #25 / ff86cfb for the remaining P1
 // gap: the handler identity was still using the raw `generator_version`
-// even though #24 (clickup16-4) had aligned on a DERIVED external
+// even though #24 (ecosystem16-4) had aligned on a DERIVED external
 // `community_profile_version = <generator_version>-<content_hash_short>`.
 // The v1-3 fix unifies the contract with #24, makes
 // `findCanonicalByIdentity` look up preserved rows by external version
@@ -254,7 +254,7 @@ test('deriveExternalCommunityProfileVersion: <generator_version>@<content_hash_p
 });
 
 test('deriveExternalCommunityProfileVersion: soft-null on missing inputs (main-canonical v1-6)', () => {
-  // ChatGPT review 5130773278: PR #25's throw-on-bad-input
+  // code review 5130773278: PR #25's throw-on-bad-input
   // semantics are not the canonical contract. The single source of
   // truth is src/community/version.mjs (main's verified soft-null
   // delegate), which returns null for any unprocessable input so
@@ -288,7 +288,7 @@ test('repository.findCanonicalByIdentity: A still resolves after B overtook the 
   assert.equal(active.profile_uuid, profileB.profile_uuid);
 
   // Old session pinned to A's external version → A's row.
-  // ClickUp 16.2 P1.v1-5 (PR #24, origin/main): the active
+  // Story 16.2 P1.v1-5 (PR #24, origin/main): the active
   // `findCanonicalByIdentity` returns `{ ok:true, profile } | { ok:false, code, message }`.
   // The PR #25 P1.v1-3 fixture was originally written for the
   // pre-PR-24 row-or-null API; the merge-of-conflicts keeps main's
@@ -319,7 +319,7 @@ test('repository.findCanonicalByIdentity: unknown external version → ok:false 
   // Pretend an old session pinned a string that does NOT match any
   // preserved row's external version. The lookup MUST return a
   // distinct error envelope (NOT silently resolve to the latest
-  // active row). ClickUp 16.2 P1.v1-5 (PR #24) wraps the failure
+  // active row). Story 16.2 P1.v1-5 (PR #24) wraps the failure
   // in `{ ok:false, code, message }` so the route layer can map
   // it onto a specific 400.
   const resolved = repo.findCanonicalByIdentity({

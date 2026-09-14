@@ -137,7 +137,7 @@ if (!relative || relative.startsWith('..') || path.isAbsolute(relative)) {
 - 问题：README 声称“real 会启动报错”，但当前 provider 是惰性初始化，`getStoryProvider()` 只在每次请求时调用；配置 `real` 后服务能正常监听，直到第一个 API 请求才返回 500。
 - 建议：在 `server.listen` 前主动调用一次 `getStoryProvider()`，或者在 `/api/health` 中声明当前 provider 状态。
 
-### 9. `stageNarrativeBatch` 允许 tool-only 批，与 ClickUp 08 契约不一致
+### 9. `stageNarrativeBatch` 允许 tool-only 批，与 Story 08 契约不一致
 
 - 位置：`src/stories/sessionService.mjs:555-563`
 - 问题：服务层校验只要求“至少一个 narrative item **或** 一个 tool_call”，因此 `items=[]` + 合法 `tool_call` 可以入库为 pending；而 `agent/runtime.mjs` 的 `normalizeProviderResult` 明确禁止 tool-only 批。任何绕过 runtime 直接调用服务层的未来调用方都会得到一个无法提交到 canonical history 的 pending。

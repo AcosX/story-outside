@@ -46,7 +46,7 @@ import { deriveExternalCommunityProfileVersion } from './community/version.mjs';
 import { closeDatabase, connectDatabase, databaseStatus } from './db/mariadb.mjs';
 import { createMariaDbRepositories } from './db/mariaPersistence.mjs';
 
-// ClickUp 16.2 P1.v2 (2026-09-07 ChatGPT review): the
+// Story 16.2 P1.v2 (2026-09-07 code review): the
 // /v1/ecosystem/discussions route is server-authoritative — it takes
 // ONLY a story_uuid + story_version_uuid + community_profile_version
 // triple from the body, resolves the canonical StoryCommunityProfile
@@ -124,7 +124,7 @@ import {
   createEcosystemKnowledgeProvider,
 } from './providers/ecosystem/knowledge.mjs';
 
-// ClickUp 16.3 P1 rebuild on `44343b2` — the follow / share surface is
+// Story 16.3 P1 rebuild on `44343b2` — the follow / share surface is
 // served from a fresh in-memory repository. The auth seam is the
 // `story_outside_session` cookie (set by `/api/sessions` POST); the
 // service layer wires `storyRepo` so `shareSession` can verify the
@@ -157,7 +157,7 @@ let databaseBootstrapError = null;
 
 /**
  * Build a deterministic, story-aware mock provider that satisfies the
- * ClickUp 08 wire contract: 1..4 ordered narrative items plus an
+ * Story 08 wire contract: 1..4 ordered narrative items plus an
  * OPTIONAL final tool call (never both items and a tool call with the
  * items array empty, and never without a tool_call riding the items).
  *
@@ -168,7 +168,7 @@ let databaseBootstrapError = null;
  *   - text contains 'long'   → a 4-item batch;
  *   - text contains 'short'  → a 1-item batch.
  * It also auto-emits a choice every CHOICE_EVERY turns and a finish_story
- * at FINISH_AFTER (ClickUp 09 demo arc, session-scoped counter).
+ * at FINISH_AFTER (Story 09 demo arc, session-scoped counter).
  */
 function buildDemoMockAgentProvider(input, sessionUuid = null) {
   const text = typeof input === 'object' && input !== null && typeof input.text === 'string'
@@ -177,7 +177,7 @@ function buildDemoMockAgentProvider(input, sessionUuid = null) {
   const isShort = text.includes('short');
   const isChoice = text.startsWith('choice');
   const isFinish = text.startsWith('finish');
-  // Session-local turn counter (ClickUp 09 demo arc): auto-emit a choice
+  // Session-local turn counter (Story 09 demo arc): auto-emit a choice
   // every CHOICE_EVERY turns and a finish_story at FINISH_AFTER so the
   // player sees the choice + ending flows without typing magic words.
   // Input-driven rules take precedence.
@@ -227,7 +227,7 @@ function buildDemoMockAgentProvider(input, sessionUuid = null) {
   return createMockAgentProvider({ responses: [{ items, tool_call }] });
 }
 
-// Demo pacing constants for buildDemoMockAgentProvider (ClickUp 09 arc).
+// Demo pacing constants for buildDemoMockAgentProvider (Story 09 arc).
 const MIN_BATCH = 1;
 const MAX_BATCH = 4;
 const CHOICE_EVERY = 2;     // emit a choice tool_call every N narrative batches
@@ -519,7 +519,7 @@ function classifyProviderError(err) {
 const { repository: seededStoryRepository, fixtures: storyFixtures } = createSeededRepository();
 let storyRepo = seededStoryRepository;
 
-// ClickUp 16.1 server.mjs wiring (2026-09-06): a single in-memory
+// Story 16.1 server.mjs wiring (2026-09-06): a single in-memory
 // community-profile repository is seeded once per process from the
 // mock fixtures so admin/dev tooling can introspect profiles for any
 // of the canonical stories. The PUBLIC real-provider routes
@@ -568,7 +568,7 @@ if (typeof globalThis !== 'undefined') {
   /** @type {any} */ (globalThis).__storyOutsideCommunityRepoForTests = communityProfileRepo;
 }
 
-// ClickUp 16.4 P1 fix (2026-09-07): home-page 知乎热榜 orchestrator.
+// Story 16.4 P1 fix (2026-09-07): home-page 知乎热榜 orchestrator.
 // Owns its own pair-key cache so two callers with different identity
 // triples share the upstream data but see distinct relevance
 // projections. The orchestrator is created once per process so its
@@ -587,7 +587,7 @@ followingService = createFollowingService({
   listActivities: (ownerUuid) => listOwnerActivities(storyRepo, ownerUuid),
 });
 
-// ClickUp 16.3 — the public surface decorator is hoisted near the
+// Story 16.3 — the public surface decorator is hoisted near the
 // ecosystem helpers so the cookie / share / follow code below can
 // reference it without hitting a TDZ on `PUBLIC_DECORATE`. The
 // original definition near POST /api/sessions is left in place for
@@ -603,7 +603,7 @@ function publicDecorate() {
  * Map a FollowingError to an HTTP status. Used by every /v1/ecosystem
  * route. Mirrors the contract used by the share / unshare PRs.
  *
- * ClickUp 16.3 P1 (ChatGPT 2026-09-07 review): a missing session
+ * Story 16.3 P1 (code review 2026-09-07 review): a missing session
  * surfaces as 401 (not 404). The caller has proven their identity via
  * the cookie; the contract is "the session exists and is yours", so a
  * missing session is an authentication-style failure from the
@@ -649,7 +649,7 @@ function sendFollowingError(res, err) {
 }
 
 // ---------------------------------------------------------------------
-// ClickUp 16.2 P1.v2 (2026-09-07 ChatGPT review): ecosystem search
+// Story 16.2 P1.v2 (2026-09-07 code review): ecosystem search
 // route uses a server-authoritative identity triple. The cache is
 // keyed per (story_version_uuid, community_profile_version, query_id,
 // query_hash) so different profiles / different queries never share
@@ -665,7 +665,7 @@ const endingAnalysisTasks = createEndingAnalysisTasks();
  * Resolve the canonical `community_profile_version` string for a
  * given `story_version_uuid`.
  *
- * ClickUp 16.2 P1.v2 (2026-09-07): the player needs a stable
+ * Story 16.2 P1.v2 (2026-09-07): the player needs a stable
  * `community_profile_version` (and the canonical `profile.queries[]`)
  * so it can submit them to `/v1/ecosystem/discussions`. The version
  * string is `${generator_version}@${content_hash[:16]}` — a new value
@@ -696,7 +696,7 @@ function resolveCommunityProfileVersion(story_version_uuid) {
   }
 }
 
-// ClickUp 16.5 — public /v1/ecosystem/knowledge orchestrator. The
+// Story 16.5 — public /v1/ecosystem/knowledge orchestrator. The
 // route layer (handler further down) calls `knowledgeProvider.match()`
 // once per canonical knowledge_query resolved from the
 // StoryCommunityProfile on the server side. We DO NOT pre-seed any
@@ -825,7 +825,7 @@ function sessionError(err) {
   if (err && err.code === 'too_many_client_request_ids') {
     return { status: 400, code: 'too_many_client_request_ids', message: err.message, details: err.details || null };
   }
-  // PR #7 ChatGPT 2026-09-05 follow-up (Blocker 1+2): opening-cache
+  // PR #7 code review 2026-09-05 follow-up (Blocker 1+2): opening-cache
   // store at the cap with every row pinned. Maps to 503 because the
   // caller has to finish or evict a session to make room — the demo
   // does not silently drop pinned caches.
@@ -1194,7 +1194,7 @@ async function handleRequest(req, res) {
         provider,
         slug: workId,
         story_uuid,
-        // ClickUp 16.1 server.mjs wiring (2026-09-06): the public
+        // Story 16.1 server.mjs wiring (2026-09-06): the public
         // real-provider path wires the in-memory community-profile
         // repo AND tags the freshly built profile with
         // `source: 'real-generated'`. Admin/dev import routes above
@@ -1274,7 +1274,7 @@ async function handleRequest(req, res) {
     }
   }
 
-  // ClickUp 05 session playback routes. These call the session-local service
+  // Story 05 session playback routes. These call the session-local service
   // directly: creating a session pins the supplied cache, recovery is read
   // only, and events are appended only by explicit commit/interrupt calls.
   if (method === 'POST' && pathname === '/api/dev/sessions') {
@@ -1284,7 +1284,7 @@ async function handleRequest(req, res) {
     } catch (err) {
       return sessionErrorResponse(res, err);
     }
-    // Keep the ClickUp 04 snapshot route compatible when the new playback
+    // Keep the Story 04 snapshot route compatible when the new playback
     // fields are absent. A request containing the new fields uses the strict
     // sessionService contract below.
     const isPlaybackRequest = validObject(body) &&
@@ -1338,7 +1338,7 @@ async function handleRequest(req, res) {
         }
       }
       try {
-        // ClickUp 16.3 P1.2 (ChatGPT 2026-09-07 review): refactored the
+        // Story 16.3 P1.2 (code review 2026-09-07 review): refactored the
         // `/api/dev/sessions` legacy helper to read the caller-provided
         // `user_ref` through a bracket-indexed accessor (NOT dot notation)
         // so the grep verification can pin "no identity-shaped fields
@@ -1370,7 +1370,7 @@ async function handleRequest(req, res) {
           generation_profile: profile,
         };
         sessionPinnedMetadata.set(body.session_uuid, pinned);
-        // ClickUp 14 observability hooks (route layer, per docs/observability.md §5).
+        // Story 14 observability hooks (route layer, per docs/observability.md §5).
         // A freshly created session pins a valid opening cache, so this counts
         // as a cache hit for the pinned cache_uuid.
         const sessionHookCtx = createStoriesHookContext({
@@ -1405,7 +1405,7 @@ async function handleRequest(req, res) {
       }
     }
     try {
-      // ClickUp 16.3 P1.2 (ChatGPT 2026-09-07 review): same
+      // Story 16.3 P1.2 (code review 2026-09-07 review): same
       // bracket-indexed indirection as the createSession branch
       // above so the grep verification can pin "no identity-shaped
       // fields are read off the body in any share-adjacent path".
@@ -1495,7 +1495,7 @@ async function handleRequest(req, res) {
     }
   }
 
-  // ClickUp 08 / 09 narrative-batch routes (unified after the 08 merge).
+  // Story 08 / 09 narrative-batch routes (unified after the 08 merge).
   //
   //   POST /generate          : runtime stages a 1..4 item batch + optional
   //                             tool call on the session pending slot. The
@@ -1554,7 +1554,7 @@ async function handleRequest(req, res) {
   }
 
   // ---------------------------------------------------------------------
-  // ClickUp 11 ending-page read-only routes. These three endpoints are
+  // Story 11 ending-page read-only routes. These three endpoints are
   // pure projections over (session_events + story_version + opening_cache)
   // and never mutate the repository. They are safe to call after a page
   // reload and, with MariaDB configured, after a process restart; they return
@@ -1686,12 +1686,12 @@ async function handleRequest(req, res) {
     }
   }
 
-  // ClickUp 08 runtime-driven narrative-batch routes.
+  // Story 08 runtime-driven narrative-batch routes.
   //
   // The runtime's deterministic demo provider stages 1..4 narrative items
   // per turn plus an optional final tool call (input-driven "choice" /
   // "finish", or the session-scoped demo arc). The contract is the real
-  // ClickUp 08 wire shape; a future Real provider must obey the same
+  // Story 08 wire shape; a future Real provider must obey the same
   // invariants.
 
   // POST /api/dev/sessions/:uuid/generate — call the runtime and STAGE
@@ -1760,7 +1760,7 @@ async function handleRequest(req, res) {
         ...result,
         session_uuid: sessionUuid,
         pending_id: result.pending_id,
-        // ClickUp 09 player aliases: the frontend reads events / revision /
+        // Story 09 player aliases: the frontend reads events / revision /
         // pending_remaining; the 08 contract keeps items / base_revision /
         // pending_total. Both name the same staged batch.
         events: result.items,
@@ -1867,7 +1867,7 @@ async function handleRequest(req, res) {
   }
 
   // -----------------------------------------------------------------------
-  // ClickUp 14 observability admin endpoints (read-only).
+  // Story 14 observability admin endpoints (read-only).
   //
   // Two GET routes expose per-session observability + a process-wide
   // metrics summary. They are demo/dev-only and intentionally live
@@ -1975,7 +1975,7 @@ async function handleRequest(req, res) {
   // ---------------------------------------------------------------------
   const PUBLIC_DECORATE = () => ({ demo: currentDemoFlag() });
 
-  // ClickUp 16.3 P1 v1-2: GET /api/auth/status — the browser calls
+  // Story 16.3 P1 v1-2: GET /api/auth/status — the browser calls
   // this BEFORE bootstrapping a session so the player.js UI can show
   // the OAuth-pending display name on the picker / ending screens.
   // The endpoint is intentionally idempotent and side-effect free:
@@ -2010,8 +2010,8 @@ async function handleRequest(req, res) {
         ...PUBLIC_DECORATE(),
       });
     }
-    // PR #10 review (B1, 2026-09-06) + ClickUp 16.3 P1 v1-2
-    // (主人 2026-09-07 04:21 巡检): public POST /api/sessions is the
+    // PR #10 review (B1, 2026-09-06) + Story 16.3 P1 v1-2
+    // (2026-09-07 review): public POST /api/sessions is the
     // browser-only bootstrap surface. The player is contractually only
     // allowed to send { work_id, role_id } — server defaults choose
     // user_ref / model / prompt and the browser never sees them.
@@ -2045,7 +2045,7 @@ async function handleRequest(req, res) {
         ...PUBLIC_DECORATE(),
       });
     }
-    // ClickUp 16.3 P1 v1-2: empty body is a legitimate request — it
+    // Story 16.3 P1 v1-2: empty body is a legitimate request — it
     // bootstraps the OAuth-pending canonical owner against the demo
     // work + role defaults. This matches the wire contract the
     // player uses before it has picked a story on the picker screen.
@@ -2085,10 +2085,10 @@ async function handleRequest(req, res) {
         ...(aiConfig ? { identity: { model: aiConfig.model, prompt: STORY_SYSTEM_PROMPT } } : {}),
         work_id: body.work_id,
         role_id: body.role_id,
-        // ClickUp 16.3 P1 v1-2: canonical session owner comes from
+        // Story 16.3 P1 v1-2: canonical session owner comes from
         // `currentUserProvider(req)` — NEVER from the request body.
         user_uuid: auth.user_uuid,
-        // ClickUp 16.1 server.mjs wiring (2026-09-06): the public
+        // Story 16.1 server.mjs wiring (2026-09-06): the public
         // POST /api/sessions route is the real-provider bootstrap
         // surface, so it wires the in-memory community-profile repo
         // and tags freshly-built profiles with `source:
@@ -2114,7 +2114,7 @@ async function handleRequest(req, res) {
         generation_profile: profile,
       };
       sessionPinnedMetadata.set(sessionUuid, pinned);
-      // ClickUp 14 observability: a freshly-created session pins a
+      // Story 14 observability: a freshly-created session pins a
       // valid opening cache, so this counts as a cache hit.
       const hookCtx = createStoriesHookContext({
         session_uuid: sessionUuid,
@@ -2126,7 +2126,7 @@ async function handleRequest(req, res) {
       });
       onSessionCreate(hookCtx);
       onOpeningCacheHit(hookCtx);
-      // ClickUp 16.2 P1.v2 (2026-09-07): the player needs the
+      // Story 16.2 P1.v2 (2026-09-07): the player needs the
       // canonical community_profile_version + canonical profile
       // queries so it can submit them to /v1/ecosystem/discussions.
       // The version string is server-authoritative and the player
@@ -2145,7 +2145,7 @@ async function handleRequest(req, res) {
         opening_cursor: result.session.opening_cursor,
         cache_reused: result.cache_reused,
         version_reused: result.version_reused,
-        // ClickUp 16.4 P1.v1-6 fix (2026-09-07): surface the canonical
+        // Story 16.4 P1.v1-6 fix (2026-09-07): surface the canonical
         // community_profile_version + the canonical profile queries
         // on the bootstrap response so the browser can publish the
         // identity triple WITHOUT a second round-trip. The version
@@ -2158,7 +2158,7 @@ async function handleRequest(req, res) {
         community_profile_version: cv.community_profile_version,
         community_profile_queries: cv.community_profile_queries,
         pinned,
-        // ClickUp 16.3 P1 v1-2: echo the canonical owner back so the
+        // Story 16.3 P1 v1-2: echo the canonical owner back so the
         // browser can render the OAuth-pending display name without
         // minting its own. `auth_source === 'oauth_pending'` is the
         // contract — the UI must NEVER treat this as a real identity.
@@ -2179,7 +2179,7 @@ async function handleRequest(req, res) {
     if (rejectInvalidSessionUuid(res, publicSessionRoot[1])) return;
     try {
       const recovered = recoverSession({ repository: storyRepo, session_uuid: publicSessionRoot[1] });
-      // ClickUp 16.2 P1.v2 (2026-09-07): also expose
+      // Story 16.2 P1.v2 (2026-09-07): also expose
       // community_profile_version + canonical profile queries so the
       // player can submit them to /v1/ecosystem/discussions after a
       // page reload.
@@ -2636,7 +2636,7 @@ async function handleRequest(req, res) {
   }
 
   // -----------------------------------------------------------------
-  // ClickUp 16.5 — public /v1/ecosystem/knowledge façade (player-facing).
+  // Story 16.5 — public /v1/ecosystem/knowledge façade (player-facing).
   //
   // P1.v1-3 fix (2026-09-07 owner review): the
   // `community_profile_version` carried in the body is the EXTERNAL
@@ -2651,7 +2651,7 @@ async function handleRequest(req, res) {
   // pinning the prior external version keeps resolving the prior row
   // even after the active row has moved on.
   //
-  // P1.v2 fix (2026-09-07 ChatGPT review): the surface is
+  // P1.v2 fix (2026-09-07 code review): the surface is
   // SERVER-AUTHORITATIVE. The handler accepts ONLY the three identity
   // fields (story_uuid, story_version_uuid, community_profile_version)
   // and resolves the canonical StoryCommunityProfile from the
@@ -2660,7 +2660,7 @@ async function handleRequest(req, res) {
   // caller-supplied knowledge_queries / topic_id / topic_label /
   // topic / theme / subject / query / identity are NEVER accepted.
   //
-  // P1.v2 fix (2026-09-07 ChatGPT review): the orchestrator's cache
+  // P1.v2 fix (2026-09-07 code review): the orchestrator's cache
   // key includes `query_hash = sha256(query.query)` so two distinct
   // query strings ALWAYS hit independent cache rows; the upstream
   // call receives the verbatim query string (NOT a query_id), so
@@ -2946,7 +2946,7 @@ async function handleRequest(req, res) {
       results,
     });
   }
-  // GET /v1/ecosystem/hot — home-page 知乎热榜 façade (ClickUp 16.4 P1.v1-2).
+  // GET /v1/ecosystem/hot — home-page 知乎热榜 façade (Story 16.4 P1.v1-2).
   //
   // Public surface (no DEV_FLAG banner). Identity triple is optional:
   // when story_uuid / story_version_uuid / community_profile_version
@@ -3102,7 +3102,7 @@ async function handleRequest(req, res) {
   }
 
   // -------------------------------------------------------------------
-  // ClickUp 16.3 P1 rebuild on `44343b2` (ChatGPT 2026-09-07 re-review
+  // Story 16.3 P1 rebuild on `44343b2` (code review 2026-09-07 re-review
   // of PR #21):
   //
   //   * The `/v1/ecosystem/*` surface is the public follow / share API.
@@ -3227,7 +3227,7 @@ async function handleRequest(req, res) {
         ...publicDecorate(),
       });
     }
-    // ClickUp 16.3 P1 v1-2: in the OAuth-pending model the share
+    // Story 16.3 P1 v1-2: in the OAuth-pending model the share
     // handler takes NO body. The contract is strict — even an empty
     // JSON object body is forbidden. The client must POST without a
     // body (Content-Length: 0). The `Content-Length` header check
@@ -3290,7 +3290,7 @@ async function handleRequest(req, res) {
       return jsonResponse(res, 200, {
         ...publicDecorate(),
         share: row,
-        // ClickUp 16.3 P1 v1-2: surface the canonical owner so the
+        // Story 16.3 P1 v1-2: surface the canonical owner so the
         // UI can render the OAuth-pending display name.
         owner: {
           user_uuid: currentUserProvider(req).user_uuid,
@@ -3382,7 +3382,7 @@ async function handleRequest(req, res) {
     }
   }
 
-  // ClickUp 16.2 P1.v2 (2026-09-07 ChatGPT review):
+  // Story 16.2 P1.v2 (2026-09-07 code review):
   //   POST /v1/ecosystem/discussions — public surface.
   //
   //   The handler maps identity-resolution failures to these

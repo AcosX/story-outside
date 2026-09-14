@@ -4,7 +4,7 @@ import { progressMetadata } from './plotProgress.mjs';
 // (story, story_version, generation_profile) and is shared across all
 // subsequent sessions that read that version.
 //
-// ClickUp 04 contract:
+// Story 04 contract:
 //   * The opening spans "from the story start to right before the first
 //     ask_player_choice marker would be presented".
 //   * Output is a per-sentence event sequence the client can play one at a

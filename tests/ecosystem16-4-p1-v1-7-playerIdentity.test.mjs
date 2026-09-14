@@ -1,7 +1,7 @@
-// tests/clickup16-4-p1-v1-7-playerIdentity.test.mjs — ClickUp 16.4 P1.v1-7
+// tests/ecosystem16-4-p1-v1-7-playerIdentity.test.mjs — Story 16.4 P1.v1-7
 // player-bootstrap → identity → hot regression (2026-09-07).
 //
-// What this test guards (owner-supervised inspection + ChatGPT
+// What this test guards (owner-supervised inspection + code review
 // independent review at 2026-09-07 10:18):
 //
 //   P1.v1-7-1. `public/scripts/player.js`'s `bootstrapSession` calls
@@ -766,7 +766,7 @@ async function run() {
     // Run.
     // ==================================================================
     // eslint-disable-next-line no-console
-    console.log(`\n[clickup16-4-p1-v1-7-playerIdentity] ${testIdx}/${testIdx} passed`);
+    console.log(`\n[ecosystem16-4-p1-v1-7-playerIdentity] ${testIdx}/${testIdx} passed`);
   } finally {
     server.close();
   }
