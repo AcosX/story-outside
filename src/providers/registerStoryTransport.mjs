@@ -4,7 +4,7 @@ import { storyTransportFromEnv } from './storyTransport.mjs';
 import { validateStoryTransportPayload } from './realProvider.mjs';
 
 const key = Symbol.for('story-outside.story-transport.original-fetch');
-if (!globalThis[key] && (process.env.STORY_OUTSIDE_STORY_SSH_HOST || process.env.STORY_OUTSIDE_STORY_CACHE_DIR)) {
+if (!globalThis[key] && (process.env.STORY_OUTSIDE_STORY_SSH_HOST || process.env.STORY_OUTSIDE_STORY_CACHE)) {
   const original = globalThis.fetch;
   globalThis[key] = original;
   const transport = storyTransportFromEnv(validateStoryTransportPayload);

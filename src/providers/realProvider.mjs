@@ -291,6 +291,12 @@ function shallowDefensiveCopy(value) {
   return /** @type {T} */ (/** @type {unknown} */ (out));
 }
 
+// Retained from 391464a: the catalog column is VARCHAR(500), while
+// original introduction/content remain intact in their dedicated fields.
+function catalogHook(value, fallback) {
+  return Array.from(value || fallback).slice(0, 500).join('');
+}
+
 /**
  * Strip the body-sized fields from a source.raw envelope and cap
  * surviving text fields. The explicit DTO fields already carry the
@@ -551,7 +557,7 @@ function summaryFromListEntry(raw) {
   // description to be missing — fall back to a short, attributable
   // placeholder so the route layer never sees an empty hook. We do
   // NOT fabricate story content; the placeholder is metadata only.
-  const hook = description || `来自知乎黑客松参赛作品（${work_id}）`;
+  const hook = catalogHook(description, `来自知乎黑客松参赛作品（${work_id}）`);
   /** @type {{ id: string, label: string, mood: string }[]} */
   const roles = [
     {
@@ -626,7 +632,7 @@ function detailFromDetailEntry(raw) {
   const introduction = typeof entry.introduction === 'string' ? entry.introduction : '';
   const description = typeof entry.description === 'string' ? entry.description : '';
   const hookSource = introduction || description || '';
-  const hook = hookSource || `来自知乎黑客松参赛作品（${work_id}）`;
+  const hook = catalogHook(hookSource, `来自知乎黑客松参赛作品（${work_id}）`);
   const author_name = typeof entry.author_name === 'string' ? entry.author_name : '';
   const author_avatar = typeof entry.author_avatar === 'string' ? entry.author_avatar : '';
   const roles = [{

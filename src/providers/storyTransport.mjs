@@ -1,15 +1,12 @@
 // Transport is opt-in and restricted to the unauthenticated story API.
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { createHash, randomUUID } from 'node:crypto';
-import { mkdir, open, rename, unlink, readdir, stat } from 'node:fs/promises';
-import { join, isAbsolute } from 'node:path';
+import { storyCacheFromEnv } from '../db/storyUpstreamCache.mjs';
 import { warn } from '../observability/logger.mjs';
 
 const run = promisify(execFile);
 const PREFIX = 'https://api.zhihu.com/km-indep-home/hackathon/v2/story/';
 const MAX_BYTES = 1024 * 1024;
-const MAX_ENTRIES = 256;
 const HEADERS = { accept: 'application/json', 'user-agent': 'story-outside/0.1 (zhihu-hackathon-2026-p2; read-only)' };
 
 export function storyTransportId(url) {
@@ -58,65 +55,37 @@ export function sshStoryFetch(host, runner = run) {
   };
 }
 
-export function createStoryTransport({ direct = globalThis.fetch, alternate, cacheDir, validate, now = Date.now } = {}) {
-  if (!alternate && !cacheDir) return direct;
-  if (cacheDir && !isAbsolute(cacheDir)) throw new Error('Story cache directory must be absolute');
+export function createStoryTransport({ direct = globalThis.fetch, alternate, cacheStore, validate, now = Date.now } = {}) {
+  if (!alternate && !cacheStore) return direct;
   if (typeof validate !== 'function') throw new Error('Story response validator is required');
   let blockedUntil = 0;
-  let writes = Promise.resolve();
   const inflight = new Map();
   const log = (event) => warn(event, { component: 'storyTransport' });
-  const filename = (url) => join(cacheDir, `${createHash('sha256').update(url).digest('hex')}.json`);
   const response = (text) => new Response(text, { headers: { 'content-type': 'application/json' } });
   const checked = (url, text) => { validate(storyTransportId(url), JSON.parse(text)); return text; };
 
-  async function save(url, text) {
-    if (!cacheDir) return;
-    const operation = writes.then(async () => {
-      await mkdir(cacheDir, { recursive: true, mode: 0o700 });
-      const file = filename(url);
-      const temp = `${file}.${randomUUID()}.tmp`;
-      try {
-        const handle = await open(temp, 'wx', 0o600);
-        try { await handle.writeFile(JSON.stringify({ version: 1, url, savedAt: now(), payload: JSON.parse(text) })); await handle.sync(); }
-        finally { await handle.close(); }
-        await rename(temp, file);
-        const dir = await open(cacheDir, 'r');
-        try { await dir.sync(); } finally { await dir.close(); }
-        const names = (await readdir(cacheDir)).filter((name) => /^[a-f0-9]{64}\.json$/.test(name));
-        if (names.length > MAX_ENTRIES) {
-          const entries = await Promise.all(names.map(async (name) => ({ name, at: (await stat(join(cacheDir, name))).mtimeMs })));
-          entries.sort((a, b) => a.at - b.at);
-          const listName = filename(`${PREFIX}list`);
-          const evictable = entries.filter((entry) => join(cacheDir, entry.name) !== listName);
-          for (const entry of evictable.slice(0, entries.length - MAX_ENTRIES)) await unlink(join(cacheDir, entry.name));
-        }
-      } finally { await unlink(temp).catch(() => {}); }
-    });
-    writes = operation.catch(() => { log('stories.transport.cache_write_failed'); });
-    await writes;
+  async function save(url, text, fetchedAt) {
+    if (!cacheStore) return;
+    try { await cacheStore.put(url, { version: 1, url, savedAt: fetchedAt, payload: JSON.parse(text) }); }
+    catch { log('stories.transport.cache_write_failed'); }
   }
 
   async function cached(url) {
-    if (!cacheDir) return null;
+    if (!cacheStore) return null;
     try {
-      const handle = await open(filename(url), 'r');
-      let data;
-      try {
-        // JSON escaping can expand the original text; keep the disk read bounded.
-        if ((await handle.stat()).size > MAX_BYTES * 6 + 4096) throw new Error('Oversized cache');
-        data = JSON.parse(await handle.readFile('utf8'));
-      } finally { await handle.close(); }
+      const data = await cacheStore.get(url);
+      if (!data) return null;
       if (data.version !== 1 || data.url !== url || !Number.isFinite(data.savedAt)) throw new Error('Invalid cache');
       const text = JSON.stringify(data.payload);
       if (Buffer.byteLength(text) > MAX_BYTES) throw new Error('Oversized cached payload');
       checked(url, text);
-      log('stories.transport.disk_stale_served');
+      warn('stories.transport.mariadb_stale_served', { component: 'storyTransport', extra: { cache_age_ms: Math.max(0, now() - data.savedAt) } });
       return response(text);
-    } catch (error) { if (error.code !== 'ENOENT') log('stories.transport.cache_read_failed'); return null; }
+    } catch { log('stories.transport.cache_read_failed'); return null; }
   }
 
   async function fetchOne(url) {
+    const fetchedAt = now();
     let original;
     let failure;
     let mayRelay = true;
@@ -125,7 +94,7 @@ export function createStoryTransport({ direct = globalThis.fetch, alternate, cac
         original = await direct(url, { method: 'GET', headers: HEADERS, redirect: 'manual', signal: AbortSignal.timeout(4000) });
         if (original.status === 200) {
           const text = checked(url, await bodyText(original));
-          await save(url, text);
+          await save(url, text, fetchedAt);
           return response(text);
         }
         // No alternate traffic on rate limits, missing works or redirects.
@@ -139,7 +108,7 @@ export function createStoryTransport({ direct = globalThis.fetch, alternate, cac
         const result = await alternate(url);
         if (result.status === 200) {
           const text = checked(url, await bodyText(result));
-          await save(url, text);
+          await save(url, text, fetchedAt);
           await original?.body?.cancel().catch(() => {});
           log('stories.transport.alternate_success');
           return response(text);
@@ -158,7 +127,7 @@ export function createStoryTransport({ direct = globalThis.fetch, alternate, cac
     storyTransportId(url);
     if (init.method && init.method !== 'GET') throw new Error('Only story GET is allowed');
     if (inflight.has(url)) return (await inflight.get(url)).clone();
-    // Bound distinct concurrent SSH processes and disk buffers; provider stale
+    // Bound distinct concurrent SSH processes and response buffers; provider stale
     // caches can still satisfy excess callers without spawning extra processes.
     if (inflight.size >= 4) {
       const hit = await cached(url);
@@ -177,7 +146,7 @@ export function storyTransportFromEnv(validate) {
   return createStoryTransport({
     direct: globalThis[Symbol.for('story-outside.story-transport.original-fetch')] || globalThis.fetch,
     alternate: host ? sshStoryFetch(host) : undefined,
-    cacheDir: process.env.STORY_OUTSIDE_STORY_CACHE_DIR,
+    cacheStore: storyCacheFromEnv(),
     validate,
   });
 }
