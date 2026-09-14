@@ -25,7 +25,7 @@ const story={content:'完整原作'.repeat(500)};
 const calls=[];
 const provider=createAIProvider({config,story,fetchImpl:async(url,opts)=>{
   calls.push({url,body:JSON.parse(opts.body)});
-  const content={items:[{type:'narration',text:'门开了。'}],tool_call:{name:'ask_player_choice',arguments:{question:'进入吗？',options:[{id:'a',label:'进入'},{id:'b',label:'等待'}]}}};
+  const content={items:[{type:'narration',text:'门开了。'}],tool_call:{name:'ask_player_choice',arguments:{question:'接下来，你想怎么做？',options:[{id:'a',label:'进入'},{id:'b',label:'等待'}]}}};
   return {ok:true,json:async()=>({choices:[{message:{content:JSON.stringify(content)},finish_reason:'stop'}]})};
 }});
 const result=await provider.complete({pinned:{role_id:'me'},canonical_history:Array.from({length:20},(_,i)=>({event_seq:i,event_type:'narrative_beat',payload:i===0?{story_progress:0.23}:{},text:'事件'})),context:{compact_text:'保留玩家选择和人物事实',recent_events:Array.from({length:16},(_,i)=>({event_seq:i+4,text:'事件'}))},input:{text:'看看'}});
@@ -209,7 +209,7 @@ console.log('AI provider: backup channel fallback after primary retry exhaustion
   const requests = [];
   const narrateArgs = {
     items: [{ type: 'narration', text: '门开了。', story_progress: 0.2 }],
-    tool_call: { name: 'ask_player_choice', arguments: { question: '进入吗？', options: [{ id: 'a', label: '进入' }, { id: 'b', label: '等待' }] } },
+    tool_call: { name: 'ask_player_choice', arguments: { question: '接下来，你想怎么做？', options: [{ id: 'a', label: '进入' }, { id: 'b', label: '等待' }] } },
   };
   const provider = createAIProvider({ config, story: {}, fetchImpl: async (url, opts) => {
     requests.push({ url, body: JSON.parse(opts.body) });

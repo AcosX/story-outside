@@ -5,7 +5,7 @@ import { normalizeProviderResult } from '../src/agent/runtime.mjs';
 
 const line = text => ({ type: 'narration', text });
 const choice = { name: 'ask_player_choice', arguments: {
-  question: '进入吗？', options: [{ id: 'enter', label: '进入' }, { id: 'wait', label: '等待' }],
+  question: '接下来，你想怎么做？', options: [{ id: 'enter', label: '进入' }, { id: 'wait', label: '等待' }],
 } };
 const requests = [];
 const provider = createAIProvider({
@@ -30,8 +30,8 @@ assert.equal(result.tool_call.name, 'ask_player_choice');
 for (const body of requests) {
   assert.equal(body.tools[0].function.parameters.properties.items.minItems, 1);
   assert.equal(body.tools[0].function.parameters.properties.items.maxItems, 1);
-  assert.match(body.messages[0].content, /每次只返回一句/);
-  assert.match(body.messages[0].content, /不必每句都询问玩家/);
+  assert.match(body.messages[0].content, /每次只返回一条/);
+  assert.match(body.messages[0].content, /不必每条都询问玩家/);
 }
 assert.equal(normalizeProviderResult({ items: [line('旧批次一。'), line('旧批次二。'), line('旧批次三。')] }).items.length, 3,
   'runtime remains compatible with existing multi-line batches');

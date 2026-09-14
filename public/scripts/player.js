@@ -1391,7 +1391,8 @@ async function performstartNextBatch() {
   let request = state.generationRequest;
   if (!request || request.sessionUuid !== state.sessionUuid || request.revision !== expectedRevision || request.epoch !== generationEpoch) {
     request = { sessionUuid: state.sessionUuid, revision: expectedRevision, epoch: generationEpoch,
-      id: `turn-${expectedRevision}-${state.lastPlayerRequestId}`, input: state.nextBatchInput || 'hello' };
+      id: `turn-${expectedRevision}-${state.lastPlayerRequestId}`,
+      input: state.nextBatchInput || '继续', kind: state.nextBatchInput ? 'player_action' : 'continue' };
     state.lastPlayerRequestId += 1;
     state.nextBatchInput = null;
     state.generationRequest = request;
@@ -1405,7 +1406,7 @@ async function performstartNextBatch() {
     const options = {
       method: 'POST',
       body: JSON.stringify({
-        input: { text: request.input },
+        input: { text: request.input, kind: request.kind },
         expected_revision: expectedRevision,
         request_id: request.id,
       }),
@@ -1795,10 +1796,7 @@ async function chooseOption(option) {
   // call actually landed in the canonical history.
   const result = await sendPlayerInputChoice(text);
   if (!result) return; // failure path: sendPlayerInput already restored status
-  // Use the choice id as a hint for the deterministic demo provider so
-  // the next batch reflects the player's decision (a/b → default
-  // 3-item batch, "finish" would be unusual here but allowed).
-  state.nextBatchInput = option.id === 'b' ? 'short' : 'hello';
+  // interruptWithPlayerText already retained the exact selected action.
   setStatus('playing');
   clearAutoplayTimer();
   scheduleNext();
