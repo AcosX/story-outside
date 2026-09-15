@@ -54,8 +54,8 @@ const config = {apiKey:'test',model:'test',baseURL:'https://test.invalid',timeou
 const story = {roles:[{id:'mother',label:'林岚'},{id:'father',label:'陈平'}],first_person_role_id:'mother'};
 let calls=0;
 const provider = createAIProvider({config,story,fetchImpl:async()=>{
- const result = ++calls===1 ? {items:[]} : calls===2 ? {items:[{type:'narration',text:'你轻声说完，准备退出房间。'}]} : {
- items:[{type:'narration',text:'我轻声说完，准备退出房间。'}],tool_call:{name:'ask_player_choice',arguments:{question:'接下来，你想怎么做？',options:[{id:'a',label:'我问他有什么事。'},{id:'b',label:'我留在门口等他。'}]}}};
+ const result = ++calls===1 ? {items:[]} : calls===2 ? {items:[{type:'narration',text:'你轻声说完，准备退出房间。'},{type:'narration',text:'门外传来脚步声。'},{type:'narration',text:'门把手轻轻转动。'}]} : {
+ items:[{type:'narration',text:'我轻声说完，准备退出房间。'},{type:'narration',text:'门外传来脚步声。'},{type:'narration',text:'门把手轻轻转动。'}],tool_call:{name:'ask_player_choice',arguments:{question:'接下来，你想怎么做？',options:[{id:'a',label:'我问他有什么事。'},{id:'b',label:'我留在门口等他。'}]}}};
  return {ok:true,json:async()=>({choices:[{message:{content:JSON.stringify(result)}}]})};}});
 const result=await provider.complete({pinned:{role_id:'mother'},input:{text:'继续'}});
 assert.equal(calls,3);

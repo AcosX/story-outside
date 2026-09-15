@@ -9,11 +9,11 @@ const RUNTIME_STATE = Symbol('agentRuntimeState');
 const SENSITIVE_KEY_PATTERN = /^(password|token|access[_-]?token|secret|api[_-]?key|app[_-]?key|authorization|cookie|headers?)$/i;
 const ERROR_CODES = new Set(['pin_mismatch', 'invalid_input', 'provider_failure', 'unknown_tool', 'invalid_tool_call', 'pending_conflict', 'revision_mismatch', 'duplicate_request']);
 
-// Story 08 contract: a provider turn MAY return 1..4 ordered narrative
+// Story 08 contract: a provider turn MAY return 1..5 ordered narrative
 // items and OPTIONALLY a single tool call as the FINAL item. The runtime
 // normalises both shapes into one canonical stage.
 const MIN_NARRATIVE = 1;
-const MAX_NARRATIVE = 4;
+const MAX_NARRATIVE = 5;
 
 class AgentRuntimeError extends Error {
   constructor(code, message, { retryable = code === 'provider_failure' } = {}) {
@@ -82,12 +82,12 @@ function sanitizeFiniteJson(value, label) {
 
 /**
  * Normalise a provider result into the Story 08 shape:
- *   * items    : array of 1..4 narrative items in order
+ *   * items    : array of 1..5 narrative items in order
  *   * tool_call: optional normalised tool call (the FINAL item)
  *
  * The provider can express this either as:
  *   { messages: [...], tool_calls: [<exactly one>] }  (legacy OpenAI-ish)
- * where messages are 1..4 ordered narrative beats and the single
+ * where messages are 1..5 ordered narrative beats and the single
  * tool_calls entry rides the batch as the optional FINAL tool, OR
  *   { items: [...], tool_call: {...} }                (explicit 08 shape)
  *
@@ -96,7 +96,7 @@ function sanitizeFiniteJson(value, label) {
  * Everything else fails closed:
  *   * tool-only batches (tool_calls without any narrative)
  *   * empty batches (0 narrative items)
- *   * >4 narrative items
+ *   * >5 narrative items
  *   * more than one tool_call in the legacy array (multi-tool)
  *   * a tool that is not final (a tool-like entry inside items, or a
  *     non-assistant message)
@@ -180,7 +180,7 @@ export function normalizeProviderResult(result) {
     return out;
   });
   if (hasToolCalls) {
-    // Legacy combined shape: { messages: 1..4, tool_calls: [<one>] }.
+    // Legacy combined shape: { messages: 1..5, tool_calls: [<one>] }.
     // Unambiguous: messages are the ordered narrative items and the single
     // tool call is the optional FINAL item. Multi-tool arrays and empty
     // arrays are rejected; a tool-only batch (no messages at all) was

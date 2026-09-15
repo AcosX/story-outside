@@ -73,6 +73,10 @@ for (const value of [undefined,null,'90%',-1,2]) {
   assert.equal(invalid.items[0].story_progress,undefined);
   commitNarrativeEvent({...identity,pending_id:invalid.pending_id,sequence:0,expected_revision:revision()});
   checkProgress(history(),0.18); // bad advisory metadata must not block narrative
+  // Each probe is a separate interaction turn. Reset the five-narrative
+  // window before the next probe so this metadata test does not cross the
+  // mandatory choice boundary.
+  interruptWithPlayerInput({...identity,text:'继续叙事',expected_revision:revision()});
 }
 checkProgress([...history(), {event_type:'player_input',payload:{story_progress:0.99}}],0.18);
 const atEnd = await runTurn(runtime(createMockAgentProvider({responses:[{items:[{type:'narration',text:'到达原作末尾但继续新的分支',story_progress:1}]}]})),{input:{},expected_revision:revision()});

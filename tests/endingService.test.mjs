@@ -65,6 +65,7 @@ async function driveToFinish(baseUrl, sessionUuid, expectedRevision) {
     const staged = stagedRes.body;
     expectedRevision = staged.revision;
     let committedToolCall = false;
+    let choiceToolCall = false;
     for (let seq = staged.pending_committed_count || 0; seq < staged.events.length; seq += 1) {
       const commitRes = await postJson(baseUrl, `/api/dev/sessions/${sessionUuid}/narrative-events`, {
         pending_id: staged.pending_id,
@@ -79,8 +80,16 @@ async function driveToFinish(baseUrl, sessionUuid, expectedRevision) {
         committedToolCall = true;
         break;
       }
+      if (commitJson.pending_tool_call?.name === 'ask_player_choice') choiceToolCall = true;
     }
     if (committedToolCall) break;
+    if (choiceToolCall) {
+      const reset = await postJson(baseUrl, `/api/dev/sessions/${sessionUuid}/interrupt`, {
+        text: '继续', client_request_id: `ending-choice-${sessionUuid}-${turn}`, expected_revision: expectedRevision,
+      });
+      if (reset.status !== 200) throw new Error(`turn ${turn} choice reset failed: ${reset.status}`);
+      expectedRevision = reset.body.revision;
+    }
   }
   return expectedRevision;
 }
@@ -225,6 +234,11 @@ async function main() {
       // Drive 2 narrative batches.
       let rev = 0;
       rev = await driveOneBatch(baseUrl, sessionUuid, rev);
+      const reset = await postJson(baseUrl, `/api/dev/sessions/${sessionUuid}/interrupt`, {
+        text: '继续', client_request_id: `replay-reset-${sessionUuid}`, expected_revision: rev,
+      });
+      assert_.equal(reset.status, 200);
+      rev = reset.body.revision;
       rev = await driveOneBatch(baseUrl, sessionUuid, rev);
       const replayRes = await getJson(baseUrl, `/api/dev/sessions/${sessionUuid}/replay`);
       check('GET /replay returns 200', replayRes.status === 200);

@@ -71,7 +71,7 @@ console.log('Ending activation: terminal durability/replay, legacy recovery, pac
 // A model that declares the original arc resolved must not open another choice.
 const { createAIProvider } = await import('../src/agent/aiProvider.mjs');
 const resolvedOutput = {
-  arc_status: 'resolved', items: [{ type: 'narration', text: '列车驶离小镇。' }],
+  arc_status: 'resolved', items: [{ type: 'narration', text: '列车驶离小镇。' }, { type: 'narration', text: '站台上的人渐渐散去。' }, { type: 'narration', text: '远处传来汽笛声。' }],
   tool_call: { name: 'ask_player_choice', arguments: { question: '接下来，你想怎么做？', options: [{ id: 'a', label: '继续' }, { id: 'b', label: '等候' }] } },
 };
 const resolvedProvider = createAIProvider({

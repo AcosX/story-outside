@@ -151,7 +151,7 @@ if (!databaseUrl) {
         const messages = JSON.parse(opts.body).messages;
         const compact = messages[0].content.includes('事实摘要');
         aiRequests.push({ compact, payload: JSON.parse(messages[1].content) });
-        const result = compact ? { summary: invalidCompact ? '' : 'SQL保存的事实摘要' } : { items: [{ text: '继续剧情' }] };
+        const result = compact ? { summary: invalidCompact ? '' : 'SQL保存的事实摘要' } : { items: [{ text: '继续剧情' }, { text: '夜色渐深。' }, { text: '远处传来钟声。' }] };
         return { ok: true, json: async () => ({ choices: [{ message: { content: JSON.stringify(result) }, finish_reason: 'stop' }] }) };
       } });
     const generate = (identity, request_id = randomUUID()) => {

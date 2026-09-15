@@ -135,9 +135,33 @@ const NARRATIVE_EVENT_TYPES = new Set(['narration', 'dialogue', 'action', 'beat'
 const NARRATIVE_ORIGIN = 'llm';
 const NARRATIVE_SOURCE = 'runtime';
 
-// Hard limits from Story 08: a staged batch may carry 1..4 narrative
+// Hard limits from Story 08: a staged batch may carry 1..5 narrative
 // items plus an OPTIONAL final tool call.
-const MAX_NARRATIVE_ITEMS = 4;
+const MAX_NARRATIVE_ITEMS = 5;
+const MAX_NARRATIVES_WITHOUT_INPUT = 5;
+
+function narrativesSincePlayerInput(history) {
+  let count = 0;
+  for (let index = history.length - 1; index >= 0; index -= 1) {
+    const event = history[index];
+    if (event.event_type === 'player_input') break;
+    if (event.event_type === 'narrative_beat') count += 1;
+  }
+  return count;
+}
+
+function validateNarrativeBoundary(session, itemCount, hasToolCall) {
+  const committed = narrativesSincePlayerInput(session.history);
+  const total = committed + itemCount;
+  const legacyRecoveryTail = committed >= MAX_NARRATIVES_WITHOUT_INPUT
+    && itemCount === 1 && hasToolCall;
+  if (!hasToolCall && total >= MAX_NARRATIVES_WITHOUT_INPUT) {
+    throw new Error('stageNarrativeBatch: choice_required before the fifth narrative is committed');
+  }
+  if (hasToolCall && total > MAX_NARRATIVES_WITHOUT_INPUT && !legacyRecoveryTail) {
+    throw new Error('stageNarrativeBatch: narrative batch exceeds the five-narrative interaction window');
+  }
+}
 
 // Idempotency-store bound. Per session we keep at most this many entries
 // in `requestIds` / `turnRequests`; inserting beyond the bound evicts the
@@ -937,7 +961,7 @@ export function commitOpeningEvent({ repository, session_uuid, cache_uuid, event
 
 /**
  * Stage a speculative narrative batch on a session. The batch MUST satisfy:
- *   * 1..4 narrative items (narration / dialogue / action / beat), each with
+ *   * 1..5 narrative items (narration / dialogue / action / beat), each with
  *     a sequence 0..N-1 in order;
  *   * an OPTIONAL final tool call (kind=choice_required | story_finished);
  *   * the session must be in opening / awaiting_first_choice / realtime;
@@ -1055,6 +1079,7 @@ export function stageNarrativeBatch({ repository, session_uuid, items, tool_call
       `stageNarrativeBatch: session already has an unconsumed pending batch (pending_id=${active.pending_id}, committed=${active.committed_count}/${active.events.length}); commit, interrupt, or discard it before staging a different batch`,
     );
   }
+  validateNarrativeBoundary(session, normalized.length, hasToolCall);
   const pending_id = randomUUID();
   const pending = {
     pending_id,

@@ -175,7 +175,7 @@ function sessionMutationResponse(req, res, sessionUuid, payload) {
 
 /**
  * Build a deterministic, story-aware mock provider that satisfies the
- * Story 08 wire contract: 1..4 ordered narrative items plus an
+ * Story 08 wire contract: 1..5 ordered narrative items plus an
  * OPTIONAL final tool call (never both items and a tool call with the
  * items array empty, and never without a tool_call riding the items).
  *
@@ -1544,7 +1544,7 @@ async function handleRequest(req, res) {
 
   // Story 08 / 09 narrative-batch routes (unified after the 08 merge).
   //
-  //   POST /generate          : runtime stages a 1..4 item batch + optional
+  //   POST /generate          : runtime stages a 1..5 item batch + optional
   //                             tool call on the session pending slot. The
   //                             response carries the 08 contract fields
   //                             (items / kind / pending_total / base_revision)
@@ -1735,7 +1735,7 @@ async function handleRequest(req, res) {
 
   // Story 08 runtime-driven narrative-batch routes.
   //
-  // The runtime's deterministic demo provider stages 1..4 narrative items
+  // The runtime's deterministic demo provider stages 1..5 narrative items
   // per turn plus an optional final tool call (input-driven "choice" /
   // "finish", or the session-scoped demo arc). The contract is the real
   // Story 08 wire shape; a future Real provider must obey the same
@@ -2421,7 +2421,7 @@ async function handleRequest(req, res) {
     }
   }
 
-  // POST /api/sessions/:uuid/generate — runtime stages a 1..4 item
+  // POST /api/sessions/:uuid/generate — runtime stages a 1..5 item
   // batch + optional tool call on the session pending slot. Same
   // runtime contract as the dev route; only the response decoration
   // differs.

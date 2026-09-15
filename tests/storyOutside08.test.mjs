@@ -216,21 +216,30 @@ try {
   check('history contains 3 narrative_beat + 1 narrative_beat (4 narrative_beat entries)',
     rec2.data?.history.every((e) => e.event_type === 'narrative_beat'));
 
+  // A player action starts a fresh interaction window before the next
+  // automatic batch. The new boundary contract must not let the following
+  // long batch accumulate on top of the previous choice node.
+  const choiceReset = await post(interruptPath, {
+    text: '继续看', client_request_id: 'choice-reset-before-long', expected_revision: 4,
+  });
+  check('choice reset after a choice returns 200', choiceReset.response.status === 200);
+  check('choice reset appends player_input', choiceReset.data?.event?.event_type === 'player_input');
+
   // ----- mid-batch interrupt -----
   // Generate a 4-item batch (input contains 'long'), commit 2, then interrupt.
   const gen3 = await post(generatePath, {
     request_id: 'turn-3',
     input: { text: 'long reply please' },
-    expected_revision: 4,
+    expected_revision: 5,
   });
   check('generate 3 returns 4-item batch', gen3.data?.items?.length === 4);
   const pendingId3 = gen3.data.pending_id;
-  await post(narrativePath, { pending_id: pendingId3, sequence: 0, expected_revision: 4, client_request_id: 'mid-c0' });
-  await post(narrativePath, { pending_id: pendingId3, sequence: 1, expected_revision: 5, client_request_id: 'mid-c1' });
+  await post(narrativePath, { pending_id: pendingId3, sequence: 0, expected_revision: 5, client_request_id: 'mid-c0' });
+  await post(narrativePath, { pending_id: pendingId3, sequence: 1, expected_revision: 6, client_request_id: 'mid-c1' });
   const interrupt = await post(interruptPath, {
     text: 'interrupt mid-batch',
     client_request_id: 'mid-int',
-    expected_revision: 6,
+    expected_revision: 7,
   });
   check('interrupt returns 200', interrupt.response.status === 200, JSON.stringify(interrupt.data).slice(0, 200));
   check('interrupt drops the pending tail', interrupt.data?.dropped_pending_id === pendingId3);
@@ -238,10 +247,10 @@ try {
   check('interrupt state becomes realtime', interrupt.data?.state === 'realtime');
   check('interrupt appended player_input', interrupt.data?.event?.event_type === 'player_input');
   const rec3 = await request(recoverPath);
-  check('history after interrupt = 7 (3 + 1 tool-narrative + 2 mid + 1 player_input)',
-    rec3.data?.history?.length === 7 && rec3.data?.history[6]?.event_type === 'player_input');
+  check('history after interrupt = 8 (3 + 1 tool-narrative + 1 reset + 2 mid + 1 player_input)',
+    rec3.data?.history?.length === 8 && rec3.data?.history[7]?.event_type === 'player_input');
   check('pending cleared after interrupt', rec3.data?.pending === null);
-  check('revision after interrupt = 7', rec3.data?.revision === 7);
+  check('revision after interrupt = 8', rec3.data?.revision === 8);
 
   // ----- recover from a fresh repository instance (no provider call) -----
   // We can't easily recreate the in-memory repository here, but recover is
@@ -277,7 +286,7 @@ try {
   const gen4 = await post(generatePath, {
     request_id: 'turn-4',
     input: { text: 'short' },
-    expected_revision: 7,
+    expected_revision: 8,
   });
   check('generate 4 returns 1-item batch', gen4.data?.items?.length === 1);
   const stale = await post(narrativePath, {
@@ -285,23 +294,23 @@ try {
   });
   check('stale expected_revision is rejected', stale.response.status === 400);
   const wrong = await post(narrativePath, {
-    pending_id: '00000000-0000-4000-8000-deadbeef0000', sequence: 0, expected_revision: 7,
+    pending_id: '00000000-0000-4000-8000-deadbeef0000', sequence: 0, expected_revision: 8,
   });
   check('wrong pending_id is rejected', wrong.response.status === 400);
   // Story 08 P1.2: drain gen4 so a fresh stage is allowed.
   await post(narrativePath, {
-    pending_id: gen4.data.pending_id, sequence: 0, expected_revision: 7, client_request_id: 'gen4-c0',
+    pending_id: gen4.data.pending_id, sequence: 0, expected_revision: 8, client_request_id: 'gen4-c0',
   });
 
   // ----- finish_story tool call flow -----
   const gen5 = await post(generatePath, {
     request_id: 'turn-5',
     input: { text: 'finish the story now' },
-    expected_revision: 8,
+    expected_revision: 9,
   });
   check('generate 5 carries a finish_story tool_call', gen5.data?.tool_call?.kind === 'story_finished' && gen5.data?.tool_call?.terminal === true);
   const finishCommit = await post(narrativePath, {
-    pending_id: gen5.data.pending_id, sequence: 0, expected_revision: 8, client_request_id: 'finish-c0',
+    pending_id: gen5.data.pending_id, sequence: 0, expected_revision: 9, client_request_id: 'finish-c0',
   });
   check('finish_story batch commit returns 200', finishCommit.response.status === 200);
   check('finish commit surfaces terminal tool_call', finishCommit.data?.pending_tool_call?.kind === 'story_finished');
@@ -309,8 +318,8 @@ try {
   check('finish_story is never written to canonical history',
     rec5.data?.history.every((e) => e.event_type !== 'story_finished' && e.event_type !== 'tool_call'));
 
-  // ----- reject 5-item batches at the application layer -----
-  // The runtime's mock never produces 5 items, but a Real provider could
+  // ----- reject 6-item batches at the application layer -----
+  // The runtime's mock never produces 6 items, but a Real provider could
   // attempt to bypass the limit. We exercise the sessionService cap via
   // stageNarrativeBatch.
   const ss = await import('../src/stories/sessionService.mjs');
@@ -325,8 +334,9 @@ try {
       { type: 'narration', text: 'c' },
       { type: 'narration', text: 'd' },
       { type: 'narration', text: 'e' },
+      { type: 'narration', text: 'f' },
     ], expected_revision: 0,
-  }), /at most 4/);
+  }), /at most 5/);
   assert.throws(() => ss.stageNarrativeBatch({
     repository: repo, session_uuid: '00000000-0000-4000-8000-eeeeeeeeeeee',
     items: [], expected_revision: 0,
@@ -477,9 +487,9 @@ try {
     p12GenDifferent.response.status === 400 && /unconsumed pending/.test(p12GenDifferent.data?.message || p12GenDifferent.data?.error || ''));
 
   // ----- P1.5: same request_id with different payload at commit is rejected (already covered) -----
-  // ----- P1.3: 5-item / empty batch / tool-only are rejected at the runtime layer -----
+  // ----- P1.3: 6-item / empty batch / tool-only are rejected at the runtime layer -----
   // Use a direct call to the sessionService to bypass the HTTP demo runtime mock.
-  // The runtime mock never exceeds 4 items, so we exercise the cap explicitly.
+  // The runtime mock never exceeds 5 items, so we exercise the cap explicitly.
   assert.throws(() => ss.stageNarrativeBatch({
     repository: repo, session_uuid: '00000000-0000-4000-8000-eeeeeeeeeeee',
     items: [
@@ -488,8 +498,9 @@ try {
       { type: 'narration', text: 'c' },
       { type: 'narration', text: 'd' },
       { type: 'narration', text: 'e' },
+      { type: 'narration', text: 'f' },
     ], expected_revision: 0,
-  }), /at most 4/);
+  }), /at most 5/);
   assert.throws(() => ss.stageNarrativeBatch({
     repository: repo, session_uuid: '00000000-0000-4000-8000-eeeeeeeeeeee',
     items: [], expected_revision: 0,
@@ -723,9 +734,9 @@ try {
   });
   p22Rev = p22CommitA.data?.revision;
   p22SourceSeqs.push(p22CommitA.data?.event?.source_sequence);
-  // Batch 2: 3 items ('default').
-  const p22GenB = await post(`/api/dev/sessions/${sessP22}/generate`, { request_id: 'p22-b', input: { text: 'default' }, expected_revision: p22Rev });
-  for (let i = 0; i < 3; i += 1) {
+  // Batch 2: 1 item ('short'), leaving room for the third batch.
+  const p22GenB = await post(`/api/dev/sessions/${sessP22}/generate`, { request_id: 'p22-b', input: { text: 'short' }, expected_revision: p22Rev });
+  for (let i = 0; i < 1; i += 1) {
     const c = await post(`/api/dev/sessions/${sessP22}/narrative-events`, {
       pending_id: p22GenB.data?.pending_id, sequence: i, expected_revision: p22Rev, client_request_id: `p22-b${i}`,
     });
@@ -739,8 +750,8 @@ try {
   });
   p22Rev = p22CommitC.data?.revision;
   p22SourceSeqs.push(p22CommitC.data?.event?.source_sequence);
-  check('P2.2: source_sequence across 3 batches is 0,1,2,3,4 (never [0,0])',
-    JSON.stringify(p22SourceSeqs) === JSON.stringify([0, 1, 2, 3, 4]));
+  check('P2.2: source_sequence across 3 batches is 0,1,2 (never [0,0])',
+    JSON.stringify(p22SourceSeqs) === JSON.stringify([0, 1, 2]));
   const p22Recovered = await request(`/api/dev/sessions/${sessP22}/recover`);
   const p22Pairs = p22Recovered.data?.history?.map((e) => `${e.source}:${e.source_sequence}`);
   check('P2.2: (source, source_sequence) pairs are unique across all batches',

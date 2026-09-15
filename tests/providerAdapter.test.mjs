@@ -390,7 +390,7 @@ async function run() {
     //                           present → provider_failure
     //   (b) { messages: [] }  — messages array present but 0 items →
     //                           invalid_tool_call ("messages must contain
-    //                           1 to 4 narrative items")
+    //                           1 to 5 narrative items")
     // Both refuse the turn. A non-empty but malformed tool_calls list
     // (e.g. []) is rejected with 'invalid_tool_call' — that path is
     // exercised in tests/agentTools.test.mjs.
@@ -421,7 +421,7 @@ async function run() {
       (err) =>
         err instanceof AgentRuntimeError
         && err.code === 'invalid_tool_call'
-        && /messages must contain 1 to 4 narrative items/.test(err.message),
+        && /messages must contain 1 to 5 narrative items/.test(err.message),
     );
     assert.equal(recoverRuntime(runtime).base_revision, revision);
     assert.equal(recoverRuntime(runtime).successful_turns.length, 0);

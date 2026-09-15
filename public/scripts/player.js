@@ -904,9 +904,10 @@ async function recoverAndStart() {
         committed_count: recovered.pending.committed_count || 0,
       };
       state.pendingIdx = state.pending.committed_count;
-      for (let i = state.pendingIdx; i < state.pending.events.length; i += 1) {
-        const el = renderPendingPlaceholder(state.pending.events[i], state.canonicalHistory.length + i);
-        registerPendingNode(`pending:${state.pending.pending_id}:${i}`, el);
+      if (state.pendingIdx < state.pending.events.length) {
+        const sequence = state.pendingIdx;
+        const el = renderPendingPlaceholder(state.pending.events[sequence], state.canonicalHistory.length);
+        registerPendingNode(`pending:${state.pending.pending_id}:${sequence}`, el);
       }
       scrollLogToEnd();
       setStatus('playing');
@@ -1201,6 +1202,15 @@ async function runStep() {
   // Path 1: still have pending items to commit
   if (state.pending && state.pendingIdx < state.pending.events.length) {
     const hadItems = state.pending.events.length;
+    // Reveal only the next line. The server already returned the complete
+    // batch, but the reader should not see future lines before their playback
+    // turn and durable commit.
+    const sequence = state.pendingIdx;
+    const pendingKey = `pending:${state.pending.pending_id}:${sequence}`;
+    if (!pendingNodes.has(pendingKey)) {
+      const el = renderPendingPlaceholder(state.pending.events[sequence], state.canonicalHistory.length);
+      registerPendingNode(pendingKey, el);
+    }
     await commitNextPendingItem();
     // commitNextPendingItem may have surfaced a tool_call and queued a
     // deferred render via setTimeout. If it did, the scheduler is now
@@ -1447,12 +1457,12 @@ async function performstartNextBatch() {
     state.pendingIdx = state.pending.committed_count;
     setGenerationStatus(false);
     setText('#player-help', '');
-    // Render the new pending lines as placeholders; track each node
-    // by (pending_id, sequence) so commitNextPendingItem can clear
-    // them deterministically.
-    for (let i = state.pendingIdx; i < state.pending.events.length; i += 1) {
-      const el = renderPendingPlaceholder(state.pending.events[i], state.canonicalHistory.length + i);
-      registerPendingNode(`pending:${state.pending.pending_id}:${i}`, el);
+    // Reveal only the first item. Later items are appended by runStep at the
+    // moment their playback slot begins, then committed in the same order.
+    if (state.pendingIdx < state.pending.events.length) {
+      const sequence = state.pendingIdx;
+      const el = renderPendingPlaceholder(state.pending.events[sequence], state.canonicalHistory.length);
+      registerPendingNode(`pending:${state.pending.pending_id}:${sequence}`, el);
     }
     if (state.inputInFlight) return;
     if (state.pending.events.length === 0 && state.pending.tool_call) {
