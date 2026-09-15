@@ -8,7 +8,7 @@
 - `recoverRuntime` 负责恢复可继续的运行态；`resumeTurn` 只恢复可续接的回合，不替代首次创建。
 - `src/db/mariaPersistence.mjs` 负责把 session projection、canonical history、pending batch 和 compact runtime state hydrate/flush 到 MariaDB；runtime 本身仍只依赖同步 repository contract。
 - Story 08 P1.2：运行时归一化的 stage 调用在 canonical session 已有未消费 active pending 时，相同 payload 返回同一 pending snapshot（幂等），不同 payload 必须 fail closed。运行时 / sessionService 都不会静默覆盖待消费的批；调用方必须先 commit / interrupt / discard 才能开新批。
-- Story 08 P1.3：normalizeProviderResult 仅接受以下合法输入形状：(a) `items: [1..4 个 narrative item]`，可选附加 `tool_call: <one>`；(b) 遗留 `messages: [1..4 个 assistant 文本]`，可选 `tool_calls: [<恰一个>]`——messages 为有序 narrative items，唯一 tool 作为可选 FINAL item 无歧义归一化。`items + messages` / `tool_calls` 数组多于一个 / `tool_calls` 仅一条无 narrative / 5+ items / 空批次 / items 内混入 tool 型条目 / 非法 tool payload 一律 `invalid_tool_call` fail closed。tool_call 永远不进入 canonical history。
+- Story 08 P1.3：normalizeProviderResult 仅接受以下合法输入形状：(a) `items: [1..5 个 narrative item]`，可选附加 `tool_call: <one>`；(b) 遗留 `messages: [1..5 个 assistant 文本]`，可选 `tool_calls: [<恰一个>]`——messages 为有序 narrative items，唯一 tool 作为可选 FINAL item 无歧义归一化。`items + messages` / `tool_calls` 数组多于一个 / `tool_calls` 仅一条无 narrative / 6+ items / 空批次 / items 内混入 tool 型条目 / 非法 tool payload 一律 `invalid_tool_call` fail closed。tool_call 永远不进入 canonical history。
 - Story 08 P1.1：`cursor` 是 canonical cursor——等于 `revision` 与最后一条 `event_seq`（已提交 canonical 事件总数），每次 commit（opening / narrative / player_input）都 +1；opening 播放顺序由内部 `opening_cursor` 单独维护（对外只读暴露）。下一轮 runtime 的 `buildRequest` 通过 `listSessionEvents` 看到上一轮所有已提交的 canonical event；`source_sequence` 是 (session, source) 单调计数器，跨 batch 不复位。
 - Story 08 P1.5：HTTP 层每次请求新建 runtime，但 request_id 幂等状态归属 **session**（`sessionService.turnRequests`）：相同 `request_id + input + expected_revision` 跨请求返回完全相同的 result（turn_id / items / tool / pending_id）且不再调用 provider；同 request_id 不同 input/revision 拒绝（`duplicate_request`）；active pending 下不同 request_id 不能覆盖（stage fail closed）。`commitNarrativeEvent` 的 client_request_id 幂等在 pending 清空后仍可重放（final-commit 幂等）。
 - Story 08 P1.6：未配置数据库时 runtime / sessionService 使用内存 repository，只提供本进程 recover；配置 MariaDB 后，server 在启动时 hydrate projection，`recoverSession` 可跨进程恢复 canonical history、revision、cursor、pending 与 compact state，且仍不调用 provider、不重放、不追加。
@@ -16,11 +16,9 @@
 
 ## 实时逐句续写
 
-真实 AI 每次 `narrate.items` 恰好一条连贯的叙事小段（通常 40～150 字，可含数句），schema 与返回校验同时限制数量；违规结果走现有有界重试，禁止截断多条结果以免丢失选择或结局的前置情节。只有有意义的分岔才附带选择，核心冲突解决时继续要求结局。
+真实 AI 每批通常生成 3 条短叙事，必要时 4～5 条；交互窗口不足时按 schema 返回剩余 1～2 条，并在末尾交还选择。每条通常 20～60 字、最多 80 字，整批正文最多 240 字（按 Unicode 码点计数），不设最低字数。条目共同推进一个行动及其直接结果，保留因果衔接和选择前提，避免重复铺陈。超长候选走现有有界重试，重新生成完整批次，不机械截断句子或丢弃尾部选择、结局。
 
-前端收到即显示，自动播放中立即提交这一条；服务端按 revision 接受这一句后立即应答，数据库写入与下一句生成并行，不再等待 SQL 完成或额外等待 1100ms。暂停停止自动推进，插话仍等待已开始的内存提交并作废旧生成。选择/结局先展示，不能越过它们生成。兼容旧会话 1～4 条 pending 与回放，公共开场缓存仍按原有阅读节奏播放。
-
-每句独立调用会增加请求次数及重复输入成本；消除了等待同批后续叙事和多余播放定时器的延迟，但首句仍依赖模型响应与网络耗时。
+当前模型调用仍等待完整批次响应；前端收到批次即显示第一条，其余条目按阅读节奏逐条显示、提交。服务端按 revision 接受叙事后应答，数据库异步保存；本批消费完且没有选择或结局时再请求下一批。暂停停止自动推进，插话等待已开始的内存提交并作废旧生成，不能越过选择或结局继续生成。旧会话较长的正文仍可回放，长度限制仅作用于新 AI 生成结果。
 
 ## 异步保存与保存状态
 

@@ -30,7 +30,7 @@ assert.equal(result.tool_call.name, 'ask_player_choice');
 for (const body of requests) {
   assert.equal(body.tools[0].function.parameters.properties.items.minItems, 3);
   assert.equal(body.tools[0].function.parameters.properties.items.maxItems, 5);
-  assert.match(body.messages[0].content, /每次返回 3 至 5 条/);
+  assert.match(body.messages[0].content, /通常包含 3 至 5 条/);
   assert.match(body.messages[0].content, /不必每条都询问玩家/);
 }
 assert.equal(normalizeProviderResult({ items: [line('旧批次一。'), line('旧批次二。'), line('旧批次三。')] }).items.length, 3,
