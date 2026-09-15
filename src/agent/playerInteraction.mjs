@@ -4,6 +4,9 @@ export const MAX_NARRATIVES_WITHOUT_INPUT = 5;
 // reload/compaction and cannot be reset by an automatic continue request.
 export function playerInteraction(history = []) {
   let narratives = 0;
+  const committed = history.filter(event => event.committed !== false && !['pending', 'staged'].includes(event.status));
+  const awaitingFirstChoice = committed.some(event => event.event_type === 'story_opening')
+    && !committed.some(event => event.event_type === 'player_input');
   for (let index = history.length - 1; index >= 0; index -= 1) {
     const event = history[index];
     if (event.committed === false || ['pending', 'staged'].includes(event.status)) continue;
@@ -11,9 +14,10 @@ export function playerInteraction(history = []) {
     if (event.event_type === 'narrative_beat') narratives += 1;
   }
   return { narratives_since_input: narratives,
-    choice_recommended: narratives >= 2,
+    awaiting_first_choice: awaitingFirstChoice,
+    choice_recommended: awaitingFirstChoice || narratives >= 2,
     max_narratives_without_input: MAX_NARRATIVES_WITHOUT_INPUT,
-    choice_required: narratives >= 2 };
+    choice_required: awaitingFirstChoice || narratives >= 2 };
 }
 
-export const PLAYER_INTERACTION_PROMPT = `这是由玩家作决定的互动故事。自动continue只允许叙述已选行动的直接结果、环境变化和其他人物的反应，绝不是让导演替玩家选楼层、进房间、答应请求、触碰或拥抱他人。遇到尚未获玩家授权的行动分岔，立即在动作发生之前用ask_player_choice交还控制权。通常每3至5条连贯叙事形成一个有意义的选择节点：choice_recommended=true时优先在本条或接下来的合适分岔停下，不为凑数拖延；遇到重大决定可更早停下。当player_interaction.choice_required=true时，本次必须附带ask_player_choice，不能只返回正文。只写清当前位置和眼前局面，给2至6个能采取的不同动作，不要再次询问已经做出的选择。只有核心冲突确实解决且arc_status=resolved时才以finish_story替代选择，不能为了绕开交互要求草率结束。`;
+export const PLAYER_INTERACTION_PROMPT = `玩家决定故事分岔，导演负责让已选行动自然展开。通常每3至5条连贯叙事形成一个有意义的选择节点；不要为了凑条数替玩家行动，也不对每个细小动作反复提问。awaiting_first_choice=true表示开场结束但尚无玩家决定，本次必须在当前现场交还第一次选择。choice_required=true时本次必须附带ask_player_choice；条目数量以工具schema为准，剩余窗口不足时可用更少条目，不必填满。玩家已明确要求的行动及其直接结果应先完成，再提供下一步选择；continue不授予新的行动。只有核心冲突确已解决且arc_status=resolved，才以finish_story替代选择。`;

@@ -290,6 +290,7 @@ async function buildRequest(state, inputJson) {
   let summary;
   try {
     summary = await state.provider.summarize({
+      pinned: { role_id: request.pinned.role_id },
       previous_summary: request.context.compact_text,
       new_committed_events: clone(window.selected),
     });

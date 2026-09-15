@@ -58,6 +58,7 @@ const id = randomUUID();
 const [a, b] = await Promise.all([run(identity, first.provider, id), run(identity, first.provider, id)]);
 assert.equal(a.turn_id, b.turn_id);
 assert.equal(first.requests.filter(r => r.compact).length, 1);
+assert.equal(first.requests[0].payload.player_role_id, 'stranger', 'runtime carries the pinned role into compaction');
 assert.deepEqual(first.requests[0].payload.new_committed_events, history.slice(0, 4));
 assert.deepEqual(first.requests[1].payload.committed_history, history.slice(4));
 assert.deepEqual(listSessionEvents(identity), history);
