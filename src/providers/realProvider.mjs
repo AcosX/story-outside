@@ -862,8 +862,8 @@ export function createRealZhihuStoryProvider(opts = {}) {
         // fabricate one.
         if (listCache) {
           // The refresh failed but a cached list shielded the homepage.
-          // Log it so a recurring "silent" upstream outage is visible in
-          // journald instead of only surfacing as a stale homepage.
+          // Log it so a recurring upstream outage is visible to the configured
+          // application log sink instead of only surfacing as stale data.
           loggerWarn('stories.list.stale_served', {
             component: 'realProvider',
             error_code: err instanceof ProviderError ? err.code : 'unknown',
@@ -942,8 +942,8 @@ export function createRealZhihuStoryProvider(opts = {}) {
         // only decides WHEN we re-request). The typed error is still
         // thrown when we have NEVER cached this work — we never fabricate
         // a story. This shields character / opening preparation, which
-        // reads getStory, from the same transient upstream 4xx that the
-        // 2026-09-14 incident showed on the list path.
+        // reads getStory, from the same transient upstream 4xx condition that can affect the
+        // list path.
         if (detailCache.has(work_id)) {
           const cached = detailCache.get(work_id);
           loggerWarn('stories.detail.stale_served', {

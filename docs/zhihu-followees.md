@@ -23,7 +23,7 @@
 
 OAuth `GET https://openapi.zhihu.com/user` 的 `url` 实际为 `/users/<数字 UID>`，不能将其当作 `/people/<url_token>`，也不能将数字 UID 直接用于关注列表匹配。
 
-当 OAuth 资料没有可用的公开主页地址时，使用该资料的 `hash_id` 查询 `GET https://www.zhihu.com/api/v4/members/<hash_id>?include=url_token`，核对响应 `id` 与 `hash_id` 完全一致后，才登记响应中的 `url_token`。此公开用户接口已于 2026-09-14 在 VM3 实测；请求不携带 OAuth token、Access Secret 或 Cookie，禁止重定向，并限制为 5 秒和 64 KiB。已有 `/people/` 资料继续直接使用。
+当 OAuth 资料没有可用的公开主页地址时，使用该资料的 `hash_id` 查询 `GET https://www.zhihu.com/api/v4/members/<hash_id>?include=url_token`，核对响应 `id` 与 `hash_id` 完全一致后，才登记响应中的 `url_token`。该公开用户接口已在受控环境验证；请求不携带 OAuth token、Access Secret 或 Cookie，禁止重定向，并限制为 5 秒和 64 KiB。已有 `/people/` 资料继续直接使用。
 
 公开资料查询失败仍允许登录，但不猜测账号映射，并记录 `following.identity.unavailable`，便于区分没有活动与身份解析失败。旧版本未登记的玩家需要在修复后重新登录一次才能补齐映射；账号 UUID、已有游戏和可见性偏好保持不变。后续部署重启可从数据库恢复已登记的映射。
 

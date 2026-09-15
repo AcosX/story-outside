@@ -1050,9 +1050,8 @@ async function handleRequest(req, res) {
       return jsonResponse(res, 200, { demo: currentDemoFlag(), stories });
     } catch (err) {
       const { status, code } = classifyProviderError(err);
-      // The catalog routes historically returned the typed error without
-      // logging, which made the 2026-09-14 upstream_4xx incident
-      // invisible in journald (only the Apache access log showed it).
+      // Catalog failures are logged at the application boundary so deployments do
+      // not need to rely on proxy-specific access logs for upstream diagnosis.
       // Emit one warn line with the upstream status when we have it.
       loggerWarn('stories.request.failed', {
         component: 'http',

@@ -201,7 +201,7 @@ bash scripts/mariadb-probes.sh /path/to/story-outside
 7. `pending_batch_items` item_type=`tool_call` 且 status=`committed` → `chk_pending_batch_items_tool_commit` 拒绝；
 8. item 的 `session_id` 与其 batch 的 `session_id` 不一致 → `fk_pending_batch_items_session_batch` 复合外键拒绝。
 
-> 注意：脚本用 `(SELECT id FROM game_sessions WHERE session_uuid=...)` 子查询解析 session 主键，不假设自增 id 连续——本机 MariaDB 的 `auto_increment_increment=3`（Galera 风格配置）下自增步长不是 1，直接写死 id=1/2 会导致探针误报。
+> 注意：脚本用 `(SELECT id FROM game_sessions WHERE session_uuid=...)` 子查询解析 session 主键，不假设自增 id 连续；某些数据库集群会配置非 1 的自增步长，直接写死 id=1/2 会导致探针误报。
 
 ## 7. 契约测试
 

@@ -6,7 +6,7 @@ const cacheKey = url => createHash('sha256').update(url).digest('hex');
 const query = (connection, sql, values = []) => connection.query({ sql, values, timeout: 2000 });
 
 // A driver query timeout alone does not bound pool acquisition or a pending
-// Galera COMMIT. Destroy the dedicated connection at the total deadline; a lost
+// clustered database COMMIT. Destroy the dedicated connection at the total deadline; a lost
 // COMMIT response is treated as uncertain, and the next upsert is idempotent.
 async function withConnection(pool, work, deadline = Date.now() + 4000) {
   const remaining = deadline - Date.now();

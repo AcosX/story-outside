@@ -794,8 +794,8 @@ async function run() {
   });
 
   // ----- 23. list resilience: bounded retry + TTL cache + stale fallback --
-  // Regression coverage for the 2026-09-14 incident: the upstream edge
-  // returned transient 4xx for ~22 minutes and the homepage failed hard.
+  // Regression coverage for transient upstream 4xx responses that would
+  // otherwise make the catalog fail hard.
   // listStories now (a) retries a transient failure once, (b) serves a
   // fresh cache without network, (c) falls back to a recent good list
   // while the upstream is failing, (d) still surfaces the typed error

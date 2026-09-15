@@ -1,5 +1,5 @@
-// Optional preload for an independently deployed runtime while the PR awaits
-// review. New providers use the saved original fetch to avoid double wrapping.
+// Optional preload for deployments that enable the bounded story transport.
+// New providers use the saved original fetch to avoid double wrapping.
 import { storyTransportFromEnv } from './storyTransport.mjs';
 import { validateStoryTransportPayload } from './realProvider.mjs';
 

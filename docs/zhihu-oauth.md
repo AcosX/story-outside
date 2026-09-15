@@ -9,7 +9,7 @@
 - 回调：`/auth/callback?authorization_code=...&state=...`，兼容单一 `code` 参数。缺失、不匹配、重复、过期或已使用的 state 一律拒绝，不能降级为无 state 登录。
 - 换 Token：`POST https://openapi.zhihu.com/access_token`，表单 `app_id`、`app_key`、`redirect_uri`、`grant_type=authorization_code`、`code`。
 - 用户资料：`GET https://openapi.zhihu.com/user`，`Authorization: Bearer <用户 access_token>`。正式响应为根对象的 `uid`、`fullname` 等字段；兼容旧 `code:20000,data:{...}` 包装。业务错误可能使用 HTTP 200，必须检查 JSON。
-- `uid` 为 19 位十进制整数，超出 JavaScript 安全整数范围（2^53-1，16 位）。响应体必须在 `JSON.parse` 之前把超长整数字面量转成字符串，否则末几位会被静默改写，既拿不到真实账号，也会让整数校验失败。2026-09-13 线上首次真人授权即因此被拒。
+- `uid` 为 19 位十进制整数，超出 JavaScript 安全整数范围（2^53-1，16 位）。响应体必须在 `JSON.parse` 之前把超长整数字面量转成字符串，否则末几位会被静默改写，既拿不到真实账号，也会让整数校验失败。真实授权验证曾暴露该精度问题。
 
 旧 Hackathon 包里的 `/user` 双凭证示例不适用于该正式 OAuth 接口。故事 Real Provider 和数据平台调用仍保持各自的鉴权契约。
 
@@ -46,4 +46,4 @@ OAuth Redirect URI: https://<你的部署域名>/auth/callback
 
 上线后的真实验收需要用户亲自在知乎授权页确认；回调必须带回匹配的 state 并成功读取 uid。静态检查和模拟上游测试不能代替该验收。如果平台仍不回传 state，应报告协议不匹配并保持拒绝登录，不能放宽验证。
 
-2026-09-13 线上实测确认：授权回调**确实回传 `state`**（形态为 `/auth/callback?state=...&authorization_code=...`），与旧资料中「实测不返 state」的记载不同，严格单次 state 校验可以正常工作。同日真人授权还暴露了 19 位 `uid` 的精度缺陷，已在协议来源一节记录。
+受控真实授权验证确认：授权回调**确实回传 `state`**（形态为 `/auth/callback?state=...&authorization_code=...`），与旧资料中「实测不返 state」的记载不同，严格单次 state 校验可以正常工作。该验证同时暴露了 19 位 `uid` 的精度缺陷，已在协议来源一节记录。

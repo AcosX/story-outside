@@ -83,12 +83,12 @@ test('untrusted URLs and mutations never reach SSH or direct fetch', async () =>
 
 test('SSH command contains only validated base64 ID and fixed helper; no headers forwarded', async () => {
   let args;
-  const relay = sshStoryFetch('opc@vm2', async (...input) => { args = input; return { stdout: JSON.stringify(list)+'\n200' }; });
+  const relay = sshStoryFetch('relay-user@relay.example', async (...input) => { args = input; return { stdout: JSON.stringify(list)+'\n200' }; });
   assert.deepEqual(await (await relay(url, { headers: { Authorization: 'never-forward' } })).json(), list);
   assert.equal(args[0], '/usr/bin/ssh');
   assert.equal(args[1].at(-1), '/usr/local/libexec/story-outside-zhihu-get.py bGlzdA');
   assert.ok(!JSON.stringify(args).includes('never-forward'));
-  assert.throws(() => sshStoryFetch('vm2;touch /tmp/oops'));
+  assert.throws(() => sshStoryFetch('relay.example;touch /tmp/oops'));
 });
 
 test('oversized successful body falls back without replacing cache', async t => {
@@ -103,7 +103,7 @@ test('disabled transport preserves original fetch identity', () => {
 });
 
 test('preload preserves other APIs and a newly integrated provider does not wrap it twice', () => {
-  const code = `process.env.STORY_OUTSIDE_STORY_SSH_HOST='opc@unused.invalid';
+  const code = `process.env.STORY_OUTSIDE_STORY_SSH_HOST='relay-user@unused.invalid';
     let calls=0; globalThis.fetch=async()=>{calls++;return Response.json(${JSON.stringify(list)})};
     await import(${JSON.stringify(new URL('../src/providers/registerStoryTransport.mjs', import.meta.url).href)});
     await fetch('https://example.com/private',{headers:{Authorization:'private'}});

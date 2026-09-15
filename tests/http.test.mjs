@@ -123,10 +123,9 @@ try {
   }
 
   // Catalog failures must leave a warn trace in the structured log.
-  // Regression for the 2026-09-14 incident: /api/stories returned
-  // upstream_4xx for ~22 minutes with zero journald evidence because the
-  // route never logged provider errors. The mock provider's unknown-id
-  // 404 exercises the same catch block.
+  // Regression: catalog provider errors must be emitted to the structured
+  // application log even when the HTTP response already carries a typed
+  // failure. The mock provider's unknown-id 404 exercises the same path.
   {
     const logLines = [];
     const previousSink = setSink((line) => logLines.push(line));
