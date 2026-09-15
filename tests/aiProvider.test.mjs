@@ -25,10 +25,10 @@ const story={content:'完整原作'.repeat(500)};
 const calls=[];
 const provider=createAIProvider({config,story,fetchImpl:async(url,opts)=>{
   calls.push({url,body:JSON.parse(opts.body)});
-  const content={items:[{type:'narration',text:'门开了。'}],tool_call:{name:'ask_player_choice',arguments:{question:'接下来，你想怎么做？',options:[{id:'a',label:'进入'},{id:'b',label:'等待'}]}}};
+  const content={items:[{type:'narration',text:'门开了。'},{type:'narration',text:'走廊尽头传来脚步声。'},{type:'narration',text:'有人轻轻敲了敲窗。'}],tool_call:{name:'ask_player_choice',arguments:{question:'接下来，你想怎么做？',options:[{id:'a',label:'进入'},{id:'b',label:'等待'}]}}};
   return {ok:true,json:async()=>({choices:[{message:{content:JSON.stringify(content)},finish_reason:'stop'}]})};
 }});
-const result=await provider.complete({pinned:{role_id:'me'},canonical_history:Array.from({length:20},(_,i)=>({event_seq:i,event_type:'narrative_beat',payload:i===0?{story_progress:0.23}:{},text:'事件'})),context:{compact_text:'保留玩家选择和人物事实',recent_events:Array.from({length:16},(_,i)=>({event_seq:i+4,text:'事件'}))},input:{text:'看看'}});
+const result=await provider.complete({pinned:{role_id:'me'},canonical_history:[...Array.from({length:20},(_,i)=>({event_seq:i,event_type:'narrative_beat',payload:i===0?{story_progress:0.23}:{},text:'事件'})),{event_seq:20,event_type:'player_input',payload:{text:'继续'}}],context:{compact_text:'保留玩家选择和人物事实',recent_events:Array.from({length:16},(_,i)=>({event_seq:i+4,text:'事件'}))},input:{text:'看看'}});
 assert.equal(calls.length,1);
 const sent=JSON.parse(calls[0].body.messages[1].content);
 assert.deepEqual(sent.original_story,story);
@@ -43,7 +43,7 @@ await assert.rejects(createAIProvider({config:{...config,maxRetries:0},story:{},
 console.log('AI provider: config, full original, compact, validated choice, upstream failure and malformed JSON passed');
 
 const retryConfig = { ...config, maxRetries: 2, retryBaseDelayMs: 0, retryMaxDelayMs: 0 };
-const completionPayload = { choices: [{ message: { content: JSON.stringify({ items: [{ text: '重试成功。' }] }) }, finish_reason: 'stop' }] };
+const completionPayload = { choices: [{ message: { content: JSON.stringify({ items: [{ text: '重试成功。' }, { text: '继续前行。' }, { text: '夜色渐深。' }] }) }, finish_reason: 'stop' }] };
 
 // Transient upstream responses and transport failures are retried twice at
 // most; the request body and model remain unchanged across attempts.
@@ -59,7 +59,7 @@ const completionPayload = { choices: [{ message: { content: JSON.stringify({ ite
     },
   });
   const result = await completion([{ role: 'user', content: 'test' }], 100);
-  assert.deepEqual(result, { items: [{ text: '重试成功。' }] });
+  assert.equal(result.items.length, 3); assert.equal(result.items[0].text, '重试成功。');
   assert.equal(calls, 3);
 }
 
@@ -124,7 +124,7 @@ const completionPayload = { choices: [{ message: { content: JSON.stringify({ ite
     },
   });
   const result = await completion([{ role: 'user', content: 'test' }], 100);
-  assert.deepEqual(result, { items: [{ text: '重试成功。' }] });
+  assert.equal(result.items.length, 3); assert.equal(result.items[0].text, '重试成功。');
   assert.equal(calls, 3);
 }
 
@@ -168,7 +168,7 @@ console.log('AI provider: transient retries, transport retry, and deterministic 
     },
   });
   const result = await completion([{ role: 'user', content: 'test' }], 100);
-  assert.deepEqual(result, { items: [{ text: '重试成功。' }] });
+  assert.equal(result.items.length, 3); assert.equal(result.items[0].text, '重试成功。');
   assert.equal(primaryCalls, 2, 'primary channel: initial attempt + 1 retry');
   assert.equal(backupCalls, 1, 'backup channel: succeeds on its first attempt');
 }
@@ -208,7 +208,7 @@ console.log('AI provider: backup channel fallback after primary retry exhaustion
 {
   const requests = [];
   const narrateArgs = {
-    items: [{ type: 'narration', text: '门开了。', story_progress: 0.2 }],
+    items: [{ type: 'narration', text: '门开了。', story_progress: 0.2 }, { type: 'narration', text: '走廊尽头传来脚步声。' }, { type: 'narration', text: '有人轻轻敲了敲窗。' }],
     tool_call: { name: 'ask_player_choice', arguments: { question: '接下来，你想怎么做？', options: [{ id: 'a', label: '进入' }, { id: 'b', label: '等待' }] } },
   };
   const provider = createAIProvider({ config, story: {}, fetchImpl: async (url, opts) => {
@@ -216,7 +216,7 @@ console.log('AI provider: backup channel fallback after primary retry exhaustion
     return { ok: true, json: async () => ({ choices: [{ message: { tool_calls: [{ function: { name: 'narrate', arguments: JSON.stringify(narrateArgs) } }] }, finish_reason: 'tool_calls' }] }) };
   } });
   const result = await provider.complete({ canonical_history: [], input: {}, pinned: {} });
-  assert.deepEqual(result.items.map(it => it.text), ['门开了。']);
+  assert.deepEqual(result.items.map(it => it.text), ['门开了。', '走廊尽头传来脚步声。', '有人轻轻敲了敲窗。']);
   assert.ok(result.tool_call.tool_call_id, 'inner tool call is normalized with an id');
   assert.equal(requests[0].body.tool_choice.function.name, 'narrate');
   assert.equal(requests[0].body.tools[0].function.name, 'narrate');
@@ -230,12 +230,12 @@ console.log('AI provider: backup channel fallback after primary retry exhaustion
     config: retryConfig,
     fetchImpl: async () => {
       calls += 1;
-      const args = calls < 2 ? '{"items":[{"text":"截断的' : JSON.stringify({ items: [{ type: 'narration', text: '重试成功。' }] });
+      const args = calls < 2 ? '{"items":[{"text":"截断的' : JSON.stringify({ items: [{ type: 'narration', text: '重试成功。' }, { type: 'narration', text: '继续前行。' }, { type: 'narration', text: '夜色渐深。' }] });
       return { ok: true, json: async () => ({ choices: [{ message: { tool_calls: [{ function: { name: 'narrate', arguments: args } }] } }] }) };
     },
   });
   const result = await completion([{ role: 'user', content: 'test' }], 100, { name: 'narrate', description: '', parameters: {} });
-  assert.deepEqual(result, { items: [{ type: 'narration', text: '重试成功。' }] });
+  assert.equal(result.items.length, 3); assert.equal(result.items[0].text, '重试成功。');
   assert.equal(calls, 2);
 }
 {
@@ -260,11 +260,11 @@ console.log('AI provider: backup channel fallback after primary retry exhaustion
     config: { ...config, maxRetries: 0, retryBaseDelayMs: 0, retryMaxDelayMs: 0 },
     fetchImpl: async (url, opts) => {
       assert.equal(JSON.parse(opts.body).tools[0].function.name, 'narrate');
-      return { ok: true, json: async () => ({ choices: [{ message: { content: JSON.stringify({ items: [{ text: '旧通道正文。' }] }) }, finish_reason: 'stop' }] }) };
+      return { ok: true, json: async () => ({ choices: [{ message: { content: JSON.stringify({ items: [{ text: '旧通道正文。' }, { text: '继续前行。' }, { text: '夜色渐深。' }] }) }, finish_reason: 'stop' }] }) };
     },
   });
   const result = await completion([{ role: 'user', content: 'test' }], 100, { name: 'narrate', description: '', parameters: {} });
-  assert.deepEqual(result, { items: [{ text: '旧通道正文。' }] });
+  assert.equal(result.items.length, 3); assert.equal(result.items[0].text, '旧通道正文。');
 }
 // Summaries ride the same channel through save_summary.
 {
@@ -310,7 +310,7 @@ try {
   const requests = [];
   const provider = createAIProvider({config, story, fetchImpl:async(_url, options)=>{
     requests.push(JSON.parse(options.body));
-    return {ok:true,json:async()=>({choices:[{message:{content:JSON.stringify({items:[{type:'narration',text:'走廊传来脚步声。'}]})}}]})};
+    return {ok:true,json:async()=>({choices:[{message:{content:JSON.stringify({items:[{type:'narration',text:'走廊传来脚步声。'},{type:'narration',text:'门缝里透出光。'},{type:'narration',text:'有人低声交谈。'}]})}}]})};
   }});
   for (const role of roles) {
     const request = {pinned:{role_id:role.id}, context:{compact_text:'我推门看见医生。',recent_events:[{event_seq:12,type:'player_input',text:'等一下'}]},input:{text:'继续'}};

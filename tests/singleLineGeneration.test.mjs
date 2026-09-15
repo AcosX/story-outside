@@ -16,21 +16,21 @@ const provider = createAIProvider({
     requests.push(JSON.parse(options.body));
     // A provider can ignore JSON-schema constraints. Do not silently keep
     // the first line and reveal a choice based on an omitted second line.
-    const items = requests.length === 1 ? [line('门开了。'), line('门内有人挥手。')] : [line('门内有人挥手。')];
+    const items = requests.length === 1 ? [line('门开了。'), line('门内有人挥手。')] : [line('门内有人挥手。'), line('门内有人挥手。'), line('门内有人挥手。')];
     return { ok: true, json: async () => ({ choices: [{ message: { tool_calls: [{ function: {
       name: 'narrate', arguments: JSON.stringify({ arc_status: 'ongoing', items, tool_call: choice }),
     } }] }, finish_reason: 'tool_calls' }] }) };
   },
 });
 const result = await provider.complete({ pinned: { model: 'test', role_id: 'self' }, canonical_history: [], input: { text: '继续' } });
-assert.equal(requests.length, 2, 'multi-line output is retried instead of truncated');
-assert.equal(result.items.length, 1);
+assert.equal(requests.length, 2, 'too-short output is retried instead of truncated');
+assert.equal(result.items.length, 3);
 assert.equal(result.items[0].text, '门内有人挥手。');
 assert.equal(result.tool_call.name, 'ask_player_choice');
 for (const body of requests) {
-  assert.equal(body.tools[0].function.parameters.properties.items.minItems, 1);
-  assert.equal(body.tools[0].function.parameters.properties.items.maxItems, 1);
-  assert.match(body.messages[0].content, /每次只返回一条/);
+  assert.equal(body.tools[0].function.parameters.properties.items.minItems, 3);
+  assert.equal(body.tools[0].function.parameters.properties.items.maxItems, 5);
+  assert.match(body.messages[0].content, /每次返回 3 至 5 条/);
   assert.match(body.messages[0].content, /不必每条都询问玩家/);
 }
 assert.equal(normalizeProviderResult({ items: [line('旧批次一。'), line('旧批次二。'), line('旧批次三。')] }).items.length, 3,
@@ -70,8 +70,8 @@ function harness() {
     const [id, timer] = timers.entries().next().value;
     timers.delete(id); timer.fn(); await settle(); return timer.delay;
   };
-  const resolveGeneration = (index, tool = null) => generations[index].resolve({ revision: state.lastRevision,
-    pending_id: `p${index}`, events: [line(`line-${index}`)], tool_call: tool });
+  const resolveGeneration = (index, tool = null, count = 1) => generations[index].resolve({ revision: state.lastRevision,
+    pending_id: `p${index}`, events: Array.from({ length: count }, (_, sequence) => line(`line-${index}-${sequence}`)), tool_call: tool });
   const resolveCommit = (index, tool = null) => commits[index].resolve({ revision: state.lastRevision + 1,
     event: { event_id: `e${index}`, event_type: 'narrative_beat', payload: line(`line-${index}`) }, pending_tool_call: tool });
   return { state, player, timers, generations, commits, displayed, surfaced, settle, tick, resolveGeneration, resolveCommit };
@@ -79,10 +79,28 @@ function harness() {
 {
   const h = harness();
   const first = h.player.startNextBatch();
+  h.resolveGeneration(0, null, 3); await first;
+  assert.deepEqual(h.displayed, ['line-0-0'], 'a returned batch reveals only its first line');
+  await h.tick();
+  assert.equal(h.commits.length, 1);
+  h.resolveCommit(0); await h.settle();
+  assert.equal(await h.tick(), 1100, 'the second line waits for the playback cadence');
+  assert.deepEqual(h.displayed, ['line-0-0', 'line-0-1']);
+  assert.equal(h.commits.length, 2);
+  h.resolveCommit(1); await h.settle();
+  assert.equal(await h.tick(), 1100, 'the third line waits for the playback cadence');
+  assert.deepEqual(h.displayed, ['line-0-0', 'line-0-1', 'line-0-2']);
+  assert.equal(h.commits.length, 3);
+  h.state.status = 'paused';
+  h.resolveCommit(2); await h.settle();
+}
+{
+  const h = harness();
+  const first = h.player.startNextBatch();
   assert.equal(h.generations.length, 1);
   assert.deepEqual(h.displayed, []);
   h.resolveGeneration(0); await first;
-  assert.deepEqual(h.displayed, ['line-0'], 'first line renders as soon as its generation returns');
+  assert.deepEqual(h.displayed, ['line-0-0'], 'first line renders as soon as its generation returns');
   assert.equal(await h.tick(), 0, 'no playback delay before committing the visible line');
   assert.equal(h.commits.length, 1);
   assert.equal(h.generations.length, 1, 'next generation must wait for durable commit');
@@ -92,9 +110,9 @@ function harness() {
   assert.equal(h.generations.length, 2);
   assert.equal(h.generations[1].body.expected_revision, 2);
   assert.notEqual(h.generations[1].body.request_id, h.generations[0].body.request_id);
-  assert.deepEqual(h.displayed, ['line-0'], 'first line stays readable while second generation is blocked');
+  assert.deepEqual(h.displayed, ['line-0-0'], 'first line stays readable while second generation is blocked');
   h.resolveGeneration(1, choice); await h.settle();
-  assert.deepEqual(h.displayed, ['line-0', 'line-1']);
+  assert.deepEqual(h.displayed, ['line-0-0', 'line-1-0']);
   assert.equal(await h.tick(), 0);
   h.resolveCommit(1, choice); await h.settle();
   assert.equal(h.generations.length, 2, 'do not generate past a choice');
@@ -139,4 +157,4 @@ function harness() {
   assert.equal(h.surfaced.length, 1);
   assert.equal(h.generations.length, 1);
 }
-console.log('Single-line generation: schema enforcement, legacy replay, immediate display/commit/continuation, pause and choice ordering PASS');
+console.log('Batch narrative: schema enforcement, legacy replay, immediate display/commit/continuation, pause and choice ordering PASS');

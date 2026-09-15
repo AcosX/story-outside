@@ -10,11 +10,11 @@ const bodies=[];
 const corrected='我按下30层，电梯缓缓上升。门打开时，一扇暗红色的门出现在走廊尽头，我停在门前。';
 const provider=createAIProvider({story:{roles:[{id:'i',label:'我'}],first_person_role_id:'i',beats:['原作后续：午后已经入住，遇见女儿。']},config:{apiKey:'test',baseURL:'https://test.invalid',model:'test',timeoutMs:1000,maxRetries:1,retryBaseDelayMs:0,retryMaxDelayMs:0},fetchImpl:async(_url,options)=>{
  bodies.push(JSON.parse(options.body));
- return Response.json({choices:[{message:{tool_calls:[{function:{name:'narrate',arguments:JSON.stringify({arc_status:'ongoing',items:[{type:'narration',text:bodies.length===1?'我按下30层。':corrected}],tool_call:{name:'ask_player_choice',arguments:{question:bodies.length===1?'电梯升到30层，我来到暗红色门前。现在怎么做？':PLAYER_CHOICE_QUESTION,options:[{id:'knock',label:'敲门'},{id:'wait',label:'等一会儿'}]}}})}}]},finish_reason:'tool_calls'}]});
+ return Response.json({choices:[{message:{tool_calls:[{function:{name:'narrate',arguments:JSON.stringify({arc_status:'ongoing',items:[{type:'narration',text:bodies.length===1?'我按下30层。':corrected},{type:'narration',text:'电梯缓缓上升。'},{type:'narration',text:'走廊尽头出现一扇暗红色的门。'}],tool_call:{name:'ask_player_choice',arguments:{question:bodies.length===1?'电梯升到30层，我来到暗红色门前。现在怎么做？':PLAYER_CHOICE_QUESTION,options:[{id:'knock',label:'敲门'},{id:'wait',label:'等一会儿'}]}}})}}]},finish_reason:'tool_calls'}]});
 }});
 const result=await provider.complete({pinned:{role_id:'i'},canonical_history:history,input:{text:'A. 选30层',kind:'player_action'}});
 assert.equal(bodies.length,2,'hidden narrative in a question must retry, never be silently erased');
-assert.equal(result.items.length,1);assert.equal(result.items[0].text,corrected);
+assert.equal(result.items.length,3);assert.equal(result.items[0].text,corrected);
 assert.equal(result.tool_call.arguments.question,PLAYER_CHOICE_QUESTION);
 assert.match(bodies[1].messages.at(-1).content,/尚未展示或提交/);
 const payload=JSON.parse(bodies[0].messages[1].content);
@@ -28,7 +28,7 @@ assert.equal(nextPayload.committed_history.at(-1).payload.text,corrected,'all di
 
 // Option IDs identify UI controls, not story facts. Complete only missing
 // IDs deterministically; keep labels and existing IDs intact, including collisions.
-const idProvider=createAIProvider({story:{},config:{apiKey:'test',baseURL:'https://test.invalid',model:'test',timeoutMs:1000,maxRetries:0},fetchImpl:async()=>Response.json({choices:[{message:{content:JSON.stringify({items:[{type:'narration',text:'门前传来脚步声。'}],tool_call:{name:'ask_player_choice',arguments:{question:PLAYER_CHOICE_QUESTION,options:[{label:'继续敲门'},{id:'choice-1',label:'等待'},{label:'后退'}]}}})}}]})});
+const idProvider=createAIProvider({story:{},config:{apiKey:'test',baseURL:'https://test.invalid',model:'test',timeoutMs:1000,maxRetries:0},fetchImpl:async()=>Response.json({choices:[{message:{content:JSON.stringify({items:[{type:'narration',text:'门前传来脚步声。'},{type:'narration',text:'门缝里透出光。'},{type:'narration',text:'有人低声交谈。'}],tool_call:{name:'ask_player_choice',arguments:{question:PLAYER_CHOICE_QUESTION,options:[{label:'继续敲门'},{id:'choice-1',label:'等待'},{label:'后退'}]}}})}}]})});
 const withIds=await idProvider.complete({pinned:{},canonical_history:[],input:{kind:'continue'}});
 assert.deepEqual(withIds.tool_call.arguments.options.map(option=>option.id),['choice-2','choice-1','choice-3']);
 assert.deepEqual(withIds.tool_call.arguments.options.map(option=>option.label),['继续敲门','等待','后退']);

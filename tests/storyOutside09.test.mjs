@@ -194,19 +194,28 @@ try {
   check('recover after final commit has pending=null', rec2.data?.pending === null);
   check('recover after final commit history count matches', rec2.data?.history?.length === gen1.data.events.length + 1);
 
+  // A choice submission opens a fresh interaction window before the next
+  // automatic batch. This keeps the next demo batch within the five-line
+  // server boundary.
+  const choiceReset = await post(`/api/dev/sessions/${sessionUuid}/interrupt`, {
+    text: '继续看', client_request_id: 'choice-reset-before-turn-3', expected_revision: rec2.data.revision,
+  });
+  check('choice reset before turn 3 200', choiceReset.response.status === 200);
+  check('choice reset before turn 3 appends player_input', choiceReset.data?.event?.event_type === 'player_input');
+
   // ----- interrupt drops pending tail -----
   // Stage a fresh 3-item batch, commit only one, then interrupt.
   const gen3 = await post(`/api/dev/sessions/${sessionUuid}/generate`, {
     request_id: 'turn-3',
     input: { text: 'hello' },
-    expected_revision: rec2.data.revision,
+    expected_revision: choiceReset.data.revision,
   });
   check('generate3 200', gen3.response.status === 200);
   const pending3 = gen3.data.pending_id;
   const commit3a = await post(`/api/dev/sessions/${sessionUuid}/narrative-events`, {
     pending_id: pending3,
     sequence: 0,
-    expected_revision: rec2.data.revision,
+    expected_revision: choiceReset.data.revision,
     client_request_id: 'commit-3a',
   });
   check('commit3a 200', commit3a.response.status === 200);
@@ -337,7 +346,7 @@ check('recover after two interrupts: history grew by 2', rec4.data?.history?.len
   check('p11: third interrupt (realtime) 200', p11Int3.response.status === 200);
   // recovered now uses rec4 (post-second-interrupt) so revision matches the live session.
   check('recover after interrupt has no pending', rec3.data?.pending === null);
-  check('recover after interrupt history size correct', rec3.data?.history?.length === rec2.data.history.length + 1 + 1);
+  check('recover after interrupt history size correct', rec3.data?.history?.length === rec2.data.history.length + 3);
 
   // ----- agentRuntime integration: provider fail-closed -----
   // The runtime must fail closed on a malformed provider result. A payload
@@ -663,6 +672,7 @@ check('recover after two interrupts: history grew by 2', rec4.data?.history?.len
       request_id: `finish-turn-${turn}`, input: { text: 'hello' }, expected_revision: finishRevision,
     });
     if (!gen.data?.pending_id) break;
+    let choiceToolCall = false;
     for (let i = 0; i < gen.data.events.length; i += 1) {
       const c = await post(`/api/dev/sessions/${finishSession}/narrative-events`, {
         pending_id: gen.data.pending_id, sequence: i, expected_revision: finishRevision,
@@ -673,8 +683,18 @@ check('recover after two interrupts: history grew by 2', rec4.data?.history?.len
       // The final commit of the turn that triggered autoFinish surfaces
       // the finish_story tool_call as `pending_tool_call`.
       if (i === gen.data.events.length - 1 && c.data?.pending_tool_call) {
-        finishToolCall = c.data.pending_tool_call;
+        if (c.data.pending_tool_call.name === 'finish_story') finishToolCall = c.data.pending_tool_call;
+        choiceToolCall = c.data.pending_tool_call.name === 'ask_player_choice';
       }
+    }
+    // Auto-choice batches also start a fresh interaction window. The demo
+    // arc needs the equivalent of a player submission before its next
+    // automatic batch can continue.
+    if (choiceToolCall && !finishToolCall) {
+      const reset = await post(`/api/dev/sessions/${finishSession}/interrupt`, {
+        text: '继续', client_request_id: `finish-choice-${turn}`, expected_revision: finishRevision,
+      });
+      finishRevision = reset.data.revision;
     }
   }
   check('finish_story surfaces terminal tool_call on final commit', finishToolCall && finishToolCall.name === 'finish_story');

@@ -169,8 +169,8 @@ await test('provider results reject empty, mixed, multi-tool, unknown, and bad p
   // Story 08 P1.3: tool-only batches (tool_calls without messages/items)
   // are explicitly rejected. The legacy messages + tool_calls mixed shape
   // is also rejected; the legacy multi-tool_calls array is rejected;
-  // unknown tool names / bad payloads fail closed; a 5-item batch is
-  // rejected by the explicit cap.
+    // unknown tool names / bad payloads fail closed; a 6-item batch is
+    // rejected by the explicit cap.
   const cases = [
     [{ messages: [] }, 'invalid_tool_call'],
     // Legacy multi-tool_calls array (2 entries) is rejected even when 1..4
@@ -180,7 +180,7 @@ await test('provider results reject empty, mixed, multi-tool, unknown, and bad p
     [{ tool_calls: [{ name: 'ask_player_choice', arguments: { options: [{ id: 'a', label: 'A' }, { id: 'b', label: 'B' }] } }, { name: 'finish_story', arguments: { summary: 'done' } }] }, 'invalid_tool_call'],
     [{ tool_calls: [{ name: 'unknown', arguments: {} }] }, 'invalid_tool_call'],
     [{ tool_calls: [{ name: 'finish_story', arguments: { summary: '' } }] }, 'invalid_tool_call'],
-    [{ items: [{ role: 'assistant', type: 'narration', text: 'hi' }, { role: 'assistant', type: 'narration', text: 'hi 2' }, { role: 'assistant', type: 'narration', text: 'hi 3' }, { role: 'assistant', type: 'narration', text: 'hi 4' }, { role: 'assistant', type: 'narration', text: 'hi 5' }] }, 'invalid_tool_call'],
+    [{ items: [{ role: 'assistant', type: 'narration', text: 'hi' }, { role: 'assistant', type: 'narration', text: 'hi 2' }, { role: 'assistant', type: 'narration', text: 'hi 3' }, { role: 'assistant', type: 'narration', text: 'hi 4' }, { role: 'assistant', type: 'narration', text: 'hi 5' }, { role: 'assistant', type: 'narration', text: 'hi 6' }] }, 'invalid_tool_call'],
   ];
   for (const [response, code] of cases) {
     const runtime = await buildRuntime(createMockAgentProvider({ responses: [response] }));

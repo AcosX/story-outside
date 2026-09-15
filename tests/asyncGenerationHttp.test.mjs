@@ -14,7 +14,7 @@ const nativeFetch=globalThis.fetch;let release;const gate=new Promise(resolve=>{
 globalThis.fetch=async(url,opts)=>{
  if(!String(url).startsWith('https://example.invalid'))return nativeFetch(url,opts);
  calls++;await gate;
- return new Response(JSON.stringify({choices:[{message:{content:JSON.stringify({items:[{type:'narration',text:'窗外雨声渐渐停了。'}]})},finish_reason:'stop'}]}),{status:200,headers:{'content-type':'application/json'}});
+ return new Response(JSON.stringify({choices:[{message:{content:JSON.stringify({items:[{type:'narration',text:'窗外雨声渐渐停了。'},{type:'narration',text:'檐角落下最后一滴水。'},{type:'narration',text:'远处的灯重新亮起。'}]})},finish_reason:'stop'}]}),{status:200,headers:{'content-type':'application/json'}});
 };
 await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
 const url=`http://127.0.0.1:${server.address().port}/api/sessions/${sessionUuid}/generate`;
