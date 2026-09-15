@@ -1,5 +1,6 @@
 import { spawnSync } from 'node:child_process';
 const tests = [
+  "tests/narrativeScene.test.mjs",
   "tests/narrativeLength.test.mjs",
   "tests/playerInteraction.test.mjs",
   "tests/narrativeContinuity.test.mjs",
